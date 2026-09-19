@@ -72,6 +72,9 @@ pub mod fabric;
 pub mod glance;
 pub mod handoff;
 pub mod hook;
+/// `aterm fabric mint-for|join` — a SECOND HOST joins the fleet over the
+/// sealed transport; see [`join::join`].
+pub mod join;
 /// A minimal JSON value, for the one document `hook install --merge` edits.
 pub mod json;
 pub mod mailbox;

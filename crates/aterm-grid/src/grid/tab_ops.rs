@@ -127,7 +127,12 @@ impl Grid {
     /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     #[inline]
     pub fn back_tab(&mut self) {
-        self.storage.clear_pending_wrap();
+        // NOTE: pending_wrap is deliberately preserved, exactly as in `tab()`.
+        // xterm's `TabToPrevStop` (tabs.c) never calls `ResetWrap`, and the
+        // `set_cur_col` it does call is a plain assignment
+        // (`#define set_cur_col(screen, value) screen->cur_col = value`,
+        // xterm.h) — so a back tab leaves `do_wrap` armed just as a forward tab
+        // does. Clearing it here cancelled a wrap xterm keeps.
         // Find the previous tab stop before the current column
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
         let current = usize::from(self.storage.cursor.col).min(max_col);
@@ -156,7 +161,7 @@ impl Grid {
             self.back_tab();
             return;
         }
-        self.storage.clear_pending_wrap();
+        // pending_wrap preserved — see `back_tab`.
         let margins = self.storage.horizontal_margins();
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
         let current = usize::from(self.storage.cursor.col).min(max_col);

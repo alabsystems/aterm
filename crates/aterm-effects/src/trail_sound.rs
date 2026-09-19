@@ -2338,10 +2338,31 @@ const SPACE_AIR_LEVEL: f32 = 0.9;
 /// the chime is a partial, so it raises the numerator of "is this a note"
 /// rather than the denominator. The gesture was the mix's darkest; it now
 /// glitters, reads MORE like a note, and does not spend a decibel doing it.
+///
+/// LIFTED 0.11/0.07 → 0.14/0.09 ON 2026-09-17 (+2.1 dB on the pair; the
+/// owner, 2026-09-16: *"i don't always hear the space bar?"*), with the
+/// chime folded into one sparkle band ([`SPACE_TWINKLE_LO_HZ`]). The fold
+/// alone put the darkest root of the register — 220 Hz, whose chime can go
+/// no higher than 32f = 7.04 kHz — at a centroid of 468-495 Hz over the
+/// engine's 432-reading sweep, inside 20 Hz of the verdict's 450 Hz floor
+/// ([`SPACE_HEAD_CENTROID_FLOOR_HZ`]); this is the smallest lift that puts
+/// every root of every voice's walk over 500 Hz (measured floor 510 Hz, at
+/// Lumen's twelfth word — degree 4, a 275 Hz root, the band's unfolded
+/// floor). The bench's tonality is untouched or up on every voice (Lumen
+/// 84.7 → 84.7, Comet 65.9 → 67.2 — measured on the bench's word-0 row; the
+/// chime sits over the 150-4500 Hz window the note is judged in for every
+/// root of the register except the [275, 281.25) Hz sliver at the band's
+/// unfolded floor, where it lands at 4400-4500 Hz, the window's top edge,
+/// as a partial that can only raise the peak-over-median figure), the
+/// energy over 2 kHz rises on every
+/// voice (the lowest, Phaser, 0.022 → 0.029), and the head's peak moves
+/// under 0.3 dB (Lumen −26.04 → −25.81 dBFS, Comet −26.94 → −26.51, Marimba
+/// −25.08 → −25.28), so the ladder's "never over the letter" keeps its
+/// margin.
 const SPACE_TWINKLE_RATIO: f32 = 16.0;
 const SPACE_TWINKLE_DETUNE: f32 = 0.030;
-const SPACE_TWINKLE: f32 = 0.11;
-const SPACE_TWINKLE_TWIN: f32 = 0.07;
+const SPACE_TWINKLE: f32 = 0.14;
+const SPACE_TWINKLE_TWIN: f32 = 0.09;
 /// The air's shimmer LFO. It rides the WHOLE voice — chime and breath alike —
 /// so the space's top scintillates rather than puffing: the twinkle is what
 /// turns a thud's cap into a sparkle.
@@ -2352,6 +2373,97 @@ const SPACE_TWINKLE_DEPTH: f32 = 0.55;
 /// life, so a word boundary is not made longer, only brighter.
 const SPACE_TWINKLE_DUR_S: f32 = 0.105;
 const SPACE_TWINKLE_DECAY_S: f32 = 0.038;
+/// THE SPARKLE BAND — the twinkle's ONE register, for every root of the walk
+/// (2026-09-17; the owner, 2026-09-16: *"i don't always hear the space
+/// bar?"*).
+///
+/// The twinkle above was stated as "16f is 4.2-6.3 kHz" — true of a root
+/// walking 262-392 Hz and FALSE of the register the root actually lives in:
+/// [`SPACE_BASS_LO_HZ`]'s fold puts every palette's walk somewhere in
+/// [220, 440), and a root at the floor of that octave twinkled at 3.5 kHz.
+/// Measured on the bench's `Space` probe (`keyboard_song_ab --probes`, vol
+/// 0.4, seed POOF) across the twelve v1 voices, the head's spectral centroid
+/// is a line in the ROOT, not a property of the palette: Comet and Laser
+/// (an A anchor, folded to 220 Hz) 420 / 440 Hz; Sparkle and Marimba (C,
+/// 261.6 Hz) 500 / 473; Lumen, Beam, Mech, Fire, Typewriter (E, 330 Hz)
+/// 585 / 588 / 580 / 582 / 554; Felt and Phaser (G, 392 Hz) 642 / 693;
+/// Water (430 Hz) 666 — and the bench's "with top" floor is 450 Hz, so the
+/// two A voices read NO TOP on their first word, and EVERY voice's walk
+/// visits the same dark roots (Lumen's fourth word is 247.5 Hz, Phaser's and
+/// Felt's third is 220.5). The Space the owner does not always hear is the
+/// one whose root landed low in the octave.
+///
+/// The head's body must scale with the root — it IS the note. Its TOP need
+/// not: the twinkle is folded into this one band, `[SPACE_TWINKLE_LO_HZ, 2 ×
+/// SPACE_TWINKLE_LO_HZ)` = [4.4, 8.8) kHz — twenty times the register's own
+/// floor, so the fold is a property of the register rather than a number —
+/// by exact octaves ([`twinkle_hz`]), which keeps it the root's own pitch
+/// class (the doc above's own condition: a power-of-two multiple cannot
+/// beat against the root). Roots in [220, 275) now twinkle FIVE octaves up
+/// (32f); roots in [275, 440) twinkle four up, exactly as before. The twin's
+/// detune stays [`SPACE_TWINKLE_DETUNE`] × the ROOT in Hz (6.6-13.2 Hz across
+/// the register), under the 15-30 Hz roughness band whichever octave the
+/// pair sits in.
+///
+/// MEASURED on the same probe, the fold alone (before → after): Comet
+/// 420 → 494 Hz centroid, over-2 kHz 0.033 → 0.035, tonality 65.9 → 67.2;
+/// Laser 440 → 519, 0.031 → 0.034, 70.0 → 70.9; Sparkle 500 → 576, 0.029 →
+/// 0.031, 74.3 → 76.9; Marimba 473 → 549, 0.033 → 0.033, 74.9 → 75.3; the
+/// eight voices whose first root sits over 275 Hz read byte-identically.
+/// The tonality ROSE on every folded voice: on those four roots the chime
+/// left the 150-4500 Hz window the note is judged in (it does so for every
+/// root of the register except [275, 281.25) Hz, whose 16f is already in
+/// the band at 4400-4500 Hz, the window's top edge — a partial there can
+/// only raise the peak-over-median figure). And over the engine's own sweep (twelve
+/// voices × twelve roots × three seeds, `the_space_head_is_heard_with_top_
+/// on_every_v1_voice`) the fold turned 43 NO-TOP readings of 432 — on nine
+/// of the twelve voices, centroid 406..450 Hz, every one a root under
+/// ~255 Hz — into none, with the lowest reading at 468 Hz: the two floors
+/// of the band, a 220 Hz root chiming at 7.04 kHz and a 275 Hz root at
+/// 4.4 kHz. That is inside 20 Hz of the verdict, so the chime is also
+/// lifted 2.1 dB ([`SPACE_TWINKLE`]); with both, the bench reads Comet
+/// −4.51 dB re the walk-mean letter / 575 Hz / 0.047, Laser −2.68 / 596 /
+/// 0.045, Lumen −2.93 / 625 / 0.034, and the sweep's floor is 510 Hz.
+const SPACE_TWINKLE_LO_HZ: f32 = SPACE_BASS_LO_HZ * 40.0;
+
+/// THE SPACE HEAD'S VERDICT — the three clauses of "heard beside the letter,
+/// never over it, with top for a laptop speaker" (re-ruled 2026-09-16 on the
+/// owner's *"i don't always hear the space bar?"*), stated ONCE, here, and
+/// read by both instruments: the bench's `space head` line
+/// (`keyboard_song_ab --probes`) and the engine's own pin
+/// (`the_space_head_is_heard_with_top_on_every_v1_voice`). The head's peak
+/// against the WALK-MEAN letter (the `Typed` peak averaged in dB over the
+/// row's accent and the next three accents of the walk — the 2026-09-16
+/// review's instrument, because the v1 head is one level while the letter
+/// walks its palette's roof) sits inside this window: never over the letter
+/// (the ladder's "never over" is the ceiling) and never the 8.7 dB under it
+/// the 2026-09-10 "felt, not heard" fit measured.
+///
+/// Stated in f64 because the bench's columns are f64 and a widened f32
+/// `0.02` prints as `0.019999999552965164` in its verdict string (found in
+/// review, 2026-09-17); the engine's own pin narrows them to f32, which is
+/// lossless for these three values (`0.02f64 as f32` IS the nearest f32).
+pub const SPACE_HEAD_RE_TYPED_DB: (f64, f64) = (-6.5, 0.0);
+/// …with TOP: a spectral centroid at or over this, over the head's first
+/// 250 ms (energy-weighted, 2048-point Hann frames hopping 1024)…
+pub const SPACE_HEAD_CENTROID_FLOOR_HZ: f64 = 450.0;
+/// …and at least this fraction of that energy over 2 kHz — a fiftieth — so
+/// a laptop speaker's rolloff leaves something of the head to hear.
+pub const SPACE_HEAD_HI_FLOOR: f64 = 0.02;
+
+/// The twinkle's pitch for a root: `root × SPACE_TWINKLE_RATIO`, folded by
+/// exact octaves into the sparkle band [`SPACE_TWINKLE_LO_HZ`]. The clamp
+/// bounds the loops exactly as [`bass_octave`]'s does.
+fn twinkle_hz(root: f32) -> f32 {
+    let mut f = (root * SPACE_TWINKLE_RATIO).clamp(20.0, 20_000.0);
+    while f >= SPACE_TWINKLE_LO_HZ * 2.0 {
+        f *= 0.5;
+    }
+    while f < SPACE_TWINKLE_LO_HZ {
+        f *= 2.0;
+    }
+    f
+}
 /// TIER 0 — the SUB-FLOOR. Cursor motion is not authorship: it accompanies what
 /// you are doing rather than being the thing you did, so the three movement
 /// gestures sit AUDIBLY under the typing floor.
@@ -3607,11 +3719,47 @@ const PAN_LAW_CLAMP: f32 = 0.6;
 /// pinned spawn has always evaluated — hoisted, not changed — so the v0.56
 /// oracle is unmoved and the meteor's claim ([`rainbow_kitty_v2`]) can re-aim
 /// a glide through the SAME law instead of a second copy of it.
+///
+/// **THE COSINE AND THE SINE STAY TWO LIBM CALLS IN EVERY PROFILE**
+/// (2026-09-18). `a.cos()` and `a.sin()` of ONE operand are exactly the pair
+/// LLVM's legalizer fuses into the single `__sincosf_stret` libcall Darwin
+/// provides — but only once the two `#[inline]` std wrappers have been inlined
+/// into one block, which an optimised build does and a debug build does not,
+/// so `--release` rendered the pan law through `sincosf` while every pin in
+/// this crate was measured through separate `cosf` and `sinf` calls. Apple's
+/// two paths do not agree in the last bit at every angle. MEASURED on this
+/// Apple silicon Mac (Darwin 25.6, Trust toolchain), the letter-only script of
+/// `rainbow_kitty_v2::tests::every_class_is_deterministic_and_the_letter_path_is_untouched`:
+/// debug folded to its pin `0x11f9_a5a4_2d77_1774`, release to
+/// `0x6000_de20_0b84_9bf2`; the first divergent sample was 12976 of 82560,
+/// one ulp (`0x3c724309` against `0x3c724308`), 9677 samples moved in all and
+/// every one by its last bits — a spawn's `(gl, gr)` carried into everything
+/// downstream of it. With the sine's operand passed through `black_box` the
+/// legalizer sees two operands it cannot prove equal and emits the two calls
+/// in both profiles; the same release render then matched debug on all 82560
+/// samples. This is one opaque move per SPAWN, never per sample, and the
+/// debug bits are untouched (there was nothing for the optimiser to pair
+/// there), so no pin moves: the render is the same in every profile now, and
+/// the fold is no longer a profile's property.
+///
+/// WHAT THAT GUARANTEE IS, EXACTLY. `core::hint::black_box` is documented as
+/// a HINT the compiler may ignore, not a language rule, so the profile
+/// independence above is EMPIRICAL for this toolchain — Trust store `9192`
+/// (`targo 1.99.0-dev (321aaeda7 2026-09-17)`), measured 2026-09-18 — and is
+/// re-checked by nothing automatic: no gate in `tools/` runs the effects
+/// tests under `--release`. A later drop that forwards the value through the
+/// barrier, or re-pairs the two libcalls some other way, shows up as this
+/// same fold missing its pin under `--release` alone while debug stays green;
+/// the check is `targo --unverified test --release -p aterm-effects --lib
+/// every_class_is_deterministic_and_the_letter_path_is_untouched`, and the
+/// answer if it ever reds again is to keep the two calls apart by a stronger
+/// means (an `#[inline(never)]` sine, or the two libm symbols named
+/// directly), never to re-bake the pin per profile.
 #[inline]
 fn pan_gains(gain: f32, pan: f32) -> (f32, f32) {
     let p = (pan * PAN_LAW_SCALE).clamp(-PAN_LAW_CLAMP, PAN_LAW_CLAMP);
     let a = (p + 1.0) * core::f32::consts::FRAC_PI_4;
-    (gain * a.cos(), gain * a.sin())
+    (gain * a.cos(), gain * core::hint::black_box(a).sin())
 }
 
 /// §9.7's BUS PEAK LIMITER: threshold 0.2 linear (−14 dBFS) after `MASTER`,
@@ -5561,7 +5709,13 @@ impl TrailSynth {
         // shimmer LFO cost one extra oscillator on a voice that already
         // existed, no new polyphony, and no new level on the note itself. See
         // [`SPACE_TWINKLE`] for why the chime is FOUR octaves up rather than
-        // two.
+        // two — and [`SPACE_TWINKLE_LO_HZ`] (2026-09-17) for why it is FIVE
+        // when the root sits in the bottom of its register: the chime is
+        // folded into one sparkle band, so a word whose root landed at the
+        // register floor twinkles as brightly as one at its top. The twin's
+        // detune is stated in Hz OF THE ROOT, so the pair's beat rate is the
+        // same whichever octave the band put it in.
+        let tw = twinkle_hz(f);
         self.spawn_seeded(
             Voice {
                 dur: SPACE_TWINKLE_DUR_S,
@@ -5570,14 +5724,14 @@ impl TrailSynth {
                 p: [
                     Partial {
                         lvl: SPACE_TWINKLE,
-                        f0: f * SPACE_TWINKLE_RATIO,
-                        f1: f * SPACE_TWINKLE_RATIO,
+                        f0: tw,
+                        f1: tw,
                         ..Partial::default()
                     },
                     Partial {
                         lvl: SPACE_TWINKLE_TWIN,
-                        f0: f * (SPACE_TWINKLE_RATIO + SPACE_TWINKLE_DETUNE),
-                        f1: f * (SPACE_TWINKLE_RATIO + SPACE_TWINKLE_DETUNE),
+                        f0: tw + f * SPACE_TWINKLE_DETUNE,
+                        f1: tw + f * SPACE_TWINKLE_DETUNE,
                         ..Partial::default()
                     },
                     Partial::default(),
@@ -5589,6 +5743,13 @@ impl TrailSynth {
                 n_q: 1.0,
                 tw_rate: SPACE_TWINKLE_RATE,
                 tw_depth: SPACE_TWINKLE_DEPTH,
+                // Not a roof over the sparkle band: the one-pole's
+                // coefficient is `lp_cut · dt · τ` clamped to 1, which is 1
+                // (a bypass) for any cut over SR/2π ≈ 7.6 kHz at 48 kHz —
+                // so the band's top, a 261.6 Hz root chiming at 8.37 kHz,
+                // is not darkened against its floor at 4.4 kHz (review
+                // question, 2026-09-17; the filter starts to bite only over
+                // a 50.3 kHz sample rate).
                 lp_cut: 8000.0,
                 ..Voice::default()
             },
@@ -13483,6 +13644,16 @@ mod tests {
     /// so cannot be fooled by an ornament in another register. The chime is
     /// pinned here too, since a twinkle that drifted into the melody's band
     /// would be a defect this file has no other guard against.
+    ///
+    /// RE-READ 2026-09-17 (the sparkle band, [`SPACE_TWINKLE_LO_HZ`]). The
+    /// chime is now the root's 16× FOLDED into [4.4, 8.8) kHz — 32× for a
+    /// root under 275 Hz. Lumen's first root is 330 Hz, whose 16× (5280 Hz)
+    /// sits inside the band unfolded, so the 16:1 assertion below reads
+    /// exactly what it always read; the fold's own law (a power-of-two
+    /// multiple, inside the band, at every root of every voice) is pinned
+    /// by `the_space_head_is_heard_with_top_on_every_v1_voice` through the
+    /// rendered spectrum, and by `the_twinkle_is_the_roots_pitch_class_in_
+    /// one_sparkle_band` on the voice table.
     #[test]
     fn the_space_is_a_lawful_walking_bass() {
         let (s, spaces) = family_voices(GlowStyle::Lumen, SoundKind::Space);
@@ -14755,6 +14926,331 @@ mod tests {
                  {LIFT_LADDER_CEIL}]; backspace {back}, space {space})"
             );
         }
+    }
+
+    /// THE TWINKLE IS THE ROOT'S PITCH CLASS IN ONE SPARKLE BAND (2026-09-17,
+    /// [`SPACE_TWINKLE_LO_HZ`]): for every root the walk can put under every
+    /// v1 voice, the chime is the root times an exact power of two — never
+    /// under 16 (four octaves clear of the note, as the 2026-08-31 design
+    /// ruled) — and inside [4.4, 8.8) kHz. Read off the voice table on Comet
+    /// too, the voice the bench read NO TOP on: its first root is 220 Hz and
+    /// its chime 32× that, 7040 Hz.
+    #[test]
+    fn the_twinkle_is_the_roots_pitch_class_in_one_sparkle_band() {
+        let band = SPACE_TWINKLE_LO_HZ..SPACE_TWINKLE_LO_HZ * 2.0;
+        for (voice, style) in WALK_VOICES {
+            let s = TrailSynth::new(48_000.0, 1);
+            let anchor = palette_for(voice, style).anchor_hz();
+            for step in 0..SONG_BASS.len() as u8 {
+                let root = s.space_root_hz(anchor, step);
+                let tw = twinkle_hz(root);
+                assert!(
+                    band.contains(&tw),
+                    "{voice:?}/{style:?} root {step} ({root} Hz): the chime at {tw} Hz is \
+                     outside the sparkle band {band:?}"
+                );
+                let ratio = tw / root;
+                assert!(
+                    ratio >= SPACE_TWINKLE_RATIO
+                        && (ratio.log2() - ratio.log2().round()).abs() < 1e-4,
+                    "{voice:?}/{style:?} root {step} ({root} Hz): the chime rides {ratio}× the \
+                     root — it must be a power of two no smaller than {SPACE_TWINKLE_RATIO}"
+                );
+            }
+        }
+        let (_, spaces) = family_voices(GlowStyle::Comet, SoundKind::Space);
+        assert_eq!(
+            spaces.len(),
+            2,
+            "Comet's downbeat is its root plus the air's twinkle"
+        );
+        assert!(
+            (spaces[0].0 - 220.0).abs() < 0.5 && (spaces[1].0 / spaces[0].0 - 32.0).abs() < 0.05,
+            "Comet's first root folds to the register floor and its chime rides 32× it: \
+             got {} Hz and {}×",
+            spaces[0].0,
+            spaces[1].0 / spaces[0].0
+        );
+    }
+
+    /// A radix-2 FFT, hand-rolled like the bench's (`keyboard_song_ab`'s
+    /// `fft`) so the pin below reads the head through the SAME instrument
+    /// the `space head` verdict does, with no library version to drift
+    /// under it.
+    fn fft(re: &mut [f32], im: &mut [f32]) {
+        let n = re.len();
+        assert!(n.is_power_of_two() && im.len() == n);
+        let mut j = 0usize;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                re.swap(i, j);
+                im.swap(i, j);
+            }
+        }
+        let mut len = 2;
+        while len <= n {
+            let ang = -core::f32::consts::TAU / len as f32;
+            let (wr, wi) = (ang.cos(), ang.sin());
+            let mut i = 0;
+            while i < n {
+                let (mut cr, mut ci) = (1.0f32, 0.0f32);
+                for k in 0..len / 2 {
+                    let (ur, ui) = (re[i + k], im[i + k]);
+                    let (ar, ai) = (re[i + k + len / 2], im[i + k + len / 2]);
+                    let (vr, vi) = (ar * cr - ai * ci, ar * ci + ai * cr);
+                    re[i + k] = ur + vr;
+                    im[i + k] = ui + vi;
+                    re[i + k + len / 2] = ur - vr;
+                    im[i + k + len / 2] = ui - vi;
+                    let ncr = cr * wr - ci * wi;
+                    ci = cr * wi + ci * wr;
+                    cr = ncr;
+                }
+                i += len;
+            }
+            len <<= 1;
+        }
+    }
+
+    /// THE BENCH'S SPECTRUM, mirrored: energy-weighted spectral centroid and
+    /// the fraction of energy over 2 kHz, over 2048-point Hann frames hopping
+    /// 1024 through `x[from..to]` — `keyboard_song_ab`'s `spectrum`, so a
+    /// number read here is the number the `space head` line prints.
+    fn spectrum(x: &[f32], from: usize, to: usize) -> (f32, f32) {
+        const N: usize = 2048;
+        let hz_per_bin = 48_000.0 / N as f64;
+        let (mut num, mut den, mut hi) = (0.0f64, 0.0f64, 0.0f64);
+        let mut s = from;
+        while s + N <= to {
+            let mut re = vec![0.0f32; N];
+            let mut im = vec![0.0f32; N];
+            for (i, r) in re.iter_mut().enumerate() {
+                let w = 0.5 * (1.0 - (core::f32::consts::TAU * i as f32 / N as f32).cos());
+                *r = x[s + i] * w;
+            }
+            fft(&mut re, &mut im);
+            for k in 0..N / 2 {
+                let e = f64::from(re[k] * re[k] + im[k] * im[k]);
+                let f = k as f64 * hz_per_bin;
+                num += e * f;
+                den += e;
+                if f > 2000.0 {
+                    hi += e;
+                }
+            }
+            s += N / 2;
+        }
+        if den < 1e-15 {
+            (0.0, 0.0)
+        } else {
+            ((num / den) as f32, (hi / den) as f32)
+        }
+    }
+
+    /// THE SPACE HEAD'S TAKE after `word` words: the walk fixture's shape
+    /// ([`walk_take`] — 341 ms stamps, bed off, vol 0.4, the difference
+    /// against the same synth left to ring) with `word` × (three letters
+    /// then a space) typed first, so the head under test opens word
+    /// `word + 1` on root `word` of [`SONG_BASS`] — the bench's `Space`
+    /// probe is `word == 0`. Returns the difference take (mono, 500 ms).
+    fn space_head_take(voice: SoundVoice, style: GlowStyle, word: usize, seed: u32) -> Vec<f32> {
+        const SETTLE_FRAMES: usize = 16_384;
+        let ev = |kind| SoundEvent {
+            hue: 0.0,
+            bed: false,
+            ..voiced(voice, style, kind)
+        };
+        let stamp = |frame: usize| EventMeta {
+            at_ms: ((frame as f64 * 1000.0 / 48_000.0) as u32).max(1),
+            ..EventMeta::default()
+        };
+        let mut base = TrailSynth::new(48_000.0, seed);
+        let mut warm = vec![0.0f32; SETTLE_FRAMES * CHANNELS];
+        let mut n = 0usize;
+        for _ in 0..=word {
+            for _ in 0..3 {
+                base.push_meta(ev(SoundKind::Typed), stamp(n * SETTLE_FRAMES));
+                base.render(&mut warm);
+                n += 1;
+            }
+            if n < (word + 1) * 4 - 1 {
+                base.push_meta(ev(SoundKind::Space), stamp(n * SETTLE_FRAMES));
+                base.render(&mut warm);
+                n += 1;
+            }
+        }
+        let frames = 24_000;
+        let mono = |s: &mut TrailSynth| -> Vec<f32> {
+            let mut o = vec![0.0f32; frames * CHANNELS];
+            s.render(&mut o);
+            (0..frames)
+                .map(|i| 0.5 * (o[2 * i] + o[2 * i + 1]))
+                .collect()
+        };
+        let alone = mono(&mut base.clone());
+        let mut with = base;
+        with.push_meta(ev(SoundKind::Space), stamp(n * SETTLE_FRAMES));
+        mono(&mut with)
+            .iter()
+            .zip(&alone)
+            .map(|(a, b)| a - b)
+            .collect()
+    }
+
+    /// THE SPACE HEAD IS HEARD WITH TOP ON EVERY V1 VOICE, AT EVERY ROOT OF
+    /// THE WALK (2026-09-17; the owner, 2026-09-16: *"i don't always hear
+    /// the space bar?"*). The bench's `space head` verdict read NO TOP on
+    /// Comet (centroid 420 Hz) and Laser (440) and green on the other ten —
+    /// and the cause was never Comet's: the head's top rode the ROOT, and
+    /// the two A-anchored palettes fold their first root to the floor of
+    /// the [220, 440) register, where every other voice's walk also goes
+    /// (see [`SPACE_TWINKLE_LO_HZ`]). The bench reads one root per voice;
+    /// this reads the walk's twelve steps (five distinct roots), on the twelve v1 voices, on
+    /// three seeds, through the bench's own spectrum (`spectrum` above)
+    /// and its own three clauses ([`SPACE_HEAD_RE_TYPED_DB`],
+    /// [`SPACE_HEAD_CENTROID_FLOOR_HZ`], [`SPACE_HEAD_HI_FLOOR`]):
+    ///
+    /// - the head's peak against the WALK-MEAN letter, inside −6.5..0 dB —
+    ///   the letter is [`walk_peak_seeded`] on settle 3, 6, 9, 12 (the
+    ///   bench's `PROBE_WALK_SETTLES`), averaged in dB, on the same seed.
+    ///   The head is read the same way: its peak averaged in dB over the
+    ///   twelve roots of the walk, per voice and seed — a walk mean against
+    ///   a walk mean, where the ting's slot law reads a seed mean for the
+    ///   same reason (a struck bell's crest is a phase draw, and Fire's
+    ///   letter is a crackle whose walk mean spreads 1.9 dB across these
+    ///   three seeds). Every single reading additionally holds the ceiling —
+    ///   never over the letter — and a FLOOR of its own, the window's floor
+    ///   less `SPACE_HEAD_READING_SLACK_DB` (1.5 dB, a floor of −8.0): one crackle draw
+    ///   under the mean's window, never the 8.7 dB of the "felt, not heard"
+    ///   fit. The slack is 1.5 dB because that is the spread the letter's
+    ///   walk mean shows across these three seeds on Fire (1.2-1.9 dB), and
+    ///   the one reading under −6.5 (below) sits 0.9 dB inside it;
+    /// - centroid ≥ 450 Hz over the head's first 250 ms, on EVERY reading;
+    /// - at least a fiftieth of that energy over 2 kHz, on every reading.
+    ///
+    /// MEASURED before the fold (432 readings): 43 read NO TOP — centroid
+    /// 406..450 Hz, on nine of the twelve voices, every one a root under
+    /// ~255 Hz; on seed POOF, word 0 (the bench's own row) they are Comet's
+    /// 420 Hz and Laser's 440. After the fold and the chime's lift: the
+    /// lowest centroid is 510 Hz (Lumen, seed 0x5EED_1234, word 11 — a
+    /// 275 Hz root, the band's unfolded floor), the lowest over-2 kHz
+    /// fraction 0.029 (Beam and Phaser), the walk-mean tier spans −5.70 (Fire,
+    /// seed 0x5EED_1234, whose letter is the hottest of the sweep at −19.67
+    /// dBFS) to −1.48 dB (Comet, the same seed, its letter the coldest at
+    /// −24.08), and the single readings −7.09 (that Fire seed's fifth word)
+    /// to −0.93 dB. That one Fire reading is under the window's floor before
+    /// and after this change (−7.31 → −7.09): the head is one level, the
+    /// letter that seed drew is 1.2-1.9 dB hotter than the other two seeds',
+    /// and the walk mean is where a level is read on such a voice — but a
+    /// per-word regression of the floor must still be caught (review,
+    /// 2026-09-17), so every reading holds the slack floor too, and the
+    /// failure message counts the 432 readings and the 36 walk means apart.
+    #[test]
+    fn the_space_head_is_heard_with_top_on_every_v1_voice() {
+        const SEEDS: [u32; 3] = [0x504F_4F46, 0x5EED_1234, 0xBEEF];
+        const WALK_SETTLES: [usize; 4] = [3, 6, 9, 12];
+        /// The single reading's allowance under the walk mean's floor — see
+        /// the doc above: Fire's letter spreads 1.2-1.9 dB across the seeds,
+        /// and its one reading under the window (−7.09 dB) sits 0.9 dB
+        /// inside this. The three clauses themselves are the engine's.
+        const SPACE_HEAD_READING_SLACK_DB: f32 = 1.5;
+        let db = |x: f32| 20.0 * x.log10();
+        let (tier_lo, tier_hi) = (
+            SPACE_HEAD_RE_TYPED_DB.0 as f32,
+            SPACE_HEAD_RE_TYPED_DB.1 as f32,
+        );
+        let reading_floor = tier_lo - SPACE_HEAD_READING_SLACK_DB;
+        let centroid_floor = SPACE_HEAD_CENTROID_FLOOR_HZ as f32;
+        let hi_floor = SPACE_HEAD_HI_FLOOR as f32;
+        let mut failures: Vec<String> = Vec::new();
+        let (mut lo_centroid, mut lo_hi, mut lo_tier, mut hi_tier) =
+            (f32::MAX, f32::MAX, f32::MAX, f32::MIN);
+        let (mut lo_mean, mut hi_mean) = (f32::MAX, f32::MIN);
+        for (voice, style) in WALK_VOICES {
+            for seed in SEEDS {
+                let letter_db = WALK_SETTLES
+                    .iter()
+                    .map(|&settle| {
+                        db(walk_peak_seeded(
+                            voice,
+                            style,
+                            settle,
+                            SoundKind::Typed,
+                            false,
+                            seed,
+                        ))
+                    })
+                    .sum::<f32>()
+                    / WALK_SETTLES.len() as f32;
+                let mut tier_sum = 0.0f32;
+                for word in 0..SONG_BASS.len() {
+                    let take = space_head_take(voice, style, word, seed);
+                    let peak = take.iter().fold(0.0f32, |m, d| m.max(d.abs()));
+                    // The bench scores the head's own body: its onset (the
+                    // first sample over 5 % of the peak) to 250 ms past it.
+                    let start = take.iter().position(|v| v.abs() > peak * 0.05).unwrap_or(0);
+                    let end = (start + 12_000).min(take.len());
+                    let (centroid, hi) = spectrum(&take, start, end);
+                    let tier = db(peak) - letter_db;
+                    tier_sum += tier;
+                    lo_centroid = lo_centroid.min(centroid);
+                    lo_hi = lo_hi.min(hi);
+                    lo_tier = lo_tier.min(tier);
+                    hi_tier = hi_tier.max(tier);
+                    let tier_ok = (reading_floor..=tier_hi).contains(&tier);
+                    let top_ok = centroid >= centroid_floor && hi >= hi_floor;
+                    println!(
+                        "space head {voice:?}/{style:?} seed {seed:#x} word {word}: \
+                         {tier:+.2} dB re the walk-mean letter ({letter_db:.2} dBFS), \
+                         centroid {centroid:.0} Hz, over 2 kHz {hi:.3}{}",
+                        if top_ok && tier_ok { "" } else { " — FAILS" }
+                    );
+                    if !tier_ok || !top_ok {
+                        failures.push(format!(
+                            "{voice:?}/{style:?} seed {seed:#x} word {word}: {tier:+.2} dB \
+                             (reading floor {reading_floor}, ceiling {tier_hi}), centroid \
+                             {centroid:.0} Hz (floor {centroid_floor}), over 2 kHz {hi:.3} \
+                             (floor {hi_floor})"
+                        ));
+                    }
+                }
+                let tier_mean = tier_sum / SONG_BASS.len() as f32;
+                lo_mean = lo_mean.min(tier_mean);
+                hi_mean = hi_mean.max(tier_mean);
+                println!(
+                    "space head {voice:?}/{style:?} seed {seed:#x}: walk-mean head \
+                     {tier_mean:+.2} dB re the walk-mean letter"
+                );
+                if !(tier_lo..=tier_hi).contains(&tier_mean) {
+                    failures.push(format!(
+                        "{voice:?}/{style:?} seed {seed:#x}: the walk-mean head reads \
+                         {tier_mean:+.2} dB re the walk-mean letter, off its window \
+                         {tier_lo}..{tier_hi}"
+                    ));
+                }
+            }
+        }
+        println!(
+            "space head over every v1 voice, root and seed: lowest centroid {lo_centroid:.0} Hz, \
+             lowest over-2 kHz fraction {lo_hi:.3}, tier {lo_tier:+.2}..{hi_tier:+.2} dB on the \
+             readings, {lo_mean:+.2}..{hi_mean:+.2} on the walk means"
+        );
+        assert!(
+            failures.is_empty(),
+            "the space head must be heard beside the letter, never over it, with top, on \
+             every v1 voice at every root of the walk — {} failures over {} readings and {} \
+             walk means:\n{}",
+            failures.len(),
+            WALK_VOICES.len() * SEEDS.len() * SONG_BASS.len(),
+            WALK_VOICES.len() * SEEDS.len(),
+            failures.join("\n")
+        );
     }
 
     /// THE ERASE POOF IS THE WHOLE DELETION, in every voice of the roster: two

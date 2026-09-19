@@ -111,12 +111,41 @@ pub fn is_linked(layout: &Layout, program: &str) -> bool {
 /// `unlink` MUST derive names identically so an unlink removes the exact shim a link created.
 fn bin_tool_name(rel: &Path) -> Option<&str> {
     let name = rel.file_name().and_then(|s| s.to_str())?;
-    let ext = std::env::consts::EXE_SUFFIX; // ".exe" on Windows, "" on Unix
+    Some(strip_exe_suffix(name, std::env::consts::EXE_SUFFIX))
+}
+
+/// `name` with a trailing `ext` removed, compared case-insensitively — the platform
+/// executable suffix split out so both halves are exercisable off the platform that
+/// has one (`EXE_SUFFIX` is `".exe"` on Windows and `""` everywhere else).
+///
+/// BYTES, NEVER A CHAR SLICE (audit 2026-09-17). This compared `name[cut..]`, where
+/// `cut` is `len - ext.len()` — an offset into the BYTES that, on Windows, lands
+/// wherever the last four of them begin. A non-ASCII bin name puts that offset INSIDE
+/// a multi-byte character, and slicing a `str` there panics: `byte index 5 is not a
+/// char boundary`. `"日本語"` is nine bytes, so `len - 4` is 5, in the middle of its
+/// third character. A marker naming such a bin — a checkout whose binary is spelled in
+/// any non-Latin script — took [`link`], [`unlink`], [`refresh`], [`linked_bins`] and
+/// [`linked_tool_names`] down with it, since every one of them derives names here.
+/// Comparing the BYTES cannot panic, and the slice below stays safe by construction:
+/// the suffix matches only when those trailing bytes are ASCII, which makes `cut` a
+/// char boundary.
+fn strip_exe_suffix<'a>(name: &'a str, ext: &str) -> &'a str {
+    if ext.is_empty() {
+        return name;
+    }
     match name.len().checked_sub(ext.len()) {
-        Some(cut) if !ext.is_empty() && cut > 0 && name[cut..].eq_ignore_ascii_case(ext) => {
-            Some(&name[..cut])
+        Some(cut) if cut > 0 && name.as_bytes()[cut..].eq_ignore_ascii_case(ext.as_bytes()) => {
+            &name[..cut]
         }
-        _ => Some(name),
+        _ => name,
+    }
+}
+
+/// Remove shims a failed [`link`] created, best-effort. Only paths that call brought
+/// into existence are passed in, so this can never widen into a name that already stood.
+fn roll_back(created: &[PathBuf]) {
+    for shim in created {
+        let _ = fs::remove_file(shim);
     }
 }
 
@@ -163,6 +192,10 @@ pub fn link(
 
     let mut linked = Vec::new();
     let mut refused = Vec::new();
+    // The shims this call BROUGHT INTO EXISTENCE, for the rollback below. Only those:
+    // a name that already stood is somebody else's (a store shim, a hand-made file),
+    // and undoing our own failure must never delete it.
+    let mut created: Vec<PathBuf> = Vec::new();
     for rel in bins {
         let Some(name) = bin_tool_name(rel) else {
             continue;
@@ -177,16 +210,32 @@ pub fn link(
         if !src.is_file() {
             continue; // a not-yet-built bin is simply skipped (refresh picks it up later)
         }
-        crate::platform::install_shim_to(&layout.shim(&tool), &src)
-            .map_err(|e| LinkError::Io(e.to_string()))?;
+        let shim = layout.shim(&tool);
+        let is_new = fs::symlink_metadata(&shim).is_err();
+        if let Err(e) = crate::platform::install_shim_to(&shim, &src) {
+            roll_back(&created);
+            return Err(LinkError::Io(e.to_string()));
+        }
+        if is_new {
+            created.push(shim);
+        }
         linked.push(name.to_string());
     }
     if linked.is_empty() {
+        roll_back(&created);
         return Err(LinkError::NoBins);
     }
 
-    write_marker(&layout.link_marker(program), &marker)
-        .map_err(|e| LinkError::Io(e.to_string()))?;
+    // THE MARKER IS WHAT MAKES A DEV LINK TRACKED (audit 2026-09-17). The shims went in
+    // first and a failed marker write simply propagated, leaving a checkout wired into
+    // `bin/` that NOTHING recorded: `is_linked` said no, so `update`/`apply` would not
+    // hard-skip the program and would re-point the shims under the developer, and
+    // `unlink` — which reads the marker — had nothing to undo. The shims this call
+    // created are rolled back, so a link either stands recorded or does not stand.
+    if let Err(e) = write_marker(&layout.link_marker(program), &marker) {
+        roll_back(&created);
+        return Err(LinkError::Io(e.to_string()));
+    }
     // A DEV LINK HAS TO WIN ON PATH. For an agent program (`crate::stub::AGENT_PROGRAMS`)
     // `agents/<tool>` goes FIRST on every PATH and names the STORE build directly, so a
     // link that re-pointed only `bin/<tool>` left the dev checkout unreachable — `claude`
@@ -484,9 +533,43 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
         )
     })?;
     let tmp = parent.join(format!(".link.tmp-{}", std::process::id()));
-    fs::write(&tmp, text.as_bytes())?;
-    crate::platform::harden_file(&tmp)?;
-    fs::rename(&tmp, dest)
+    // NO TEMP SURVIVES A FAILURE (audit 2026-09-17). This left `.link.tmp-<pid>` behind
+    // whenever hardening or the rename failed, and `links_dir` is enumerated by NAME:
+    // `linked_programs` admits every entry that is a safe path component, so the litter
+    // was reported as a dev-linked PROGRAM by `atpkg list`, by `which` and by the
+    // Packages screen — a program nobody linked and no `unlink` could remove. Born
+    // `0600` through `create_new` for the same reason the hooks are: `fs::write`
+    // creates at the umask default, leaving the marker world-readable until the chmod.
+    let _ = fs::remove_file(&tmp);
+    let staged = create_marker_temp(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+        .and_then(|()| crate::platform::harden_file(&tmp));
+    if let Err(e) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, dest).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Create the link marker's temp EXCLUSIVELY and, on Unix, born `0600`.
+#[cfg(unix)]
+fn create_marker_temp(tmp: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)
+}
+
+#[cfg(not(unix))]
+fn create_marker_temp(tmp: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
 }
 
 #[cfg(test)]
@@ -522,6 +605,86 @@ mod tests {
         d
     }
 
+    /// THE EXE SUFFIX IS STRIPPED BY BYTES, SO A NAME CAN NEVER BE CUT MID-CHARACTER.
+    ///
+    /// Driven with an explicit `".exe"` rather than `EXE_SUFFIX`, so the WINDOWS
+    /// behaviour is exercised on every host: the panic this replaces needed no Windows
+    /// to reproduce, only the byte offset the suffix's length implies. `"日本語"` is
+    /// nine bytes, so `len - 4` is 5 — inside its third character — and the old
+    /// `&name[cut..]` panicked with `byte index 5 is not a char boundary`.
+    #[test]
+    fn the_exe_suffix_is_stripped_without_ever_slicing_mid_character() {
+        // The regression itself: a non-ASCII name whose length puts the cut inside a
+        // character. Every one of these panicked before.
+        assert_eq!(strip_exe_suffix("日本語", ".exe"), "日本語");
+        assert_eq!(strip_exe_suffix("日本語.exe", ".exe"), "日本語");
+        assert_eq!(strip_exe_suffix("日本語.EXE", ".exe"), "日本語");
+        assert_eq!(strip_exe_suffix("é", ".exe"), "é");
+        assert_eq!(strip_exe_suffix("éxe", ".exe"), "éxe");
+        assert_eq!(strip_exe_suffix("é.exe", ".exe"), "é");
+        // Plain ASCII, unchanged in both directions.
+        assert_eq!(strip_exe_suffix("ay.exe", ".exe"), "ay");
+        assert_eq!(strip_exe_suffix("ay.ExE", ".exe"), "ay");
+        assert_eq!(strip_exe_suffix("ay", ".exe"), "ay");
+        // The Unix suffix is empty: nothing is ever stripped.
+        assert_eq!(strip_exe_suffix("ay", ""), "ay");
+        assert_eq!(strip_exe_suffix("ay.exe", ""), "ay.exe");
+        // A name that is ONLY the suffix keeps it — `cut > 0` — since ".exe" names no
+        // tool and `ToolName::new("")` would refuse it anyway.
+        assert_eq!(strip_exe_suffix(".exe", ".exe"), ".exe");
+        // And the derivation `link`/`unlink` share still agrees on a real bin path.
+        assert_eq!(bin_tool_name(Path::new("target/release/ay")), Some("ay"));
+    }
+    /// A MARKER THAT CANNOT BE WRITTEN LEAVES NO DEV SHIM AND NO TEMP (audit 2026-09-17).
+    ///
+    /// The marker is the ONLY thing that records a dev link. Writing the shims first and
+    /// letting a failed marker write propagate left a checkout wired into `bin/` that
+    /// nothing tracked: `is_linked` answered no, so `update`/`apply` would not hard-skip
+    /// the program and would re-point the shims under the developer, and `unlink` — which
+    /// reads the marker — had nothing to undo. The leaked `.link.tmp-<pid>` was worse
+    /// still: `linked_programs` admits every entry of the links dir whose name is a safe
+    /// path component, so the litter was reported as a dev-linked PROGRAM by `list`, by
+    /// `which` and by the Packages screen — one nobody linked and no `unlink` could remove.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_whose_marker_cannot_be_written_rolls_back_and_leaves_no_temp() {
+        let l = layout("markerfail");
+        let co = checkout("markerfail", &["ay"]);
+        let bins = [PathBuf::from("target/release/ay")];
+        // The marker's destination is a NON-EMPTY DIRECTORY, so the rename cannot
+        // replace it — the arm that used to leak the temp with the shim already laid.
+        fs::create_dir_all(l.links_dir().join("ay").join("occupied")).unwrap();
+
+        let out = link(&l, "ay", &co, &bins);
+        assert!(
+            out.is_err(),
+            "a marker that cannot be written must fail the link"
+        );
+        assert!(
+            !shim_of(&l, "ay").exists(),
+            "the shim this call created must be rolled back — an UNTRACKED dev shim is \
+             worse than no link at all"
+        );
+        let litter: Vec<String> = fs::read_dir(l.links_dir())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|n| n.starts_with(".link.tmp-"))
+            .collect();
+        assert!(
+            litter.is_empty(),
+            "no marker temp may survive a failed write, found {litter:?}"
+        );
+        assert!(
+            !linked_programs(&l)
+                .iter()
+                .any(|p| p.starts_with(".link.tmp-")),
+            "a leaked temp must never be reported as a dev-linked program"
+        );
+
+        let _ = fs::remove_dir_all(&l.prefix);
+        let _ = fs::remove_dir_all(&co);
+    }
     #[test]
     fn link_and_unlink_round_trip() {
         let l = layout("rt");

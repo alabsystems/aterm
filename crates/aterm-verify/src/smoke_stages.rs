@@ -123,7 +123,30 @@ const ACQUIRE_P99_CEILING_MS: u64 = 50;
 /// display refresh, so ONE refresh of wait is healthy here; this is therefore a bar
 /// on a compositor holding frames for 3+ refreshes, not on a single added frame.
 /// Pinning it tighter needs a measured per-refresh-rate baseline the idle-only
-/// smoke cannot supply. Gated only when the leg was SAMPLED (`n_present_glass > 0`):
+/// smoke cannot supply.
+///
+/// AND ON ONE CLASS OF HOST THE BAR IS ALREADY AT THE BASELINE, which the row's
+/// author could not know without such a measurement. Measured 2026-09-18 by
+/// reading `metrics percentiles` off the RUNNING app on a 2017 15-inch MacBook Pro
+/// (macOS 13.7.8, Intel HD Graphics 630, 60 Hz panel) after two days of ordinary
+/// use — 71,884 samples, not a smoke's 88:
+///
+/// ```text
+/// present_glass_p50_ms=27.26  p95=37.75  p99=50.33  max=147.52
+/// ```
+///
+/// So this machine's HEALTHY p99 is 50.33 ms: the three-refresh bar sits on top of
+/// it, and the gate's own smoke read 50 ms (inside the bar, an exclusive bucket
+/// edge) on one run and 54 ms (over it, max 51.19 ms) on the next. Nothing about
+/// either run was wrong. What the number says is that a 27 ms MEDIAN — 1.6
+/// refreshes after present-return — is what this iGPU does, so three refreshes is
+/// not headroom here, and the row cannot separate a compositor regression from this
+/// host's floor until the ceiling is decided against a measured baseline per
+/// refresh rate and GPU class. That decision is the owner's: widening a latency bar
+/// is a product statement, and this comment is the measurement it needs, not a
+/// licence to move the constant.
+///
+/// Gated only when the leg was SAMPLED (`n_present_glass > 0`):
 /// a CPU backend, a non-macOS present and a process that installs no sink register
 /// no presented handler at all, and an absent slice is not a slow one.
 const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
@@ -670,6 +693,19 @@ fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
         .unwrap_or("?")
 }
 
+/// WHAT A REPORTED p99 IS, and why these four bars read `>` and not `>=`.
+/// `aterm-gui`'s percentiles come from a histogram and report the containing
+/// bucket's EXCLUSIVE upper edge (`metrics.rs`'s `Histogram::percentile`:
+/// "every value in the bucket is strictly below it, so reporting it keeps
+/// percentiles conservative"). So a reported `p99 = 50.00` against a 50 ms bar
+/// says every sample was UNDER the bar, not at it — and `>=` failed such a run.
+/// Measured 2026-09-18 on a 2017 Intel MacBook Pro, in the merge gate: the
+/// compositor leg reported `p99 50ms` beside `max 47.85ms` — a percentile above
+/// the observed maximum, which only a bucket edge can be — and the gate refused
+/// a run whose worst frame was 2 ms inside budget. Where the same slice also
+/// publishes a true maximum (acquire, present→glass), the max must confirm the
+/// bar too, so a ceiling that does not fall exactly on a bucket edge cannot fail
+/// a run on the edge above it either.
 /// The hardware burst's `metrics percentiles` reply, slice by slice: `Ok` is the
 /// pass line, `Err` the failure. Extracted so the thresholds are testable.
 ///
@@ -706,6 +742,11 @@ pub fn hardware_key_verdict(posted: u64, reply: &str) -> Result<String, String> 
         ));
     };
     let f = |name: &str| reply_field(reply, name);
+    // A slice's TRUE maximum, as a number: the bucketed p99 above is an exclusive
+    // bucket edge, so the max is what confirms a bar the edge only brushes. An
+    // unparsable or absent field reads 0, which confirms nothing — the same
+    // fail-open direction `n_* > 0` already takes for an unsampled slice.
+    let max_ms = |name: &str| reply_field(reply, name).parse::<f64>().unwrap_or(0.0);
     if n_key_write < HW_KEY_WRITE_FLOOR {
         return Err(format!(
             "gui smoke: hardware keys never reached the KeyboardInput arm — \
@@ -714,9 +755,9 @@ pub fn hardware_key_verdict(posted: u64, reply: &str) -> Result<String, String> 
              [{reply}]"
         ));
     }
-    if key_write >= KEY_WRITE_P99_CEILING_MS {
+    if key_write > KEY_WRITE_P99_CEILING_MS {
         return Err(format!(
-            "gui smoke: hardware key→write — p99 {key_write}ms (>= {KEY_WRITE_P99_CEILING_MS}), \
+            "gui smoke: hardware key→write — p99 {key_write}ms (> {KEY_WRITE_P99_CEILING_MS}), \
              aterm's own dispatch with OS queue residence; press lock wait max {}ms, \
              acquire p99 {}ms, child echo p99 {}ms [{reply}]",
             f("max_term_wait_press_ms"),
@@ -731,26 +772,34 @@ pub fn hardware_key_verdict(posted: u64, reply: &str) -> Result<String, String> 
             f("n_term_wait_press"),
         ));
     }
-    if n_acquire > 0 && acquire >= ACQUIRE_P99_CEILING_MS {
+    if n_acquire > 0
+        && acquire > ACQUIRE_P99_CEILING_MS
+        && max_ms("max_acquire_wait_ms")
+            >= f64::from(u32::try_from(ACQUIRE_P99_CEILING_MS).unwrap_or(u32::MAX))
+    {
         return Err(format!(
-            "gui smoke: drawable acquire — p99 {acquire}ms (>= {ACQUIRE_P99_CEILING_MS}) \
+            "gui smoke: drawable acquire — p99 {acquire}ms (> {ACQUIRE_P99_CEILING_MS}, and its max confirms it) \
              over n={n_acquire}, max {}ms [{reply}]",
             f("max_acquire_wait_ms"),
         ));
     }
-    if n_present_glass > 0 && glass >= PRESENT_GLASS_P99_CEILING_MS {
+    if n_present_glass > 0
+        && glass > PRESENT_GLASS_P99_CEILING_MS
+        && max_ms("max_present_glass_ms")
+            >= f64::from(u32::try_from(PRESENT_GLASS_P99_CEILING_MS).unwrap_or(u32::MAX))
+    {
         return Err(format!(
             "gui smoke: present→glass — p99 {glass}ms \
-             (>= {PRESENT_GLASS_P99_CEILING_MS}) over n={n_present_glass}, the compositor \
+             (> {PRESENT_GLASS_P99_CEILING_MS}, and its max confirms it) over n={n_present_glass}, the compositor \
              leg AFTER present-return that every slice above stops short of; max {}ms, \
              {} drawable(s) never shown [{reply}]",
             f("max_present_glass_ms"),
             f("present_glass_skipped"),
         ));
     }
-    if n_input > 0 && input >= INPUT_PRESENT_CEILING_MS {
+    if n_input > 0 && input > INPUT_PRESENT_CEILING_MS {
         return Err(format!(
-            "gui smoke: hardware input→present — p99 {input}ms (>= {INPUT_PRESENT_CEILING_MS}), \
+            "gui smoke: hardware input→present — p99 {input}ms (> {INPUT_PRESENT_CEILING_MS}), \
              OS queue residence included [{reply}]"
         ));
     }
@@ -940,6 +989,18 @@ mod tests {
         )
     }
 
+    /// The same reply with one `max_*_ms` field replaced: the bucketed p99 above is
+    /// an exclusive bucket edge, so a case that means "a sample really did cross the
+    /// bar" has to move the MAX too, which is what the verdict now requires.
+    fn with_max(reply: &str, field: &str, value: &str) -> String {
+        let at = reply
+            .find(&format!("{field}="))
+            .expect("the field is in the reply");
+        let from = at + field.len() + 1;
+        let end = from + reply[from..].find(' ').expect("a field ends in a space");
+        format!("{}{value}{}", &reply[..from], &reply[end..])
+    }
+
     /// A healthy reply with the compositor leg's sample count and p99 replaced.
     fn with_glass(n: u64, p99: &str) -> String {
         percentiles(30, "6.00", "0.10", "1.00", "10.00")
@@ -971,7 +1032,7 @@ mod tests {
         let hw = percentiles(30, "46.13", "0.10", "5.24", "58.00");
         let bad = hardware_key_verdict(30, &hw).expect_err("a finding");
         assert!(
-            bad.contains("hardware key→write — p99 46ms (>= 40)"),
+            bad.contains("hardware key→write — p99 46ms (> 40)"),
             "{bad}"
         );
         assert!(
@@ -1019,8 +1080,12 @@ mod tests {
             "39 ms key→write passes"
         );
         assert!(
-            v("40.00", "0.10", "1.00", "10.00").is_err(),
-            "40 ms key→write fails"
+            v("40.00", "0.10", "1.00", "10.00").is_ok(),
+            "an exclusive edge AT the 40 ms bar means every sample was under it"
+        );
+        assert!(
+            v("41.00", "0.10", "1.00", "10.00").is_err(),
+            "41 ms key→write fails"
         );
 
         assert!(
@@ -1037,19 +1102,46 @@ mod tests {
             v("6.00", "0.10", "49.90", "10.00").is_ok(),
             "49 ms acquire passes"
         );
-        let acq = v("6.00", "0.10", "50.00", "10.00").expect_err("acquire");
         assert!(
-            acq.contains("drawable acquire — p99 50ms (>= 50) over n=31, max 4.80ms"),
+            v("6.00", "0.10", "50.00", "10.00").is_ok(),
+            "an exclusive edge AT the 50 ms bar is not a crossing"
+        );
+        // Above the bar AND confirmed by the max: 4.80 ms is the fixture's max, so the
+        // case has to move it or it is the bucket-edge artifact, not a slow acquire.
+        let acq = hardware_key_verdict(
+            30,
+            &with_max(
+                &percentiles(30, "6.00", "0.10", "56.00", "10.00"),
+                "max_acquire_wait_ms",
+                "55.20",
+            ),
+        )
+        .expect_err("acquire");
+        assert!(
+            acq.contains(
+                "drawable acquire — p99 56ms (> 50, and its max confirms it) over n=31, max 55.20ms"
+            ),
             "{acq}"
+        );
+        assert!(
+            v("6.00", "0.10", "56.00", "10.00").is_ok(),
+            "an acquire edge above the bar with a 4.80 ms max is the artifact, not a finding"
         );
 
         assert!(
             v("6.00", "0.10", "1.00", "249.90").is_ok(),
             "249 ms input→present passes"
         );
-        let inp = v("6.00", "0.10", "1.00", "250.00").expect_err("input→present");
         assert!(
-            inp.contains("hardware input→present — p99 250ms (>= 250)"),
+            v("6.00", "0.10", "1.00", "250.00").is_ok(),
+            "an exclusive edge AT the 250 ms bar is not a crossing"
+        );
+        // This slice publishes no max of its own here (the pacing verdict gates
+        // `max_input_present_ms` separately, and there `>=` is right because that IS a
+        // true maximum), so the bar rests on the edge alone: one step above it fails.
+        let inp = v("6.00", "0.10", "1.00", "260.00").expect_err("input→present");
+        assert!(
+            inp.contains("hardware input→present — p99 260ms (> 250)"),
             "{inp}"
         );
 
@@ -1066,7 +1158,9 @@ mod tests {
         // RETURNS at once, so key->write, the press lock, acquire and input->present
         // are all healthy, and until the present->glass row EVERY published number
         // stayed green while the owner waited an extra frame for each keystroke.
-        let held = with_glass(31, "92.00");
+        // 92 ms is four refreshes of queue, and the max confirms it — without that
+        // the number could be a bucket edge brushed by a sample well under the bar.
+        let held = with_max(&with_glass(31, "92.00"), "max_present_glass_ms", "91.50");
         assert!(
             hardware_key_verdict(30, &with_glass(31, "8.90")).is_ok(),
             "the same reply with a healthy compositor leg passes"
@@ -1084,7 +1178,7 @@ mod tests {
         }
         let bad = hardware_key_verdict(30, &held).expect_err("a finding");
         assert!(
-            bad.contains("present→glass — p99 92ms (>= 50) over n=31"),
+            bad.contains("present→glass — p99 92ms (> 50, and its max confirms it) over n=31"),
             "{bad}"
         );
         assert!(
@@ -1099,9 +1193,28 @@ mod tests {
             hardware_key_verdict(30, &with_glass(31, "49.90")).is_ok(),
             "49 ms present->glass passes"
         );
+        // AN EDGE AT THE BAR IS NOT A CROSSING. The reported p99 is a bucket's
+        // EXCLUSIVE upper edge, so 50.00 against a 50 ms bar says every sample was
+        // under it — the run the 2026-09-18 gate refused reported exactly this beside
+        // `max 47.85ms`, a percentile above its own maximum.
         assert!(
-            hardware_key_verdict(30, &with_glass(31, "50.00")).is_err(),
-            "50 ms present->glass fails"
+            hardware_key_verdict(30, &with_glass(31, "50.00")).is_ok(),
+            "an exclusive edge AT the bar means every sample was under it"
+        );
+        // Above the bar, with the max confirming: the finding this row exists for.
+        assert!(
+            hardware_key_verdict(
+                30,
+                &with_max(&with_glass(31, "56.00"), "max_present_glass_ms", "55.10")
+            )
+            .is_err(),
+            "a p99 above the bar whose max confirms it fails"
+        );
+        // Above the bar with a max that does not reach it: the bucket-edge artifact,
+        // which is a pass. A 12.40 ms worst frame is not a compositor holding frames.
+        assert!(
+            hardware_key_verdict(30, &with_glass(31, "56.00")).is_ok(),
+            "an edge above the bar that no sample reached is not a slow leg"
         );
         // No sink, no handler: a CPU backend and every non-macOS present book none,
         // and an absent slice must never be read as a slow one.

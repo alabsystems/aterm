@@ -34,7 +34,11 @@
 //! by the same `--release-credentials` profile that already holds the Ed25519
 //! signing key; see [`NotaryAuth`].
 //!
-//! # Ports three shell sources at once
+//! # Ports three RETIRED shell sources at once
+//!
+//! All three were deleted with the shell pipeline and are NOT in this tree —
+//! they are named for provenance only (`git log --diff-filter=D -- <path>`
+//! finds each). Nothing here shells out to any of them.
 //!
 //!   * tools/release-conf.sh — the credentials file + its ownership/mode
 //!     refusal. The file is now PARSED, never sourced, so a hostile line is

@@ -935,10 +935,20 @@ impl AppRt for AppRtMacOS {
     fn activate_instance(&self, pid: u32) -> bool {
         // NSRunningApplication is InteriorMutable (not MainThreadOnly), but
         // this is only ever called on the event-loop turn, keeping the AppKit
-        // call ordered against our own window state. `ActivateAllWindows`
-        // only — `IgnoringOtherApps` is deprecated and inert on macOS 14+.
+        // call ordered against our own window state. BOTH flags, always:
+        // `IgnoringOtherApps` is deprecated and inert on macOS 14+ (the
+        // cooperative activation model ignores it), but on macOS 13 and
+        // earlier `-activateWithOptions:` WITHOUT it is refused whenever
+        // another app is frontmost — which is the only time this menu row is
+        // ever used — so the status item's "raise instance" silently did
+        // nothing on a Ventura machine (measured 2026-09-06). Inert where it
+        // is deprecated, required where it is not: setting it unconditionally
+        // is the one spelling that is right on every macOS this app supports.
         /// `NSRunningApplication.h:23` — `NSApplicationActivateAllWindows = 1 << 0`.
         const ACTIVATE_ALL_WINDOWS: usize = 1 << 0;
+        /// `NSRunningApplication.h:39` in MacOSX13.3.sdk —
+        /// `NSApplicationActivateIgnoringOtherApps = 1 << 1`.
+        const ACTIVATE_IGNORING_OTHER_APPS: usize = 1 << 1;
         if pid == 0 || pid == std::process::id() {
             return false;
         }
@@ -973,7 +983,7 @@ impl AppRt for AppRtMacOS {
             activate(
                 app,
                 aterm_objc::sel!(activateWithOptions:),
-                ACTIVATE_ALL_WINDOWS,
+                ACTIVATE_ALL_WINDOWS | ACTIVATE_IGNORING_OTHER_APPS,
             )
             .as_bool()
         }

@@ -484,6 +484,7 @@ const SYNC_ATTEMPTS: usize = 3;
 fn sync(caller: &Path, snap: &Path, path_env: &OsStr) -> Result<TreeState, String> {
     let keep_dir = snap.join(GATE_STATE_DIR).join("keep");
     let mut last = String::new();
+    let mut last_paths: Vec<String> = Vec::new();
     let keep_ok = || refuse_symlinked_dir(snap, &keep_dir).map_err(|e| e.to_string());
     for _ in 0..SYNC_ATTEMPTS {
         keep_ok()?;
@@ -536,13 +537,45 @@ fn sync(caller: &Path, snap: &Path, path_env: &OsStr) -> Result<TreeState, Strin
             .ok_or_else(|| format!("git could not read the snapshot {}", snap.display()))?;
         match want.moved_to(&got) {
             None => return Ok(got),
-            Some(m) => last = m,
+            Some(m) => {
+                last = m;
+                last_paths = want.moved_paths(&got);
+            }
         }
     }
     Err(format!(
         "the snapshot still differed from the checkout after {SYNC_ATTEMPTS} syncs ({last}) — \
-         the checkout is changing faster than it can be copied"
+         the checkout is changing faster than it can be copied{}",
+        churn_remedy(caller, path_env, &last_paths)
     ))
+}
+
+/// The remedy for the ONE cause of sync churn an operator can fix in one move:
+/// a file the run itself is writing inside the checkout.
+///
+/// A growing untracked file — `verify.sh --fast | tee gate.log`, an editor's
+/// scratch file, another agent's output — differs between the capture and the
+/// copy on every attempt, so the sync exhausts its attempts and the run decides
+/// nothing. A plain `> gate.log` redirect is already excluded
+/// ([`identity::claim_own_output`]); this is what covers the rest. When a
+/// TRACKED path churned too, somebody is really editing source and the remedy
+/// would be a lie, so nothing is added.
+fn churn_remedy(caller: &Path, path_env: &OsStr, moved: &[String]) -> String {
+    if moved.is_empty() {
+        return String::new();
+    }
+    let Some((untracked, _)) = identity::untracked_split(caller, path_env) else {
+        return String::new();
+    };
+    if !moved.iter().all(|p| untracked.contains(p)) {
+        return String::new();
+    }
+    format!(
+        ". Every path that churned is UNTRACKED: if one of them is this run's own log, \
+         write it outside {} or under {GATE_STATE_DIR}/, which the gate never copies or \
+         reads as source",
+        caller.display()
+    )
 }
 
 /// `git diff --binary HEAD | git apply --binary`, with every config knob that

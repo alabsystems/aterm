@@ -9918,6 +9918,28 @@ for it up front.\n\
         /// (`music_box_golden::ORACLE_SCRIPT_FOLD`, `BRRRRING_FOLD`, no
         /// space in either script) are unchanged on the same run.
         /// Previous: `0x1377_c8b9_63c3_47f1`.
+        ///
+        /// **THE SAME BITS IN EVERY PROFILE, 2026-09-18.** Under
+        /// `targo --unverified test --release -p aterm-effects` this pin
+        /// missed on the very Apple silicon Mac that measured it — `82560
+        /// samples folded to 0x6000de200b849bf2`, debug green at the pin —
+        /// and the cause was not in this file: the equal-power pan law
+        /// (`trail_sound::pan_gains`) takes the cosine and the sine of one
+        /// angle, which an optimised build fuses into Darwin's
+        /// `__sincosf_stret` while a debug build calls `cosf` and `sinf`,
+        /// and the two disagree in the last bit at some angles. Sample by
+        /// sample: the first miss was sample 12976 (`0x3c724309` debug,
+        /// `0x3c724308` release, one ulp), 9677 samples moved in all,
+        /// none by more than its last bits. The fix keeps the two calls
+        /// apart in every profile (see `pan_gains`); the release render
+        /// then matched debug on all 82560 samples, so this pin is NOT
+        /// per-profile and was not re-baked — the value here is the one a
+        /// debug run always produced. That fix rests on `black_box`, which
+        /// the language calls a hint: it is verified for Trust store `9192`
+        /// (2026-09-18) and by no automatic gate, since none runs this crate
+        /// under `--release`. A release-only miss here with debug green is
+        /// that hint being seen through by a newer toolchain; the answer is
+        /// at `pan_gains`, not a second pin.
         const LETTER_PATH_FOLD: u64 = 0x11f9_a5a4_2d77_1774;
         let fold = |x: &[f32]| -> u64 {
             x.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, s| {

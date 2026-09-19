@@ -373,7 +373,32 @@ pub(crate) use x86_simd::has_avx2;
 /// toolchain — 13 `.16b` ops per chunk, the only `ldrb` being the sub-16-byte
 /// tail), because the lane predicate is a chain of `==` with no
 /// short-circuiting range test for the vectorizer to choke on.
-#[cfg(all(target_arch = "aarch64", not(kani)))]
+///
+/// ## Why this module compiles into EVERY test build, not just aarch64
+///
+/// Nothing in here is an intrinsic or an `asm!` block — that is the whole
+/// point of the rewrite described above. `as_chunks::<16>()` plus a byte fold
+/// is portable safe Rust whose RESULTS are target-independent; only the
+/// instruction selection is aarch64's. So the `test` arm of the cfg below
+/// compiles these three functions on x86_64 (and on any other host) for one
+/// reason: so the differential tests can hold them against the scalar
+/// reference wherever `cargo test` runs.
+///
+/// That arm is load-bearing, not a convenience. While the cfg read
+/// `all(target_arch = "aarch64", not(kani))` the aarch64 arm had NO
+/// differential guard anywhere — the exhaustive and random-buffer
+/// differentials were themselves `target_arch = "x86_64"`-gated. Breaking the
+/// `wrapping_sub(0x20)` / `worst > 0x5E` bias identity below (`0x5E` -> `0x5F`,
+/// which stops 0x7F from being seen) left the entire x86_64 suite green AND
+/// type-checked clean for aarch64-unknown-linux-gnu. A guard that cannot fail
+/// reads as coverage, which is worse than no guard. That break now fails
+/// `test_tiers_exhaustive_bytes_and_positions` on every host in the fleet,
+/// aarch64 hardware or not.
+///
+/// What a non-aarch64 host cannot check is the CODEGEN contract above — that
+/// these folds still lower to `umaxv`/`uminv`. That stays an `--emit asm`
+/// inspection on an aarch64 box; the differentials guard the semantics.
+#[cfg(all(not(kani), any(target_arch = "aarch64", test)))]
 mod arm_simd {
     /// Find first C0 control byte (< 0x20) via chunked classification.
     #[inline]
@@ -987,12 +1012,26 @@ mod tests {
         }
     }
 
-    // Differential tests for the x86_64 tiers: SSE2 and AVX2 (when the host
-    // has it) must classify every byte exactly like the scalar reference, at
-    // every position across the 16- and 32-byte chunk boundaries.
-    #[cfg(all(target_arch = "x86_64", not(kani)))]
+    // Differential: every scan arm in this file must classify every byte
+    // exactly like the scalar reference, at every position across the 16- and
+    // 32-byte chunk boundaries.
+    //
+    // Three layers, and the arch gating of each is deliberate:
+    //   * the DISPATCHER asserts are arch-neutral, so this checks whichever
+    //     arm the host running `cargo test` actually takes — SSE2/AVX2 on
+    //     x86_64, NEON on an aarch64 box, the scalar fallback on a target with
+    //     neither;
+    //   * the NEON asserts are arch-neutral too, because `arm_simd` is
+    //     portable safe Rust that compiles into every test build (see its
+    //     module doc). This is what gives the aarch64 arm a guard on x86-only
+    //     CI, in place of the nothing it had while these tests were
+    //     `target_arch = "x86_64"`-gated;
+    //   * only the SSE2/AVX2 tier calls stay x86-gated, x86_64 being the one
+    //     target with more than one tier to name.
+    #[cfg(not(kani))]
     #[test]
-    fn test_x86_tiers_exhaustive_bytes_and_positions() {
+    fn test_tiers_exhaustive_bytes_and_positions() {
+        #[cfg(all(target_arch = "x86_64", not(kani)))]
         let avx2 = x86_simd::has_avx2();
         for size in [1usize, 7, 8, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65] {
             for pos in 0..size {
@@ -1001,42 +1040,80 @@ mod tests {
                     data[pos] = byte;
 
                     let np = find_non_printable_scalar(&data);
-                    assert_eq!(
-                        x86_simd::find_non_printable_sse2(&data),
-                        np,
-                        "sse2 non_printable size {size} pos {pos} byte 0x{byte:02X}"
-                    );
                     let c0 = find_c0_control_scalar(&data);
-                    assert_eq!(
-                        x86_simd::find_c0_control_sse2(&data),
-                        c0,
-                        "sse2 c0_control size {size} pos {pos} byte 0x{byte:02X}"
-                    );
                     let any = find_any_of_scalar(&data, DCS_PASSTHROUGH);
+
+                    // Whichever arm this host dispatches to.
                     assert_eq!(
-                        x86_simd::find_any_of_sse2(&data, DCS_PASSTHROUGH),
+                        find_non_printable_simd(&data),
+                        np,
+                        "dispatch non_printable size {size} pos {pos} byte 0x{byte:02X}"
+                    );
+                    assert_eq!(
+                        find_c0_control_simd(&data),
+                        c0,
+                        "dispatch c0_control size {size} pos {pos} byte 0x{byte:02X}"
+                    );
+                    assert_eq!(
+                        find_any_of_simd(&data, DCS_PASSTHROUGH),
                         any,
-                        "sse2 any_of size {size} pos {pos} byte 0x{byte:02X}"
+                        "dispatch any_of size {size} pos {pos} byte 0x{byte:02X}"
                     );
 
-                    if avx2 {
-                        // SAFETY: AVX2 availability checked above.
-                        unsafe {
-                            assert_eq!(
-                                x86_simd::find_non_printable_avx2(&data),
-                                np,
-                                "avx2 non_printable size {size} pos {pos} byte 0x{byte:02X}"
-                            );
-                            assert_eq!(
-                                x86_simd::find_c0_control_avx2(&data),
-                                c0,
-                                "avx2 c0_control size {size} pos {pos} byte 0x{byte:02X}"
-                            );
-                            assert_eq!(
-                                x86_simd::find_any_of_avx2(&data, DCS_PASSTHROUGH),
-                                any,
-                                "avx2 any_of size {size} pos {pos} byte 0x{byte:02X}"
-                            );
+                    // The aarch64 arm, held to the same grid from any host.
+                    assert_eq!(
+                        arm_simd::find_non_printable_neon(&data),
+                        np,
+                        "neon non_printable size {size} pos {pos} byte 0x{byte:02X}"
+                    );
+                    assert_eq!(
+                        arm_simd::find_c0_control_neon(&data),
+                        c0,
+                        "neon c0_control size {size} pos {pos} byte 0x{byte:02X}"
+                    );
+                    assert_eq!(
+                        arm_simd::find_any_of_neon(&data, DCS_PASSTHROUGH),
+                        any,
+                        "neon any_of size {size} pos {pos} byte 0x{byte:02X}"
+                    );
+
+                    #[cfg(all(target_arch = "x86_64", not(kani)))]
+                    {
+                        assert_eq!(
+                            x86_simd::find_non_printable_sse2(&data),
+                            np,
+                            "sse2 non_printable size {size} pos {pos} byte 0x{byte:02X}"
+                        );
+                        assert_eq!(
+                            x86_simd::find_c0_control_sse2(&data),
+                            c0,
+                            "sse2 c0_control size {size} pos {pos} byte 0x{byte:02X}"
+                        );
+                        assert_eq!(
+                            x86_simd::find_any_of_sse2(&data, DCS_PASSTHROUGH),
+                            any,
+                            "sse2 any_of size {size} pos {pos} byte 0x{byte:02X}"
+                        );
+
+                        if avx2 {
+                            // SAFETY: AVX2 availability checked above.
+                            unsafe {
+                                assert_eq!(
+                                    x86_simd::find_non_printable_avx2(&data),
+                                    np,
+                                    "avx2 non_printable size {size} pos {pos} byte 0x{byte:02X}"
+                                );
+                                assert_eq!(
+                                    x86_simd::find_c0_control_avx2(&data),
+                                    c0,
+                                    "avx2 c0_control size {size} pos {pos} byte 0x{byte:02X}"
+                                );
+                                assert_eq!(
+                                    x86_simd::find_any_of_avx2(&data, DCS_PASSTHROUGH),
+                                    any,
+                                    "avx2 any_of size {size} pos {pos} byte 0x{byte:02X}"
+                                );
+                            }
                         }
                     }
                 }
@@ -1044,12 +1121,17 @@ mod tests {
         }
     }
 
-    // Random-buffer differential: all x86 tiers vs scalar over buffers whose
-    // lengths span the 16/32-byte chunk boundaries, biased toward printable
-    // bytes so the scans reach deep offsets and chunk-boundary tails.
-    #[cfg(all(target_arch = "x86_64", not(kani)))]
+    // Random-buffer differential over the same arms, with buffer lengths that
+    // span the 16/32-byte chunk boundaries and bytes biased toward printable
+    // so the scans reach deep offsets and chunk-boundary tails. This is the
+    // half the planted-byte grid above cannot reach: several matches in one
+    // chunk, where an arm must still return the FIRST.
+    //
+    // Arch-neutral for the same reason, and by the same three layers.
+    #[cfg(not(kani))]
     #[test]
-    fn test_x86_tiers_random_buffers() {
+    fn test_tiers_random_buffers() {
+        #[cfg(all(target_arch = "x86_64", not(kani)))]
         let avx2 = x86_simd::has_avx2();
         let mut state: u64 = 0x243F_6A88_85A3_08D3;
         let mut next = move || {
@@ -1072,22 +1154,56 @@ mod tests {
                 .collect();
 
             let np = find_non_printable_scalar(&data);
-            assert_eq!(x86_simd::find_non_printable_sse2(&data), np);
             let c0 = find_c0_control_scalar(&data);
-            assert_eq!(x86_simd::find_c0_control_sse2(&data), c0);
             let any = find_any_of_scalar(&data, DCS_PASSTHROUGH);
-            assert_eq!(x86_simd::find_any_of_sse2(&data, DCS_PASSTHROUGH), any);
-            // The public dispatch must agree regardless of which tier it picks.
-            assert_eq!(find_non_printable_simd(&data), np);
-            assert_eq!(find_c0_control_simd(&data), c0);
-            assert_eq!(find_any_of_simd(&data, DCS_PASSTHROUGH), any);
 
-            if avx2 {
-                // SAFETY: AVX2 availability checked above.
-                unsafe {
-                    assert_eq!(x86_simd::find_non_printable_avx2(&data), np);
-                    assert_eq!(x86_simd::find_c0_control_avx2(&data), c0);
-                    assert_eq!(x86_simd::find_any_of_avx2(&data, DCS_PASSTHROUGH), any);
+            // The public dispatch must agree regardless of which arm it picks.
+            assert_eq!(
+                find_non_printable_simd(&data),
+                np,
+                "dispatch non_printable {data:02X?}"
+            );
+            assert_eq!(
+                find_c0_control_simd(&data),
+                c0,
+                "dispatch c0_control {data:02X?}"
+            );
+            assert_eq!(
+                find_any_of_simd(&data, DCS_PASSTHROUGH),
+                any,
+                "dispatch any_of {data:02X?}"
+            );
+
+            // The aarch64 arm, from any host.
+            assert_eq!(
+                arm_simd::find_non_printable_neon(&data),
+                np,
+                "neon non_printable {data:02X?}"
+            );
+            assert_eq!(
+                arm_simd::find_c0_control_neon(&data),
+                c0,
+                "neon c0_control {data:02X?}"
+            );
+            assert_eq!(
+                arm_simd::find_any_of_neon(&data, DCS_PASSTHROUGH),
+                any,
+                "neon any_of {data:02X?}"
+            );
+
+            #[cfg(all(target_arch = "x86_64", not(kani)))]
+            {
+                assert_eq!(x86_simd::find_non_printable_sse2(&data), np);
+                assert_eq!(x86_simd::find_c0_control_sse2(&data), c0);
+                assert_eq!(x86_simd::find_any_of_sse2(&data, DCS_PASSTHROUGH), any);
+
+                if avx2 {
+                    // SAFETY: AVX2 availability checked above.
+                    unsafe {
+                        assert_eq!(x86_simd::find_non_printable_avx2(&data), np);
+                        assert_eq!(x86_simd::find_c0_control_avx2(&data), c0);
+                        assert_eq!(x86_simd::find_any_of_avx2(&data, DCS_PASSTHROUGH), any);
+                    }
                 }
             }
         }

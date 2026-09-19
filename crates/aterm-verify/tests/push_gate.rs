@@ -1,0 +1,530 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! THE PUSH GATE, MEASURED RATHER THAN DESCRIBED.
+//!
+//! `.githooks/pre-push` is the only thing between an ungated commit and
+//! `origin/main` — aterm has no CI by owner decision. It has been wrong about
+//! itself twice: the gate announced it as "pre-push L0 gate active" while the
+//! hook ran nothing, and then twenty files were edited to say "ADVISORY"
+//! instead of closing the gap. Both times the words were maintained by hand and
+//! nothing compared them with the file.
+//!
+//! So this file RUNS THE HOOK. Every law below is a real `bash .githooks/pre-push`
+//! against a real receipt directory, and the last one holds
+//! [`aterm_verify::HOOK_CLAIM`] — the sentence the gate prints to every fresh
+//! clone — against what the hook was just measured doing.
+#![cfg(unix)]
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use aterm_verify::receipt::{self, Receipt};
+
+const ZERO: &str = "0000000000000000000000000000000000000000";
+
+/// A git checkout with one commit, the repo's own hook, and a receipts dir.
+struct Push {
+    root: PathBuf,
+    sha: String,
+}
+
+impl Push {
+    fn new(name: &str) -> Self {
+        let root = aterm_verify::mktemp_dir(name)
+            .expect("scratch")
+            .join("repo");
+        fs::create_dir_all(&root).expect("mkdir");
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&root)
+                .args([
+                    "-c",
+                    "user.name=gate",
+                    "-c",
+                    "user.email=gate@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        fs::write(root.join("a.txt"), "one\n").expect("write");
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "one"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        Self { root, sha }
+    }
+
+    /// The hook this repository actually ships, not a copy of it.
+    fn hook() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.githooks/pre-push")
+            .canonicalize()
+            .expect("the repo ships .githooks/pre-push")
+    }
+
+    fn receipt(&self, r: &Receipt) {
+        receipt::write(&self.root, r).expect("the receipt is written");
+    }
+
+    /// One more commit on the current branch touching exactly `files`
+    /// (each written with fresh content): its sha.
+    fn commit(&self, files: &[&str]) -> String {
+        for f in files {
+            let path = self.root.join(f);
+            let prior = fs::read_to_string(&path).unwrap_or_default();
+            fs::write(&path, format!("{prior}{f} moved\n")).expect("write");
+        }
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&self.root)
+                .args([
+                    "-c",
+                    "user.name=gate",
+                    "-c",
+                    "user.email=gate@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "next"]);
+        git(&["rev-parse", "HEAD"])
+    }
+
+    /// Run git in the fixture with the identity the fixture commits under.
+    fn git(&self, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(&self.root)
+            .args([
+                "-c",
+                "user.name=gate",
+                "-c",
+                "user.email=gate@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The gated-merge shape: the remote's tip `tip` moved past the base on
+    /// `main` (a peer's push), a side branch off the base carries the gated
+    /// commit `gated`, and `merge` is git's own `--no-ff` merge of the side
+    /// branch into `main`. Returns `(tip, gated, merge)`.
+    fn peer_tip_and_gated_merge(&self) -> (String, String, String) {
+        let base = self.sha.clone();
+        let tip = self.commit(&["a.txt"]);
+        self.git(&["checkout", "-q", "-b", "side", &base]);
+        let gated = self.commit(&["b.txt"]);
+        self.git(&["checkout", "-q", "main"]);
+        self.git(&["merge", "-q", "--no-ff", "--no-edit", "side"]);
+        let merge = self.git(&["rev-parse", "HEAD"]);
+        (tip, gated, merge)
+    }
+
+    /// Push `sha` on `main` into an empty remote ref: `(exit code, stderr)`.
+    fn push(&self, sha: &str, bypass: bool) -> (i32, String) {
+        self.push_line(
+            &format!("refs/heads/main {sha} refs/heads/main {ZERO}\n"),
+            bypass,
+        )
+    }
+
+    /// Run the hook on exactly this ref line — the four fields git hands a
+    /// pre-push hook: local ref, local sha, remote ref, remote sha.
+    fn push_line(&self, line: &str, bypass: bool) -> (i32, String) {
+        let mut c = Command::new("bash");
+        c.arg(Self::hook())
+            .arg("origin")
+            .arg("git@example.invalid:x/y.git")
+            .current_dir(&self.root)
+            .env_remove("ATERM_PUSH_NO_GATE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if bypass {
+            c.env("ATERM_PUSH_NO_GATE", "1");
+        }
+        let mut child = c.spawn().expect("the hook runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(line.as_bytes())
+            .expect("the hook reads its ref list");
+        let out = child.wait_with_output().expect("the hook exits");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+}
+
+fn green(sha: &str) -> Receipt {
+    Receipt {
+        head: sha.to_string(),
+        dirty: None,
+        mode: "fast".into(),
+        scope: "workspace".into(),
+        verdict: "PASS".into(),
+        merge_contract: true,
+        skipped: "none".into(),
+        when: 1_758_000_000,
+    }
+}
+
+/// THE RELEASE CUTTER'S CLAIM. `crates/aterm-release` claims a build number by
+/// pushing "release: vX.Y.Z (build N)" from this checkout: origin's tip plus
+/// one `RELEASES.ledger` line and the rolled `CHANGELOG.md`, and nothing else
+/// (`ledger::claim`, `publish::regen_release_files`). No gate ran on that
+/// commit and none needs to — no code enters — so the hook admits it, judged
+/// against the remote's CURRENT tip, the sha git hands the hook.
+#[test]
+fn a_release_claim_over_the_remote_tip_is_admitted_without_a_receipt() {
+    let p = Push::new("atv-push-claim-admitted");
+    let tip = p.sha.clone();
+    let claim = p.commit(&["CHANGELOG.md", "RELEASES.ledger"]);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {claim} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(code, 0, "a claim over the remote's tip is admitted: {err}");
+    assert!(
+        err.contains("release claim") && err.contains("RELEASES.ledger"),
+        "…and the hook says what it admitted and why: {err}"
+    );
+}
+
+/// The claim's shape is the whole admission: one more path in that diff is
+/// code entering main, and code owes a receipt.
+#[test]
+fn a_claim_shaped_commit_that_also_moves_code_is_refused() {
+    let p = Push::new("atv-push-claim-with-code");
+    let tip = p.sha.clone();
+    let claim = p.commit(&["CHANGELOG.md", "RELEASES.ledger", "a.txt"]);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {claim} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(code, 1, "a.txt moved too, so the push is refused: {err}");
+    assert!(err.contains("no gate receipt"), "{err}");
+}
+
+/// Judged against the REMOTE'S tip, not the local parent: a ledger-only
+/// commit that does not fast-forward what the remote holds is not the
+/// cutter's claim (the claim is a compare-and-swap on origin's tip and
+/// regenerates on a lost race), and is refused like any other commit.
+#[test]
+fn a_ledger_only_commit_that_does_not_fast_forward_the_remote_is_refused() {
+    let p = Push::new("atv-push-claim-diverged");
+    let remote_tip = p.commit(&["a.txt"]);
+    // Back to the first commit, on a side branch; the "claim" hangs off it.
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&p.root)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["checkout", "-q", "-b", "side", &p.sha]);
+    let claim = p.commit(&["CHANGELOG.md", "RELEASES.ledger"]);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/side {claim} refs/heads/main {remote_tip}\n"),
+        false,
+    );
+    assert_eq!(code, 1, "not a fast-forward of the remote's tip: {err}");
+}
+
+/// A SLOW GATE ON A FAST-MOVING MAIN. The gate takes over an hour and peers
+/// push every few minutes, so a receipt for the exact remote tip is a race the
+/// gate loses by construction. What is admitted instead is git's own automatic
+/// merge of a receipted commit onto the remote's current tip — the merge's
+/// tree byte-equal to `git merge-tree` of its two parents, so nothing was
+/// resolved or added by hand — and the receipted side's receipt stands for it.
+#[test]
+fn a_clean_automatic_merge_of_a_receipted_commit_onto_the_remote_tip_is_admitted() {
+    let p = Push::new("atv-push-merge-admitted");
+    let (tip, gated, merge) = p.peer_tip_and_gated_merge();
+    p.receipt(&green(&gated));
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {merge} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(
+        code, 0,
+        "the merge is admitted on the gated side's receipt: {err}"
+    );
+    assert!(
+        err.contains("automatic merge") && err.contains(&gated[..7]),
+        "…and the hook names the gated side it stood on: {err}"
+    );
+}
+
+/// The receipted side is the whole admission: the same merge with no receipt
+/// on its side is a merge of two ungated commits, and is refused.
+#[test]
+fn the_same_merge_with_an_unreceipted_side_is_refused() {
+    let p = Push::new("atv-push-merge-unreceipted");
+    let (tip, _gated, merge) = p.peer_tip_and_gated_merge();
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {merge} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(code, 1, "no receipt on either side: {err}");
+    assert!(err.contains("no gate receipt"), "{err}");
+}
+
+/// Byte-equal to git's own result, or nothing: a merge commit that also
+/// carries an edit of its own — a hand-resolved conflict has the same shape —
+/// holds content nobody gated, and is refused.
+#[test]
+fn a_merge_that_adds_anything_beyond_gits_own_result_is_refused() {
+    let p = Push::new("atv-push-merge-hand-edited");
+    let (tip, gated, _merge) = p.peer_tip_and_gated_merge();
+    p.receipt(&green(&gated));
+    fs::write(p.root.join("c.txt"), "by hand\n").expect("write");
+    p.git(&["add", "-A"]);
+    p.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let amended = p.git(&["rev-parse", "HEAD"]);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {amended} refs/heads/main {tip}\n"),
+        false,
+    );
+    assert_eq!(
+        code, 1,
+        "c.txt is not in git's merge of the two parents: {err}"
+    );
+    assert!(err.contains("no gate receipt"), "{err}");
+}
+
+/// Onto the REMOTE'S tip, not onto anything: a merge whose parents do not
+/// include what the remote holds now would carry the remote's own commits
+/// past the hook as if they were the gated side's.
+#[test]
+fn a_merge_that_does_not_sit_on_the_remote_tip_is_refused() {
+    let p = Push::new("atv-push-merge-off-tip");
+    let base = p.sha.clone();
+    let (_tip, gated, merge) = p.peer_tip_and_gated_merge();
+    p.receipt(&green(&gated));
+    // The remote still holds the base: neither parent of the merge is it.
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {merge} refs/heads/main {base}\n"),
+        false,
+    );
+    assert_eq!(code, 1, "neither parent is the remote's tip: {err}");
+}
+
+/// A tag moves no branch: the commit it names either already sits on the
+/// remote or arrives through a branch push this hook judges. The cutter pushes
+/// its fence, its lease and the vX.Y.0 tag from this checkout.
+#[test]
+fn a_tag_push_needs_no_receipt() {
+    let p = Push::new("atv-push-tag");
+    let (code, err) = p.push_line(
+        &format!("refs/tags/v0.0.1 {} refs/tags/v0.0.1 {ZERO}\n", p.sha),
+        false,
+    );
+    assert_eq!(code, 0, "a tag owes no receipt: {err}");
+    assert!(!err.contains("REFUSED"), "{err}");
+}
+
+/// THE GAP THIS CLOSES. A commit no gate ever ran on does not leave.
+#[test]
+fn a_commit_with_no_receipt_is_refused_and_told_how_to_get_one() {
+    let p = Push::new("atv-push-none");
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("no gate receipt for this commit"), "{err}");
+    assert!(
+        err.contains("tools/verify.sh --fast"),
+        "the remedy is the command, not an adjective: {err}"
+    );
+    assert!(
+        err.contains("ATERM_PUSH_NO_GATE=1"),
+        "and the escape is named out loud: {err}"
+    );
+}
+
+/// A whole-tree PASS on exactly these bytes, and the push goes.
+#[test]
+fn a_clean_merge_contract_receipt_admits_the_push() {
+    let p = Push::new("atv-push-green");
+    p.receipt(&green(&p.sha));
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("carry a passing gate receipt"), "{err}");
+}
+
+/// A PASS over HEAD **plus uncommitted work** verified bytes nobody is pushing.
+#[test]
+fn a_pass_on_a_dirty_tree_is_refused() {
+    let p = Push::new("atv-push-dirty");
+    let mut r = green(&p.sha);
+    r.dirty = Some("f00dcafe1234".into());
+    p.receipt(&r);
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("uncommitted work"), "{err}");
+}
+
+/// A narrowed, skipping or failing run never discharged the contract, whatever
+/// its exit code was.
+#[test]
+fn a_run_that_did_not_discharge_the_contract_is_refused() {
+    let p = Push::new("atv-push-narrow");
+    let mut r = green(&p.sha);
+    r.merge_contract = false;
+    r.scope = "crate:aterm-gui".into();
+    p.receipt(&r);
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("did NOT discharge the merge contract"),
+        "{err}"
+    );
+}
+
+/// A SKIP IS NOT A PASS, and the refusal says WHICH skip — the difference
+/// between "the gate refused your change" and "this machine cannot present, so
+/// the gui smoke skipped", which is the whole of an operator's next move on a
+/// headless box. The contract is unchanged (nothing skipped is what discharges
+/// it); what is added is that the tool says why.
+#[test]
+fn a_skipping_run_is_refused_and_the_refusal_names_the_skip() {
+    let p = Push::new("atv-push-skip");
+    let mut r = green(&p.sha);
+    r.merge_contract = false;
+    r.skipped = "gui smoke (ATERM_SKIP_GUI_SMOKE)".into();
+    p.receipt(&r);
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("gui smoke (ATERM_SKIP_GUI_SMOKE)"),
+        "the refusal names the skip rather than only its consequence: {err}"
+    );
+}
+
+/// A FILE THE HOOK CANNOT READ IS NOT PERMISSION. The one direction this must
+/// never fail in.
+#[test]
+fn a_receipt_the_hook_cannot_parse_refuses_the_push() {
+    let p = Push::new("atv-push-garbage");
+    let dir = receipt::dir(&p.root);
+    fs::create_dir_all(&dir).expect("mkdir");
+    fs::write(dir.join(&p.sha), "merge-contract yes\ntree clean\n").expect("write");
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(
+        code, 1,
+        "a file without the magic line is no receipt: {err}"
+    );
+}
+
+/// Deleting a ref pushes no code, so there is nothing to have gated.
+#[test]
+fn deleting_a_ref_needs_no_receipt() {
+    let p = Push::new("atv-push-delete");
+    let (code, err) = p.push(ZERO, false);
+    assert_eq!(code, 0, "{err}");
+}
+
+/// The exception exists, and it is LOUD — an unescapable gate is what taught
+/// the bypass the first time.
+#[test]
+fn the_named_bypass_works_and_says_so() {
+    let p = Push::new("atv-push-bypass");
+    let (code, err) = p.push(&p.sha, true);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("GATE BYPASSED"), "{err}");
+    assert!(err.contains("nothing was checked"), "{err}");
+}
+
+/// A HOOK THAT IS NOT EXECUTABLE IS NOT A HOOK, and git says nothing about it.
+///
+/// This is the one way the whole push gate can disappear silently: git runs
+/// `core.hooksPath/pre-push` only if the file is executable, and a checkout,
+/// a patch application or an editor that drops the bit leaves a repository that
+/// pushes everything with no refusal and no message. Nothing else in this tree
+/// looks at the bit, so this does — and it checks the COMMITTED mode as well as
+/// the working tree's, because that is what every other clone will get.
+#[test]
+fn the_hook_is_executable_here_and_in_the_index() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let hook = Push::hook();
+    let mode = fs::metadata(&hook)
+        .expect("stat the hook")
+        .permissions()
+        .mode();
+    assert!(
+        mode & 0o111 != 0,
+        "{} is not executable ({mode:o}) — git would skip it and every push would go          ungated, silently",
+        hook.display()
+    );
+
+    let root = hook.parent().and_then(Path::parent).expect("repo root");
+    let out = Command::new("git")
+        .args(["ls-files", "-s", "--", ".githooks/pre-push"])
+        .current_dir(root)
+        .output()
+        .expect("git runs");
+    let row = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        row.starts_with("100755 "),
+        "the COMMITTED mode is not executable, so a fresh clone gets an inert push gate:          {row:?}"
+    );
+}
+
+/// THE SENTENCE AND THE FILE AGREE.
+///
+/// [`aterm_verify::HOOK_CLAIM`] is printed to every operator on a fresh clone.
+/// Both previous spellings of it were false — "L0 gate active" for a hook that
+/// ran nothing, then "ADVISORY" after this one grew teeth — because the words
+/// lived in one file and the behaviour in another and nothing compared them.
+/// This does.
+#[test]
+fn the_claim_the_gate_prints_is_what_the_hook_was_just_measured_doing() {
+    let claim = aterm_verify::HOOK_CLAIM;
+    let p = Push::new("atv-push-claim");
+    let (blocked, _) = p.push(&p.sha, false);
+    p.receipt(&green(&p.sha));
+    let (admitted, _) = p.push(&p.sha, false);
+    let (bypassed, _) = p.push(&p.sha, true);
+
+    assert_eq!((blocked, admitted), (1, 0), "the hook blocks, then admits");
+    assert_eq!(bypassed, 0, "the bypass works");
+    assert!(
+        claim.contains("BLOCKS") && claim.contains("receipt"),
+        "the claim must say what was just measured: {claim}"
+    );
+    assert!(
+        claim.contains("ATERM_PUSH_NO_GATE=1"),
+        "…and name the exception that was just measured: {claim}"
+    );
+    assert!(
+        !claim.to_ascii_lowercase().contains("advisory"),
+        "the hook is not advisory any more: {claim}"
+    );
+}

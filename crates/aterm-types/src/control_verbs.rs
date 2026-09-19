@@ -215,7 +215,19 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// was red on the commits that grew them, whose runs filtered the suite to
 /// `--lib fabric` and so never ran it. Same accounting as the four raises
 /// above, and the shape is unchanged.
-pub const SHORT_CATALOG_MAX_BYTES: usize = 9984;
+///
+/// RAISED AGAIN FROM 9984 on 2026-09-17, for session identities (phase 1): the
+/// `identities` row, the recut `spawn` summary (`[raise=<t|f>]` making room for
+/// `[identity=<name>|-]`) and ` identity=` on the `sessions` summary, taking the
+/// table from 104 entries to 105. The GUI's short `help` MEASURES 10 098 B with
+/// them (10 059 B of content lines after the `OK 108 …` status line — three
+/// framing lines and the 105 rows — read through aterm-ctl on the headless live
+/// try of 2026-09-17), against 9 984; same
+/// accounting as the five raises above - the
+/// alternative is rewording unrelated verbs' prose to make room, which is the
+/// drift a generated golden exists to catch - and the shape is unchanged: one
+/// summary row per verb under [`SUMMARY_MAX_CHARS`].
+pub const SHORT_CATALOG_MAX_BYTES: usize = 10240;
 /// The column a catalog row's text starts in: a 28-wide name plus one space.
 pub const CATALOG_TEXT_COLUMN: usize = 29;
 /// The width a `help <verb>` entry is wrapped to.
@@ -808,7 +820,7 @@ pub const VERBS: &[VerbSpec] = &[
          confidence=exact|strong|heuristic|unknown reasons= attribution=live|adopted|unknown \
          fs_consent=covered|denied|unknown conflict= revision= enabled= hold=<0|1> \
          fabric=<connected|stalled|disconnected|absent> fabric_rtt_ms=<n|-> \
-         fabric_link_age_ms=<n|->. `attribution=`/`fs_consent=` are this \
+         fabric_link_age_ms=<n|-> identity=<name|->. `attribution=`/`fs_consent=` are this \
          session's consent posture (see `privacy` and `await consent`). \
          Read-only. `observed=false` means never classified, which is NOT `phase=unknown` \
          (classified, no evidence); `subject_source=unavailable` means the terminal lock was \
@@ -842,6 +854,10 @@ pub const VERBS: &[VerbSpec] = &[
          last acknowledged round trip to the broker in ms (`-` before the first) and \
          `fabric_link_age_ms=` is how long ago that ack was — a large age on `connected` means \
          a quiet link, not a dead one, and only the next exchange can tell. \
+         `identity=<name|->` is the agent identity the session was spawned under (`spawn \
+         identity=<name>`), `-` for the human's own agent config - the same word the \
+         `sessions` roster carries, so a driver polling one session need not re-read the \
+         fleet to learn whose login it is driving. \
          No `window=` here: `status` is \
          polled, and the window lives on the main thread, so a per-poll hop would be a \
          latency regression — ask `sessions`/`ls` (one hop for the whole fleet) or `dims`",
@@ -1493,7 +1509,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "spawn [window=<id>] [raise=<true|false>] [cwd=<path>] [split=<v|h>] [connected=...]:",
+        "spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [identity=<name>|-] [connected=…]:",
         "mint a new session (a tab, or split the focused pane), reply OK <sid> - immediately \
          addressable. AIM it with window=<id> (an id from `inspect app/v1 tabs`) or `@<sid> \
          spawn` (the window hosting <sid>; window= wins); split= then divides THAT window's \
@@ -1508,7 +1524,17 @@ pub const VERBS: &[VerbSpec] = &[
          `both` session connection with of=<sid> (controlled: of= drives the newborn; \
          controller: the newborn drives of=, its shell gets ATERM_OBSERVE_SESSION_ID) - \
          Owner-only, of= mandatory, no window=/raise=/split= beside it, place=window is `ERR \
-         headless` with no GUI",
+         headless` with no GUI. `identity=<name>` (session identities): the newborn's agents \
+         keep their login, settings and skills in `<state>/identities/<name>/` instead of the \
+         human's `$HOME` - `CLAUDE_CONFIG_DIR`/`CODEX_HOME` point into it, set AFTER the env \
+         strip, so neither login leaks into the other. The name folds to lowercase \
+         (`[a-z0-9][a-z0-9._-]{0,63}`); the directory is created ONCE on first use (0700, \
+         primed with the aterm skills and the human's aterm hook block) - this verb is the \
+         only create path, and a create failure is the reply (`ERR identity <name>: <why>`). \
+         `@<sid> spawn` (and the connected form's of=) INHERITS the aimed session's identity; \
+         `identity=-` opts out; a plain spawn has none. Spawn-time and immutable: `meta set \
+         identity` is refused. Owner-only like connected= (an identity is a directory of \
+         credentials). `identities` lists and forgets them",
     ),
     v(
         "close",
@@ -2044,7 +2070,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "OK <n> + per session: local sid parent state title meta= nonce= window= active= wfocus= detail=",
+        "OK <n> rows: local sid parent state title meta= nonce= window= active= wfocus= detail= identity=",
         "Owner-only. `nonce=<hex32>` is the session's PUBLIC launch nonce — the freshness fence \
          an edge binds to and the fabric's `epoch=` verbatim; it is here because `whoami` reports \
          only the connection's own session, so a bridge could not read any other's. \
@@ -2065,7 +2091,11 @@ pub const VERBS: &[VerbSpec] = &[
          not parsed and reads that keyword (`for i in 1 2 3; do ...; done` reads `for`), and \
          a keyword opening a LATER segment reads the same way (`cd x && for ...; done` is \
          `for`, never its closer `done`). The \
-         same value `status` carries; `-` when idle or the engine lock was contended. One main-thread hop per call, not per session; the client `ls` \
+         same value `status` carries; `-` when idle or the engine lock was contended. \
+         `identity=<name|->`: the agent identity the session was spawned under (`spawn \
+         identity=<name>` - the directory its agents keep their login in; `identities` lists \
+         them), `-` for the human's own agent config - and for a shell adopted from a build \
+         without the field, which keeps its env and drops the label. One main-thread hop per call, not per session; the client `ls` \
          relays these lines verbatim and `windows` folds them per window. The menu-bar \
          status item's fleet scan reads this on every open under a 2 s per-peer budget, so \
          a peer whose main thread cannot answer inside it drops out of that menu rather \
@@ -2112,6 +2142,39 @@ pub const VERBS: &[VerbSpec] = &[
          verb cannot be asked for the `closing` row after the close (the sid stops resolving in \
          the store write that records it; only a request that resolved the session just before \
          that write can still read it)",
+    ),
+    // `identities` is the on-disk roster of agent identities (`spawn identity=`):
+    // Owner-gated like `sessions`, whose `identity=` column it explains, and
+    // Lines-framed from the table so the client is untouched.
+    va(
+        "identities",
+        Owner,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "identities [<name>|forget <name> [confirm=<name>]]: the agent identities on disk. Owner-only",
+        "- an identity is `<state>/identities/<name>/`, the directory a session spawned with \
+         `spawn identity=<name>` points its agents' home variables into (`CLAUDE_CONFIG_DIR`, \
+         `CODEX_HOME`), so its login, settings and skills are its own and never the human's. \
+         `identities` -> `OK <n>` then one `<name> dir=<pct> sessions=<n> \
+         agents=<prog>:present|absent,...` line per identity, sorted by name: `sessions=` \
+         counts the LIVE sessions carrying it, and `present` means the agent's subdirectory \
+         is NON-EMPTY - a `read_dir` name listing, bytes never opened; a primed identity \
+         reads `present` for every agent aterm knows, and aterm never reads, names or claims \
+         a login. `identities <name>` -> `OK <n>` (the row plus one line per agent, so the \
+         client's line framing carries them all): that row, then one `agent=<prog> var=<VAR> \
+         home=<pct> files=present|absent` line per agent. The `forget` form answers ONE status \
+         line (no row count): `identities forget <name>` -> `ERR \
+         confirm: identities forget <name> confirm=<name> removes <pct>` (nothing removed); \
+         with `confirm=<name>` -> `ERR identity in use sessions=<sid>,...` while any live \
+         session carries it, else `OK removed=<pct> left=keychain` - the tree is gone, and \
+         with it the credentials the agents keep as files, but a login an agent keeps in the \
+         macOS keychain is NOT: sign out in the agent first (`/logout`); aterm never reads, \
+         names or deletes a keychain item it did not create. Names fold to lowercase. \
+         Unknown: `ERR no such identity <name>`; anything else: `ERR usage: identities \
+         [<name>|forget <name> [confirm=<name>]]`. A read except `forget`, which removes a \
+         directory and never a session; a shell adopted from a build without the label reads \
+         as no user of its identity (`sessions=0`), so close it before forgetting",
     ),
     va(
         "whoami",
@@ -2373,6 +2436,14 @@ pub fn framing_of(verb: &str, request: &str) -> Framing {
     if verb == "outbox" && sub == Some("sent") {
         return Status;
     }
+    // `identities forget <name> [confirm=<name>]` answers ONE status line —
+    // `OK removed=<pct> left=keychain`, or the confirm/in-use `ERR` — not the
+    // `OK <n>` + rows the bare listing and `identities <name>` answer. Same flip,
+    // same hazard, MEASURED on the live try of 2026-09-17: under Lines framing
+    // aterm-ctl refused the removal's reply as a `malformed response header`.
+    if verb == "identities" && sub == Some("forget") {
+        return Status;
+    }
     // `video frames [count=N]` lists the newest recording's top-delta frames as
     // `OK <n>\n` + n rows — Lines-framed, unlike the base `video <secs>` capture
     // (a single Status `OK …` dump line) and `video status`/`video stop`.
@@ -2503,6 +2574,15 @@ mod tests {
         assert_eq!(framing_of("video", "video status"), Status);
         // `temporal status` is a Status line; base `temporal`/`temporal <tick>` stay Bytes.
         assert_eq!(framing_of("temporal", "temporal status"), Status);
+        // `identities` lists (`OK <n>` + rows) and describes one (`OK <1+agents>`
+        // + rows); its `forget` sub-form answers one status line.
+        assert_eq!(framing_of("identities", "identities"), Lines);
+        assert_eq!(framing_of("identities", "identities worker"), Lines);
+        assert_eq!(framing_of("identities", "identities forget worker"), Status);
+        assert_eq!(
+            framing_of("identities", "identities forget worker confirm=worker"),
+            Status
+        );
         assert_eq!(framing_of("temporal", "temporal"), Bytes);
         assert_eq!(framing_of("temporal", "temporal 1200"), Bytes);
         assert_eq!(framing_of("temporal", "@s-a temporal status"), Status);
@@ -2842,6 +2922,93 @@ mod tests {
         }
     }
 
+    /// Session identities (phase 1) are documented where the wire is: the
+    /// `identities` row spells every reply of its table (list, one, forget
+    /// unconfirmed, in use, removed, unknown, usage) and the keychain rule the
+    /// review bound (`present` = a non-empty subdirectory, bytes never opened;
+    /// `left=keychain`, sign out in the agent first); `spawn` documents
+    /// `identity=` (fold, create-once, inherit, `-`, Owner-only, `meta set`
+    /// refused); `sessions` and `status` both carry `identity=<name|->` after
+    /// their last column. Pinned so the help a reader is handed cannot drift
+    /// from what the verbs do.
+    #[test]
+    fn session_identities_are_documented_on_spawn_sessions_status_and_identities() {
+        let identities = spec("identities").expect("identities is in the table");
+        assert_eq!(identities.access, Access::OwnerOnly);
+        assert_eq!(identities.framing, Lines);
+        assert_eq!(identities.target, Target::Meta);
+        assert!(
+            identities
+                .summary
+                .starts_with("identities [<name>|forget <name> [confirm=<name>]]:"),
+            "{}",
+            identities.summary
+        );
+        for phrase in [
+            "`OK <n>` then one `<name> dir=<pct> sessions=<n> agents=<prog>:present|absent,...` line",
+            "`present` means the agent's subdirectory is NON-EMPTY",
+            "bytes never opened",
+            "`agent=<prog> var=<VAR> home=<pct> files=present|absent`",
+            "`ERR confirm: identities forget <name> confirm=<name> removes <pct>`",
+            "`ERR identity in use sessions=<sid>,...`",
+            "`OK removed=<pct> left=keychain`",
+            "sign out in the agent first (`/logout`)",
+            "aterm never reads, names or deletes a keychain item it did not create",
+            "`ERR no such identity <name>`",
+            "`ERR usage: identities [<name>|forget <name> [confirm=<name>]]`",
+        ] {
+            assert!(
+                identities.detail.contains(phrase),
+                "identities detail lacks {phrase:?}"
+            );
+        }
+        let spawn = spec("spawn").expect("spawn is in the table");
+        assert!(
+            spawn.summary.contains("[identity=<name>|-]"),
+            "{}",
+            spawn.summary
+        );
+        for phrase in [
+            "`identity=<name>` (session identities)",
+            "set AFTER the env strip",
+            "folds to lowercase",
+            "this verb is the only create path",
+            "`ERR identity <name>: <why>`",
+            "INHERITS the aimed session's identity",
+            "`identity=-` opts out",
+            "`meta set identity` is refused",
+            "Owner-only like connected=",
+        ] {
+            assert!(
+                spawn.detail.contains(phrase),
+                "spawn detail lacks {phrase:?}"
+            );
+        }
+        let sessions = spec("sessions").expect("sessions is in the table");
+        assert!(
+            sessions
+                .detail
+                .contains("`identity=<name|->`: the agent identity the session was spawned under"),
+            "{}",
+            sessions.detail
+        );
+        let status = spec("status").expect("status is in the table");
+        assert!(
+            status
+                .detail
+                .contains("fabric_link_age_ms=<n|-> identity=<name|->."),
+            "{}",
+            status.detail
+        );
+        assert!(
+            status.detail.contains(
+                "`identity=<name|->` is the agent identity the session was spawned under"
+            ),
+            "{}",
+            status.detail
+        );
+    }
+
     /// The placement columns are documented where the wire is (F2/F5): `sessions`
     /// spells every `window=` value, says a headless instance is `window=0` (it
     /// owns logical window 0, the one `dims` names) and NOT `none`, and names
@@ -2854,7 +3021,7 @@ mod tests {
         assert!(
             sessions
                 .summary
-                .ends_with("meta= nonce= window= active= wfocus= detail="),
+                .ends_with("meta= nonce= window= active= wfocus= detail= identity="),
             "{}",
             sessions.summary
         );
@@ -2945,6 +3112,9 @@ mod tests {
                 "sessions",
                 "who",
                 "exits",
+                // The on-disk identity roster and its `forget`: Owner like
+                // `sessions`, whose `identity=` column it explains.
+                "identities",
                 "whoami",
                 "grant",
                 "revoke",

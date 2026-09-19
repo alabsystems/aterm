@@ -591,7 +591,10 @@ const MAX_PACK_AUTHORS: usize = 8;
 const MAX_AUTHOR_BYTES: usize = 80;
 const MAX_LICENSE_BYTES: usize = 64;
 const MAX_LANG_BYTES: usize = 35;
-const MIN_ANIMATION_MS: u32 = 350;
+/// The crate's ANIMATION FLOOR: no authored window, drift or sweep may run
+/// faster. `pub(crate)` so an engine-owned animation (the trick flash) can
+/// const-assert against THE floor instead of restating 350.
+pub(crate) const MIN_ANIMATION_MS: u32 = 350;
 const MAX_ANIMATION_MS: u32 = 6000;
 const MAX_CAT_DWELL_MS: u32 = 3750;
 

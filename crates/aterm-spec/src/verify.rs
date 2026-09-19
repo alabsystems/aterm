@@ -148,9 +148,10 @@ fn find_trust_bin(bin: &str, first_party_rel_dir: &str) -> Option<PathBuf> {
     // The atpkg-managed store (batteries-included installs): the per-tool shim
     // under the manager-owned prefix. Probed after the developer checkouts (a
     // live $HOME/trust always wins) and before PATH — atpkg's bin/ reaches PATH
-    // only in interactive aterm shells (~/.aterm/shell.d, APPENDED), so
-    // without this probe a seeded toolchain is invisible to `cargo test` and
-    // CI processes. A shim is trusted only when it resolves to a real file
+    // only in INTERACTIVE shells (aterm's integration, or the rc block atpkg
+    // appends to an existing rc; APPENDED either way), never in a `cargo test`
+    // / CI process, so without this probe a seeded toolchain is invisible to
+    // those. A shim is trusted only when it resolves to a real file
     // (a dangling link after a GC must not satisfy discovery).
     if let Some(p) = atpkg_store_probe(&exe) {
         return Some(p);

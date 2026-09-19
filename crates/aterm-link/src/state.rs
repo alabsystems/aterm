@@ -152,29 +152,38 @@ pub struct Deadline {
     pub at: u64,
     /// The advisory `dl=` the ask carried, echoed onto the verdict.
     pub dl: u64,
+    /// The principal whose reply settles it — the node (or `p/` principal)
+    /// owning the lane the ask went to ([`Asked`]). `None` for a line written
+    /// before round 16's review, which any reply settles, as it always did.
+    pub to: Option<String>,
 }
 
 impl Deadline {
     /// The one line this deadline is stored as.
     #[must_use]
     pub fn render(&self) -> String {
-        format!(
+        let mut line = format!(
             "off={} sid={} at={} dl={}",
             self.off, self.sid, self.at, self.dl
-        )
+        );
+        if let Some(to) = &self.to {
+            line.push_str(&format!(" to={to}"));
+        }
+        line
     }
 
     /// Parse one back. TOTAL, and partial is `None`: a half line is not a
     /// deadline this bridge should publish a verdict for.
     #[must_use]
     pub fn parse(line: &str) -> Option<Self> {
-        let (mut off, mut sid, mut at, mut dl) = (None, None, None, None);
+        let (mut off, mut sid, mut at, mut dl, mut to) = (None, None, None, None, None);
         for tok in line.split_whitespace() {
             match tok.split_once('=') {
                 Some(("off", v)) => off = v.parse().ok(),
                 Some(("sid", v)) => sid = Some(v.to_string()),
                 Some(("at", v)) => at = v.parse().ok(),
                 Some(("dl", v)) => dl = v.parse().ok(),
+                Some(("to", v)) => to = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -182,14 +191,56 @@ impl Deadline {
         if sid.is_empty() {
             return None;
         }
+        // A `to=` that is present and empty is a damaged line, not an old one.
+        if to.as_deref() == Some("") {
+            return None;
+        }
         Some(Self {
             off: off?,
             sid,
             at: at?,
             dl: dl?,
+            to,
         })
     }
 }
+
+/// One `ask`/`task` this node published, and the principal whose REPLY it is:
+/// the node that owns the lane it went to (`/f/<F>/in/<node>/<sid>/…`), or the
+/// principal of a `p/` lane (`/f/<F>/in/p/<principal>/…`). The broker's grant
+/// binds a reply's `<src>` segment to its publisher, so this is what tells the
+/// recipient's receipt from anybody else's record that merely names the same
+/// offset (round 16 review: a third node's `ack re=<off>` settled the asker's
+/// `--wait-ack` and its deadline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asked {
+    /// The bus offset of the ask.
+    pub off: u64,
+    /// The principal whose reply it is.
+    pub to: String,
+}
+
+impl Asked {
+    /// The one line this entry is stored as: `<off> <to>`.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!("{} {}", self.off, self.to)
+    }
+
+    /// Parse one back — TOTAL, a partial line is `None`.
+    #[must_use]
+    pub fn parse(line: &str) -> Option<Self> {
+        let mut toks = line.split_whitespace();
+        let off = toks.next()?.parse().ok()?;
+        let to = toks.next()?.to_string();
+        toks.next().is_none().then_some(Self { off, to })
+    }
+}
+
+/// How many published asks the node remembers the recipient of, newest last.
+/// A `post --wait-ack` parks for at most 600 s, and a deadline carries its
+/// own [`Deadline::to`]: this only has to outlive the waits, with room.
+pub const ASKED_KEEP: usize = 1024;
 
 /// How many `post key=` reservations one session keeps, newest last.
 ///
@@ -673,6 +724,25 @@ impl StateDir {
             .unwrap_or_default()
     }
 
+    /// Every ask this node remembers the recipient of, oldest offset first.
+    #[must_use]
+    pub fn asked(&self) -> Vec<Asked> {
+        self.read("asked")
+            .map(|s| s.lines().filter_map(Asked::parse).collect())
+            .unwrap_or_default()
+    }
+
+    /// Replace the asked table, keeping the newest [`ASKED_KEEP`] by position.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O failure.
+    pub fn set_asked(&self, list: &[Asked]) -> io::Result<()> {
+        let over = list.len().saturating_sub(ASKED_KEEP);
+        let lines: Vec<String> = list[over..].iter().map(Asked::render).collect();
+        self.write("asked", &lines.join("\n"))
+    }
+
     /// Replace the deadline table, keeping the newest [`DEADLINES_KEEP`] by
     /// offset. Written whole because it is small and changes rarely: once per
     /// ask with a `dl=`, once per reply to one.
@@ -964,6 +1034,7 @@ mod tests {
             sid: "s-abcdef0123456789".to_string(),
             at: 1_700_000_240_123,
             dl: 240_000,
+            to: Some("n-0123456789abcdef".to_string()),
         };
         st.set_deadlines(std::slice::from_ref(&one)).expect("write");
         assert_eq!(
@@ -974,16 +1045,22 @@ mod tests {
         assert!(st.deadlines().is_empty());
         for damaged in [
             "",
-            "off=1 sid=s-a at=2",      // no dl
-            "off=1 sid=s-a dl=3",      // no at
-            "sid=s-a at=2 dl=3",       // no offset
-            "off=1 at=2 dl=3",         // no sid
-            "off=1 sid= at=2 dl=3",    // an empty sid
-            "off=x sid=s-a at=2 dl=3", // an offset that is not one
+            "off=1 sid=s-a at=2",          // no dl
+            "off=1 sid=s-a dl=3",          // no at
+            "sid=s-a at=2 dl=3",           // no offset
+            "off=1 at=2 dl=3",             // no sid
+            "off=1 sid= at=2 dl=3",        // an empty sid
+            "off=x sid=s-a at=2 dl=3",     // an offset that is not one
+            "off=1 sid=s-a at=2 dl=3 to=", // an empty recipient
         ] {
             assert_eq!(Deadline::parse(damaged), None, "{damaged:?}");
         }
-        assert_eq!(Deadline::parse(&one.render()), Some(one));
+        assert_eq!(Deadline::parse(&one.render()), Some(one.clone()));
+        // A line from before `to=` reads, with no recipient to hold replies to.
+        assert_eq!(
+            Deadline::parse("off=90312 sid=s-abcdef0123456789 at=1700000240123 dl=240000"),
+            Some(Deadline { to: None, ..one })
+        );
         // BOUNDED: the newest by position survive.
         let many: Vec<Deadline> = (0..DEADLINES_KEEP as u64 + 3)
             .map(|n| Deadline {
@@ -991,12 +1068,48 @@ mod tests {
                 sid: "s-a".to_string(),
                 at: n,
                 dl: 1,
+                to: None,
             })
             .collect();
         st.set_deadlines(&many).expect("write many");
         let kept = st.deadlines();
         assert_eq!(kept.len(), DEADLINES_KEEP);
         assert_eq!(kept[0].off, 3, "the three oldest are gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE ASKED TABLE ROUND-TRIPS, IS BOUNDED, AND A DAMAGED LINE READS AS
+    /// NOTHING — a misread recipient would hold a real receipt as a stray.
+    #[test]
+    fn the_asked_table_round_trips_and_is_bounded() {
+        let dir = scratch("asked");
+        let st = StateDir::open(&dir).expect("open");
+        assert!(st.asked().is_empty());
+        let two = vec![
+            Asked {
+                off: 7,
+                to: "n-0123456789abcdef".to_string(),
+            },
+            Asked {
+                off: 9,
+                to: "h-andrew".to_string(),
+            },
+        ];
+        st.set_asked(&two).expect("write");
+        assert_eq!(StateDir::open(&dir).expect("reopen").asked(), two);
+        for damaged in ["", "7", "x n-a", "7 n-a extra"] {
+            assert_eq!(Asked::parse(damaged), None, "{damaged:?}");
+        }
+        let many: Vec<Asked> = (0..ASKED_KEEP as u64 + 2)
+            .map(|off| Asked {
+                off,
+                to: "n-a".to_string(),
+            })
+            .collect();
+        st.set_asked(&many).expect("write many");
+        let kept = st.asked();
+        assert_eq!(kept.len(), ASKED_KEEP);
+        assert_eq!(kept[0].off, 2, "the two oldest are gone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

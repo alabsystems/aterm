@@ -817,6 +817,29 @@ impl EffectsPipeline {
         self.companion.note_bell(self.now());
     }
 
+    /// A KITTY COMMAND was typed (`sit`, `kitty jump`, `good kitty`) — the
+    /// fire a page's `crate::typed_tricks::TrickListener` reported, forwarded
+    /// to the resident pet on THIS pipeline's clock. `confirmed` is the
+    /// listener's `addressed`. Latch only: the pet performs it on a later
+    /// frame, once the caret has been still, and a pipeline with no resident
+    /// on glass drops it (a typed word never summons). The latch re-arms
+    /// [`Self::is_active`], so the page's next `wake()` asks for frames.
+    pub fn note_trick(&mut self, trick: aterm_lexicon::Trick, confirmed: bool) {
+        self.companion.note_trick(self.now(), trick, confirmed);
+    }
+
+    /// The typed line turned into prose, or was aborted, before a tentative
+    /// kitty command was performed: take it back. Idempotent.
+    pub fn revoke_trick(&mut self) {
+        self.companion.revoke_trick();
+    }
+
+    /// The whole submitted line was pet talk: the pet does not grieve the
+    /// fast `command not found` the shell is about to report.
+    pub fn note_trick_submit(&mut self) {
+        self.companion.note_trick_submit(self.now());
+    }
+
     /// Embedded host observed wheel/PgUp while an alternate-screen TUI is
     /// active: hold the rain still during transcript reading.
     pub fn note_matrix_rain_alt_scroll(&mut self) {
@@ -3502,6 +3525,72 @@ mod tests {
             consumed_after.is_some_and(|f| f >= 1),
             "the stroke is consumed by a tick, on the ground"
         );
+    }
+
+    /// A TYPED KITTY COMMAND ONLY LATCHES, on the pipeline's own clock: the
+    /// note moves the resident's latch and asks for frames, nothing on glass
+    /// moves until the ticks that perform it, a revoke takes a tentative one
+    /// back, and the pet-only submit reaches the brain's exit-127
+    /// forgiveness — the three passthroughs a page's
+    /// `typed_tricks::TrickListener` drives.
+    #[test]
+    fn a_typed_trick_latches_through_the_pipeline_and_needs_ticks() {
+        use aterm_lexicon::Trick;
+
+        let mut p = pet_pipeline(7);
+        let (mut term, mut input) = glass(8, 40);
+        materialize_pet(&mut p, &mut term, &mut input);
+        idle(&mut p, &mut term, &mut input, 60, 50.0);
+        assert_eq!(p.companion.brain().pending_trick(), None);
+
+        // Tentative, then revoked: the latch moves and is taken back whole.
+        p.note_trick(Trick::Roll, false);
+        assert_eq!(p.companion.brain().pending_trick(), Some(Trick::Roll));
+        assert!(
+            p.companion.needs_frames() && p.is_active(),
+            "the latch asks for the frames that perform it"
+        );
+        p.revoke_trick();
+        assert_eq!(p.companion.brain().pending_trick(), None);
+        p.revoke_trick(); // idempotent: the listener revokes with nothing pending
+
+        // Confirmed: nothing moves without a tick, then the cat rolls over.
+        let sprites = input.free_sprites.clone();
+        p.note_trick(Trick::Roll, true);
+        assert_eq!(p.companion.brain().pending_trick(), Some(Trick::Roll));
+        assert!(matches!(p.wake(), Wake::Frames));
+        assert_eq!(input.free_sprites, sprites, "a note draws nothing");
+        let mut rolled = false;
+        for _ in 0..120 {
+            idle(&mut p, &mut term, &mut input, 1, 33.0);
+            rolled |= p.companion.brain().pose_name().starts_with("pet_roll");
+        }
+        assert_eq!(
+            p.companion.brain().pending_trick(),
+            None,
+            "consumed by ticks"
+        );
+        assert!(rolled, "and performed: the authored roll reached the glass");
+
+        // The pet-only submit, against the grief gate's own round trip: the
+        // `command not found` that follows a line of pet talk is forgiven,
+        // and the identical failure without the stamp is grieved.
+        for pet_talk in [false, true] {
+            let mut p = pet_pipeline(7);
+            let (mut term, mut input) = glass(24, 80);
+            term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            idle(&mut p, &mut term, &mut input, 1, 33.0);
+            materialize_pet(&mut p, &mut term, &mut input);
+            if pet_talk {
+                p.note_trick_submit();
+            }
+            run_command_block(&mut p, &mut term, &mut input, 127);
+            assert_eq!(
+                p.companion.grieving(),
+                !pet_talk,
+                "pet talk {pet_talk}: only an ordinary failure is grieved"
+            );
+        }
     }
 
     #[test]

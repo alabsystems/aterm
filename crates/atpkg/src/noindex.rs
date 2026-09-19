@@ -1648,6 +1648,42 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
                 .to_string(),
         };
     }
+    // WHAT `migrate` WOULD SAY, ASKED FIRST — and it is the answer whatever else this pass
+    // measures. A directory it refuses (not build output, a symlink, a destination in the
+    // way) or calls already excluded cannot be changed into a migration by a lock that
+    // frees or an ignore rule that moves, while BOTH probes below cost real work on every
+    // pass: `build_in_progress` opens and `flock(2)`s up to three lock paths, and the git
+    // answer SPAWNS `git check-ignore`. The app's pass runs this over every target dir in a
+    // whole home directory, six-hourly, so an in-repo target that can never be migrated —
+    // the commonest being one whose `.noindex` name is already taken — paid a process spawn
+    // per pass forever to be told the same thing.
+    //
+    // The one ordering this changes is against the lock: such a directory now reports the
+    // refusal (a `Failed`, the line the window keys on) instead of the transient
+    // "a build holds …" skip it used to report while a build happened to be running — the
+    // same answer it gave the moment that build finished. Answers that CAN change with time
+    // still come after: `require_repo` above, and the migration itself below.
+    let planned = match migrate(dir, true) {
+        Ok(Migration::Planned { from, to }) => (from, to),
+        Ok(Migration::AlreadyExcluded(p)) => return Applied::AlreadyExcluded(p),
+        Ok(Migration::NotApplicable) => {
+            return Applied::Skipped {
+                path: dir.to_path_buf(),
+                reason: "not applicable".to_string(),
+            };
+        }
+        // Unreachable by construction: `migrate(dir, true)` is a DRY RUN and renames
+        // nothing. Answered like `Planned` rather than asserted, so a future change to
+        // `migrate` costs this pass its plan, never its correctness — the real migration
+        // below is still the one that decides.
+        Ok(Migration::Migrated { from, to }) => (from, to),
+        Err(e) => {
+            return Applied::Failed {
+                path: dir.to_path_buf(),
+                reason: e.to_string(),
+            };
+        }
+    };
     if let Some(lock) = build_in_progress(dir) {
         return Applied::Skipped {
             path: dir.to_path_buf(),
@@ -1663,13 +1699,12 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
         _ => None,
     };
     // The config edit is decided BEFORE the rename, so a tree whose cargo cannot be
-    // re-pointed is never moved (`plan_repo_config`). Only when the rename would
-    // happen: a directory `migrate` refuses or calls excluded keeps that answer.
+    // re-pointed is never moved (`plan_repo_config`). Over the plan already taken above —
+    // a directory `migrate` refuses or calls excluded returned there with that answer.
     let mut config_plan = None;
-    if let (Some(repo), Pointer::Config(_)) = (&repo, &pointer)
-        && let Ok(Migration::Planned { from, to }) = migrate(dir, true)
-    {
-        match plan_repo_config(repo, &from, &to) {
+    if let (Some(repo), Pointer::Config(_)) = (&repo, &pointer) {
+        let (from, to) = (&planned.0, &planned.1);
+        match plan_repo_config(repo, from, to) {
             Ok(plan) => config_plan = Some(plan),
             Err(why) => {
                 return Applied::Failed {
@@ -2394,6 +2429,33 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
+    /// RELEASE THE LOCK FROM THE OPEN FILE DESCRIPTION ITSELF, rather than by
+    /// dropping the last descriptor this process holds.
+    ///
+    /// `drop` closes OUR descriptor; `flock` is released only when EVERY
+    /// descriptor on that open file description is closed, and a
+    /// `fork`/`posix_spawn` anywhere else in this test binary copies every open
+    /// descriptor into the child, which holds them until it `exec`s
+    /// (`FD_CLOEXEC` closes at exec, never at fork). This binary forks
+    /// constantly — `git_fixture` below is forty lines down — so a `drop` here
+    /// can leave the lock READING AS HELD for the length of someone else's
+    /// spawn, measured at up to ~523 ms under load.
+    ///
+    /// [`lock_is_held`] already absorbs a short window (its
+    /// `LOCK_PROBE_PATIENCE` is exactly this mechanism, 100 ms of it), so this
+    /// is not the difference between pass and fail on a quiet box; it is the
+    /// difference between a test whose truth depends on how loaded the machine
+    /// is and one whose truth does not. `LOCK_UN` strips the lock from the
+    /// description, every inherited duplicate included, so the release is
+    /// DETERMINISTIC and needs no polling at all. Prefer it wherever the
+    /// property under test is not drop-release itself.
+    #[cfg(unix)]
+    fn release(file: &std::fs::File) {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: LOCK_UN on a valid descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+
     /// A synthetic root under `temp_dir()`. Module tag + per-test label + PID, so parallel
     /// tests and concurrent runs cannot collide. Nothing here reads the environment or the
     /// user's real home, and no test below queries Spotlight: on macOS `temp_dir()` is
@@ -2872,7 +2934,7 @@ mod tests {
             );
             assert!(target.is_dir(), "nothing moved under a live build");
         }
-        drop(held);
+        release(&held);
         assert_eq!(build_in_progress(&target), None);
         // A `--target <triple>` build locks one level deeper — seen too (review
         // 2026-09-10), and a plain file at that depth that nobody holds is not a build.
@@ -2884,11 +2946,81 @@ mod tests {
         // SAFETY: flock on an open descriptor owned by this test.
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
         assert_eq!(build_in_progress(&target), Some(deep.clone()));
-        drop(held);
+        release(&held);
         assert_eq!(build_in_progress(&target), None);
         if SUPPORTED {
             assert!(apply_one(&target, true, false).migrated());
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A REFUSAL IS THE ANSWER WHATEVER ELSE THE PASS MEASURES, so `apply_one` asks for it
+    /// first. A directory `migrate` refuses — here the commonest one, a `.noindex` name
+    /// already taken — cannot be turned into a migration by a lock that frees or an ignore
+    /// rule that moves, and the two probes it used to pay before hearing that are the
+    /// expensive ones: `build_in_progress` `flock(2)`s up to three paths and the git answer
+    /// SPAWNS `git check-ignore`, over every target dir in a home directory, six-hourly.
+    /// The refusal is the more honest report too — it is exactly what the pass said the
+    /// moment the build finished, rather than a transient "a build holds …" skip.
+    #[cfg(unix)]
+    #[test]
+    fn apply_one_answers_a_refusal_before_the_lock_and_git_probes() {
+        use std::os::unix::io::AsRawFd as _;
+        if !SUPPORTED {
+            return;
+        }
+        let root = scratch("apply-refusal-first");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = repo.join("target");
+        tagged_target(&target);
+        // The name the migration would take is occupied, so `migrate` refuses this
+        // directory on this pass and on every later one, for as long as both names stand.
+        std::fs::create_dir_all(repo.join("target.noindex")).unwrap();
+        // …and a build holds the cargo lock while the pass runs.
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let lock_path = target.join("debug/.cargo-lock");
+        std::fs::write(&lock_path, "").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        // SAFETY: flock on an open descriptor owned by this test.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert_eq!(build_in_progress(&target), Some(lock_path.clone()));
+
+        let out = apply_one(&target, true, false);
+
+        assert!(
+            matches!(out, Applied::Failed { ref reason, .. } if reason.contains("already exists")),
+            "the standing refusal is the answer, not the lock that happens to be held: {out:?}"
+        );
+        assert!(target.is_dir(), "and nothing moved");
+        drop(held);
+
+        // The idempotent case answers at once for the same reason: a tree an earlier pass
+        // already migrated is a SUCCESS, whatever is building inside it.
+        let done = root.join("done");
+        std::fs::create_dir_all(done.join(".git")).unwrap();
+        std::fs::write(done.join("Cargo.toml"), "[package]\nname = \"y\"\n").unwrap();
+        let hidden = done.join("target.noindex");
+        tagged_target(&hidden);
+        std::fs::create_dir_all(hidden.join("debug")).unwrap();
+        let lock2 = hidden.join("debug/.cargo-lock");
+        std::fs::write(&lock2, "").unwrap();
+        let held2 = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock2)
+            .unwrap();
+        // SAFETY: flock on an open descriptor owned by this test.
+        assert_eq!(unsafe { libc::flock(held2.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert_eq!(
+            apply_one(&hidden, true, false),
+            Applied::AlreadyExcluded(hidden.clone()),
+            "an already-excluded tree is a success, not a lock report"
+        );
+        drop(held2);
         let _ = std::fs::remove_dir_all(&root);
     }
 

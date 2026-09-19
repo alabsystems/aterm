@@ -83,7 +83,8 @@ use std::time::Instant;
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::tone::Tone;
 use aterm_effects::trail_sound::{
-    CHANNELS, EventMeta, MIN_GAP, SoundEvent, SoundGesture, SoundKind, SoundVoice, TimbreStops,
+    CHANNELS, EventMeta, MIN_GAP, SPACE_HEAD_CENTROID_FLOOR_HZ, SPACE_HEAD_HI_FLOOR,
+    SPACE_HEAD_RE_TYPED_DB, SoundEvent, SoundGesture, SoundKind, SoundVoice, TimbreStops,
     TrailSynth,
 };
 
@@ -3100,15 +3101,30 @@ fn probe_tables(
         // seed and −6.85 (Lumen) / −7.52 (Comet) re the same-seed letter on
         // one other seed each — off the window on luck alone. The row's own
         // reading is still printed beside it, as the ting line prints its.
-        const SPACE_RE_TYPED_LO_DB: f64 = -6.5;
-        const SPACE_RE_TYPED_HI_DB: f64 = 0.0;
-        const SPACE_CENTROID_FLOOR_HZ: f64 = 450.0;
-        const SPACE_HI_FLOOR: f64 = 0.02;
+        //
+        // THE THREE CLAUSES ARE THE ENGINE'S (2026-09-17): `trail_sound`'s
+        // `SPACE_HEAD_RE_TYPED_DB`, `SPACE_HEAD_CENTROID_FLOOR_HZ` and
+        // `SPACE_HEAD_HI_FLOOR`, read here and by its own pin
+        // (`the_space_head_is_heard_with_top_on_every_v1_voice`) so the two
+        // instruments cannot drift apart. That day's finding: this line read
+        // NO TOP on Comet (420 Hz) and Laser (440) — and the cause was the
+        // ROOT, not the palette: the v1 head's twinkle rode 16× a root that
+        // the two A anchors fold to the floor of the [220, 440) register, and
+        // every other voice's walk visits the same floor on later words.
+        // The twinkle is folded into one sparkle band now
+        // (`SPACE_TWINKLE_LO_HZ`) and lifted 2.1 dB; this row reads Comet
+        // 420 → 575 Hz / 0.033 → 0.047 at −4.51 dB, Laser 440 → 596 at
+        // −2.68, Lumen 585 → 625 at −2.93.
+        // The engine states them in f64 so nothing is widened here: an f32
+        // `0.02` widened printed as `0.019999999552965164` in the NO TOP
+        // string (review, 2026-09-17).
+        let (space_re_typed_lo_db, space_re_typed_hi_db) = SPACE_HEAD_RE_TYPED_DB;
         if let (Some(sp), Some(t)) = (find("Space"), find("Typed")) {
             let re = sp.peak_db - typed_walk_db;
             let re_row = sp.peak_db - t.peak_db;
-            let tier_ok = (SPACE_RE_TYPED_LO_DB..=SPACE_RE_TYPED_HI_DB).contains(&re);
-            let top_ok = sp.centroid_hz >= SPACE_CENTROID_FLOOR_HZ && sp.hi_frac >= SPACE_HI_FLOOR;
+            let tier_ok = (space_re_typed_lo_db..=space_re_typed_hi_db).contains(&re);
+            let top_ok =
+                sp.centroid_hz >= SPACE_HEAD_CENTROID_FLOOR_HZ && sp.hi_frac >= SPACE_HEAD_HI_FLOOR;
             println!(
                 "space head (2026-09-16): Space {re:+.2} dB re the walk-mean Typed \
                  ({typed_walk_db:.2} dBFS over settle {PROBE_WALK_SETTLES:?}; the row's own \
@@ -3117,10 +3133,17 @@ fn probe_tables(
                 sp.hi_frac,
                 if tier_ok && top_ok {
                     "heard beside the letter, never over it, with top for a laptop speaker"
+                        .to_string()
                 } else if !tier_ok {
-                    "OFF ITS −6.5..0 dB WINDOW re the letter"
+                    format!(
+                        "OFF ITS {space_re_typed_lo_db}..{space_re_typed_hi_db} dB WINDOW re \
+                         the letter"
+                    )
                 } else {
-                    "NO TOP: centroid under 450 Hz or under a fiftieth of the energy over 2 kHz"
+                    format!(
+                        "NO TOP: centroid under {SPACE_HEAD_CENTROID_FLOOR_HZ:.0} Hz or under \
+                         {SPACE_HEAD_HI_FLOOR} of the energy over 2 kHz"
+                    )
                 }
             );
         }

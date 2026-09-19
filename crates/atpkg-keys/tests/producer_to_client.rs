@@ -79,8 +79,10 @@ fn atpkg_bin() -> PathBuf {
         p.is_file(),
         "the client verifier is not built at {}.\n\
          This test drives the REAL producer against the REAL client, so it needs both:\n\
-             cargo build -p atpkg --bin atpkg\n\
-         (a workspace-wide `cargo test` builds it as a matter of course).",
+             targo --unverified build -p atpkg --bin atpkg\n\
+         (a workspace-wide `targo --unverified test` builds it as a matter of course;\n\
+         the lane flag is not optional — a bare `targo build`/`targo test` is refused\n\
+         on purpose, and stock `cargo` is this machine's exception, not its default).",
         p.display()
     );
     p

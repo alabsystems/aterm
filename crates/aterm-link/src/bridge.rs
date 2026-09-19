@@ -111,7 +111,7 @@ use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
 use crate::handoff::{self, decide_control, Decision, Event as HandoffEvent};
 use crate::mailbox::{Item, Mailbox, Source};
 use crate::presence::{self, Fields, Mode, Slot};
-use crate::state::{Deadline, StateDir, DEADLINES_KEEP};
+use crate::state::{Asked, Deadline, StateDir, ASKED_KEEP, DEADLINES_KEEP};
 use crate::subject::{self, Reject};
 use crate::transport::{self, Closer, Conn, Transport};
 
@@ -935,6 +935,12 @@ pub struct Bridge {
     /// BUS before publishing, so a table that outlived an answer cannot record
     /// a false `expired` (see [`Bridge::expire_deadlines`]).
     deadlines: BTreeMap<u64, Deadline>,
+    /// `ask offset -> the principal whose reply it is`, for every `ask`/`task`
+    /// this node published ([`Asked`]): a reply of an [`ANSWER_KINDS`] kind
+    /// naming that offset counts — settles a deadline, is a receipt — only
+    /// when its cap-forced `<src>` is that principal ([`Bridge::reply_from`]).
+    /// Newest [`ASKED_KEEP`], durable ([`StateDir::asked`]).
+    asked: BTreeMap<u64, String>,
     /// `ask offset -> the asking sid` for the asks this bridge has recorded
     /// `expired` for, newest [`EXPIRED_KEEP`], so a reply arriving afterwards
     /// ON THE ASKER'S LANE is delivered `late=1`.
@@ -1028,6 +1034,7 @@ impl Bridge {
             inc: 0,
             self_acked: state.self_acked(),
             deadlines: state.deadlines().into_iter().map(|d| (d.off, d)).collect(),
+            asked: state.asked().into_iter().map(|a| (a.off, a.to)).collect(),
             expired: BTreeMap::new(),
             deadline_due: Instant::now() + DEADLINE_TICK,
             state,
@@ -1826,7 +1833,7 @@ impl Bridge {
         if !body.via.as_deref().is_none_or(via_ok) {
             return self.refuse_locally(&addr, &body, off, "via");
         }
-        let (kind, demoted) = self.classify_kind(&addr, &body);
+        let (kind, demoted, stray) = self.classify_delivery(&addr, &body);
         let trust = trust_of(&addr.src, body.via.is_some());
         let from = self.render_from(&addr, &body);
         // A REPLY SETTLES THE ASK IT NAMES (R8), before anything can refuse the
@@ -1843,7 +1850,7 @@ impl Bridge {
         // reads the asker's lane only, so the two disagreed about what settles.
         let late = body
             .re
-            .filter(|_| ANSWER_KINDS.contains(&kind.as_str()))
+            .filter(|_| !stray && ANSWER_KINDS.contains(&kind.as_str()))
             .is_some_and(|re| {
                 self.settle_deadline_for(&addr.sid, re);
                 self.expired
@@ -2055,6 +2062,37 @@ impl Bridge {
             return ("note".to_string(), Some(addr.kind.clone()));
         }
         (addr.kind.clone(), None)
+    }
+
+    /// [`Bridge::classify_kind`], after one more rule — and whether it applied:
+    /// A REPLY COUNTS ONLY FROM WHERE THE ASK WENT (round 16 review). A node's
+    /// ring grants it `rw,p=<N>:/f/<F>/in/*/*/<N>/*` — every lane on the fleet,
+    /// as itself — so a third node could publish `ack re=<off>
+    /// verdict=handled` onto an asker's lane for a task it was never sent, and
+    /// that settled the asker's `post --wait-ack` (`ack=handled` while the
+    /// recipient's inbox still held the task) and its deadline. The `<src>`
+    /// segment is the broker's word; where the ask went is this bridge's own
+    /// record ([`Bridge::reply_from`]). A reply-kind record naming an ask of
+    /// ours from anyone else is STRAY: a receipt arrives as what it is —
+    /// `kind=note demoted=ack` — and no stray reply settles anything (the
+    /// caller's `late`/deadline arm reads the flag). An offset this bridge has
+    /// no record of (older than the table, or asked before it existed) is
+    /// judged as before. ONE function for the live delivery and the refill,
+    /// so a refilled row reads exactly as it did the first time.
+    fn classify_delivery(
+        &self,
+        addr: &subject::InAddr,
+        body: &Body,
+    ) -> (String, Option<String>, bool) {
+        let stray = ANSWER_KINDS.contains(&addr.kind.as_str())
+            && body
+                .re
+                .is_some_and(|re| self.reply_from(re, &addr.src) == Some(false));
+        if stray && addr.kind == "ack" {
+            return ("note".to_string(), Some(addr.kind.clone()), true);
+        }
+        let (kind, demoted) = self.classify_kind(addr, body);
+        (kind, demoted, stray)
     }
 
     /// Whether `src` may speak a `task`/`control` AS ITSELF — every human, plus
@@ -2445,7 +2483,7 @@ impl Bridge {
         if !body.via.as_deref().is_none_or(via_ok) {
             return Err("via");
         }
-        let (kind, demoted) = self.classify_kind(&addr, &body);
+        let (kind, demoted, _) = self.classify_delivery(&addr, &body);
         let trust = trust_of(&addr.src, body.via.is_some());
         let from = self.render_from(&addr, &body);
         let mut fields = format!("from={from} kind={kind} trust={trust}");
@@ -2529,8 +2567,9 @@ impl Bridge {
     // -----------------------------------------------------------------------
 
     /// Remember that the ask at `off` expires `dl` ms from now, unless it is
-    /// already remembered (a deduped re-post does not restart the clock).
-    fn note_deadline(&mut self, sid: &str, off: u64, dl: u64) {
+    /// already remembered (a deduped re-post does not restart the clock), and
+    /// whose reply settles it.
+    fn note_deadline(&mut self, sid: &str, off: u64, dl: u64, to: Option<String>) {
         if self.deadlines.contains_key(&off) {
             return;
         }
@@ -2541,12 +2580,46 @@ impl Bridge {
                 sid: sid.to_string(),
                 at: crate::now_ms().saturating_add(dl),
                 dl,
+                to,
             },
         );
         while self.deadlines.len() > DEADLINES_KEEP {
             self.deadlines.pop_first();
         }
         self.persist_deadlines();
+    }
+
+    /// Remember whose reply the ask at `off` is ([`Bridge::asked`]),
+    /// durably, keeping the newest [`ASKED_KEEP`]. A failed write is said and
+    /// survived: the in-memory table still judges this process's replies.
+    fn note_asked(&mut self, off: u64, to: &str) {
+        self.asked.insert(off, to.to_string());
+        while self.asked.len() > ASKED_KEEP {
+            self.asked.pop_first();
+        }
+        let list: Vec<Asked> = self
+            .asked
+            .iter()
+            .map(|(off, to)| Asked {
+                off: *off,
+                to: to.clone(),
+            })
+            .collect();
+        if let Err(e) = self.state.set_asked(&list) {
+            eprintln!("aterm-link: could not persist the asked table: {e}");
+        }
+    }
+
+    /// Whether a reply from `src` naming the ask at `off` is from the
+    /// principal that ask went to: `Some(true)`/`Some(false)` when this
+    /// bridge knows where it went (the asked table, else the deadline's own
+    /// record), `None` when it does not — which is judged as before.
+    fn reply_from(&self, off: u64, src: &str) -> Option<bool> {
+        self.asked
+            .get(&off)
+            .cloned()
+            .or_else(|| self.deadlines.get(&off).and_then(|d| d.to.clone()))
+            .map(|to| to == src)
     }
 
     /// Forget the deadline of the ask at `off` — when `sid` ASKED it, and only
@@ -2693,7 +2766,18 @@ impl Bridge {
                     .chain(std::iter::once(&"expired"))
                     .find(|k| **k == kind)
                     .copied();
-                if let Some(k) = settles {
+                // `/f/<F>/in/<node>/<sid>/<src>/<kind>`: the record SETTLES
+                // only from the recipient (a reply) or from this node (its
+                // own `expired`) — the rule delivery applies, read off the
+                // bus the same way, so the sweep and the delivery cannot
+                // disagree about a stray `ack re=<off>`.
+                let src = subj.split('/').nth(6).unwrap_or("");
+                let from_right = if kind == "expired" {
+                    src == self.node
+                } else {
+                    self.reply_from(off, src) != Some(false)
+                };
+                if let Some(k) = settles.filter(|_| from_right) {
                     if Body::decode(&raw).0.re == Some(off) {
                         return Ok(Some(k));
                     }
@@ -4717,11 +4801,19 @@ impl Bridge {
                             // of THAT post is `via_key == false`, so it still
                             // does).
                             let appended = !(via_key && deduped);
+                            // WHOSE REPLY IT IS, remembered with the ask: the
+                            // owner of the lane it went to.
+                            let to = replier_of(&subject);
+                            if appended && WAITING_KINDS.contains(&post.kind.as_str()) {
+                                if let Some(to) = &to {
+                                    self.note_asked(off, to);
+                                }
+                            }
                             if let Some(dl) = post
                                 .dl
                                 .filter(|_| appended && WAITING_KINDS.contains(&post.kind.as_str()))
                             {
-                                self.note_deadline(&post.sid, off, dl);
+                                self.note_deadline(&post.sid, off, dl, to);
                             }
                             // `dup=1` IS THE BROKER'S WORD, NOT A GUESS: only a
                             // sequence a `key=` entry chose AND the broker
@@ -6000,6 +6092,19 @@ const MIRRORED_PREFIX: &str = "owner-cli:";
 /// — asks this question first.
 fn is_mirrored(holder: &str) -> bool {
     holder.starts_with(MIRRORED_PREFIX)
+}
+
+/// The principal whose REPLY a record published at `subject` is — the owner
+/// of the `in` lane it went to: `<node>` of `/f/<F>/in/<node>/<sid>/<src>/<kind>`,
+/// `<principal>` of `/f/<F>/in/p/<principal>/<src>/<kind>`. `None` for any
+/// other subject (a `say` face has no recipient to answer it).
+fn replier_of(subject: &str) -> Option<String> {
+    let seg: Vec<&str> = subject.split('/').collect();
+    if seg.len() != 8 || seg[1] != "f" || seg[3] != "in" {
+        return None;
+    }
+    let owner = if seg[4] == "p" { seg[5] } else { seg[4] };
+    subject::is_principal(owner).then(|| owner.to_string())
 }
 
 /// TRUST is a pure function of `(sender class, relay)` — never read from a body

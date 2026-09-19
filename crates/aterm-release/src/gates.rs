@@ -40,9 +40,13 @@ pub const MIN_FREE_DISK_GIB: u64 = 10;
 /// binaries directly rather than a PATH `cargo` — correctness does not depend
 /// on the operator's rustup state. (An earlier revision of this comment claimed
 /// the stock-name `{rustc,cargo}` compatibility entries were purged from stage2;
-/// current stage2 builds ship them again, and the rustup `trust` link over the
-/// stage2 dir is exactly what makes `cargo ship …` dispatch into Trust — the
-/// front door `provision` audits. The gates still never rely on it.)
+/// current stage2 builds ship them again — measured 2026-09-18 on store build
+/// 9192, `bin/cargo -Vv` answers as targo and `bin/rustc` is a hard link of
+/// `trustc`. Every host lane runs `targo --unverified …` FROM THIS DIR: the
+/// release cutter's proof scripts, `provision`'s front door (targo + trustc
+/// here answer `--version`), and tools/bootstrap-publisher.sh's hand-off. A
+/// rustup `trust` link over this dir is what `provision` REPORTS in its
+/// informational `rustup` row; nothing dispatches through it.)
 pub fn trust_stage2_bin() -> Result<PathBuf> {
     // PINNED ONCE PER PROCESS. The candidate walk below ends at the atpkg
     // store's `store/trust/current`, which is a MUTABLE indirection: `aterm pkg
@@ -196,6 +200,10 @@ pub struct GateOpts {
     /// A rehearsal mutates its scratch repository, so it must use the tree's
     /// own binary just like a production cut.
     pub allow_stale_cutter: bool,
+    /// Will the self-check's paint smoke run? `--no-paint-smoke` means it will
+    /// not, and then the scheduler tier this cut was spawned at cannot starve it
+    /// ([`launchd_qos_gate`]).
+    pub paint_smoke: bool,
 }
 
 /// What the gates learned — everything the cut transcript's `gates` lines
@@ -229,9 +237,14 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
     host_gate()?;
     clean_tree(git)?;
     on_main(git)?;
+    // `align_to_origin` ran BEFORE this whole function, at the top of the cut and
+    // before a single file was read — a fast-forward changes Cargo.toml and the
+    // changelog under anything that read them first. What is left here is the
+    // ASSERTION that it worked, which after a successful alignment can only fail
+    // if a peer pushed again in the intervening seconds.
     let head = head_matches_origin(git)?;
     // The tree is proven; now prove the binary proving it.
-    cutter_identity_gate(&head, opts.allow_stale_cutter)?;
+    cutter_identity_gate(git, &head, opts.allow_stale_cutter)?;
     tag_free(git, &opts.version)?;
     let cl = changelog_gate(
         repo,
@@ -246,6 +259,9 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
     let trustc = trustc_probe(repo)?;
     // The compiler runs; now prove it will not tag everything it writes.
     provenance_gate(&trustc)?;
+    // ...and that the scheduler will not starve the one proof that runs after the
+    // claim.
+    launchd_qos_gate(opts.paint_smoke)?;
     let universal = if opts.arm64_only {
         false
     } else {
@@ -488,6 +504,222 @@ pub fn head_matches_origin(git: &dyn GitRunner) -> Result<String> {
     Ok(head)
 }
 
+/// The repository-owned inputs that can change the `aterm-release` binary —
+/// the SAME list `crates/aterm-release/build.rs` watches and judges dirty, kept
+/// here so the identity gate can ask what changed between the stamp and `HEAD`.
+///
+/// Duplicated rather than shared because a build script cannot be imported by
+/// the crate it builds; `tests/cutter_closure.rs` parses `build.rs` and refuses
+/// any drift between the two lists, so the duplication is checked, not trusted.
+pub const SOURCE_INPUTS: &[&str] = &[
+    "crates",
+    "vendor",
+    ".cargo",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+];
+
+/// How this checkout stands against `origin/main`.
+///
+/// [`head_matches_origin`] collapses all three failures into one refusal, which
+/// is the right shape for a gate that can only say no. A cut that means to
+/// CONTINUE has to tell them apart: exactly one of them — a peer's push landing
+/// while this cutter was being compiled — is absorbed by an operation that
+/// destroys nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeadAlignment {
+    /// Nothing to do.
+    Equal,
+    /// A strict ancestor of the tip: every local commit is on origin and origin
+    /// has `commits` more. A fast-forward re-establishes equality.
+    Behind { tip: String, commits: u64 },
+    /// Local commits origin has never seen. The claim would push them, so a cut
+    /// from here publishes unreviewed work: refuse.
+    Ahead,
+    /// Both sides moved. Only a human can decide what merges: refuse.
+    Diverged,
+}
+
+/// Pure classifier: the three git facts in, the verdict out.
+pub fn classify_head(
+    head: &str,
+    tip: &str,
+    head_is_ancestor_of_tip: bool,
+    tip_is_ancestor_of_head: bool,
+    commits_behind: u64,
+) -> HeadAlignment {
+    if head == tip {
+        return HeadAlignment::Equal;
+    }
+    match (head_is_ancestor_of_tip, tip_is_ancestor_of_head) {
+        (true, _) => HeadAlignment::Behind {
+            tip: tip.to_string(),
+            commits: commits_behind,
+        },
+        (false, true) => HeadAlignment::Ahead,
+        (false, false) => HeadAlignment::Diverged,
+    }
+}
+
+/// Fetch, classify, and — when the ONLY difference is commits a peer pushed —
+/// fast-forward onto them and let the cut continue.
+///
+/// WHY A CUT MAY MOVE THE BRANCH IT IS CUTTING. Before this existed, the cutter
+/// compiled itself for minutes and then refused with `HEAD != origin/main —
+/// pull first`, because a peer had pushed during the compile. On a repository
+/// several machines push to, that race is lost BY CONSTRUCTION: the remedy
+/// (`git pull`) moves `HEAD`, which invalidates the just-built cutter
+/// ([`cutter_identity_gate`]), so the next attempt rebuilds — and the next push
+/// lands during THAT build. The pipeline could livelock with nothing wrong.
+///
+/// The fast-forward is not a new liberty. `ledger::claim` already resets the
+/// worktree hard to `origin/main` and regenerates the release commit whenever it
+/// loses the push race, so the release's source has always been defined as
+/// "origin/main's tip plus the ledger line", not "whatever this checkout held".
+/// This step only does, deliberately and visibly, what the claim already does
+/// implicitly — and it does it BEFORE the claim, where the cheap gates can still
+/// judge the result.
+///
+/// Its preconditions are exactly the two that make it lossless: the tree is
+/// clean ([`clean_tree`] ran first, and a fast-forward with a dirty tree could
+/// fail halfway) and `HEAD` is a STRICT ANCESTOR of the tip, so no local commit
+/// can be lost and no merge can be created. Ahead and diverged keep the old
+/// refusal, each now naming what is actually wrong.
+///
+/// Returns `Some(note)` when the branch moved, for the transcript.
+pub fn align_to_origin(git: &dyn GitRunner) -> Result<Option<String>> {
+    // ITS OWN PRECONDITIONS, not the caller's ordering. A fast-forward over a
+    // dirty tree can fail halfway, and a fast-forward on a side branch would move
+    // THAT branch onto origin/main — so this asks both questions itself rather
+    // than relying on having been called after the gates that happen to ask them.
+    clean_tree(git)?;
+    on_main(git)?;
+    git_ok(git, &["fetch", "origin", "main"])
+        .map_err(|e| Error::new(format!("cannot reach origin (no offline cuts): {e}")))?;
+    let head = rev_parse(git, "HEAD")?;
+    let tip = rev_parse(git, "origin/main")?;
+    let is_ancestor = |a: &str, b: &str| -> Result<bool> {
+        Ok(git.git(&["merge-base", "--is-ancestor", a, b])?.success())
+    };
+    let behind = git_ok(git, &["rev-list", "--count", "HEAD..origin/main"])?
+        .stdout_utf8()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    match classify_head(
+        &head,
+        &tip,
+        is_ancestor(&head, &tip)?,
+        is_ancestor(&tip, &head)?,
+        behind,
+    ) {
+        HeadAlignment::Equal => Ok(None),
+        HeadAlignment::Behind { tip, commits } => {
+            git_ok(git, &["merge", "--ff-only", "origin/main"])?;
+            let now = rev_parse(git, "HEAD")?;
+            if now != tip {
+                return Err(Error::new(format!(
+                    "fast-forward to origin/main left HEAD at {now}, not {tip} — refusing to \
+                     cut from a checkout that will not align"
+                )));
+            }
+            Ok(Some(format!(
+                "fast-forwarded {commits} commit(s) a peer pushed while this cutter was \
+                 building — now at {}",
+                &tip[..tip.len().min(8)]
+            )))
+        }
+        HeadAlignment::Ahead => Err(Error::new(format!(
+            "HEAD ({head}) is AHEAD of origin/main ({tip}) — this checkout holds commits \
+             origin has never seen, and the ledger claim would push them as part of the \
+             release.\nfix:  push them for review first, or reset onto origin/main"
+        ))),
+        HeadAlignment::Diverged => Err(Error::new(format!(
+            "HEAD ({head}) and origin/main ({tip}) have DIVERGED — this is not a peer's push \
+             arriving during the build; both sides moved.\nfix:  rebase this checkout onto \
+             origin/main by hand, then re-run"
+        ))),
+    }
+}
+
+/// What the cutter's own source closure did between the commit it was built
+/// from and the commit it is about to cut.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SourceClosure {
+    /// Not one byte of [`SOURCE_INPUTS`] differs: a rebuild at `HEAD` would
+    /// produce the same binary, so this one IS the tree's cutter.
+    Identical,
+    /// Something the binary is compiled from moved. The paths are named so the
+    /// refusal can say what.
+    Changed(Vec<String>),
+    /// Could not be established — an absent stamp commit, a git that would not
+    /// answer, a stamp that is not this line of history. "Cannot tell" is the
+    /// refusing answer here for the same reason it is in
+    /// [`cutter_identity_verdict`].
+    Unresolvable(String),
+}
+
+/// Ask git what changed, under [`SOURCE_INPUTS`], between `stamp` and `head`.
+///
+/// The stamp must also be an ANCESTOR of `head`: a binary built from a foreign
+/// branch that happens to share these paths is not this tree's cutter, and the
+/// whole point of the stamp is provenance, not coincidence.
+pub fn cutter_source_closure(git: &dyn GitRunner, stamp: &str, head: &str) -> SourceClosure {
+    if !canonical_commit(stamp) {
+        return SourceClosure::Unresolvable(format!("{stamp} is not a commit id"));
+    }
+    match git.git(&["cat-file", "-e", &format!("{stamp}^{{commit}}")]) {
+        Ok(out) if out.success() => {}
+        Ok(_) => {
+            return SourceClosure::Unresolvable(format!(
+                "{stamp} is not in this checkout (fetch it, or rebuild the cutter)"
+            ));
+        }
+        Err(e) => return SourceClosure::Unresolvable(e.to_string()),
+    }
+    match git.git(&["merge-base", "--is-ancestor", stamp, head]) {
+        Ok(out) if out.success() => {}
+        Ok(_) => {
+            return SourceClosure::Unresolvable(format!(
+                "{stamp} is not an ancestor of {head} — the cutter was built off this line \
+                 of history"
+            ));
+        }
+        Err(e) => return SourceClosure::Unresolvable(e.to_string()),
+    }
+    let mut args = vec!["diff", "--name-only", stamp, head, "--"];
+    args.extend_from_slice(SOURCE_INPUTS);
+    match git.git(&args) {
+        Ok(out) if out.success() => {
+            let changed: Vec<String> = out
+                .stdout_utf8()
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            if changed.is_empty() {
+                SourceClosure::Identical
+            } else {
+                SourceClosure::Changed(changed)
+            }
+        }
+        Ok(out) => SourceClosure::Unresolvable(out.stderr_utf8().trim().to_string()),
+        Err(e) => SourceClosure::Unresolvable(e.to_string()),
+    }
+}
+
+/// A real 40-hex commit id — not `"unknown"`, not git's reserved all-zero null
+/// object id that `build.rs` stamps on a dirty source closure.
+pub fn canonical_commit(value: &str) -> bool {
+    value.len() == 40
+        && value != DIRTY_BUILD_COMMIT
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// The commit THIS BINARY was built from, stamped by `build.rs`; the reserved
 /// null object ID means its repository source closure was dirty, and
 /// `"unknown"` means the build could not establish either fact.
@@ -511,8 +743,9 @@ const DIRTY_BUILD_COMMIT: &str = "0000000000000000000000000000000000000000";
 /// reported so its local result is not mistaken for evidence about the tree.
 /// A rehearsal publishes to a scratch repository and therefore gets no
 /// exemption.
-pub fn cutter_identity_gate(head: &str, allow_stale: bool) -> Result<()> {
-    match cutter_identity_verdict(BUILD_COMMIT, head, allow_stale) {
+pub fn cutter_identity_gate(git: &dyn GitRunner, head: &str, allow_stale: bool) -> Result<()> {
+    let closure = cutter_source_closure(git, BUILD_COMMIT, head);
+    match cutter_identity_verdict(BUILD_COMMIT, head, &closure, allow_stale) {
         Ok(Some(note)) => {
             println!("==> {note}");
             Ok(())
@@ -528,10 +761,30 @@ pub fn cutter_identity_gate(head: &str, allow_stale: bool) -> Result<()> {
 pub fn cutter_identity_verdict(
     stamp: &str,
     head: &str,
+    closure: &SourceClosure,
     allow_stale: bool,
 ) -> Result<Option<String>> {
     if stamp == head {
         return Ok(None);
+    }
+    // THE STAMP IS A PROXY; THE CLOSURE IS THE PREDICATE. What this gate owes is
+    // "the rules this binary enforces are the rules this tree declares", and sha
+    // equality was only ever a conservative way to say it. On a repository several
+    // machines push to, that proxy costs releases: a peer's push to anything at all
+    // — a doc, the changelog, another program's crate — moves HEAD, and the cutter
+    // that was compiled from the previous tip is refused although not one byte it
+    // was built from has moved. Ask the real question instead: if nothing under
+    // SOURCE_INPUTS differs between the stamp and HEAD, a rebuild here would emit
+    // this same binary, and v0.63.0's hole (a cutter validating its output against
+    // its own older rules) stays shut because its rules ARE this tree's.
+    if let SourceClosure::Identical = closure
+        && canonical_commit(stamp)
+    {
+        return Ok(Some(format!(
+            "cutter identity: built from {stamp}, tree is at {head} — nothing under the \
+             cutter's own source closure moved between them, so this binary is what this \
+             tree builds"
+        )));
     }
     // An unknown stamp is NOT a pass. "Cannot tell" is how the stale cutter got
     // through, so it is the refusing answer here, exactly as an unreachable
@@ -542,17 +795,46 @@ pub fn cutter_identity_verdict(
     } else if stamp == DIRTY_BUILD_COMMIT {
         "this aterm-release binary was built from a dirty repository source closure".to_string()
     } else {
-        format!("this aterm-release binary was built from {stamp}, but the tree is at {head}")
+        let detail = match closure {
+            SourceClosure::Changed(paths) => {
+                let shown: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
+                format!(
+                    " — {} of the cutter's own source files moved between them ({}{})",
+                    paths.len(),
+                    shown.join(", "),
+                    if paths.len() > shown.len() {
+                        ", …"
+                    } else {
+                        ""
+                    }
+                )
+            }
+            SourceClosure::Unresolvable(why) => {
+                format!(" — and what moved between them cannot be established: {why}")
+            }
+            SourceClosure::Identical => String::new(),
+        };
+        format!(
+            "this aterm-release binary was built from {stamp}, but the tree is at \
+             {head}{detail}"
+        )
     };
     if allow_stale {
         return Ok(Some(format!(
-            "cutter identity: {what} — allowed because this dry-run publishes nowhere,              but it is running OTHER code than the tree"
+            "cutter identity: {what} — allowed because this dry-run publishes nowhere, \
+             but it is running OTHER code than the tree"
         )));
     }
     Err(Error::new(format!(
-        "{what}.
-fix:  cargo clean -p aterm-release   (then re-run; the cutter is rebuilt from this tree)
-         why:  v0.63.0 was cut by a binary older than its own source and shipped the seeded          image the tree had already retired"
+        "{what}.\n\
+         fix:  re-run the cut — cargo rebuilds the cutter from this tree automatically.\n\
+         \x20     To force it: `targo clean --release -p aterm-release`. THE PROFILE IS \
+         NOT OPTIONAL — the `ship` alias is `run --release`, so the cutter is a release \
+         artifact and `clean -p` without `--release` cleans the dev profile and removes \
+         nothing (measured on m3, 2026-09-17: 0 files vs 166). `clean` takes no lane \
+         flag; `targo --unverified clean` is refused.\n\
+         why:  v0.63.0 was cut by a binary older than its own source and shipped the \
+         seeded image the tree had already retired"
     )))
 }
 
@@ -561,7 +843,7 @@ fix:  cargo clean -p aterm-release   (then re-run; the cutter is rebuilt from th
 /// [`run_all`], so each of those paths uses this shared boundary before its
 /// first remote mutation.
 pub fn current_cutter_identity_gate(git: &dyn GitRunner) -> Result<()> {
-    cutter_identity_gate(&rev_parse(git, "HEAD")?, false)
+    cutter_identity_gate(git, &rev_parse(git, "HEAD")?, false)
 }
 
 /// Tag vX.Y.Z must be absent BOTH locally and on origin: the publish step mints
@@ -882,6 +1164,123 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
     result
 }
 
+/// The scheduling tier a launchd job was spawned at, as `launchctl print` names
+/// it. `None` is "this launchd does not say", which is not a refusal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpawnTier {
+    /// Not a launchd job at all — an interactive shell, which is the tier the
+    /// paint smoke was calibrated in.
+    Shell,
+    /// `spawn type = interactive (4)`: the tier a `ProcessType=Interactive`
+    /// LaunchAgent gets, and the only launchd tier the smoke survives.
+    Interactive,
+    /// Any other named tier — `launchctl submit` produces this one.
+    Other(String),
+    /// A launchd job whose tier could not be read.
+    Unknown,
+}
+
+/// Refuse, BEFORE the claim, a cut whose PAINT SMOKE is going to fail for the
+/// scheduler's reasons rather than the renderer's.
+///
+/// Measured 2026-09-12 and recorded in docs/RELEASING.md: a job started with
+/// `launchctl submit` runs at `QOS_CLASS_UTILITY`, its 50 ms sampling timer
+/// fires 75 ms late on the first tick and 25-35 ms late at the median, and the
+/// aterm instance the smoke launches INHERITS the tier. Thirty takes of the
+/// cutter's exact smoke under `launchctl submit` went red eleven times; eight
+/// from a shell went red none. The smoke runs at the self-check step — AFTER the
+/// ledger claim — so that coin flip costs a burned build number each time it
+/// lands tails, and `--resume` re-enters at the same starved step.
+///
+/// The tier is knowable before any of it: a launchd job's own label is in
+/// `XPC_SERVICE_NAME`, and `launchctl print` names its `spawn type`. A cut from a
+/// shell is the calibrated case and asks launchd nothing.
+///
+/// "Cannot tell" is a NOTE here, not a refusal — deliberately the opposite of
+/// [`cutter_identity_gate`]. A wrong answer there ships a bad artifact; a wrong
+/// answer here costs a flake on a resumable step, so an unreadable `launchctl
+/// print` (an older macOS, a renamed field) must not be able to block a release.
+pub fn launchd_qos_gate(paint_smoke_will_run: bool) -> Result<()> {
+    let tier = match env::var("XPC_SERVICE_NAME").ok().filter(|l| l != "0") {
+        None => SpawnTier::Shell,
+        Some(label) => read_spawn_tier(&label),
+    };
+    match launchd_qos_verdict(&tier, paint_smoke_will_run)? {
+        Some(note) => {
+            println!("==> {note}");
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Ask launchd what tier it spawned this job at. Never fails: every unreadable
+/// answer is [`SpawnTier::Unknown`].
+fn read_spawn_tier(label: &str) -> SpawnTier {
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+    let Some(uid) = uid else {
+        return SpawnTier::Unknown;
+    };
+    let out = Command::new("launchctl")
+        .arg("print")
+        .arg(format!("gui/{uid}/{label}"))
+        .output();
+    let Ok(out) = out else {
+        return SpawnTier::Unknown;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("spawn type = ") {
+            // "interactive (4)" — the tier name is the first word.
+            let name = rest.split_whitespace().next().unwrap_or("").to_string();
+            return if name == "interactive" {
+                SpawnTier::Interactive
+            } else if name.is_empty() {
+                SpawnTier::Unknown
+            } else {
+                SpawnTier::Other(name)
+            };
+        }
+    }
+    SpawnTier::Unknown
+}
+
+/// The decision, without the environment. `Ok(None)` is silence, `Ok(Some(note))`
+/// is something the transcript should say, `Err` is the refusal.
+pub fn launchd_qos_verdict(tier: &SpawnTier, paint_smoke_will_run: bool) -> Result<Option<String>> {
+    if !paint_smoke_will_run {
+        // No smoke, no starvation to worry about: --no-paint-smoke already
+        // carries its own (much louder) refusal on a notarized real cut.
+        return Ok(None);
+    }
+    match tier {
+        SpawnTier::Shell | SpawnTier::Interactive => Ok(None),
+        SpawnTier::Unknown => Ok(Some(
+            "scheduler tier: this cut is a launchd job whose spawn type launchd would not \
+             name — if its plist does not say ProcessType=Interactive, the paint smoke will \
+             be sampled at UTILITY and can fail for the scheduler's reasons (docs/RELEASING.md)"
+                .to_string(),
+        )),
+        SpawnTier::Other(name) => Err(Error::new(format!(
+            "this cut is a launchd job spawned at tier {name:?}, not `interactive` — the \
+             paint smoke samples at 50 ms and its timer fires 25-75 ms late at this tier; \
+             measured, 11 of 30 takes go red for that reason alone, at the self-check step \
+             AFTER the ledger claim (docs/RELEASING.md, 2026-09-12).\n\
+             fix:  bootstrap the job from a plist carrying \
+             <key>ProcessType</key><string>Interactive</string> (docs/RELEASING.md has the \
+             plist), or cut from an interactive shell. `launchctl submit` cannot set the \
+             tier and is the shape that produced the measurement above.\n\
+             or:   --no-paint-smoke, which is an EMERGENCY escape and refuses on a \
+             notarized real cut without its acknowledgement"
+        ))),
+    }
+}
+
 /// The provenance gate: refuse, BEFORE the claim, a cut whose files would all carry
 /// `com.apple.provenance`.
 ///
@@ -1008,9 +1407,18 @@ pub fn provenance_verdict(carriers: &[(&str, PathBuf)], cutter_tracked: bool) ->
     msg.push_str("\nfix:  ");
     msg.push_str(atpkg::provenance::REMEDY);
     msg.push_str(
-        "\nor:   with the toolchain clean, run this cut as a launchd job — `launchctl submit \
-         -l aterm-cut -- <path to cargo-ship> ship cut …` — so the cutter is neither a \
-         descendant of aterm.app nor of an agent (docs/RELEASING.md)",
+        // The remedy names the LAUNCHER, not the plist it writes. This message is
+        // what sent every cut of this session to QOS_CLASS_UTILITY: it used to read
+        // `launchctl submit`, an operator pasted exactly that, and the post-claim
+        // paint smoke was starved by the tier it chose. A refusal that hands over a
+        // runnable command is the whole fix — `tools/cut-launch.sh` bootstraps the
+        // ProcessType=Interactive agent itself, so nobody has to transcribe a plist.
+        "\nor:   with the toolchain clean, run this cut as a launchd job — \
+         `tools/cut-launch.sh --release-credentials <path>` — so the cutter is neither a \
+         descendant of aterm.app nor of an agent. Use THAT launcher and not `launchctl \
+         submit`: submit escapes this tag and runs the job at QOS_CLASS_UTILITY, which the \
+         paint smoke's aterm inherits and starves under (11 of 30 takes red; \
+         docs/RELEASING.md)",
     );
     Err(Error::new(msg))
 }
@@ -1097,16 +1505,303 @@ pub fn disk_gate(repo: &Path) -> Result<u64> {
 }
 
 #[cfg(test)]
+mod launchd_qos_tests {
+    use super::*;
+
+    #[test]
+    fn a_shell_and_an_interactive_agent_are_the_calibrated_cases() {
+        for tier in [SpawnTier::Shell, SpawnTier::Interactive] {
+            assert_eq!(
+                launchd_qos_verdict(&tier, true).expect("calibrated tiers pass"),
+                None,
+                "{tier:?} must pass silently"
+            );
+        }
+    }
+
+    /// `launchctl submit`'s tier, refused BEFORE the claim rather than sampled
+    /// after it.
+    #[test]
+    fn a_utility_job_is_refused_with_the_plist_remedy() {
+        let err = launchd_qos_verdict(&SpawnTier::Other("background".to_string()), true)
+            .expect_err("a starved tier must not reach the claim");
+        let msg = err.to_string();
+        assert!(msg.contains("ProcessType"), "{msg}");
+        assert!(
+            msg.contains("11 of 30"),
+            "the refusal carries its measurement: {msg}"
+        );
+        assert!(
+            msg.contains("launchctl submit"),
+            "it names the shape that causes it: {msg}"
+        );
+    }
+
+    /// Cannot-tell is a NOTE, not a refusal — the opposite of the identity gate,
+    /// and deliberately: the cost here is a resumable flake, not a bad artifact.
+    #[test]
+    fn an_unreadable_tier_notes_and_proceeds() {
+        let note = launchd_qos_verdict(&SpawnTier::Unknown, true)
+            .expect("cannot-tell must not block a release")
+            .expect("but it must say something");
+        assert!(note.contains("ProcessType=Interactive"), "{note}");
+    }
+
+    /// No smoke, nothing to starve.
+    #[test]
+    fn no_paint_smoke_makes_the_tier_irrelevant() {
+        assert_eq!(
+            launchd_qos_verdict(&SpawnTier::Other("background".to_string()), false)
+                .expect("nothing to starve"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod alignment_tests {
+    use super::*;
+    use crate::ledger::RunOut;
+    use std::sync::Mutex;
+
+    /// A git that answers by ARGV rather than by position: these tests are about
+    /// which question is asked, so a positional script would pass while the gate
+    /// asked something else entirely.
+    struct FakeGit {
+        answers: Mutex<Vec<(&'static str, RunOut)>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    fn out(status: i32, stdout: &str) -> RunOut {
+        RunOut {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: vec![],
+        }
+    }
+
+    impl FakeGit {
+        fn new(answers: Vec<(&'static str, RunOut)>) -> Self {
+            Self {
+                answers: Mutex::new(answers),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn saw(&self, needle: &str) -> bool {
+            self.calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|c| c.contains(needle))
+        }
+    }
+
+    impl GitRunner for FakeGit {
+        fn git(&self, args: &[&str]) -> Result<RunOut> {
+            let line = args.join(" ");
+            self.calls.lock().expect("calls").push(line.clone());
+            let mut answers = self.answers.lock().expect("answers");
+            // First MATCHING answer, consumed: the same question asked twice
+            // (`rev-parse HEAD` before and after the fast-forward) gets its two
+            // different truths in order.
+            match answers.iter().position(|(needle, _)| line.contains(needle)) {
+                Some(i) => Ok(answers.remove(i).1),
+                None => Ok(out(0, "")),
+            }
+        }
+    }
+
+    /// `align_to_origin` states its own preconditions — a clean tree on main —
+    /// so every scripted git has to be able to answer them.
+    fn with_preconditions(mut answers: Vec<(&'static str, RunOut)>) -> Vec<(&'static str, RunOut)> {
+        let mut base = vec![
+            ("status --porcelain", out(0, "")),
+            ("rev-parse --abbrev-ref HEAD", out(0, "main\n")),
+        ];
+        base.append(&mut answers);
+        base
+    }
+
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+    const TIP: &str = "2222222222222222222222222222222222222222";
+
+    #[test]
+    fn equal_is_equal_whatever_the_ancestry_answers_are() {
+        assert_eq!(
+            classify_head(HEAD, HEAD, true, true, 0),
+            HeadAlignment::Equal
+        );
+    }
+
+    #[test]
+    fn behind_ahead_and_diverged_are_three_different_answers() {
+        assert_eq!(
+            classify_head(HEAD, TIP, true, false, 3),
+            HeadAlignment::Behind {
+                tip: TIP.to_string(),
+                commits: 3
+            }
+        );
+        assert_eq!(
+            classify_head(HEAD, TIP, false, true, 0),
+            HeadAlignment::Ahead
+        );
+        assert_eq!(
+            classify_head(HEAD, TIP, false, false, 0),
+            HeadAlignment::Diverged
+        );
+    }
+
+    /// THE WHOLE POINT: a peer's push during the cutter's compile is absorbed by
+    /// a fast-forward and the cut continues.
+    /// THE WHOLE POINT: a peer's push during the cutter's compile is absorbed by
+    /// a fast-forward and the cut continues.
+    #[test]
+    fn a_peer_push_is_fast_forwarded_rather_than_refused() {
+        let git = FakeGit::new(with_preconditions(vec![
+            ("rev-parse HEAD", out(0, HEAD)),
+            ("rev-parse origin/main", out(0, TIP)),
+            ("merge-base --is-ancestor 1111", out(0, "")),
+            ("merge-base --is-ancestor 2222", out(1, "")),
+            ("rev-list --count", out(0, "2\n")),
+            ("merge --ff-only", out(0, "")),
+            // The post-merge read: the branch is now the tip.
+            ("rev-parse HEAD", out(0, TIP)),
+        ]));
+        let note = align_to_origin(&git)
+            .expect("a behind checkout is not a refusal")
+            .expect("a move must be announced");
+        assert!(note.contains("fast-forwarded 2 commit"), "{note}");
+        assert!(
+            git.saw("merge --ff-only origin/main"),
+            "it must actually move"
+        );
+    }
+
+    #[test]
+    fn an_ahead_checkout_is_refused_and_named() {
+        let git = FakeGit::new(with_preconditions(vec![
+            ("rev-parse HEAD", out(0, HEAD)),
+            ("rev-parse origin/main", out(0, TIP)),
+            ("merge-base --is-ancestor 1111", out(1, "")),
+            ("merge-base --is-ancestor 2222", out(0, "")),
+        ]));
+        let err = align_to_origin(&git).expect_err("unpushed local commits must refuse");
+        assert!(err.to_string().contains("AHEAD"), "{err}");
+        assert!(
+            !git.saw("merge --ff-only"),
+            "it must not move a diverging branch"
+        );
+    }
+
+    #[test]
+    fn a_diverged_checkout_is_refused_and_named() {
+        let git = FakeGit::new(with_preconditions(vec![
+            ("rev-parse HEAD", out(0, HEAD)),
+            ("rev-parse origin/main", out(0, TIP)),
+            // NEITHER is an ancestor of the other: both answers must be scripted,
+            // because a missing one defaults to success and would read as AHEAD.
+            ("merge-base --is-ancestor 1111", out(1, "")),
+            ("merge-base --is-ancestor 2222", out(1, "")),
+        ]));
+        let err = align_to_origin(&git).expect_err("a diverged checkout must refuse");
+        assert!(err.to_string().contains("DIVERGED"), "{err}");
+    }
+
+    #[test]
+    fn an_unreachable_origin_still_fails_closed() {
+        let git = FakeGit::new(with_preconditions(vec![("fetch origin main", out(1, ""))]));
+        let err = align_to_origin(&git).expect_err("no offline cuts");
+        assert!(err.to_string().contains("cannot reach origin"), "{err}");
+    }
+
+    #[test]
+    fn a_closure_untouched_by_the_diff_is_identical() {
+        let git = FakeGit::new(with_preconditions(vec![
+            ("cat-file -e", out(0, "")),
+            ("merge-base --is-ancestor", out(0, "")),
+            ("diff --name-only", out(0, "")),
+        ]));
+        assert_eq!(
+            cutter_source_closure(&git, HEAD, TIP),
+            SourceClosure::Identical
+        );
+        // The diff must be SCOPED — an unscoped one would call every peer push a
+        // change to the cutter and hand the race straight back.
+        assert!(
+            git.saw("-- crates vendor"),
+            "the diff must name SOURCE_INPUTS"
+        );
+    }
+
+    #[test]
+    fn a_stamp_this_checkout_does_not_have_is_unresolvable() {
+        let git = FakeGit::new(vec![("cat-file -e", out(1, ""))]);
+        assert!(matches!(
+            cutter_source_closure(&git, HEAD, TIP),
+            SourceClosure::Unresolvable(_)
+        ));
+    }
+
+    /// Provenance, not coincidence: a binary from a foreign branch whose files
+    /// happen to match is still not this tree's cutter.
+    #[test]
+    fn a_stamp_off_this_line_of_history_is_unresolvable() {
+        let git = FakeGit::new(with_preconditions(vec![
+            ("cat-file -e", out(0, "")),
+            ("merge-base --is-ancestor", out(1, "")),
+        ]));
+        match cutter_source_closure(&git, HEAD, TIP) {
+            SourceClosure::Unresolvable(why) => assert!(why.contains("ancestor"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The list in this module is a copy of the one `build.rs` watches and judges
+    /// dirty. Copies drift; this refuses the drift instead of trusting a comment.
+    #[test]
+    fn the_source_closure_matches_the_one_build_rs_judges() {
+        let build_rs = include_str!("../build.rs");
+        let start = build_rs
+            .find("const SOURCE_INPUTS: &[&str] = &[")
+            .expect("build.rs declares SOURCE_INPUTS");
+        let body = &build_rs[start..];
+        let body = &body[..body.find("];").expect("terminated array")];
+        let declared: Vec<String> = body
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('"'))
+            .filter_map(|l| l.split('"').next())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            declared,
+            SOURCE_INPUTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "gates::SOURCE_INPUTS and build.rs's SOURCE_INPUTS have drifted — the identity \
+             gate would then admit a binary built from source it cannot see"
+        );
+    }
+}
+
+#[cfg(test)]
 mod cutter_identity_tests {
     use super::*;
 
     const HEAD: &str = "2617295d1111111111111111111111111111aaaa";
     const OLDER: &str = "15f2b5b6bc51d9ef56e5e4fa50f434fca07f40ee";
 
+    /// The closure verdict every pre-existing case was written under: the stamp
+    /// and HEAD differ AND so does the cutter's own source.
+    fn moved() -> SourceClosure {
+        SourceClosure::Changed(vec!["crates/aterm-release/src/publish.rs".to_string()])
+    }
+
     #[test]
     fn the_trees_own_binary_passes_silently() {
         assert!(matches!(
-            cutter_identity_verdict(HEAD, HEAD, false),
+            cutter_identity_verdict(HEAD, HEAD, &moved(), false),
             Ok(None)
         ));
     }
@@ -1114,12 +1809,19 @@ mod cutter_identity_tests {
     /// The v0.63.0 shape: a real cut by a binary older than its own source.
     #[test]
     fn a_stale_binary_cannot_cut_for_real() {
-        let err = cutter_identity_verdict(OLDER, HEAD, false)
+        let err = cutter_identity_verdict(OLDER, HEAD, &moved(), false)
             .expect_err("a stale cutter must not cut a real release");
         let msg = err.to_string();
         assert!(msg.contains(OLDER), "{msg}");
         assert!(msg.contains(HEAD), "{msg}");
-        assert!(msg.contains("cargo clean -p aterm-release"), "{msg}");
+        assert!(
+            msg.contains("targo clean --release -p aterm-release"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("crates/aterm-release/src/publish.rs"),
+            "the refusal names what moved: {msg}"
+        );
         assert!(
             msg.contains("v0.63.0"),
             "the refusal should say why it exists: {msg}"
@@ -1130,14 +1832,14 @@ mod cutter_identity_tests {
     /// unproven as a stale one.
     #[test]
     fn an_unstamped_binary_fails_closed() {
-        let err = cutter_identity_verdict("unknown", HEAD, false)
+        let err = cutter_identity_verdict("unknown", HEAD, &moved(), false)
             .expect_err("an unstamped cutter must fail closed");
         assert!(err.to_string().contains("no build commit"), "{err}");
     }
 
     #[test]
     fn a_dirty_built_binary_fails_closed() {
-        let err = cutter_identity_verdict(DIRTY_BUILD_COMMIT, HEAD, false)
+        let err = cutter_identity_verdict(DIRTY_BUILD_COMMIT, HEAD, &moved(), false)
             .expect_err("uncommitted build-time code must never publish after the tree is clean");
         assert!(
             err.to_string().contains("dirty repository source closure"),
@@ -1149,25 +1851,25 @@ mod cutter_identity_tests {
     /// results came from code other than the tree.
     #[test]
     fn a_dry_run_proceeds_but_says_so() {
-        let note = cutter_identity_verdict(OLDER, HEAD, true)
+        let note = cutter_identity_verdict(OLDER, HEAD, &moved(), true)
             .expect("a dry-run must not be blocked")
             .expect("a mismatched dry-run must say something");
         assert!(note.contains("dry-run publishes nowhere"), "{note}");
         assert!(note.contains("OTHER code"), "{note}");
         assert!(
-            cutter_identity_verdict("unknown", HEAD, true).is_ok(),
+            cutter_identity_verdict("unknown", HEAD, &moved(), true).is_ok(),
             "an unstamped dry-run is not blocked either"
         );
         // ...and a matching dry-run stays silent.
         assert!(matches!(
-            cutter_identity_verdict(HEAD, HEAD, true),
+            cutter_identity_verdict(HEAD, HEAD, &moved(), true),
             Ok(None)
         ));
     }
 
     #[test]
     fn a_stale_rehearsal_is_refused_because_it_mutates_a_remote() {
-        let err = cutter_identity_verdict(OLDER, HEAD, false)
+        let err = cutter_identity_verdict(OLDER, HEAD, &moved(), false)
             .expect_err("a scratch-repository publication still needs the tree's own cutter");
         assert!(err.to_string().contains(OLDER), "{err}");
     }
@@ -1183,6 +1885,46 @@ mod cutter_identity_tests {
             BUILD_COMMIT.chars().all(|c| c.is_ascii_hexdigit()),
             "not hex: {BUILD_COMMIT}"
         );
+    }
+
+    /// THE RACE THIS GATE USED TO LOSE. A peer pushes to another program while
+    /// the cutter is compiling; HEAD moves; not one byte the binary was built
+    /// from moved with it. The binary IS what this tree builds, so it cuts —
+    /// and says which two commits it reconciled.
+    #[test]
+    fn a_peer_push_that_misses_the_cutters_source_does_not_stale_it() {
+        let note = cutter_identity_verdict(OLDER, HEAD, &SourceClosure::Identical, false)
+            .expect("an unchanged source closure is not a stale cutter")
+            .expect("it must say what it reconciled");
+        assert!(note.contains(OLDER), "{note}");
+        assert!(note.contains(HEAD), "{note}");
+        assert!(note.contains("source closure"), "{note}");
+    }
+
+    /// ...but an unstamped or dirty binary is never rescued by a closure answer:
+    /// there is no commit to compare, so `Identical` cannot be meant about it.
+    #[test]
+    fn the_closure_escape_needs_a_real_stamp() {
+        for stamp in ["unknown", DIRTY_BUILD_COMMIT] {
+            assert!(
+                cutter_identity_verdict(stamp, HEAD, &SourceClosure::Identical, false).is_err(),
+                "{stamp} must fail closed whatever the closure says"
+            );
+        }
+    }
+
+    /// An unresolvable closure refuses and says it could not tell — never the
+    /// permissive answer.
+    #[test]
+    fn an_unresolvable_closure_refuses_and_says_so() {
+        let err = cutter_identity_verdict(
+            OLDER,
+            HEAD,
+            &SourceClosure::Unresolvable("not in this checkout".to_string()),
+            false,
+        )
+        .expect_err("cannot tell is a refusal");
+        assert!(err.to_string().contains("cannot be established"), "{err}");
     }
 }
 
@@ -1265,7 +2007,15 @@ mod provenance_gate_tests {
             msg.contains("aterm pkg uninstall <program> && aterm pkg install <program>"),
             "remedy 2: {msg}"
         );
-        assert!(msg.contains("launchctl submit"), "remedy 3: {msg}");
+        assert!(msg.contains("tools/cut-launch.sh"), "remedy 3: {msg}");
+        // …and remedy 3 must not send the operator to the launcher that starves
+        // the paint smoke. `launchctl submit` may appear only as the warning it
+        // now is.
+        assert!(
+            msg.contains("not `launchctl submit`"),
+            "remedy 3 names the wrong launcher without warning against it: {msg}"
+        );
+        assert!(msg.contains("QOS_CLASS_UTILITY"), "remedy 3: {msg}");
         assert!(
             !msg.contains("cutter PROCESS is provenance-tracked"),
             "not measured tracked: {msg}"
@@ -1283,7 +2033,7 @@ mod provenance_gate_tests {
             "{msg}"
         );
         assert!(msg.contains("probe file"), "{msg}");
-        assert!(msg.contains("launchctl submit"), "{msg}");
+        assert!(msg.contains("tools/cut-launch.sh"), "{msg}");
     }
 
     /// Every carrier is named, in the order checked — the operator should not fix one

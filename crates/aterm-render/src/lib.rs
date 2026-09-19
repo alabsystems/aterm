@@ -1336,7 +1336,7 @@ pub struct AdmittedFontSources {
     injected_bold: Option<AdmittedFaceSource>,
     styled: [Option<AdmittedFaceSource>; 3],
     fallback: Vec<AdmittedFaceSource>,
-    symbol: Option<AdmittedFaceSource>,
+    symbol: Vec<AdmittedFaceSource>,
     emoji: Option<AdmittedFaceSource>,
 }
 
@@ -1624,13 +1624,24 @@ pub struct Renderer {
     /// The last-applied config `emoji_font` (W6, resolved path) — the no-op
     /// guard for [`Self::set_config_emoji_font`].
     cfg_emoji_font: Option<String>,
-    /// Monochrome SYMBOL fallback face ([`FaceId::SymbolFallback`]), loaded
+    /// Monochrome SYMBOL fallback CHAIN ([`FaceId::SymbolFallback`]), loaded
     /// LAZILY the first time a code point misses BOTH the primary and broad
     /// fallback faces. Covers the default-text symbols (⏸⏹⏺ and friends) that
     /// would otherwise have no monochrome glyph anywhere on the system.
-    symbol_fallback: Option<FallbackFace>,
+    ///
+    /// A CHAIN, like [`Self::fallback_chain`]: the dedicated symbol face first,
+    /// then the platform's broad-symbol backstop, tried in order by
+    /// [`Self::symbol_chain_pick`]. It was a single `Option` slot until the
+    /// backstop `SYMBOL_FALLBACK_CANDIDATES` declares turned out to be
+    /// unreachable on every host that also has the dedicated face.
+    symbol_chain: Vec<FallbackFace>,
     /// Candidate symbol-fallback font paths, tried on first symbol miss; emptied once consumed.
     symbol_fallback_paths: Vec<String>,
+    /// How many leading [`Self::symbol_fallback_paths`] entries are USER-supplied
+    /// (config `symbol_font`, then `$ATERM_SYMBOL_FONT`) — the boundary
+    /// [`build_symbol_chain`] needs. Written together with
+    /// `symbol_fallback_paths` from [`symbol_fallback_candidate_paths`].
+    symbol_user_prefix: usize,
     /// In-flight BACKGROUND read+parse of the lazy broad-fallback face (native
     /// only; always `None` on wasm, where the lazy parse stays synchronous).
     /// While `Some`, a code point no loaded face covers resolves to a
@@ -3221,6 +3232,39 @@ const NATIVE_SCRIPT_FALLBACK_CANDIDATES: &[&str] = &[
 /// (⏸⏹⏺). It is consulted only AFTER the primary + broad fallback miss, so it
 /// never shadows their coverage; it exists purely to give default-text symbols a
 /// real monochrome glyph instead of `.notdef`, keeping them off the colour face.
+///
+/// THIS IS A CHAIN, not a slot — the same law the broad tier already obeys, and
+/// it is here because this list was written as one while the loader took only
+/// its FIRST entry. On any Linux desktop with `fonts-noto-core`,
+/// `NotoSansSymbols2-Regular.ttf` exists and won the slot, so `DejaVuSans.ttf`
+/// — the entry the comment below calls the broad-symbol backstop — never loaded
+/// at all. Its OTHER listing, last in [`FALLBACK_CANDIDATES`], is unreachable on
+/// such a host BY DESIGN: the "DEJAVU STAYS LAST" note there forbids reaching
+/// past a CJK face for a measured reason, and that ruling stands. THIS tier is
+/// where the face can be reached honestly, because the tier is monochrome and
+/// the gate in [`SYMBOL_TIER_TEXT_ONLY_BACKSTOPS`] keeps it off the colour
+/// face's code points.
+///
+/// MEASURED on a stock Ubuntu/GNOME box, THROUGH THE RENDERER rather than by
+/// static set arithmetic — two sealed generations differing only in whether the
+/// symbol chain reaches its second entry, differenced over U+2000..U+2BFF:
+/// **309** code points newly resolve to this backstop, **307** of which drew the
+/// primary face's `.notdef` before it (the other two came from the colour face's
+/// monochrome lane), and **290** of those 307 rasterize with real ink — ⊨ ⋈ ⋱ ⩽
+/// ⟹ ⨁ ℒ ℠ ⁃ ․ among them. The remaining 17 are U+2028/2029 and the
+/// U+2060..206F invisible-format block, which draw blank either way.
+///
+/// The union it is differenced against is everything a SEALED renderer on this
+/// host actually reaches, not a hand-listed subset: the primary face
+/// (`DejaVuSansMono.ttf`), all 36 broad-chain entries (35 per-script Noto faces
+/// plus `NotoSansCJK-Regular.ttc`), this tier's own dedicated
+/// `NotoSansSymbols2-Regular.ttf`, the colour face, and the always-reachable
+/// `include_bytes!`'d Symbols Nerd Font. An earlier revision of this comment said
+/// 689; that figure differenced against the per-script faces alone, omitting the
+/// primary face and the bundled symbol face, and so roughly doubled the truth.
+///
+/// [`build_symbol_chain`] walks the whole list; which entries it walks PAST is
+/// [`SYMBOL_TIER_ADDITIVE_CANDIDATES`].
 const SYMBOL_FALLBACK_CANDIDATES: &[&str] = &[
     // macOS
     "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
@@ -3234,6 +3278,95 @@ const SYMBOL_FALLBACK_CANDIDATES: &[&str] = &[
     #[cfg(windows)]
     "C:\\Windows\\Fonts\\seguisym.ttf",
 ];
+
+/// The [`SYMBOL_FALLBACK_CANDIDATES`] entries the scan keeps going PAST — the
+/// symbol tier's analog of [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`], and membership
+/// is BY PATH for the same reason. Every other entry is an ALTERNATIVE: the
+/// first of them that loads ends the scan and is the tier's last face.
+///
+/// Only Linux has one today, and that asymmetry is measured, not an oversight:
+///
+/// * macOS lists `STIXTwoMath.otf` at TWO paths (Ventura moved it into
+///   `Supplemental/`) — one file, two spellings, so a Mac must stop at whichever
+///   exists — followed by `Apple Symbols.ttf`, which is there for a Mac too old
+///   to ship STIX. Alternatives, all three.
+/// * Windows lists one face, so additivity cannot arise.
+/// * Linux lists a DEDICATED symbol face and then a BROAD TEXT face that is
+///   declared a backstop. Those are a sequence, and the scan must reach the
+///   second — which is the whole point of this const.
+const SYMBOL_TIER_ADDITIVE_CANDIDATES: &[&str] =
+    &["/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"];
+
+/// Symbol-tier entries that are BROAD TEXT faces rather than dedicated symbol
+/// faces: their coverage counts only where it is the code point's OWN coverage
+/// rather than an incidental extra — that is, for a code point whose Unicode
+/// default presentation is TEXT (`Emoji_Presentation=No`) and which is NOT
+/// PRIVATE USE. Membership is BY PATH; the gate itself lives in
+/// [`Renderer::symbol_chain_pick`].
+///
+/// WHY THE GATE, REASON 1 — THE COLOUR FACE. The symbol tier is probed BEFORE
+/// the colour face ([`font_chain::resolve_chain`]), so a broad text face reached
+/// here would do to the colour face exactly what the "DEJAVU STAYS LAST" note on
+/// [`FALLBACK_CANDIDATES`] forbids it doing from the broad tier — and by the
+/// same measurement: `DejaVuSans.ttf` maps 98 `Emoji_Presentation=Yes` code
+/// points, 88 of which nothing else in the Linux chain covers, 😀 U+1F600 and
+/// the whole Emoticons block among them. Reaching the backstop without this
+/// gate would have turned every one of them from colour into a monochrome
+/// outline. The gate costs those points nothing: the colour face covers all 88.
+/// WHAT IT DOES COST, stated so nobody rediscovers it as a bug: on a host that
+/// has this backstop but NO colour emoji face, those code points no longer take
+/// the backstop's monochrome outline — they fall through to the runtime tier,
+/// where the bundled Symbols Nerd Font or a discovered face answers, or they
+/// end at `.notdef`. That is the same verdict they had before this tier could
+/// reach the backstop at all, so nothing regressed; it is simply not an
+/// improvement for that host.
+///
+/// WHY THE GATE, REASON 2 — THE ICON FACE. Same hazard, third door. A broad
+/// text face's PRIVATE-USE coverage is INCIDENTAL: PUA carries no Unicode
+/// meaning, so a text face that maps one is asserting a private convention and
+/// the odds it is the convention the author meant are poor.
+/// [`font_chain::ChainPolicy::prefers_symbol`] already records this as a
+/// MEASURED past bug — making `arial.ttf` reachable on Windows handed U+F301,
+/// the one private code point arial maps, to arial's dot instead of the bundled
+/// Nerd Font's logo. The symbol tier is probed before BOTH the colour face and
+/// the runtime tier that carries the `include_bytes!`'d
+/// [`embedded_symbols_font`], so ungated the same thing happens here, one file
+/// larger: MEASURED on this host, `DejaVuSans.ttf` maps 96 PUA code points and
+/// 95 of them are also in the bundled Symbols Nerd Font (oct-git_branch U+F418,
+/// oct-mark_github, oct-repo, fa-music … the Starship / Powerlevel10k / eza
+/// statusline set), while neither the primary face nor
+/// `NotoSansSymbols2-Regular.ttf` covers any of them. All 95 would regress from
+/// a real icon to DejaVu's unrelated private glyph — U+EF00..EF19 in particular
+/// to near-blank Chao tone-contour FRAGMENTS (ink 80 → 10). So: do not narrow
+/// this gate back to emoji; the test
+/// `the_symbol_backstop_never_takes_a_private_use_icon_the_bundled_face_owns`
+/// is the law that holds it, and it is non-vacuous on any host with both files.
+///
+/// The gate reads the code point's Unicode DEFAULT presentation and its BLOCK,
+/// never the request, and that is deliberate: [`Renderer::symbol_chain_pick`]
+/// must stay a pure function of the code point and the loaded chain so the
+/// rasterizer can RECOMPUTE the pick instead of recovering it from a memo that
+/// could drift. It costs an explicit VS15 `😀︎` the backstop's monochrome
+/// outline, which is exactly what that code point rendered before this const
+/// existed.
+///
+/// Only a BROAD TEXT face belongs here. A DEDICATED symbol face is the face
+/// those code points exist for, so it keeps its precedence over the colour face
+/// unchanged — that is this tier's whole charter, and `⏺` U+23FA (`Emoji=Yes`,
+/// `Emoji_Presentation=No`) is the shape of it. A dedicated symbol face is
+/// likewise untouched by the PUA clause, deliberately: it is exactly the face
+/// `prefers_symbol` wants consulted FIRST for a private code point.
+const SYMBOL_TIER_TEXT_ONLY_BACKSTOPS: &[&str] =
+    &["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"];
+
+/// Whether a loaded symbol-tier face is one of the
+/// [`SYMBOL_TIER_TEXT_ONLY_BACKSTOPS`]. A byte-injected face (no path) never is
+/// — a host that injects a symbol face means it as the symbol face.
+fn symbol_face_is_text_only_backstop(face: &FallbackFace) -> bool {
+    face.path
+        .as_deref()
+        .is_some_and(|p| SYMBOL_TIER_TEXT_ONLY_BACKSTOPS.contains(&p))
+}
 
 /// Colour-emoji faces (bitmap strikes), most-preferred first. Override with
 /// `$ATERM_EMOJI_FONT`. Apple Color Emoji is `sbix`; Noto Color Emoji is `CBDT/CBLC`
@@ -3298,11 +3431,17 @@ fn symbol_discovery_paths() -> Vec<String> {
 /// The ordered symbol-fallback candidate paths (config `symbol_font` >
 /// `$ATERM_SYMBOL_FONT` > built-ins, the [`fallback_chain_order`] law), loaded
 /// lazily the first time a code point misses the primary + broad fallback.
-fn symbol_fallback_candidate_paths(config: &[String]) -> Vec<String> {
-    fallback_chain_order(
-        config,
-        std::env::var("ATERM_SYMBOL_FONT").ok(),
-        &symbol_discovery_paths(),
+///
+/// Returns the paths with the length of their USER-supplied prefix, exactly as
+/// [`fallback_candidate_paths`] does and for the same reason:
+/// [`build_symbol_chain`] needs the boundary, and reading the env var ONCE and
+/// returning the count keeps the two from disagreeing.
+fn symbol_fallback_candidate_paths(config: &[String]) -> (Vec<String>, usize) {
+    let env = std::env::var("ATERM_SYMBOL_FONT").ok();
+    let user_prefix = config.len() + usize::from(env.is_some());
+    (
+        fallback_chain_order(config, env, &symbol_discovery_paths()),
+        user_prefix,
     )
 }
 
@@ -4623,21 +4762,6 @@ static FONT_COVERAGE_INDEX: std::sync::OnceLock<Vec<FontCoverage>> = std::sync::
 static FONT_COVERAGE_SCAN_QUERIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// The FIRST candidate path whose bytes read AND pass admission, in order —
-/// first-success-wins, identical to the lazy `ensure_fallback` /
-/// `ensure_symbol_fallback` loops. The face's fontdue parse is DEFERRED
-/// ([`FallbackFace::from_path_bytes`]); when it happens it lands in the
-/// process-global parsed-face intern.
-fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
-    paths.iter().find_map(|p| {
-        // The admission's handle goes STRAIGHT into the store — a file MAPPING
-        // for a face on the system font volume, else the bounded copy
-        // (moved, never re-copied). See `intern_discovered_font_bytes`.
-        let bytes = font_file::admit_font_file(std::path::Path::new(p)).ok()?;
-        FallbackFace::from_path_bytes(&bytes, Some(p.clone())).ok()
-    })
-}
-
 /// Build the LAZY broad-fallback CHAIN for `paths` (W8). A face is ADDITIVE when
 /// the scan keeps going past it; the first NON-additive face that LOADS ends the
 /// scan. Two classes are additive:
@@ -4762,6 +4886,46 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
         let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
             continue;
         };
+        chain.push(face);
+        if !keep_scanning {
+            break;
+        }
+    }
+    chain
+}
+
+/// Build the lazy SYMBOL-tier chain for `paths` — the symbol analog of
+/// [`build_fallback_chain`], and it exists because the symbol tier used to take
+/// only the FIRST candidate that loaded while its candidate list was written
+/// (and commented) as a sequence ending in a backstop.
+///
+/// One scan rule, the same one: a [`SYMBOL_TIER_ADDITIVE_CANDIDATES`] entry
+/// keeps the scan going, the first other entry that LOADS ends it, and a path
+/// that fails to read or parse is skipped WITHOUT ending the scan.
+///
+/// `user_prefix` leading entries — the config `symbol_font` then
+/// `$ATERM_SYMBOL_FONT` — are NOT additive, and that is the deliberate
+/// difference from the broad tier. `fallback_fonts` is PLURAL and documented as
+/// an ordered chain of the user's own faces; `symbol_font` is SINGULAR and
+/// documented as the symbol face, so a host or a user who names one gets exactly
+/// it, as they always have. They are still passed positionally rather than
+/// matched by path, for the reason `build_fallback_chain` gives: a user may
+/// legitimately configure a path that is also a built-in entry.
+///
+/// No speculative parallel read here: the whole list is at most three paths, two
+/// of which are the same macOS file at two spellings, so the scope + join would
+/// cost more than the reads it overlaps.
+fn build_symbol_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFace> {
+    let mut chain = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(p)) else {
+            continue;
+        };
+        let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
+            continue;
+        };
+        let keep_scanning =
+            i >= user_prefix && SYMBOL_TIER_ADDITIVE_CANDIDATES.contains(&p.as_str());
         chain.push(face);
         if !keep_scanning {
             break;
@@ -7285,8 +7449,9 @@ impl Renderer {
             cfg_fallback_fonts: Vec::new(),
             cfg_symbol_font: None,
             cfg_emoji_font: None,
-            symbol_fallback: None,
+            symbol_chain: Vec::new(),
             symbol_fallback_paths: Vec::new(),
+            symbol_user_prefix: 0,
             fallback_parse_rx: None,
             symbol_parse_rx: None,
             missing_font_classes: 0,
@@ -7509,8 +7674,11 @@ impl Renderer {
     /// [`set_fallback_bytes`] for the symbol slot. Clearing the candidate paths
     /// stops the lazy system scan from later overwriting the injected face.
     pub fn set_symbol_fallback_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.symbol_fallback = Some(FallbackFace::from_bytes(bytes, None)?);
+        self.symbol_chain.clear();
+        self.symbol_chain
+            .push(FallbackFace::from_bytes(bytes, None)?);
         self.symbol_fallback_paths.clear();
+        self.symbol_user_prefix = 0;
         // A char that ALREADY resolved (cached as a Primary `.notdef` key in
         // `self.keys` + its rasterized bitmap in `self.glyphs`) is never re-routed to
         // the newly-installed symbol face unless we drop BOTH the per-char key memo and
@@ -7721,8 +7889,9 @@ impl Renderer {
         }
         self.cfg_symbol_font = path.map(str::to_string);
         let config: Vec<String> = path.map(str::to_string).into_iter().collect();
-        self.symbol_fallback = None;
-        self.symbol_fallback_paths = symbol_fallback_candidate_paths(&config);
+        self.symbol_chain.clear();
+        (self.symbol_fallback_paths, self.symbol_user_prefix) =
+            symbol_fallback_candidate_paths(&config);
         self.admitted_sources_sealed = false;
         self.keys.clear();
         self.clear_glyph_images();
@@ -7972,7 +8141,8 @@ impl Renderer {
         let mut renderer = Self::from_bytes(bytes, px, theme)?;
         renderer.primary_path = Some(path.into());
         (renderer.fallback_paths, renderer.fallback_user_prefix) = fallback_candidate_paths(&[]);
-        renderer.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
+        (renderer.symbol_fallback_paths, renderer.symbol_user_prefix) =
+            symbol_fallback_candidate_paths(&[]);
         renderer.color_font_paths = color_emoji_candidate_paths(&[]);
         Ok(renderer)
     }
@@ -8038,7 +8208,7 @@ impl Renderer {
         #[cfg(feature = "embedded-font")]
         if let Ok(mut r) = Self::from_bytes(embedded_font(), px, theme) {
             (r.fallback_paths, r.fallback_user_prefix) = fallback_candidate_paths(&[]);
-            r.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
+            (r.symbol_fallback_paths, r.symbol_user_prefix) = symbol_fallback_candidate_paths(&[]);
             r.color_font_paths = color_emoji_candidate_paths(&[]);
             return Some(r);
         }
@@ -8107,10 +8277,10 @@ impl Renderer {
         self.font_epoch += 1;
     }
 
-    /// Symbol-slot analog of [`Self::install_fallback_chain`].
+    /// Symbol-tier analog of [`Self::install_fallback_chain`].
     fn install_symbol_result(&mut self, chain: Vec<FallbackFace>) {
-        if self.symbol_fallback.is_none() {
-            self.symbol_fallback = chain.into_iter().next();
+        if self.symbol_chain.is_empty() {
+            self.symbol_chain = chain;
         }
         self.font_epoch += 1;
     }
@@ -8471,20 +8641,21 @@ impl Renderer {
         false
     }
 
-    /// Lazily load the first available symbol-fallback face the first time a code
-    /// point misses both the primary and broad fallback faces. After this runs
-    /// once, `symbol_fallback_paths` is empty so we never re-try. Same async
+    /// Lazily load the symbol-fallback CHAIN the first time a code point misses
+    /// both the primary and broad fallback faces. After this runs once,
+    /// `symbol_fallback_paths` is empty so we never re-try. Same async
     /// discipline as [`Self::ensure_fallback`]: the parse runs on a background
     /// thread on native, synchronously on wasm.
     fn ensure_symbol_fallback(&mut self) {
         self.poll_fallback_parses();
-        if self.symbol_fallback.is_some()
+        if !self.symbol_chain.is_empty()
             || self.symbol_parse_rx.is_some()
             || self.symbol_fallback_paths.is_empty()
         {
             return;
         }
         let paths = std::mem::take(&mut self.symbol_fallback_paths);
+        let user_prefix = self.symbol_user_prefix;
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -8492,9 +8663,8 @@ impl Renderer {
             if std::thread::Builder::new()
                 .name("aterm-symbol-parse".into())
                 .spawn(move || {
-                    // A send error only means the renderer was dropped first. The
-                    // symbol slot is a single face — send it as a 0-or-1 chain.
-                    let _ = tx.send(first_interned_face(&thread_paths).into_iter().collect());
+                    // A send error only means the renderer was dropped first.
+                    let _ = tx.send(build_symbol_chain(&thread_paths, user_prefix));
                 })
                 .is_ok()
             {
@@ -8503,31 +8673,57 @@ impl Renderer {
             }
         }
         // wasm (no threads) — or a failed native spawn: the synchronous parse.
-        self.symbol_fallback = first_interned_face(&paths);
+        self.symbol_chain = build_symbol_chain(&paths, user_prefix);
     }
 
-    /// Whether the symbol-fallback face has a (non-`.notdef`) glyph for `ch`
-    /// (loads it lazily).
+    /// The FIRST symbol-chain entry whose cmap covers `ch` under the tier's own
+    /// rule (loads the chain lazily), or `None` when none does.
     ///
-    /// COVERAGE FROM THE UNICODE CMAP (ttf-parser), for the two reasons
-    /// [`Self::fallback_has`] already gives at length — fontdue mis-selects a Mac
-    /// Roman subtable on Apple `.ttc` faces, and the primary tier was fixed for
-    /// this long ago — plus a third that is specific to this slot.
+    /// Unlike [`Self::fallback_has`] this writes NO per-code-point memo, for the
+    /// reason `fallback_mono_raster` already gives for the display mix: the pick
+    /// is a pure function of the code point and the loaded chain, so recomputing
+    /// it in the rasterizer cannot disagree with what the key recorded. The chain
+    /// is at most a handful of faces and `Face::parse` is a table-directory read,
+    /// so there is nothing here worth a cache that could go stale.
     ///
-    /// This probe runs ON THE RENDER THREAD, and it is reached by exactly the code
-    /// points [`SYMBOL_FALLBACK_CANDIDATES`] exists for (U+23F8..23FA ⏸⏹⏺ and
-    /// friends). Asking fontdue would MATERIALISE the deferred parse of
-    /// STIXTwoMath right there — a synchronous stall mid-frame on the first such
-    /// char, which is precisely the cost the lazy chain exists to avoid. The cmap
-    /// is a table read over bytes that are already resident.
-    fn symbol_fallback_has(&mut self, ch: char) -> bool {
+    /// THE RULE has two clauses:
+    ///
+    ///  * COVERAGE FROM THE UNICODE CMAP (ttf-parser), for the two reasons
+    ///    [`Self::fallback_has`] gives at length — fontdue mis-selects a Mac
+    ///    Roman subtable on Apple `.ttc` faces, and the primary tier was fixed
+    ///    for this long ago — plus a third specific to this tier. This probe runs
+    ///    ON THE RENDER THREAD. Asking fontdue would MATERIALISE the deferred
+    ///    parse of STIXTwoMath right there — a synchronous stall mid-frame on the
+    ///    first such char, precisely the cost the lazy chain exists to avoid. The
+    ///    cmap is a table read over bytes that are already resident.
+    ///  * A [`SYMBOL_TIER_TEXT_ONLY_BACKSTOPS`] entry is SKIPPED for a code point
+    ///    whose coverage in a BROAD TEXT face is INCIDENTAL rather than the
+    ///    reason that code point exists — an EMOJI-default code point (the
+    ///    colour face owns it) or a PRIVATE USE code point (the icon face owns
+    ///    it). That const carries both measurements; in one line, a broad text
+    ///    face reached here would otherwise shadow the colour face for 😀 and
+    ///    87 others, and the bundled Symbols Nerd Font for 95 Nerd Font icons.
+    fn symbol_chain_pick(&mut self, ch: char) -> Option<usize> {
         self.ensure_symbol_fallback();
-        self.symbol_fallback.as_ref().is_some_and(|f| {
-            ttf_parser::Face::parse(&f.bytes, f.index)
+        // BOTH clauses are pure functions of `ch` alone, which is what keeps
+        // this pick RECOMPUTABLE in the rasterizer (see the doc above).
+        let incidental =
+            aterm_grapheme::is_emoji_presentation(ch) || font_chain::is_private_use(ch);
+        self.symbol_chain.iter().position(|face| {
+            if incidental && symbol_face_is_text_only_backstop(face) {
+                return false;
+            }
+            ttf_parser::Face::parse(&face.bytes, face.index)
                 .ok()
-                .and_then(|face| face.glyph_index(ch))
+                .and_then(|parsed| parsed.glyph_index(ch))
                 .is_some_and(|g| g.0 != 0)
         })
+    }
+
+    /// Whether any symbol-fallback chain face has a (non-`.notdef`) glyph for
+    /// `ch` under [`Self::symbol_chain_pick`]'s rule (loads the chain lazily).
+    fn symbol_fallback_has(&mut self, ch: char) -> bool {
+        self.symbol_chain_pick(ch).is_some()
     }
 
     /// Lazily load the PRIMARY face's real `[bold, italic, bold-italic]` siblings
@@ -8648,9 +8844,10 @@ impl Renderer {
                 .map(|face| vec(&face.bytes, face.index))
                 .collect(),
             symbol: self
-                .symbol_fallback
-                .as_ref()
-                .map(|face| vec(&face.bytes, face.index)),
+                .symbol_chain
+                .iter()
+                .map(|face| vec(&face.bytes, face.index))
+                .collect(),
             emoji: self.color_font.as_ref().map(|bytes| vec(bytes, 0)),
         }
     }
@@ -8711,6 +8908,7 @@ impl Renderer {
         // remains a hard boundary if their implementation later changes.
         self.clear_fallback_candidates();
         self.symbol_fallback_paths.clear();
+        self.symbol_user_prefix = 0;
         self.color_font_paths.clear();
         self.fallback_parse_rx = None;
         self.symbol_parse_rx = None;
@@ -8782,8 +8980,9 @@ impl Renderer {
         rebuilt
             .cfg_fallback_fonts
             .clone_from(&self.cfg_fallback_fonts);
-        rebuilt.symbol_fallback = self.symbol_fallback.clone();
+        rebuilt.symbol_chain = self.symbol_chain.clone();
         rebuilt.symbol_fallback_paths.clear();
+        rebuilt.symbol_user_prefix = 0;
         rebuilt.cfg_symbol_font.clone_from(&self.cfg_symbol_font);
         rebuilt.color_font = self.color_font.clone();
         rebuilt.color_font_paths.clear();
@@ -8884,7 +9083,7 @@ impl Renderer {
     ) -> impl Iterator<Item = &std::sync::Arc<crate::font::Font>> + '_ {
         self.fallback_chain
             .iter()
-            .chain(self.symbol_fallback.iter())
+            .chain(self.symbol_chain.iter())
             .filter_map(|face| face.font.parsed())
     }
 
@@ -8927,12 +9126,12 @@ impl Renderer {
         } else {
             (Vec::new(), 0)
         };
-        fork.symbol_fallback = self.symbol_fallback.clone();
+        fork.symbol_chain = self.symbol_chain.clone();
         fork.cfg_symbol_font = self.cfg_symbol_font.clone();
-        fork.symbol_fallback_paths = if fork.symbol_fallback.is_none() {
+        (fork.symbol_fallback_paths, fork.symbol_user_prefix) = if fork.symbol_chain.is_empty() {
             symbol_fallback_candidate_paths(fork.cfg_symbol_font.as_slice())
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
         fork.color_font = self.color_font.clone();
         fork.cfg_emoji_font = self.cfg_emoji_font.clone();
@@ -9433,9 +9632,14 @@ impl Renderer {
                         .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm))
                 }
                 FaceId::SymbolFallback => {
-                    self.ensure_symbol_fallback();
-                    self.symbol_fallback
-                        .as_ref()
+                    // RECOMPUTED, not recovered from a memo: the symbol pick is a
+                    // pure function of `ch` and the loaded chain, so this is the
+                    // same entry `symbol_fallback_has` chose when the key was
+                    // built (`symbol_chain_pick`). Fail safe to the first chain
+                    // face, then the primary (`.notdef`).
+                    let pick = self.symbol_chain_pick(ch);
+                    pick.and_then(|i| self.symbol_chain.get(i))
+                        .or_else(|| self.symbol_chain.first())
                         .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm))
                 }
                 // The per-code-point decision was cached by `glyph_key` before this
@@ -9510,15 +9714,18 @@ impl Renderer {
             //    `true` only when it really removed an entry, so the recursion
             //    strictly shrinks the chain and terminates.
             //
-            // The SYMBOL slot is deliberately not retired: it holds at most one
-            // face, so it can shadow nothing, and its fail-safe below is the
-            // same `.notdef` it always was.
-            if source == FaceId::Fallback
-                && font.as_ref().is_some_and(LazyFontdue::known_bad)
-                && self.retire_unparsable_fallback(&bytes)
-            {
-                let _ = self.fallback_has(ch);
-                return self.fallback_mono_raster(source, ch);
+            // THE SYMBOL TIER IS NOW A CHAIN TOO, so it gets the same treatment.
+            // It used to be exempt on the stated ground that "it holds at most
+            // one face, so it can shadow nothing" — true of a slot, false the
+            // moment the dedicated symbol face sits in front of a backstop.
+            if font.as_ref().is_some_and(LazyFontdue::known_bad) {
+                if source == FaceId::Fallback && self.retire_unparsable_fallback(&bytes) {
+                    let _ = self.fallback_has(ch);
+                    return self.fallback_mono_raster(source, ch);
+                }
+                if source == FaceId::SymbolFallback && self.retire_unparsable_symbol_face(&bytes) {
+                    return self.fallback_mono_raster(source, ch);
+                }
             }
             let (m, b) = self.font.rasterize(ch, self.px);
             (m.width, m.height, m.xmin, m.ymin, m.advance_width, b)
@@ -9561,6 +9768,27 @@ impl Renderer {
         };
         self.fallback_chain.remove(i);
         self.fallback_pick.clear();
+        self.keys.clear();
+        self.clear_glyph_images();
+        self.clear_face_address_caches();
+        self.font_epoch += 1;
+        true
+    }
+
+    /// The SYMBOL-tier twin of [`Self::retire_unparsable_fallback`], and it
+    /// exists for exactly the reason that one does: a chain entry whose deferred
+    /// parse fails must not stay in front of the entries behind it, drawing
+    /// nothing. That hazard arrived with the symbol CHAIN — a one-face slot
+    /// could shadow nobody, which is why this tier had no retire before.
+    ///
+    /// No `symbol_pick` to drop: [`Self::symbol_chain_pick`] recomputes, so the
+    /// shortened chain simply answers differently. The `keys`/`glyphs` clears
+    /// and the pointer-keyed caches are the same ones, for the same reasons.
+    fn retire_unparsable_symbol_face(&mut self, bytes: &crate::font::FaceBytes) -> bool {
+        let Some(i) = self.symbol_chain.iter().position(|f| f.bytes.ptr_eq(bytes)) else {
+            return false;
+        };
+        self.symbol_chain.remove(i);
         self.keys.clear();
         self.clear_glyph_images();
         self.clear_face_address_caches();
@@ -16864,9 +17092,14 @@ impl Renderer {
         // HOLDS an `Arc` clone of `image.image` and matches by `Arc::ptr_eq`, so a
         // hit can't be the stale decode of a freed image whose address was reused.
         if ic.get(&image.image, fp_w, fp_h).is_none() {
-            let rgba =
-                decode_image_to_footprint(&image.image.bytes, image.image.format, fp_w, fp_h)
-                    .unwrap_or_default();
+            let rgba = decode_image_to_footprint(
+                &image.image.bytes,
+                image.image.format,
+                fp_w,
+                fp_h,
+                image.image.pixel_exact,
+            )
+            .unwrap_or_default();
             ic.put(
                 image.image.clone(),
                 fp_w,
@@ -23540,11 +23773,25 @@ fn to_rgba8(buf: &[u8], color_type: aterm_png::ColorType, w: usize, h: usize) ->
     }
 }
 
-/// Decode an inline-image payload (iTerm2 OSC 1337 / sixel) to RGBA8 filling the
-/// footprint pixel box `fp_w × fp_h`, with the SOURCE ASPECT RATIO PRESERVED:
-/// the image is scaled to the largest box that fits, centered, and the remainder
-/// left fully transparent (the cell background shows through). Each covered cell
-/// then paints a 1:1 tile of the result.
+/// Decode an inline-image payload (iTerm2 OSC 1337 / sixel / Kitty) to RGBA8
+/// filling the footprint pixel box `fp_w × fp_h`. Each covered cell then paints
+/// a 1:1 tile of the result.
+///
+/// `pixel_exact` ([`ImageData::pixel_exact`](aterm_core::grid::extra::ImageData::pixel_exact))
+/// picks between the TWO placement policies, and which one is right depends on
+/// what the PROGRAM named:
+///
+/// - `false` — FIT. The source is scaled, ASPECT RATIO PRESERVED, to the largest
+///   box that fits the footprint, centered there, remainder fully transparent
+///   (the cell background shows through). Right when the program asked for a
+///   target in CELLS — iTerm2 `File=width=…;height=…`, Kitty `c=`/`r=`, the
+///   host's own chrome rasters — because filling the cells it asked for IS the
+///   spec.
+/// - `true` — PIXEL-EXACT. One source pixel to one device pixel, anchored at the
+///   footprint's TOP-LEFT, the rounded-up remainder left unpainted. Right when
+///   the program named PIXELS (sixel; Kitty with neither `c=` nor `r=`), where
+///   the footprint was DERIVED from the raster by rounding up to whole cells and
+///   scaling back out to it is pure rounding noise (`place_rgba_at_origin`).
 ///
 /// ## Why not simply fill the box
 ///
@@ -23568,11 +23815,11 @@ fn to_rgba8(buf: &[u8], color_type: aterm_png::ColorType, w: usize, h: usize) ->
 ///
 /// iTerm2's `preserveAspectRatio=0` — "stretch to fill, ignore the inherent
 /// ratio" — has no carrier: [`ImageData`](aterm_core::grid::extra::ImageData)
-/// stores no such flag, so the renderer cannot tell a default placement from an
-/// explicit stretch request and treats both as fit. That option was ALREADY
-/// ignored before this change (it stretched both ways round); making the default
-/// correct is strictly closer to the spec, and the remaining gap is one bool on
-/// `ImageData` away.
+/// carries `pixel_exact` but no stretch flag, so the renderer cannot tell a
+/// default placement from an explicit stretch request and treats both as fit.
+/// That option was ALREADY ignored before this change (it stretched both ways
+/// round); making the default correct is strictly closer to the spec, and the
+/// remaining gap is one more bool on `ImageData` away.
 ///
 /// Returns `None` only for a format the renderer cannot decode (non-PNG) or a
 /// corrupt/oversized PNG; the caller caches that as "draw nothing" so a bad image
@@ -23588,26 +23835,26 @@ pub fn decode_image_to_footprint(
     format: aterm_core::grid::extra::ImageFormat,
     fp_w: usize,
     fp_h: usize,
+    pixel_exact: bool,
 ) -> Option<Vec<u8>> {
     if fp_w == 0 || fp_h == 0 {
         return None;
     }
-    // Already-decoded RGBA8 (the sixel path): fit the stored raster into the
-    // footprint directly — no container to decode. The engine guarantees the
-    // byte layout (`[r, g, b, a]` per pixel, row-major over `width`), matching
-    // `resample_rgba`'s input contract.
+    // Already-decoded RGBA8 (the sixel path, and Kitty's `f=32`/`f=24`): place
+    // the stored raster into the footprint directly — no container to decode.
+    // The engine guarantees the byte layout (`[r, g, b, a]` per pixel, row-major
+    // over `width`), matching `resample_rgba`'s input contract.
     if let aterm_core::grid::extra::ImageFormat::RawRgba8 { width, height } = format {
         let (w, h) = (width as usize, height as usize);
         if w == 0 || h == 0 || bytes.len() < w.checked_mul(h)?.checked_mul(4)? {
             return None;
         }
-        return Some(fit_rgba_into_footprint(
-            &bytes[..w * h * 4],
-            w,
-            h,
-            fp_w,
-            fp_h,
-        ));
+        let src = &bytes[..w * h * 4];
+        return Some(if pixel_exact {
+            place_rgba_at_origin(src, w, h, fp_w, fp_h)
+        } else {
+            fit_rgba_into_footprint(src, w, h, fp_w, fp_h)
+        });
     }
     // Only PNG is decodable today; anything else degrades to nothing.
     if !matches!(format, aterm_core::grid::extra::ImageFormat::Png) {
@@ -23616,13 +23863,57 @@ pub fn decode_image_to_footprint(
     let (src, src_w, src_h) = decode_png_rgba8(bytes)?;
     // Identity fast path (perf): a source already at footprint size needs no
     // resample — its aspect IS the box's, so the fit is the whole box and the
-    // area/bilinear ratio is 1:1 (the identity filter). Returning the decode
-    // directly is byte-identical AND skips a full multi-megapixel float pass on
-    // the event-loop thread.
+    // area/bilinear ratio is 1:1 (the identity filter). It is equally the
+    // pixel-exact answer (a raster that fills the footprint has no margin to
+    // leave unpainted), so both policies take it. Returning the decode directly
+    // is byte-identical AND skips a full multi-megapixel float pass on the
+    // event-loop thread.
     if (src_w, src_h) == (fp_w, fp_h) {
         return Some(src);
     }
-    Some(fit_rgba_into_footprint(&src, src_w, src_h, fp_w, fp_h))
+    Some(if pixel_exact {
+        place_rgba_at_origin(&src, src_w, src_h, fp_w, fp_h)
+    } else {
+        fit_rgba_into_footprint(&src, src_w, src_h, fp_w, fp_h)
+    })
+}
+
+/// PIXEL-EXACT placement: copy `src` into an `fp_w × fp_h` RGBA8 footprint ONE
+/// SOURCE PIXEL TO ONE DEVICE PIXEL, anchored at the TOP-LEFT, every pixel the
+/// source does not reach left fully transparent (RGBA 0,0,0,0 — the blit's
+/// straight-alpha OVER then leaves the cell background untouched, and the GPU
+/// pass samples the same zeros). No resample runs at all, so a 1-px feature
+/// survives as a 1-px feature and a palette colour comes out as itself.
+///
+/// This is what sixel means. The caller derived the footprint FROM the raster by
+/// rounding each axis up to whole cells, so the margin here is at most one cell
+/// short of the right/bottom edge — exactly the sliver xterm, foot, mlterm,
+/// wezterm, contour and mintty leave unpainted.
+///
+/// A source LARGER than the footprint is CLIPPED, not shrunk: that happens only
+/// when the engine had to clamp the cell span to the grid width (or the per-image
+/// cell cap), and clipping at the right margin is what a real terminal does with
+/// an image too wide for the screen.
+fn place_rgba_at_origin(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    fp_w: usize,
+    fp_h: usize,
+) -> Vec<u8> {
+    if (src_w, src_h) == (fp_w, fp_h) {
+        return src.to_vec();
+    }
+    let mut out = vec![0u8; fp_w * fp_h * 4];
+    let copy_w = src_w.min(fp_w);
+    let copy_h = src_h.min(fp_h);
+    let row_bytes = copy_w * 4;
+    for y in 0..copy_h {
+        let s = y * src_w * 4;
+        let d = y * fp_w * 4;
+        out[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+    }
+    out
 }
 
 /// The largest `w × h` with `src`'s aspect ratio that fits inside `fp_w × fp_h`.
@@ -25394,6 +25685,7 @@ mod tests {
                 rows: 4,
                 z_index: z,
                 band_lift_px: 0,
+                pixel_exact: false,
             })
         };
         let base = mk(payload.clone(), 8, 0);
@@ -25478,6 +25770,7 @@ mod tests {
                 rows: 2,
                 z_index: 0,
                 band_lift_px: 0,
+                pixel_exact: false,
             })
         };
         let fill = |input: &mut RenderInput, img: &Arc<ImageData>| {
@@ -26546,6 +26839,7 @@ mod tests {
             },
             4,
             4,
+            false,
         )
         .expect("RawRgba8 must decode without a codec");
         assert_eq!(out.len(), 4 * 4 * 4, "footprint is 4x4 RGBA");
@@ -26572,7 +26866,8 @@ mod tests {
                     height: 4
                 },
                 8,
-                8
+                8,
+                false
             )
             .is_none(),
             "a too-short RawRgba8 buffer must decode to None"
@@ -26596,6 +26891,7 @@ mod tests {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
+                pixel_exact: false,
             })
         };
         let (a, b) = (mk(), mk());
@@ -26638,6 +26934,7 @@ mod tests {
             rows: 1,
             z_index: 0,
             band_lift_px: 0,
+            pixel_exact: false,
         })
     }
 
@@ -27321,13 +27618,20 @@ mod tests {
     /// read from the FILE rather than from any chain.
     #[cfg(target_os = "linux")]
     fn face_coverage(path: &str) -> std::collections::BTreeSet<u32> {
-        let mut out = std::collections::BTreeSet::new();
         let Ok(bytes) = std::fs::read(path) else {
-            return out;
+            return std::collections::BTreeSet::new();
         };
-        let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+        collection_coverage(&bytes)
+    }
+
+    /// [`face_coverage`] over BYTES, so the `include_bytes!`'d bundled symbol
+    /// face can be measured by the same authority as a file on disk.
+    #[cfg(target_os = "linux")]
+    fn collection_coverage(bytes: &[u8]) -> std::collections::BTreeSet<u32> {
+        let mut out = std::collections::BTreeSet::new();
+        let faces = ttf_parser::fonts_in_collection(bytes).unwrap_or(1);
         for i in 0..faces {
-            let Ok(f) = ttf_parser::Face::parse(&bytes, i) else {
+            let Ok(f) = ttf_parser::Face::parse(bytes, i) else {
                 continue;
             };
             let Some(cmap) = f.tables().cmap else {
@@ -27639,6 +27943,385 @@ mod tests {
         eprintln!("{checked} script(s) dispatched to the fallback chain with real ink");
     }
 
+    // ---- The SYMBOL tier is a CHAIN, and its backstop must be reachable ------
+    //
+    // `SYMBOL_FALLBACK_CANDIDATES` was written as a sequence — a dedicated
+    // symbol face, then a broad-symbol backstop, with a comment naming the
+    // second as exactly that — while the loader took only its FIRST entry. On
+    // every Linux desktop that installs `fonts-noto-core`,
+    // `NotoSansSymbols2-Regular.ttf` exists and won the slot, so DejaVu Sans
+    // never loaded HERE (and, being behind `NotoSansCJK-Regular.ttc`, never
+    // loaded in the broad tier either). MEASURED on this host THROUGH THE
+    // RENDERER (two sealed generations differing only in whether the symbol
+    // chain reaches its second entry, differenced over U+2000..U+2BFF): 309
+    // code points newly resolve to the backstop, 307 of them from the primary
+    // face's `.notdef`, and 290 of those rasterize with real ink — ⊨ ⋈ ⋱ ⩽ ⟹ ⨁
+    // ℒ ℠ ⁃ ․ among them, every one of them drawn as the same empty rectangle
+    // before. (The remaining 17 are U+2028/2029 and the U+2060..206F invisible
+    // formats, blank either way.) The union that was differenced against is
+    // every face a SEALED renderer here reaches, the primary face and the
+    // bundled Symbols Nerd Font included; leaving those two out is what
+    // produced the 689 an earlier revision claimed.
+
+    /// FACT 1, as a PURE LIST LAW — no font I/O, so it holds on any machine.
+    ///
+    /// Both auxiliary consts must name real [`SYMBOL_FALLBACK_CANDIDATES`]
+    /// entries (membership is BY PATH, so a typo silently means "not in the
+    /// list"), a text-only backstop may never also be additive (it must END the
+    /// scan, so it is last), and no entry may appear twice.
+    #[test]
+    fn the_symbol_tier_consts_name_real_candidates_and_do_not_overlap() {
+        for p in SYMBOL_TIER_ADDITIVE_CANDIDATES {
+            assert!(
+                SYMBOL_FALLBACK_CANDIDATES.contains(p),
+                "{p} is declared an additive symbol candidate but is not IN \
+                 SYMBOL_FALLBACK_CANDIDATES — membership is by path, so this \
+                 declaration does nothing"
+            );
+        }
+        for p in SYMBOL_TIER_TEXT_ONLY_BACKSTOPS {
+            assert!(
+                SYMBOL_FALLBACK_CANDIDATES.contains(p),
+                "{p} is declared a text-only symbol backstop but is not IN \
+                 SYMBOL_FALLBACK_CANDIDATES"
+            );
+            assert!(
+                !SYMBOL_TIER_ADDITIVE_CANDIDATES.contains(p),
+                "{p} is both a text-only backstop and additive — an additive \
+                 backstop does not end the scan, and anything listed after it \
+                 would load as well"
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for p in SYMBOL_FALLBACK_CANDIDATES {
+            assert!(seen.insert(*p), "{p} is listed twice in the symbol tier");
+        }
+    }
+
+    /// FACT 1b, the LINUX arm's shape: the dedicated symbol face is additive so
+    /// the scan continues past it, the backstop is NOT so it ends the scan, and
+    /// the backstop is LAST — anything listed after it would be unreachable, the
+    /// very defect this tier had.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_linux_symbol_arm_ends_at_its_declared_backstop() {
+        let linux: Vec<&&str> = SYMBOL_FALLBACK_CANDIDATES
+            .iter()
+            .filter(|p| p.starts_with("/usr/share/fonts/"))
+            .collect();
+        assert_eq!(
+            linux.len(),
+            2,
+            "the Linux symbol arm changed shape; this law needs rewriting: {linux:?}"
+        );
+        assert!(
+            SYMBOL_TIER_ADDITIVE_CANDIDATES.contains(linux[0]),
+            "{} leads the Linux symbol arm and must be additive, or the scan \
+             stops there and the backstop behind it never loads",
+            linux[0]
+        );
+        assert!(
+            SYMBOL_TIER_TEXT_ONLY_BACKSTOPS.contains(linux[1]),
+            "{} ends the Linux symbol arm and must be declared a text-only \
+             backstop, or it shadows the colour face for 😀 and 87 others",
+            linux[1]
+        );
+    }
+
+    /// FACT 2 — THE DEFECT ITSELF, at the RENDERER, on a SEALED generation.
+    ///
+    /// Sealed because that is what a GUI window does: it closes the
+    /// pathname-discovery runtime tier, so a code point only `RuntimeFallback`
+    /// can reach still paints `.notdef` on glass. Unsealed, every one of these
+    /// operators resolves fine through system discovery and the defect is
+    /// invisible — which is exactly why it survived.
+    ///
+    /// Each probe is checked only when this host's own files say the backstop
+    /// carries it and no other chain face does, so nothing here assumes a
+    /// particular font set; it fails when the glyph IS installed at the path the
+    /// list names and the tier still cannot reach it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_symbol_backstop_draws_the_operators_the_reachable_chain_lacks() {
+        let backstop = SYMBOL_TIER_TEXT_ONLY_BACKSTOPS[0];
+        if !std::path::Path::new(backstop).is_file() {
+            eprintln!("SKIP: {backstop} is not installed here");
+            return;
+        }
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        // The generation a GUI window publishes: every candidate admitted, no
+        // pathname discovery left on the render thread.
+        r.seal_admitted_font_sources();
+        let backstop_cov = face_coverage(backstop);
+        // The measured casualties from the report, in code-point order.
+        let probes: &[char] = &[
+            '\u{2024}', // ․ ONE DOT LEADER
+            '\u{2043}', // ⁃ HYPHEN BULLET
+            '\u{2112}', // ℒ SCRIPT CAPITAL L
+            '\u{2120}', // ℠ SERVICE MARK
+            '\u{2216}', // ∖ SET MINUS
+            '\u{22A8}', // ⊨ TRUE (entailment)
+            '\u{22C8}', // ⋈ BOWTIE (relational join)
+            '\u{22F1}', // ⋱ DOWN RIGHT DIAGONAL ELLIPSIS
+            '\u{27F9}', // ⟹ LONG RIGHTWARDS DOUBLE ARROW
+            '\u{2A01}', // ⨁ N-ARY CIRCLED PLUS
+            '\u{2A7D}', // ⩽ LESS-THAN OR SLANTED EQUAL TO
+        ];
+        let mut checked = 0usize;
+        for &ch in probes {
+            if !backstop_cov.contains(&(ch as u32)) {
+                eprintln!("SKIP U+{:04X}: this host's backstop lacks it", ch as u32);
+                continue;
+            }
+            if r.primary_unicode_gid(ch).is_some() {
+                eprintln!("SKIP U+{:04X}: the primary face carries it here", ch as u32);
+                continue;
+            }
+            let key = r.glyph_key(ch);
+            assert_eq!(
+                key.source,
+                FaceId::SymbolFallback,
+                "{ch:?} U+{:04X} resolved to {:?}. The symbol tier names \
+                 {backstop} its broad-symbol backstop and this host HAS that \
+                 file — Primary here means the .notdef box a person cannot tell \
+                 from any other .notdef box.",
+                ch as u32,
+                key.source
+            );
+            let img = r.glyph_image(key);
+            assert!(
+                img.bytes().iter().any(|&c| c > 0),
+                "{ch:?} rasterized with no coverage at all"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no probe was installed here; nothing proven");
+        // And the face the raster actually drew from is the declared backstop,
+        // not some other entry that happened to answer.
+        let pick = r
+            .symbol_chain_pick('\u{22A8}')
+            .and_then(|i| r.symbol_chain.get(i))
+            .and_then(|f| f.path.clone());
+        assert_eq!(
+            pick.as_deref(),
+            Some(backstop),
+            "⊨ must draw from the declared backstop itself"
+        );
+        eprintln!("{checked} operator(s) reached the symbol backstop with real ink");
+    }
+
+    /// FACT 3 — THE SHADOW LAW for this tier, and the reason the backstop is
+    /// declared text-only rather than simply appended.
+    ///
+    /// The symbol tier is probed BEFORE the colour face
+    /// ([`font_chain::resolve_chain`]), so a BROAD TEXT face reached here would
+    /// take Emoji_Presentation code points away from the face they exist for —
+    /// the same hazard the "DEJAVU STAYS LAST" note on [`FALLBACK_CANDIDATES`]
+    /// names, arriving through a different door. MEASURED on this host: the
+    /// backstop maps 98 `Emoji_Presentation=Yes` code points, 88 of them
+    /// reachable nowhere else in the chain, 😀 U+1F600 among them.
+    ///
+    /// The law is stated on the PICK, not on the resolved face, and that is the
+    /// precise reading: a DEDICATED symbol face may legitimately answer an
+    /// emoji-default code point (it is the face those glyphs exist for, and this
+    /// tier has always outranked the colour face for them). Only the BROAD TEXT
+    /// backstop may not.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_symbol_backstop_never_takes_a_code_point_the_colour_face_owns() {
+        let backstop = SYMBOL_TIER_TEXT_ONLY_BACKSTOPS[0];
+        if !std::path::Path::new(backstop).is_file() {
+            eprintln!("SKIP: {backstop} is not installed here");
+            return;
+        }
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        r.seal_admitted_font_sources();
+        // NON-VACUITY, first clause: the gate can only be tested on a chain that
+        // actually REACHES the face it gates. A one-face symbol slot passes every
+        // assertion below by never picking the backstop at all.
+        assert!(
+            r.symbol_chain
+                .iter()
+                .any(|f| f.path.as_deref() == Some(backstop)),
+            "{backstop} is installed but is not in the loaded symbol chain, so \
+             nothing below can exercise the gate"
+        );
+        let backstop_cov = face_coverage(backstop);
+        let mut checked = 0usize;
+        for cp in backstop_cov.iter().copied() {
+            let Some(ch) = char::from_u32(cp) else {
+                continue;
+            };
+            if !aterm_grapheme::is_emoji_presentation(ch) || !r.color_font_has(ch) {
+                continue;
+            }
+            let picked = r
+                .symbol_chain_pick(ch)
+                .and_then(|i| r.symbol_chain.get(i))
+                .and_then(|f| f.path.clone());
+            assert_ne!(
+                picked.as_deref(),
+                Some(backstop),
+                "{ch:?} U+{cp:04X} defaults to EMOJI presentation and the colour \
+                 face covers it, but the broad-text backstop took it — the \
+                 text-only gate on {backstop} is not holding"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "the backstop shadows no emoji code point on this host, so this law \
+             is vacuous here and proves nothing"
+        );
+        // END TO END for the loudest of them: 😀 is reachable in this chain ONLY
+        // through the backstop, so the gate is the only thing standing between
+        // it and a monochrome outline.
+        let grin = '\u{1F600}';
+        if backstop_cov.contains(&(grin as u32)) && r.color_font_has(grin) {
+            assert_eq!(
+                r.glyph_key(grin).source,
+                FaceId::ColorEmoji,
+                "😀 must still render in COLOUR"
+            );
+        }
+        eprintln!("{checked} emoji-default code point(s) stayed off the backstop");
+    }
+
+    /// FACT 4 — THE ICON LAW: the shadow law's twin, through the other door.
+    ///
+    /// The colour face is not the only face the symbol tier is probed in front
+    /// of. [`font_chain::resolve_chain`] consults `Tier::Symbol` before
+    /// `Tier::Color` AND before `Tier::RuntimeEmbedded`, which is the
+    /// `include_bytes!`'d Symbols Nerd Font ([`embedded_symbols_font`]) — the
+    /// one runtime tier a SEALED generation may still reach, and the reason
+    /// Nerd Font icons render out of the box with no Nerd Font installed.
+    ///
+    /// So a BROAD TEXT backstop reached on this tier takes PRIVATE-USE code
+    /// points away from the bundled icon face exactly as it would take
+    /// emoji-default ones from the colour face. It is not a hypothesis: the
+    /// doc on [`font_chain::ChainPolicy::prefers_symbol`] records the measured
+    /// original — making `arial.ttf` reachable on Windows handed U+F301 to
+    /// arial's dot. MEASURED here: `DejaVuSans.ttf` maps 96 private code points,
+    /// 95 of them also in the bundled face (oct-git_branch U+F418, oct-repo,
+    /// oct-mark_github, fa-music …), and NEITHER the primary face NOR
+    /// `NotoSansSymbols2-Regular.ttf` covers one of them. Ungated, all 95
+    /// silently became DejaVu's unrelated private glyphs; U+EF00..EF19 in
+    /// particular became near-blank Chao tone-contour fragments (ink 80 → 10).
+    ///
+    /// Like FACT 3 this is stated on the PICK as well as on the resolved face,
+    /// and for the same reason: a DEDICATED symbol face may legitimately answer
+    /// a private code point — that is precisely what `prefers_symbol` asks for.
+    /// Only the BROAD TEXT backstop may not.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "embedded-symbols"))]
+    fn the_symbol_backstop_never_takes_a_private_use_icon_the_bundled_face_owns() {
+        let backstop = SYMBOL_TIER_TEXT_ONLY_BACKSTOPS[0];
+        if !std::path::Path::new(backstop).is_file() {
+            eprintln!("SKIP: {backstop} is not installed here");
+            return;
+        }
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        r.seal_admitted_font_sources();
+        // NON-VACUITY, first clause — the same one FACT 3 needs: a chain that
+        // never REACHES the gated face passes every assertion below for free.
+        assert!(
+            r.symbol_chain
+                .iter()
+                .any(|f| f.path.as_deref() == Some(backstop)),
+            "{backstop} is installed but is not in the loaded symbol chain, so \
+             nothing below can exercise the gate"
+        );
+        // The CONTESTED set, read from the two files themselves rather than
+        // from any chain: private code points BOTH the broad-text backstop and
+        // the bundled icon face map.
+        let backstop_cov = face_coverage(backstop);
+        let bundled_cov = collection_coverage(embedded_symbols_font());
+        let contested: Vec<u32> = backstop_cov
+            .iter()
+            .copied()
+            .filter(|cp| bundled_cov.contains(cp))
+            .filter(|cp| char::from_u32(*cp).is_some_and(font_chain::is_private_use))
+            .collect();
+        // NON-VACUITY, second clause: the two faces must actually COLLIDE here.
+        assert!(
+            !contested.is_empty(),
+            "no private code point is mapped by BOTH {backstop} and the bundled \
+             Symbols Nerd Font on this host, so this law is vacuous and proves \
+             nothing"
+        );
+        for &cp in &contested {
+            let ch = char::from_u32(cp).expect("filtered to real chars above");
+            let picked = r
+                .symbol_chain_pick(ch)
+                .and_then(|i| r.symbol_chain.get(i))
+                .and_then(|f| f.path.clone());
+            assert_ne!(
+                picked.as_deref(),
+                Some(backstop),
+                "U+{cp:04X} is PRIVATE USE and the bundled Symbols Nerd Font \
+                 carries it, but the broad-text backstop took it — a private \
+                 code point's coverage in a broad TEXT face is incidental, and \
+                 {backstop} draws an unrelated glyph for it"
+            );
+            assert_ne!(
+                r.glyph_key(ch).source,
+                FaceId::SymbolFallback,
+                "U+{cp:04X} resolved to the symbol tier; the bundled icon face \
+                 owns this private code point"
+            );
+        }
+        eprintln!(
+            "{} private-use icon(s) stayed off the broad-text backstop",
+            contested.len()
+        );
+        // END TO END for the loudest of them, all the way to the RASTER:
+        // U+F418 is Nerd Font `oct-git_branch`, on a Starship/Powerlevel10k
+        // prompt and an eza listing, and it must still come from the
+        // runtime-EMBEDDED tier with real ink — not merely "not from the
+        // backstop".
+        let git_branch = '\u{F418}';
+        if contested.contains(&(git_branch as u32)) {
+            let key = r.glyph_key(git_branch);
+            assert_eq!(
+                key.source,
+                FaceId::RuntimeFallback,
+                "oct-git_branch U+F418 must still draw from the runtime tier"
+            );
+            let slot = r
+                .runtime_fallback
+                .embedded_decisions
+                .get(&git_branch)
+                .copied()
+                .flatten()
+                .expect(
+                    "a SEALED generation resolves the runtime tier through \
+                     `resolve_embedded_only`, so the decision must be in \
+                     `embedded_decisions`",
+                );
+            assert_eq!(
+                r.runtime_fallback.faces[slot].path,
+                RuntimeFallback::EMBEDDED_SYMBOLS_PATH,
+                "oct-git_branch U+F418 must come from the bundled Symbols Nerd \
+                 Font itself, not from some other runtime face"
+            );
+            let img = r.glyph_image(key);
+            assert!(
+                img.bytes().iter().any(|&c| c > 0),
+                "oct-git_branch U+F418 rasterized with no coverage at all"
+            );
+            eprintln!("oct-git_branch U+F418 still draws from the bundled icon face");
+        }
+    }
+
     /// The RENDER-SIDE end of the same defect, on whatever platform this is: a
     /// Hangul syllable must dispatch to the broad fallback tier and rasterize
     /// with real ink — not land on the primary face's `.notdef`. This is what
@@ -27829,7 +28512,7 @@ mod tests {
         // `from_bytes` installs no candidate paths (only `from_system` does);
         // seed the real ones so this seals the generation a GUI backend seals.
         r.fallback_paths = present_fallback_paths();
-        r.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
+        (r.symbol_fallback_paths, r.symbol_user_prefix) = symbol_fallback_candidate_paths(&[]);
         let sources = r.seal_admitted_font_sources();
         assert!(
             !sources.fallback.is_empty(),
@@ -27842,7 +28525,7 @@ mod tests {
                 face.path
             );
         }
-        if let Some(sym) = &r.symbol_fallback {
+        for sym in &r.symbol_chain {
             assert!(
                 !sym.font.is_materialised(),
                 "seal fontdue-parsed symbol entry {:?}",
@@ -28717,9 +29400,9 @@ mod tests {
     fn probing_symbol_coverage_does_not_fontdue_parse_the_symbol_face() {
         let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
             .expect("embedded font builds a renderer");
-        r.symbol_fallback_paths = symbol_fallback_candidate_paths(&[]);
+        (r.symbol_fallback_paths, r.symbol_user_prefix) = symbol_fallback_candidate_paths(&[]);
         r.debug_block_on_lazy_fallbacks();
-        let Some(before) = r.symbol_fallback.as_ref().map(|f| f.font.clone()) else {
+        let Some(before) = r.symbol_chain.first().map(|f| f.font.clone()) else {
             eprintln!("SKIP: no symbol fallback face on this machine");
             return;
         };
@@ -29952,8 +30635,9 @@ mod tests {
         }
         // Force every mono symbol face to be unavailable (simulate a minimal
         // system without STIX Two Math / Apple Symbols).
-        r.symbol_fallback = None;
+        r.symbol_chain.clear();
         r.symbol_fallback_paths = vec!["/nonexistent/no-symbol-font.ttf".to_string()];
+        r.symbol_user_prefix = 0;
         // Consume the fabricated (dead) symbol path + load the broad fallback
         // NOW: the lazy loads are async, and the test pins the settled routing.
         r.debug_block_on_lazy_fallbacks();
@@ -32418,8 +33102,14 @@ mod tests {
         );
         // And so does the public inline-image footprint path the SSH peer reaches.
         assert!(
-            decode_image_to_footprint(&bomb, aterm_core::grid::extra::ImageFormat::Png, 8, 8)
-                .is_none(),
+            decode_image_to_footprint(
+                &bomb,
+                aterm_core::grid::extra::ImageFormat::Png,
+                8,
+                8,
+                false
+            )
+            .is_none(),
             "oversized inline-image PNG must decode to nothing"
         );
     }
@@ -32447,8 +33137,14 @@ mod tests {
         assert_eq!(&rgba[0..4], &[200, 30, 30, 255], "first pixel is the fill");
 
         // And it flows through the footprint path to a non-empty 16×16 raster.
-        let fp = decode_image_to_footprint(&png, aterm_core::grid::extra::ImageFormat::Png, 16, 16)
-            .expect("small PNG resamples to its footprint");
+        let fp = decode_image_to_footprint(
+            &png,
+            aterm_core::grid::extra::ImageFormat::Png,
+            16,
+            16,
+            false,
+        )
+        .expect("small PNG resamples to its footprint");
         assert_eq!(fp.len(), 16 * 16 * 4);
     }
 
@@ -32481,8 +33177,9 @@ mod tests {
 
         let png = solid_rgba_png(8, 4, [12, 200, 99]);
         let (decoded, w, h) = decode_png_rgba8(&png).expect("8x4 PNG decodes");
-        let fp = decode_image_to_footprint(&png, aterm_core::grid::extra::ImageFormat::Png, w, h)
-            .expect("identity footprint decodes");
+        let fp =
+            decode_image_to_footprint(&png, aterm_core::grid::extra::ImageFormat::Png, w, h, false)
+                .expect("identity footprint decodes");
         assert_eq!(fp, decoded, "footprint at source size is the decode itself");
     }
 
@@ -32929,7 +33626,7 @@ mod tests {
         assert!(before.injected_bold.is_some());
         assert!(before.styled.iter().all(Option::is_some));
         assert_eq!(before.fallback.len(), 1);
-        assert!(before.symbol.is_some());
+        assert_eq!(before.symbol.len(), 1);
         assert!(before.emoji.is_some());
 
         std::fs::remove_dir_all(&dir).expect("remove every source pathname");

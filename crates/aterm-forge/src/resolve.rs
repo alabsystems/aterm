@@ -27,11 +27,38 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The five measurement cells, in report order.
+/// The eight measurement cells, in report order.
+///
+/// # THE SIX SHIPPED TRIPLES ARE ALL HERE, and until 2026-09-18 three were not
+///
+/// `atpkg::manifest::TARGETS` is the roster of triples this project publishes
+/// an `[[artifact]]` row for, and `atpkg`'s client reports one of those six for
+/// itself. Three of them — `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`
+/// and `aarch64-pc-windows-msvc` — were in NO cell, and `xtask gate cells` is
+/// the only lane in this repository that compiles aterm for a triple the box in
+/// front of you is not. So a break visible only on one of those three reached no
+/// gate on any box: the matrix said `GREEN — all 5 cells type-check` over a list
+/// that never mentioned them, which is the same silence that let `aterm-gui`,
+/// `atpkg` and `aterm-verify` ship un-compilable for Windows for four days
+/// (crates/xtask/src/gate.rs, `gate_cells_foreign`). `crates/atpkg/tests/
+/// shipped_triples_have_a_compile_cell.rs` is the standing law that keeps the
+/// two lists in step; it costs no compiler and fails by name.
+///
+/// The three that arrived late are the SECOND architecture of each shipped
+/// operating system, which is exactly where a cfg break hides: the first arch
+/// is compiled by somebody's daily build, and the second is compiled by this
+/// matrix or by nothing.
+///
+/// # ORDER IS APPEND-ONLY
+///
+/// `measured::CELLS` is zipped against this vector position by position and
+/// `loc.rs`'s tests index cells 0, 3 and 4 by number, so a cell inserted in the
+/// middle silently re-points both. New cells go on the END, and the report reads
+/// in the order cells joined the matrix rather than in OS order.
 ///
 /// # Every cell is rooted at something aterm actually SHIPS
 ///
-/// The three native cells are rooted at the binary package `aterm`, because on
+/// The six native cells are rooted at the binary package `aterm`, because on
 /// those targets the question is "what does the terminal ship" and the terminal
 /// is one binary.
 ///
@@ -106,6 +133,37 @@ pub fn default_cells() -> Vec<Cell> {
             name: "wasm-gpu".to_string(),
             triple: "wasm32-unknown-unknown".to_string(),
             package: "aterm-gpu-web".to_string(),
+        },
+        // THE SECOND ARCHITECTURE OF EACH SHIPPED OS, added 2026-09-18 so that
+        // the six triples the index can name are the six a compiler reads.
+        // Each is rooted at `aterm` like its sibling, and each is FOREIGN to
+        // every box in this fleet — no `FLEET_HOST_TRIPLES` entry — so all
+        // three join `xtask gate cells-foreign`, which `gate all` runs, and
+        // their verdicts do not depend on who is asking.
+        //
+        // The Intel-Mac slice of the universal release binary
+        // (`aterm-release`'s buildplan.rs builds it under `RUSTUP_TOOLCHAIN=
+        // stable`); the one triple of the six whose artifacts ship inside
+        // another cell's `.dmg` rather than on their own.
+        Cell {
+            name: "mac-x64".to_string(),
+            triple: "x86_64-apple-darwin".to_string(),
+            package: "aterm".to_string(),
+        },
+        // ARM Linux: the triple tools/linux-auto-atpkg.sh cross-packs beside
+        // x86_64 (`cross_linker_for`), and the one an aarch64 cell would serve.
+        Cell {
+            name: "linux-arm".to_string(),
+            triple: "aarch64-unknown-linux-gnu".to_string(),
+            package: "aterm".to_string(),
+        },
+        // ARM Windows: the triple apps/aterm-win/build.ps1 selects for itself
+        // when it detects an ARM64 host, and the one whose ABI cell
+        // crates/aterm-libc did not carry until 2026-09-16.
+        Cell {
+            name: "win-arm".to_string(),
+            triple: "aarch64-pc-windows-msvc".to_string(),
+            package: "aterm".to_string(),
         },
     ]
 }
@@ -503,25 +561,64 @@ mod tests {
     }
 
     #[test]
-    fn the_matrix_is_five_cells_in_report_order() {
+    fn the_matrix_is_eight_cells_in_report_order() {
         let cells = default_cells();
         assert_eq!(
             names(&cells),
-            ["mac-arm", "linux", "win", "wasm-cpu", "wasm-gpu"]
+            [
+                "mac-arm",
+                "linux",
+                "win",
+                "wasm-cpu",
+                "wasm-gpu",
+                "mac-x64",
+                "linux-arm",
+                "win-arm",
+            ]
         );
-        // THE ROOTS ARE THE POINT. The three native cells measure the one
+        // THE ROOTS ARE THE POINT. The six native cells measure the one
         // binary; the two wasm cells measure the two cdylib modules the
         // browser actually loads, because `aterm` is a `[[bin]]` that is never
         // compiled for wasm32 and a cell rooted there measured a configuration
         // nothing builds.
         assert_eq!(
             cells.iter().map(|c| c.package.as_str()).collect::<Vec<_>>(),
-            ["aterm", "aterm", "aterm", "aterm-wasm", "aterm-gpu-web"],
+            [
+                "aterm",
+                "aterm",
+                "aterm",
+                "aterm-wasm",
+                "aterm-gpu-web",
+                "aterm",
+                "aterm",
+                "aterm",
+            ],
             "a cell must be rooted at something aterm ships for that target"
         );
         assert_eq!(cells[0].triple, "aarch64-apple-darwin");
         assert_eq!(cells[3].triple, "wasm32-unknown-unknown");
         assert_eq!(cells[4].triple, "wasm32-unknown-unknown");
+        // EVERY TRIPLE atpkg PUBLISHES AN ARTIFACT ROW FOR IS A CELL. The
+        // authority is `atpkg::manifest::TARGETS`, which this crate does not
+        // depend on — the law with teeth is
+        // crates/atpkg/tests/shipped_triples_have_a_compile_cell.rs, which reads
+        // that constant and this function's source — and this is its local echo,
+        // so a cell deleted here fails in this crate too and not only two crates
+        // away.
+        let triples: Vec<&str> = cells.iter().map(|c| c.triple.as_str()).collect();
+        for shipped in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+        ] {
+            assert!(
+                triples.contains(&shipped),
+                "no cell compiles `{shipped}`, and atpkg publishes artifact rows for it"
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! PROCESS TREE: `aterm pkg …` is a child of the shell that typed it (`exec`'d shims keep
 //! the parent), so the parent's executable name is the shell — `zsh`, `bash`, `fish`,
 //! `pwsh` — read once, by pid, with no fork: `sysctl(KERN_PROCARGS2)` on macOS (the exec
-//! path leads the buffer), `/proc/<pid>/comm` on Linux. Only when the parent is not a
+//! path leads the buffer), `/proc/<pid>/exe` on Linux. Only when the parent is not a
 //! shell at all (`sudo`, `make`, a Python driver) does `$SHELL` answer, as before.
 
 /// The shell families this crate can name a remedy for, or hand a PATH line to:
@@ -91,9 +91,31 @@ fn parent_exe_name() -> Option<String> {
 ///
 /// macOS: `sysctl` `KERN_PROCARGS2` — the buffer leads with `argc` (one `c_int`) and
 /// then the executable's path, NUL-terminated, before the arguments; the kernel answers
-/// for a process of the caller's uid (or any, as root). Linux: `/proc/<pid>/comm`, the
-/// kernel's own name for the thread group (the executable's basename, ≤ 15 bytes), then
-/// `/proc/<pid>/exe`. Elsewhere, and on any refusal, `None`.
+/// for a process of the caller's uid (or any, as root). Linux: `/proc/<pid>/exe`, and
+/// only where that link cannot be read, `/proc/<pid>/comm`. Elsewhere, and on any
+/// refusal, `None`.
+///
+/// LINUX READS THE EXE LINK, NOT `comm` (2026-09-17). `comm` was the first source here
+/// and it is not this function's answer: it is a 15-byte kernel LABEL, not a name.
+/// Measured on x86_64 Linux — this crate's own test binary, `atpkg-5f7cdb9e74b7019f`,
+/// reads back from `comm` as `atpkg-5f7cdb9e7`, so the reader could not name ANY
+/// executable whose basename runs to 16 bytes; and a `python3` child that called
+/// `prctl(PR_SET_NAME, "bash")` reads back from `comm` as `bash` while its exe link
+/// still says `python3.14`, which is exactly the masquerade [`SHELLS`] is documented to
+/// refuse. The exe link is the file itself and no process can rewrite it.
+///
+/// Two consequences of the link, both measured the same day. It is resolved through
+/// every symlink, so a multi-call binary invoked by an applet name answers with the real
+/// file (`/bin/sh` → `dash` on a Debian-family host — hookless either way, so
+/// [`crate::cli::shell_remedy_for`] prints the same `PATH` line for both). And a file
+/// replaced under a running process keeps its link with " (deleted)" appended
+/// (`/…/sleep (deleted)` after an `rm`) — the routine state of every shell alive across
+/// a package upgrade — so that kernel annotation comes off the basename.
+///
+/// `comm` stays as the fallback because it is the only readable source when the link is
+/// not: `readlink /proc/1/exe` is `EACCES` for a non-root reader (measured), while
+/// `comm` is world-readable, and a name is better than nothing for a parent of another
+/// uid — which `known_shell` still has to admit before anything is claimed of it.
 #[must_use]
 pub(crate) fn process_exe_name(pid: u32) -> Option<String> {
     #[cfg(target_os = "macos")]
@@ -102,19 +124,37 @@ pub(crate) fn process_exe_name(pid: u32) -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
-        let comm = comm.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
-        comm.or_else(|| {
-            std::fs::read_link(format!("/proc/{pid}/exe"))
-                .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        })
+        linux_exe_link_name(pid).or_else(|| linux_comm_name(pid))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
     }
+}
+
+/// The basename of the file `/proc/<pid>/exe` points at, with procfs's " (deleted)"
+/// annotation removed. `None` when the link cannot be read (no such pid, or a process
+/// this one may not `ptrace`-read).
+///
+/// A file genuinely named `x (deleted)` and a deleted `x` read as the same ten trailing
+/// bytes here; procfs itself makes them so, and only one of the two ever runs a shell.
+#[cfg(target_os = "linux")]
+fn linux_exe_link_name(pid: u32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let name = link.file_name()?.to_string_lossy();
+    let name = name.strip_suffix(" (deleted)").unwrap_or(&name);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// `/proc/<pid>/comm`: the kernel's label for the thread group — the exec'd file's
+/// basename truncated to 15 bytes, unless the process has renamed itself. World-readable
+/// where the exe link is not, which is the only reason it is still read.
+#[cfg(target_os = "linux")]
+fn linux_comm_name(pid: u32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let comm = comm.trim();
+    (!comm.is_empty()).then(|| comm.to_string())
 }
 
 /// `sysctl` `kern.procargs2` for `pid`: the executable's path is the first NUL-terminated
@@ -214,14 +254,51 @@ mod tests {
         assert_eq!(invoking_shell_from(None, None), None);
     }
 
+    /// WAIT FOR THE EXEC, then measure. `Command::spawn` does NOT promise the child has
+    /// exec'd: Rust takes the `posix_spawn` path on macOS wherever it can, and that path
+    /// cannot report an exec failure back through a CLOEXEC pipe, so it returns as soon as
+    /// the kernel has the process. Both cases below then either ask for a name the child
+    /// does not carry yet, or — worse, in the outliving case — delete the file before the
+    /// exec reads it, so the child dies ENOENT and there is nothing left to name. Measured
+    /// 2026-09-17: `a_program_outliving_its_own_file_is_still_named` failed once in two
+    /// runs on a loaded 4-core Intel Mac, and inside the merge gate's own test stage.
+    ///
+    /// So poll until the pid answers the name it is supposed to carry, bounded, and say
+    /// what a timeout means: not the law under test, but a child that never got there.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn await_exec(pid: u32, want: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if process_exe_name(pid).as_deref() == Some(want) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} never came up as {want:?} within 30 s — the spawn or the exec \
+                 failed, which is not what this case is about"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// The pid reader names THIS test binary and a spawned `sleep` by executable, and
     /// answers `None` for a pid nobody has.
+    ///
+    /// Our own name is the fixture that catches Linux's `comm`: cargo suffixes a test
+    /// binary with `-<16 hex>`, which puts it past the 15-byte `TASK_COMM_LEN` cap that
+    /// truncated `atpkg-5f7cdb9e74b7019f` to `atpkg-5f7cdb9e7`. The length is asserted so
+    /// a shorter binary name could never quietly retire the case.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_pid_reader_names_a_process_by_its_executable() {
         let me = process_exe_name(std::process::id()).expect("our own name");
         let exe = std::env::current_exe().unwrap();
-        assert_eq!(me, exe.file_name().unwrap().to_string_lossy(), "{me}");
+        let own = exe.file_name().unwrap().to_string_lossy();
+        assert!(
+            own.len() > 15,
+            "the truncation this asserts away needs a name past 15 bytes, not {own:?}"
+        );
+        assert_eq!(me, own, "{me}");
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .stdin(std::process::Stdio::null())
@@ -229,11 +306,85 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("/bin/sleep");
+        await_exec(child.id(), "sleep");
         let name = process_exe_name(child.id());
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(name.as_deref(), Some("sleep"));
         assert_eq!(process_exe_name(u32::MAX), None);
+    }
+
+    /// A program whose file is deleted under it is still named: the state of every shell
+    /// running across a package upgrade, and the one where Linux's exe link reads
+    /// `/…/sleep (deleted)`. macOS keeps answering the exec path it recorded, so both
+    /// platforms are asserted the same way.
+    ///
+    /// THE FIXTURE IS THIS TEST BINARY, not a copy of a system one. A copy of `/bin/sleep`
+    /// is what this case used until 2026-09-17, and on macOS 13.7.8 that is not a program
+    /// this host will reliably run: `/bin/sleep` carries Apple's identifier
+    /// (`com.apple.sleep`) and a LAUNCH CONSTRAINT, so a copy of it elsewhere is refused by
+    /// AMFI — measured, `kernel (AppleMobileFileIntegrity) AMFI: Launch Constraint Violation
+    /// (enforcing)` with the copy never reaching exec — and when it did run, deleting it
+    /// left nothing to name, so the case failed 2 runs in 3 on this Mac and inside the merge
+    /// gate. A copy of the test binary carries no such constraint: it is the locally built,
+    /// ad-hoc-signed file this process is already running.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_program_outliving_its_own_file_is_still_named() {
+        if std::env::var_os(PROBE_ENV).is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("atpkg-exe-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The copy keeps a basename of OUR choosing, which is also what is asserted: the
+        // reader must answer the file's name, not the name of the binary it was copied from.
+        let exe = dir.join("outliver");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).expect("copy this test binary");
+        let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(&exe, perms).unwrap();
+        // Run it as the probe: it prints one line and waits to be killed, so there is a live
+        // process whose file can be deleted under it.
+        let mut child = std::process::Command::new(&exe)
+            .args(["--exact", "--nocapture", "--quiet", OUTLIVER_PROBE])
+            .env(PROBE_ENV, "1")
+            .env(OUTLIVER_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the copy of this test binary");
+        // The exec must have happened before the file goes, or the test measures a failed
+        // spawn instead of a program outliving its file (see `await_exec`).
+        await_exec(child.id(), "outliver");
+        std::fs::remove_file(&exe).expect("delete it under the running process");
+        let name = process_exe_name(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            name.as_deref(),
+            Some("outliver"),
+            "the reader must still name a process whose file was deleted under it"
+        );
+    }
+
+    /// The env that puts the copy above into its waiting mode, and the name of the case it
+    /// runs there: one test, so the copy does nothing but park until it is killed.
+    const OUTLIVER_ENV: &str = "ATPKG_CALLER_SHELL_OUTLIVER";
+    const OUTLIVER_PROBE: &str = "caller_shell::tests::probe_parks_until_killed";
+
+    /// The copy's whole job: exist, under its own name, until the parent kills it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn probe_parks_until_killed() {
+        if std::env::var_os(OUTLIVER_ENV).is_none() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(60));
     }
 
     /// End to end through a REAL shell: `sh -c` / `zsh -c` / `bash -c` / `fish -c` each

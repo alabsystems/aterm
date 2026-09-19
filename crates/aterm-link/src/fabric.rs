@@ -8,13 +8,18 @@
 //! aterm fabric [status] [--json]
 //! aterm fabric tail [--bodies] [--from <offset>]
 //! aterm fabric on [--dry-run] [--fleet <F>] [--service launchd|systemd|none]
+//!                 [--tcp <host:port> --key-file <path> [--allow-remote]]
 //! aterm fabric off [--dry-run] [--service launchd|systemd|none]
 //! aterm fabric doctor
+//! aterm fabric mint-for <node-id>|new [--out <cap>] [--fleet <F>]
+//! aterm fabric join --broker <host:port> --tcp --key-file <k> --cap-file <c> [...]
 //! aterm fabric help
 //! ```
 //!
 //! `on`, `off` and `doctor` are [`crate::enable`]: turning the fabric on in
 //! one command, proving it, and naming the fix for each warning below.
+//! `mint-for` and `join` are [`crate::join`]: a second host joins the fleet
+//! over the sealed transport (round 16).
 //!
 //! THE OWNER'S COMMAND, AND IT TAKES NO ARGUMENTS. Everything it needs is in the
 //! `[fabric] command` aterm launches its bridge from: the fleet, the broker, the
@@ -70,7 +75,21 @@
 //!   A HELD session's `timeline` is read for the hold's reason and origin, which
 //!   no other read verb reports; an unhandled task's or ask's age is the `t=` of
 //!   its record on the bus.
+//! * NODES — every node row on the presence roster, as the node published it
+//!   (`host=`, `state=`, `fabric=`), with its live-session count, `this` for
+//!   the node the command's state dir names, `local` for another instance on
+//!   this machine, and `remote` for one only the bus knows — the second host
+//!   of round 16. Before round 16 a remote node was a row of BRIDGES, a table
+//!   whose header says it is this machine's instances.
 //! * TRAFFIC — the last ten records under `/f/<F>/>`, metadata only.
+//!
+//! A GUARDED BROKER is read through the caps' own faces. A node's ring never
+//! grants `/f/<F>/>`, and the broker a second host dials is always guarded
+//! (`aterm link broker --tcp`), so on one the whole-fleet reads above are
+//! refused `unauthorized`. The head query then asks the first granted face
+//! (the head is global), and TRAFFIC, the deadline scan and the task ages read
+//! each granted face and merge by offset ([`BrokerView::faces`]) — the report
+//! reads what this node may read, and BROKER's `reads` line says so.
 //! * WARNINGS — every condition found above that makes `connected` a lie or
 //!   loses mail. A `stalled` bridge is one: its instance's mail queues and none
 //!   arrives until the link is back. Among them: a node the bus's OWN roster calls `state=gone`
@@ -95,7 +114,7 @@
 //! `0` healthy; `1` at least one WARNING was printed; `2` the fabric is off, its
 //! config cannot be read, or the command line is wrong.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
@@ -116,8 +135,13 @@ pub const USAGE: &str = "\
 usage: aterm fabric [status] [--json]
        aterm fabric tail [--bodies] [--from <offset>]
        aterm fabric on  [--dry-run] [--fleet <F>] [--service launchd|systemd|none]
+                        [--tcp <host:port> --key-file <path> [--allow-remote]]
        aterm fabric off [--dry-run] [--service launchd|systemd|none]
        aterm fabric doctor
+       aterm fabric mint-for <node-id>|new [--out <cap>] [--fleet <F>]
+       aterm fabric join --broker <host:port> --tcp --key-file <path> --cap-file <path>
+                         [--node <id>] [--accept-from <p>,...] [--dry-run]
+                         [--service launchd|systemd|none]
        aterm fabric help
 
 The fabric's state on one screen, and the one command that turns it on. `status`
@@ -126,13 +150,20 @@ takes no arguments: the fleet, broker, cap file and state dir are read from the
 as it does for aterm itself, and the rendezvous file `on` writes beside the
 instance control sockets (fabric.toml) is read when the file has no command.
 
-  status           the default. Six sections: CONFIG (where the command came from,
+  status           the default. Seven sections: CONFIG (where the command came from,
                    its fleet, node id and cap-file grants), BROKER (a real connect,
                    attach and head query, plus the broker's pid and launchd job),
+                   NODES (every node on the bus's presence roster: host=, state=,
+                   fabric= and its live sessions, `this` marking this one and
+                   `remote` a node only the bus knows — a joined second host),
                    BRIDGES (every aterm instance on this machine and its bridge),
                    SESSIONS (each session's phase, running program, hold and inbox
-                   numbers), TRAFFIC (the last 10 bus records) and WARNINGS (what
-                   makes `connected` a lie or loses mail)
+                   numbers, and its node once the fleet has two — a remote node's
+                   too, from its presence), TRAFFIC (the last 10 bus records) and
+                   WARNINGS (what makes `connected` a lie or loses mail). On a
+                   GUARDED broker whose grants do not cover /f/<F>/> (the sealed
+                   one always is) every read is made over the faces the cap files
+                   grant, and BROKER says which
   --json           status only: the same data as one JSON object
   tail             follow the bus live, one line per record, until Ctrl-C
   --from <offset>  tail only: replay from that bus offset first (default: new
@@ -150,20 +181,71 @@ instance control sockets (fabric.toml) is read when the file has no command.
                    from a session to itself and awaited back through the broker
                    within 5 s; `aterm fabric` status prints last. A second `on`
                    changes nothing and says so per step
-  --dry-run        on/off only: print every step and touch nothing
-  --fleet <F>      on only: the fleet name (default $ATERM_FABRIC_FLEET, else local)
-  --service <s>    on/off only: launchd | systemd | none — `none` means the broker
-                   is kept alive by something else (it must already answer)
-  --tcp <bind>, --key-file <path>
-                   REFUSED in this build: `aterm link broker` serves the Unix socket
-                   only; the sealed TCP listener is behind astream's `aead` feature,
-                   which the default build and the shipped binary do not carry
+  --dry-run        on/off/join only: print every step and touch nothing (join
+                   still PROBES the remote broker, and the first attach of a
+                   node's cap binds its producer id there: one hidden /a/bind
+                   record in the first host's log, which the real join writes)
+  --fleet <F>      on and mint-for only: the fleet name (on: default
+                   $ATERM_FABRIC_FLEET, else local; mint-for: this host's fleet)
+  --service <s>    on/off/join only: launchd | systemd | none — `none` means the
+                   broker is kept alive by something else (it must already answer),
+                   and for join that no supervisor is touched
+  --tcp <host:port>, --key-file <path>
+                   on: only in a `sealed` build (a default build refuses them
+                   naming the feature). For join, --tcp is a bare flag and both
+                   are required (see join). On: serve the broker on the SEALED TCP wire
+                   at <host:port> as well as the Unix socket — astream's
+                   XChaCha20-Poly1305 record layer under the pre-shared key in
+                   <path> (64 hex, 0600; minted there when the file is absent,
+                   never replaced when it is not) — and always GUARDED with this
+                   root's mint secret. The port is fixed (not 0) and is for the
+                   hosts that join: this host's own bridges keep dialing the
+                   socket, where no peer can hold the port's 64 handshake slots.
+                   The `wire` step proves the port (at the loopback twin of
+                   0.0.0.0/[::]), the rendezvous file records it as serves_tcp,
+                   and the label, the plist and every idempotence rule are `on`'s
+                   own
+  --allow-remote   on --tcp only: bind a non-loopback address. The key is ONE secret
+                   every host holds — a transport boundary, not a per-host identity
+                   — so a broker on the network is refused unless you say so
   off              stop and remove the broker job, remove the `[fabric]` table
                    (previous file kept as .bak) and the rendezvous file — and keep
                    the node id, secret and cap: identity is provisioned, never
                    discarded. The bus log stays; the line says where
   doctor           `status`'s WARNINGS, each with the fix for it, plus whether the
                    rendezvous file is there
+  mint-for <node>  on the FIRST host (a `sealed` build): mint that node's 8 grants
+                   (the node ring) on this host's fleet under this host's mint
+                   secret, which never leaves it and is never printed. <node> is
+                   the joining host's id (its <root>/link-state/node) or `new` for
+                   a fresh n-<16 hex>; a malformed id, THIS host's own id, and a
+                   host that JOINED another host's fleet (its node cap was not
+                   minted under its secret) are refused
+  --out <cap>      mint-for only: write the cap there, 0600, never over a different
+                   file and never through a symlink; an identical one already there
+                   is made 0600 (default: the 8 lines on stdout, the guidance on
+                   stderr). The last lines are the `join` to run on the other host
+  join             on the SECOND host (a `sealed` build): check the key (64 hex,
+                   0600) and the cap (0600, exactly one node's 8 grants — the node
+                   and the fleet are read from it; a DIFFERENT node id already here
+                   is refused), probe the remote broker with them BEFORE writing
+                   anything (the handshake, every grant attached, a read — and a
+                   node LIVE on the bus that this root never recorded, the same cap
+                   joined from another root, is refused), then
+                   record the node id, install both as <root>/fleet.key and
+                   <root>/node.cap (0600), stop this root's own local broker job if
+                   `on` installed one (not under --service none), write `[fabric]
+                   command` for the remote broker and the rendezvous file, arm every
+                   running instance and PROVE it: a note from a session to itself
+                   out through the REMOTE broker and back within 5 s. A second
+                   `join` changes nothing and says so
+  --broker <h:p>   join only: the first host's broker, as this host reaches it
+  --cap-file <c>   join only: this node's cap, from the first host's `mint-for`
+  --node <id>      join only: assert this host's node id (must be the cap's)
+  --accept-from <p>,...
+                   join only: principals whose task arrives as a task, not a note —
+                   the first host's node, for a manager there (this node is always
+                   listed)
 
 A message body never prints without `tail --bodies`; `status`, `tail` and `doctor`
 write nothing to disk. Exit status: 0 healthy, 1 a warning was printed (or the
@@ -220,6 +302,10 @@ pub enum Cmd {
     Off(crate::enable::OffOpts),
     /// `aterm fabric doctor` ([`crate::enable::doctor`]).
     Doctor,
+    /// `aterm fabric mint-for …` ([`crate::join::mint_for`]).
+    MintFor(crate::join::MintForOpts),
+    /// `aterm fabric join …` ([`crate::join::join`]).
+    Join(crate::join::JoinOpts),
 }
 
 /// Parse argv (everything after `fabric`). Every refusal names the word.
@@ -231,12 +317,14 @@ pub enum Cmd {
 pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
     let (verb, rest): (&str, &[String]) = match args.first().map(String::as_str) {
         None => ("status", &[]),
-        Some(v @ ("status" | "tail" | "on" | "off" | "doctor")) => (v, &args[1..]),
+        Some(v @ ("status" | "tail" | "on" | "off" | "doctor" | "mint-for" | "join")) => {
+            (v, &args[1..])
+        }
         Some("help" | "-h" | "--help") => return Ok(Cmd::Help),
         Some(flag) if flag.starts_with('-') => ("status", args),
         Some(other) => {
             return Err(format!(
-                "unknown subcommand `{}` (status, tail, on, off, doctor or help)",
+                "unknown subcommand `{}` (status, tail, on, off, doctor, mint-for, join or help)",
                 safe(other, 64)
             ));
         }
@@ -246,6 +334,8 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
     let mut from = None;
     let mut on = crate::enable::OnOpts::default();
     let mut off = crate::enable::OffOpts::default();
+    let mut mint = crate::join::MintForOpts::default();
+    let mut join = crate::join::JoinOpts::default();
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
         let mut value = || {
@@ -255,6 +345,41 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
         };
         match (verb, flag.as_str()) {
             (_, "-h" | "--help") => return Ok(Cmd::Help),
+            // `mint-for`: one positional, the node id (or `new`), and two flags.
+            ("mint-for", "--out") => mint.out = Some(value()?),
+            ("mint-for", "--fleet") => {
+                let f = value()?;
+                if !crate::subject::is_fleet(&f) {
+                    return Err(format!(
+                        "--fleet {} is not a subject segment ([a-z0-9-]{{1,32}})",
+                        safe(&f, 64)
+                    ));
+                }
+                mint.fleet = Some(f);
+            }
+            ("mint-for", word) if !word.starts_with('-') => {
+                if !mint.node.is_empty() {
+                    return Err(format!(
+                        "mint-for takes ONE node id; `{}` is a second",
+                        safe(word, 64)
+                    ));
+                }
+                mint.node = word.to_string();
+            }
+            // `join`: every flag names the files copied from the first host.
+            ("join", "--broker") => join.broker = Some(value()?),
+            ("join", "--tcp") => join.tcp = true,
+            ("join", "--key-file") => join.key_file = Some(value()?),
+            ("join", "--cap-file") => join.cap_file = Some(value()?),
+            ("join", "--node") => join.node = Some(value()?),
+            ("join", "--accept-from") => join.accept_from.extend(
+                value()?
+                    .split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string),
+            ),
+            ("join", "--dry-run") => join.dry_run = true,
+            ("join", "--service") => join.service = Some(crate::enable::Service::parse(&value()?)?),
             ("status", "--json") => json = true,
             ("tail", "--bodies") => bodies = true,
             ("tail", "--from") => {
@@ -281,6 +406,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
             }
             ("on", "--tcp") => on.tcp = Some(value()?),
             ("on", "--key-file") => on.key_file = Some(value()?),
+            ("on", "--allow-remote") => on.allow_remote = true,
             ("status", f @ ("--bodies" | "--from")) => {
                 return Err(format!("{f} is a `tail` flag (`aterm fabric tail {f}`)"));
             }
@@ -288,19 +414,50 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 return Err("--json is a `status` flag (`aterm fabric --json`)".to_string());
             }
             (_, f @ ("--dry-run" | "--service")) => {
-                return Err(format!("{f} is an `on`/`off` flag (`aterm fabric on {f}`)"));
+                return Err(format!(
+                    "{f} is an `on`/`off`/`join` flag (`aterm fabric on {f}`)"
+                ));
             }
-            (_, f @ ("--fleet" | "--tcp" | "--key-file")) => {
-                return Err(format!("{f} is an `on` flag (`aterm fabric on {f}`)"));
+            (_, f @ ("--tcp" | "--key-file")) => {
+                return Err(format!(
+                    "{f} is an `on` or `join` flag (`aterm fabric on --tcp <bind> --key-file <k>`)"
+                ));
+            }
+            (_, "--fleet") => {
+                return Err(
+                    "--fleet is an `on` or `mint-for` flag (`aterm fabric on --fleet <F>`)"
+                        .to_string(),
+                );
+            }
+            (_, "--allow-remote") => {
+                return Err("--allow-remote is an `on` flag, with --tcp".to_string());
+            }
+            (_, f @ ("--broker" | "--cap-file" | "--node" | "--accept-from")) => {
+                return Err(format!("{f} is a `join` flag (`aterm fabric join {f} …`)"));
+            }
+            (_, "--out") => {
+                return Err(
+                    "--out is a `mint-for` flag (`aterm fabric mint-for <node> --out <cap>`)"
+                        .to_string(),
+                );
             }
             (_, other) => return Err(format!("unknown flag {}", safe(other, 64))),
         }
+    }
+    if verb == "mint-for" && mint.node.is_empty() {
+        return Err(format!(
+            "mint-for needs a node id: the joining host's (its <root>/link-state/node), or `{}` \
+             for a fresh one",
+            crate::join::NEW_NODE
+        ));
     }
     Ok(match verb {
         "tail" => Cmd::Tail { bodies, from },
         "on" => Cmd::On(on),
         "off" => Cmd::Off(off),
         "doctor" => Cmd::Doctor,
+        "mint-for" => Cmd::MintFor(mint),
+        "join" => Cmd::Join(join),
         _ => Cmd::Status { json },
     })
 }
@@ -319,6 +476,8 @@ pub fn main(args: &[String]) -> ExitCode {
         Ok(Cmd::On(opts)) => crate::enable::on(&opts),
         Ok(Cmd::Off(opts)) => crate::enable::off(&opts),
         Ok(Cmd::Doctor) => crate::enable::doctor(),
+        Ok(Cmd::MintFor(opts)) => crate::join::mint_for(&opts),
+        Ok(Cmd::Join(opts)) => crate::join::join(&opts),
         Err(e) => {
             eprintln!("aterm fabric: {e}");
             eprint!("{USAGE}");
@@ -661,8 +820,36 @@ pub fn broker_pid(procs: &[Proc], sock: &str) -> Option<u32> {
     procs.iter().find_map(|p| {
         let words: Vec<&str> = p.cmd.split_whitespace().collect();
         (0..words.len())
-            .any(|i| is_link_verb(&words, i, "broker") && words.get(i + 1) == Some(&sock))
+            .any(|i| {
+                is_link_verb(&words, i, "broker")
+                    && (words.get(i + 1) == Some(&sock) || serves_socket(&words, i, sock))
+            })
             .then_some(p.pid)
+    })
+}
+
+/// [`broker_pid`]'s other spelling: the socket a `--tcp` broker serves
+/// beside its port, `--unix <sock>` (`on --tcp`).
+fn serves_socket(words: &[&str], at: usize, sock: &str) -> bool {
+    words[at + 1..]
+        .windows(2)
+        .any(|w| w[0] == "--unix" && w[1] == sock)
+}
+
+/// The process serving a TCP broker a client dials at `dial`: `link broker
+/// … --tcp <bind> …` whose bind IS `dial`, or an unspecified address
+/// (`0.0.0.0` / `[::]`) on the same port — the bind this host's clients reach
+/// on loopback ([`transport::dial_for_bind`]).
+#[must_use]
+pub fn broker_pid_tcp(procs: &[Proc], dial: &str) -> Option<u32> {
+    procs.iter().find_map(|p| {
+        let words: Vec<&str> = p.cmd.split_whitespace().collect();
+        let at = (0..words.len()).find(|&i| is_link_verb(&words, i, "broker"))?;
+        let bind = words[at + 1..]
+            .windows(2)
+            .find(|w| w[0] == "--tcp")
+            .map(|w| w[1])?;
+        (transport::dial_for_bind(bind) == dial).then_some(p.pid)
     })
 }
 
@@ -729,6 +916,17 @@ pub struct BrokerView {
     pub head: Option<u64>,
     /// How long connect + hello + attach + head took.
     pub rtt_ms: Option<u64>,
+    /// `None` when the report reads the whole fleet (`/f/<F>/>`); `Some(faces)`
+    /// when the broker is GUARDED and the cap files do not grant that — the
+    /// sealed cross-host broker (round 16) always is — so every read is made
+    /// over the faces the caps DO grant, and TRAFFIC says so.
+    pub faces: Option<Vec<String>>,
+    /// The sealed TCP endpoint this host's broker serves BESIDE the socket
+    /// probed above (`on --tcp`, from the rendezvous file's `serves_tcp`):
+    /// the one port a joining host dials. Not probed here — `on`'s `wire`
+    /// step proves it — so a report is never held up by that port's
+    /// handshake slots.
+    pub serves_tcp: Option<String>,
 }
 
 impl BrokerView {
@@ -772,9 +970,46 @@ fn connect_bounded(t: &Transport, endpoint: &str) -> io::Result<Conn> {
             ))
         }
         // The sealed wire is only in a `sealed` build, and its handshake is the
-        // transport's own; `transport::connect` refuses it by name otherwise.
-        Transport::Sealed(_) => transport::connect(t, endpoint).map(|(c, _)| c),
+        // transport's own (bounded there); `transport::connect` refuses it by
+        // name otherwise. The bound for every read after the handshake is set
+        // through the closer — the one handle on the socket under the record
+        // layer — so a broker that completes the handshake and then never
+        // answers costs the operator IO_TIMEOUT, not a hung terminal.
+        Transport::Sealed(_) => {
+            let (conn, closer) = transport::connect(t, endpoint)?;
+            closer.set_read_timeout(Some(IO_TIMEOUT))?;
+            Ok(conn)
+        }
     }
+}
+
+/// The faces a report may read when the broker is guarded and `/f/<F>/>` is
+/// not granted: every grant's filter under `/f/<F>/` in the cap files — both
+/// modes, because a guarded broker authorizes a read by ANY grant containing
+/// it — except the consumer-group names under `/f/<F>/cur/`, which are never
+/// published to. Sorted and deduplicated, so a report is reproducible.
+#[must_use]
+pub fn readable_faces(fleet: &str, cap_files: &[String]) -> Vec<String> {
+    let root = format!("/f/{fleet}/");
+    let groups = format!("/f/{fleet}/cur/");
+    let mut faces = BTreeSet::new();
+    for path in cap_files {
+        for cap in read_cap_file(path).unwrap_or_default() {
+            if let Ok(g) = astream_cap::Grant::parse(&cap.grant) {
+                if g.filter.starts_with(&root) && !g.filter.starts_with(&groups) {
+                    faces.insert(g.filter);
+                }
+            }
+        }
+    }
+    faces.into_iter().collect()
+}
+
+/// Whether a broker error is the GUARD refusing a read (as opposed to a
+/// broken connection or a dead broker) — the one error a narrower read can
+/// answer.
+fn refused(e: &io::Error) -> bool {
+    e.to_string().contains("unauthorized")
 }
 
 /// Reach the broker FOR REAL: connect, `Hello`, attach every cap, head query.
@@ -784,10 +1019,12 @@ pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<
         transport: cfg.transport.name(),
         ..BrokerView::default()
     };
-    if matches!(cfg.transport, Transport::Unix) {
-        view.pid = broker_pid(procs, &cfg.broker);
-        view.launchd = view.pid.and_then(launchd_label);
-    }
+    view.pid = if matches!(cfg.transport, Transport::Unix) {
+        broker_pid(procs, &cfg.broker)
+    } else {
+        broker_pid_tcp(procs, &cfg.broker)
+    };
+    view.launchd = view.pid.and_then(launchd_label);
     let started = Instant::now();
     let mut conn = match connect_bounded(&cfg.transport, &cfg.broker) {
         Ok(c) => c,
@@ -817,8 +1054,29 @@ pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<
         }
     }
     view.attached = true;
+    // THE HEAD IS GLOBAL, whichever filter asks: the whole fleet first, and on
+    // a GUARDED broker that refuses it — the sealed cross-host broker always
+    // is, and a node's ring never grants `/f/<F>/>` — the first face the caps
+    // do grant. A broker that refuses every one is still "the bus cannot be
+    // read", with the whole-fleet refusal as its reason.
     match conn.fetch(0, &fleet_root(&cfg.fleet), 0) {
         Ok((_, (_, head))) => view.head = Some(head),
+        Err(e) if refused(&e) => {
+            let faces = readable_faces(&cfg.fleet, &cfg.cap_files);
+            let head = faces
+                .iter()
+                .find_map(|f| conn.fetch(0, f, 0).ok().map(|(_, (_, h))| h));
+            match head {
+                Some(h) => {
+                    view.head = Some(h);
+                    view.faces = Some(faces);
+                }
+                None => {
+                    view.error = Some(format!("head query: {e}"));
+                    return (view, None);
+                }
+            }
+        }
         Err(e) => {
             view.error = Some(format!("head query: {e}"));
             return (view, None);
@@ -974,31 +1232,47 @@ pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Traffic {
 /// [`TRAFFIC_SCAN_MAX`] offsets back — whichever is first. Offsets are dense
 /// over the whole log, and records outside the fleet (and the broker's own
 /// commit records) take offsets too, which is why a window can come back short.
-fn last_records(conn: &mut Conn, fleet: &str, head: u64, n: usize) -> io::Result<Vec<Traffic>> {
-    let filter = fleet_root(fleet);
+///
+/// On a guarded broker ([`BrokerView::faces`]) the window is read per granted
+/// face and the pages merged by offset — a record two faces both match is
+/// one record.
+fn last_records(
+    conn: &mut Conn,
+    fleet: &str,
+    faces: Option<&[String]>,
+    head: u64,
+    n: usize,
+) -> io::Result<Vec<Traffic>> {
+    let filters: Vec<String> = faces.map_or_else(|| vec![fleet_root(fleet)], <[String]>::to_vec);
+    // ONE WINDOW FOR EVERY FACE, widened together: the merged answer is what
+    // has to hold `n` records, so a face that is quiet (a node's screen face,
+    // say) does not widen its own scan to the ceiling while the busy faces
+    // already filled the table — the cost stays one window's worth per face.
     let mut window: u64 = 256;
     loop {
         let start = head.saturating_sub(window);
-        let mut ring: VecDeque<Traffic> = VecDeque::with_capacity(n + 1);
-        let mut next = start;
-        loop {
-            let (page, (after, now_head)) = conn.fetch(next, &filter, 256)?;
-            for (off, subject, raw) in &page {
-                ring.push_back(traffic_of(fleet, *off, subject, raw));
-                if ring.len() > n {
-                    ring.pop_front();
+        let mut merged: BTreeMap<u64, Traffic> = BTreeMap::new();
+        for filter in &filters {
+            let mut next = start;
+            loop {
+                let (page, (after, now_head)) = conn.fetch(next, filter, 256)?;
+                for (off, subject, raw) in &page {
+                    merged.insert(*off, traffic_of(fleet, *off, subject, raw));
+                    if merged.len() > n {
+                        merged.pop_first();
+                    }
                 }
+                // `after` is the offset past the last record the broker SCANNED,
+                // so it advances across a page that matched nothing; no progress
+                // at all is the broker's end of the log.
+                if after <= next || after >= now_head {
+                    break;
+                }
+                next = after;
             }
-            // `after` is the offset past the last record the broker SCANNED, so it
-            // advances across a page that matched nothing; no progress at all is
-            // the broker's end of the log.
-            if after <= next || after >= now_head {
-                break;
-            }
-            next = after;
         }
-        if ring.len() >= n || start == 0 || window >= TRAFFIC_SCAN_MAX {
-            return Ok(ring.into_iter().collect());
+        if merged.len() >= n || start == 0 || window >= TRAFFIC_SCAN_MAX {
+            return Ok(merged.into_values().collect());
         }
         window = window.saturating_mul(16).min(TRAFFIC_SCAN_MAX);
     }
@@ -1047,21 +1321,50 @@ const OVERDUE_SCAN_SPAN: u64 = 1 << 16;
 /// the whole window's text. Each page is reduced to the few fields the rule
 /// needs ([`OverdueScan`]) and dropped, so the scan holds one page of bodies at
 /// a time and the rest as offsets and addresses.
-fn overdue_work(conn: &mut Conn, fleet: &str, head: u64, now_ms: u64) -> io::Result<Vec<Overdue>> {
-    let filter = format!("/f/{fleet}/in/>");
+///
+/// On a guarded broker the `in` faces the caps grant are scanned instead of
+/// `/f/<F>/in/>` — a node's own inbox lanes and its own posts, which are the
+/// asks a node can see — and a record two faces match is fed once.
+fn overdue_work(
+    conn: &mut Conn,
+    fleet: &str,
+    faces: Option<&[String]>,
+    head: u64,
+    now_ms: u64,
+) -> io::Result<Vec<Overdue>> {
+    let filters = in_filters(fleet, faces);
     let mut scan = OverdueScan::default();
-    let mut next = head.saturating_sub(OVERDUE_SCAN_SPAN);
-    loop {
-        let (page, (after, now_head)) = conn.fetch(next, &filter, 256)?;
-        for (off, subject, raw) in &page {
-            scan.feed(fleet, *off, subject, raw);
+    let mut fed: BTreeSet<u64> = BTreeSet::new();
+    for filter in &filters {
+        let mut next = head.saturating_sub(OVERDUE_SCAN_SPAN);
+        loop {
+            let (page, (after, now_head)) = conn.fetch(next, filter, 256)?;
+            for (off, subject, raw) in &page {
+                if fed.insert(*off) {
+                    scan.feed(fleet, *off, subject, raw);
+                }
+            }
+            if after <= next || after >= now_head {
+                break;
+            }
+            next = after;
         }
-        if after <= next || after >= now_head {
-            break;
-        }
-        next = after;
     }
     Ok(scan.finish(now_ms))
+}
+
+/// The filters the `in`-face reads use: `/f/<F>/in/>`, or on a guarded broker
+/// the granted faces under it.
+fn in_filters(fleet: &str, faces: Option<&[String]>) -> Vec<String> {
+    let all = format!("/f/{fleet}/in/");
+    match faces {
+        None => vec![format!("{all}>")],
+        Some(faces) => faces
+            .iter()
+            .filter(|f| f.starts_with(&all))
+            .cloned()
+            .collect(),
+    }
 }
 
 /// The overdue asks among `records` (each `(off, subject, raw)`), as of
@@ -1609,7 +1912,12 @@ pub fn gather() -> Result<Report, Off> {
         })
         .collect();
 
-    let (broker, conn) = probe_broker(&cfg, &procs);
+    let (mut broker, conn) = probe_broker(&cfg, &procs);
+    broker.serves_tcp = crate::enable::Rendezvous::read()
+        .ok()
+        .flatten()
+        .filter(|r| r.broker == cfg.broker)
+        .and_then(|r| r.serves_tcp);
     let mut report = Report {
         source,
         command,
@@ -1640,16 +1948,23 @@ pub fn gather() -> Result<Report, Off> {
             Ok(g) => roster = Some(g),
             Err(e) => bus_errors.push(format!("the presence roster could not be read: {e}")),
         }
-        match last_records(&mut conn, &report.cfg.fleet, head, TRAFFIC_ROWS) {
+        let faces = report.broker.faces.clone();
+        match last_records(
+            &mut conn,
+            &report.cfg.fleet,
+            faces.as_deref(),
+            head,
+            TRAFFIC_ROWS,
+        ) {
             Ok(t) => report.traffic = t,
             Err(e) => bus_errors.push(format!("the traffic could not be read: {e}")),
         }
         halts = fleet_halts(&mut conn, &report.cfg.fleet);
-        match overdue_work(&mut conn, &report.cfg.fleet, head, now_ms) {
+        match overdue_work(&mut conn, &report.cfg.fleet, faces.as_deref(), head, now_ms) {
             Ok(o) => report.overdue = o,
             Err(e) => bus_errors.push(format!("the deadlines could not be read: {e}")),
         }
-        let in_filter = format!("/f/{}/in/>", report.cfg.fleet);
+        let in_filters = in_filters(&report.cfg.fleet, faces.as_deref());
         for inst in &report.instances {
             for s in &inst.sessions {
                 for m in s
@@ -1657,7 +1972,10 @@ pub fn gather() -> Result<Report, Off> {
                     .iter()
                     .filter(|m| WORK_KINDS.contains(&m.kind.as_str()))
                 {
-                    if let Some(t) = record_t(&mut conn, &in_filter, m.off) {
+                    if let Some(t) = in_filters
+                        .iter()
+                        .find_map(|f| record_t(&mut conn, f, m.off))
+                    {
                         ages.insert((s.sid.clone(), m.off), t);
                     }
                 }
@@ -2223,6 +2541,89 @@ fn session_title(s: &SessionRow) -> &str {
         .unwrap_or("-")
 }
 
+/// Which node a NODES row is, from where this report stands: `this` — the
+/// node the command's state dir names; `local` — another instance on this
+/// machine answers as it (its own state dir); `remote` — only the bus knows it.
+#[must_use]
+pub fn node_where(r: &Report, node: &str) -> &'static str {
+    if r.node.as_deref() == Some(node) {
+        "this"
+    } else if r.instances.iter().any(|i| i.node.as_deref() == Some(node)) {
+        "local"
+    } else {
+        "remote"
+    }
+}
+
+/// How many LIVE sessions the roster advertises on `node`.
+#[must_use]
+pub fn live_sessions_on(r: &Report, node: &str) -> usize {
+    r.sessions
+        .iter()
+        .filter(|s| s.node == node && s.bus == "live")
+        .count()
+}
+
+/// The NODES section (round 16): every node on the bus's presence roster —
+/// its `host=`, `state=` and `fabric=` as the node itself published them, and
+/// how many live sessions it advertises — `this` node first. A second host
+/// joined over the sealed wire is a `remote` row here, and its sessions are in
+/// SESSIONS under its node. This node with no presence row on the bus is a row
+/// too, saying so: absence is the finding.
+fn render_nodes(r: &Report) -> String {
+    let mut out = String::from(
+        "\nNODES  every node on the fleet's presence roster · this = the node this command's \
+         state dir names\n",
+    );
+    let mut nodes: Vec<&NodeRow> = r.nodes.iter().collect();
+    nodes.sort_by_key(|n| (node_where(r, &n.node) != "this", n.node.clone()));
+    let mut rows: Vec<Vec<String>> = nodes
+        .iter()
+        .map(|n| {
+            vec![
+                safe(&n.node, 64),
+                node_where(r, &n.node).to_string(),
+                format!(
+                    "host={} state={} fabric={}",
+                    safe(&n.host, 64),
+                    safe(&n.state, 16),
+                    safe(&n.fabric, 16)
+                ),
+                live_sessions_on(r, &n.node).to_string(),
+            ]
+        })
+        .collect();
+    if let Some(me) = r.node.as_deref() {
+        if r.broker.head.is_some() && !r.nodes.iter().any(|n| n.node == me) {
+            rows.insert(
+                0,
+                vec![
+                    safe(me, 64),
+                    "this".to_string(),
+                    "- (no presence row on the bus: no bridge of this node has attached)"
+                        .to_string(),
+                    "0".to_string(),
+                ],
+            );
+        }
+    }
+    if rows.is_empty() {
+        out.push_str(if r.broker.head.is_some() {
+            "  (the roster lists no node on this fleet)\n"
+        } else {
+            "  (the bus could not be read)\n"
+        });
+    } else {
+        table(
+            &mut out,
+            &["NODE", "WHICH", "ON THE BUS", "SESSIONS"],
+            &rows,
+            &[false, false, false, true],
+        );
+    }
+    out
+}
+
 /// Render the report as the text a human reads.
 #[must_use]
 pub fn render_text(r: &Report) -> String {
@@ -2310,6 +2711,16 @@ pub fn render_text(r: &Report) -> String {
             }
         ),
     )];
+    if let Some(tcp) = &b.serves_tcp {
+        kvs.push((
+            "serves",
+            format!(
+                "{} (tcp+sealed) too — the one port a joining host dials; this host's own \
+                 bridges use the socket above",
+                safe(tcp, 128)
+            ),
+        ));
+    }
     kvs.push((
         "reachable",
         if b.read_ok() {
@@ -2338,10 +2749,22 @@ pub fn render_text(r: &Report) -> String {
         "bus head",
         b.head.map_or_else(|| "-".to_string(), |h| format!("@{h}")),
     ));
+    if let Some(faces) = &b.faces {
+        kvs.push((
+            "reads",
+            format!(
+                "the faces the cap files grant — the broker is GUARDED and they do not grant \
+                 /f/{}/>: {}",
+                safe(&r.cfg.fleet, 64),
+                safe(&faces.join(" "), 512)
+            ),
+        ));
+    }
     push_kvs(&mut out, &kvs);
 
+    out.push_str(&render_nodes(r));
+
     out.push_str("\nBRIDGES  one row per aterm instance on this machine\n");
-    let local_nodes: BTreeSet<String> = r.instances.iter().filter_map(|i| i.node.clone()).collect();
     let node_row = |n: &str| r.nodes.iter().find(|row| row.node == n);
     let mut rows: Vec<Vec<String>> = Vec::new();
     for i in &r.instances {
@@ -2381,24 +2804,8 @@ pub fn render_text(r: &Report) -> String {
             bus,
         ]);
     }
-    for n in r.nodes.iter().filter(|n| !local_nodes.contains(&n.node)) {
-        if r.node.as_deref() == Some(n.node.as_str()) {
-            continue;
-        }
-        rows.push(vec![
-            "remote".to_string(),
-            "-".to_string(),
-            "-".to_string(),
-            "-".to_string(),
-            safe(&n.node, 64),
-            format!(
-                "state={} fabric={} host={}",
-                safe(&n.state, 16),
-                safe(&n.fabric, 16),
-                safe(&n.host, 64)
-            ),
-        ]);
-    }
+    // Another node's row is in NODES, above: this table is this machine's
+    // instances, one row each, as its header says.
     if rows.is_empty() {
         out.push_str("  (no aterm instance on this machine publishes a control socket)\n");
     } else {
@@ -2421,13 +2828,15 @@ pub fn render_text(r: &Report) -> String {
         "\nSESSIONS  unread = listed, not handled · pending = delivered, never listed · \
          posts = queued outbound\n",
     );
-    let many_nodes = r
-        .sessions
-        .iter()
-        .map(|s| &s.node)
-        .collect::<BTreeSet<_>>()
-        .len()
-        > 1;
+    // THE NODE COLUMN whenever the fleet has more than one node — on the bus
+    // or among these rows — so every node's sessions say whose they are.
+    let many_nodes = r.nodes.len() > 1
+        || r.sessions
+            .iter()
+            .map(|s| &s.node)
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 1;
     // A row no instance here hosts is REMOTE when another node advertises it,
     // and `-` when this machine's own node does (a WARNING says why).
     let here: BTreeSet<&str> = r
@@ -2507,11 +2916,15 @@ pub fn render_text(r: &Report) -> String {
     }
 
     out.push_str(&format!(
-        "\nTRAFFIC  the last {} record{} under /f/{}/> — metadata only; `aterm fabric tail \
+        "\nTRAFFIC  the last {} record{} {} — metadata only; `aterm fabric tail \
          --bodies` shows text\n",
         r.traffic.len(),
         if r.traffic.len() == 1 { "" } else { "s" },
-        safe(&r.cfg.fleet, 64)
+        if r.broker.faces.is_some() {
+            "on the faces this node's cap reads (BROKER `reads`)".to_string()
+        } else {
+            format!("under /f/{}/>", safe(&r.cfg.fleet, 64))
+        }
     ));
     if r.traffic.is_empty() {
         out.push_str(if r.broker.head.is_some() {
@@ -2721,6 +3134,9 @@ pub fn render_json(r: &Report) -> String {
                 ("host", J::s(&n.host)),
                 ("state", J::s(&n.state)),
                 ("fabric", J::s(&n.fabric)),
+                ("this", J::Bool(r.node.as_deref() == Some(n.node.as_str()))),
+                ("where", J::s(node_where(r, &n.node))),
+                ("sessions", J::Num(live_sessions_on(r, &n.node) as u64)),
             ])
         })
         .collect();
@@ -2786,6 +3202,13 @@ pub fn render_json(r: &Report) -> String {
                 ("launchd", J::opt_s(b.launchd.as_deref())),
                 ("head", J::opt_n(b.head)),
                 ("rtt_ms", J::opt_n(b.rtt_ms)),
+                ("serves_tcp", J::opt_s(b.serves_tcp.as_deref())),
+                (
+                    "faces",
+                    b.faces
+                        .as_ref()
+                        .map_or(J::Null, |f| J::Arr(f.iter().map(|x| J::s(x)).collect())),
+                ),
             ]),
         ),
         ("bridges", J::Arr(bridges)),
@@ -2953,8 +3376,26 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>) -> io::Result<()> {
             conn.attach(&cap.grant, &cap.tag)?;
         }
     }
-    let filter = fleet_root(&cfg.fleet);
-    let (_, (_, head)) = conn.fetch(0, &filter, 0)?;
+    let whole = fleet_root(&cfg.fleet);
+    // A GUARDED broker whose grants do not cover the whole fleet (the sealed
+    // cross-host one, under a node's ring) refuses `/f/<F>/>`: the tail then
+    // follows every face the caps DO grant, one subscription each, in arrival
+    // order (see `tail_faces`).
+    let (faces, head) = match conn.fetch(0, &whole, 0) {
+        Ok((_, (_, head))) => (None, head),
+        Err(e) if refused(&e) => {
+            let faces = readable_faces(&cfg.fleet, &cfg.cap_files);
+            let head = faces
+                .iter()
+                .find_map(|f| conn.fetch(0, f, 0).ok().map(|(_, (_, h))| h))
+                .ok_or(e)?;
+            (Some(faces), head)
+        }
+        Err(e) => return Err(e),
+    };
+    let filter = faces
+        .as_ref()
+        .map_or_else(|| whole.clone(), |f| f.join(" "));
     let start = from.unwrap_or(head);
     let offset = local_offset();
     eprintln!(
@@ -2988,6 +3429,10 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>) -> io::Result<()> {
     {
         return Ok(());
     }
+    if let Some(faces) = faces {
+        drop(conn);
+        return tail_faces(cfg, &faces, start, bodies, offset.unwrap_or(0), &mut out);
+    }
     let mut sub = conn.subscribe(start, &filter)?;
     while let Some((off, subject, raw)) = sub.recv()? {
         let t = traffic_of(&cfg.fleet, off, &subject, &raw);
@@ -2998,6 +3443,75 @@ fn tail(cfg: &Config, bodies: bool, from: Option<u64>) -> io::Result<()> {
     }
     Err(io::Error::other(format!(
         "the broker at {broker} closed the stream"
+    )))
+}
+
+/// `tail` over SEVERAL granted faces — one connection and one subscription
+/// each, every record forwarded to this thread and printed as it arrives. A
+/// record two faces both match (a node's post to one of its own sessions is
+/// on its write lane and its read lane) is printed once: the offsets printed
+/// are remembered, and forgotten below the lowest one still in flight so the
+/// memory is bounded by how far the faces are apart, not by the log.
+fn tail_faces(
+    cfg: &Config,
+    faces: &[String],
+    start: u64,
+    bodies: bool,
+    offset: i64,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    use std::sync::mpsc;
+    let broker = safe(&cfg.broker, 256);
+    let (tx, rx) = mpsc::channel::<io::Result<(u64, String, Vec<u8>)>>();
+    for face in faces {
+        let (mut conn, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
+        for path in &cfg.cap_files {
+            for cap in read_cap_file(path)? {
+                conn.attach(&cap.grant, &cap.tag)?;
+            }
+        }
+        let mut sub = conn.subscribe(start, face)?;
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            match sub.recv() {
+                Ok(Some(rec)) => {
+                    if tx.send(Ok(rec)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx.send(Err(io::Error::other("closed")));
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let mut printed: BTreeSet<u64> = BTreeSet::new();
+    while let Ok(next) = rx.recv() {
+        let Ok((off, subject, raw)) = next else {
+            break;
+        };
+        if !printed.insert(off) {
+            continue;
+        }
+        // BOUNDED: keep the newest 4096 offsets, which is far more than two
+        // faces of one log can be apart.
+        while printed.len() > 4096 {
+            printed.pop_first();
+        }
+        let t = traffic_of(&cfg.fleet, off, &subject, &raw);
+        let line = tail_line(&t, crate::now_ms(), offset, bodies);
+        if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+            return Ok(());
+        }
+    }
+    Err(io::Error::other(format!(
+        "the broker at {broker} closed a face's stream"
     )))
 }
 
@@ -3064,16 +3578,51 @@ mod tests {
                 fleet: Some("lab".to_string()),
                 tcp: None,
                 key_file: None,
+                allow_remote: false,
             }))
         );
         assert_eq!(
-            parse_args(&argv("on --tcp 127.0.0.1:7000 --key-file /k")),
+            parse_args(&argv("on --tcp 0.0.0.0:7000 --key-file /k --allow-remote")),
             Ok(Cmd::On(OnOpts {
-                tcp: Some("127.0.0.1:7000".to_string()),
+                tcp: Some("0.0.0.0:7000".to_string()),
                 key_file: Some("/k".to_string()),
+                allow_remote: true,
                 ..OnOpts::default()
             })),
-            "parsed here, refused by `on` itself with the reason"
+            "parsed here; `on` itself refuses them in a default build, naming the feature"
+        );
+        // ROUND 16: `mint-for` and `join`, each with its own flags only.
+        use crate::join::{JoinOpts, MintForOpts};
+        assert_eq!(
+            parse_args(&argv("mint-for n-m7 --out /tmp/m7.cap")),
+            Ok(Cmd::MintFor(MintForOpts {
+                node: "n-m7".to_string(),
+                out: Some("/tmp/m7.cap".to_string()),
+                fleet: None,
+            }))
+        );
+        assert_eq!(
+            parse_args(&argv("mint-for new")),
+            Ok(Cmd::MintFor(MintForOpts {
+                node: "new".to_string(),
+                ..MintForOpts::default()
+            }))
+        );
+        assert_eq!(
+            parse_args(&argv(
+                "join --broker h1:7000 --tcp --key-file /k --cap-file /c --node n-m7 \
+                 --accept-from n-h1,h-andrew --dry-run --service none"
+            )),
+            Ok(Cmd::Join(JoinOpts {
+                broker: Some("h1:7000".to_string()),
+                tcp: true,
+                key_file: Some("/k".to_string()),
+                cap_file: Some("/c".to_string()),
+                node: Some("n-m7".to_string()),
+                accept_from: vec!["n-h1".to_string(), "h-andrew".to_string()],
+                dry_run: true,
+                service: Some(Service::None),
+            }))
         );
         assert_eq!(
             parse_args(&argv("off --dry-run --service launchd")),
@@ -3098,6 +3647,14 @@ mod tests {
             "on --json",
             "off --fleet lab",
             "doctor --dry-run",
+            "mint-for",
+            "mint-for n-a n-b",
+            "mint-for n-a --broker x:1",
+            "join --out /c",
+            "on --broker x:1",
+            "on --cap-file /c",
+            "off --allow-remote",
+            "status --accept-from n-a",
         ] {
             assert!(parse_args(&argv(bad)).is_err(), "{bad} must be refused");
         }
@@ -3554,6 +4111,152 @@ mod tests {
 
     fn warned(r: &Report) -> Vec<String> {
         warnings(r, &BTreeMap::new(), &[])
+    }
+
+    /// **ROUND 16: NODES LISTS EVERY NODE AND SAYS WHICH ONE THIS IS.** A
+    /// second host joined over the sealed wire is a `remote` row with its own
+    /// `host=`, `state=` and `fabric=` and its live-session count; this node
+    /// is `this` and first; another instance of this machine is `local`; and
+    /// this node with NO row on the bus is a row saying so. BRIDGES keeps to
+    /// this machine's instances — the remote node is not a row there any more
+    /// — and SESSIONS names every row's node.
+    #[test]
+    fn nodes_lists_every_node_and_marks_this_one() {
+        let mut r = healthy();
+        let body = b"v=1 t=1 inc=1 state=live hold=0 holder=- attention=-";
+        let roster = crate::glance::Glance {
+            fleet: "lab".to_string(),
+            rows: vec![
+                crate::glance::Row::parse(
+                    "lab",
+                    1,
+                    "/f/lab/pub/n-z/node/presence",
+                    b"v=1 t=1 inc=1 state=live fabric=connected host=m7",
+                )
+                .expect("row"),
+                crate::glance::Row::parse(
+                    "lab",
+                    2,
+                    "/f/lab/pub/n-a/node/presence",
+                    b"v=1 t=1 inc=1 state=live fabric=connected host=m100",
+                )
+                .expect("row"),
+                crate::glance::Row::parse("lab", 3, "/f/lab/pub/n-z/s-far/presence", body)
+                    .expect("row"),
+                crate::glance::Row::parse("lab", 4, "/f/lab/pub/n-a/s-one/presence", body)
+                    .expect("row"),
+            ],
+            truncated: false,
+        };
+        join_sessions(&mut r, Some(&roster));
+        let text = render_text(&r);
+        let nodes = text
+            .split("\nNODES")
+            .nth(1)
+            .and_then(|t| t.split("\nBRIDGES").next())
+            .expect("a NODES section between BROKER and BRIDGES");
+        let rows: Vec<&str> = nodes.lines().skip(2).collect();
+        assert!(
+            rows[0].trim_start().starts_with("n-a")
+                && rows[0].contains("  this  ")
+                && rows[0].contains("host=m100 state=live fabric=connected"),
+            "this node first:\n{nodes}"
+        );
+        assert!(
+            rows[1].trim_start().starts_with("n-z")
+                && rows[1].contains("  remote  ")
+                && rows[1].contains("host=m7")
+                && rows[1].trim_end().ends_with('1'),
+            "the remote node, its host and its one live session:\n{nodes}"
+        );
+        let bridges = text
+            .split("\nBRIDGES")
+            .nth(1)
+            .and_then(|t| t.split("\nSESSIONS").next())
+            .expect("BRIDGES");
+        assert!(
+            !bridges.contains("n-z"),
+            "BRIDGES is this machine's instances:\n{bridges}"
+        );
+        let far = text
+            .lines()
+            .find(|l| l.contains("s-far"))
+            .expect("the remote session");
+        assert!(far.contains("n-z") && far.contains("remote"), "{far}");
+        // And the JSON says the same.
+        let json = render_json(&r);
+        assert!(
+            json.contains("\"this\":true") && json.contains("\"where\":\"remote\""),
+            "{json}"
+        );
+        // THIS NODE WITH NO PRESENCE ROW is a row, saying so.
+        let mut lonely = healthy();
+        lonely.nodes = vec![NodeRow {
+            node: "n-z".to_string(),
+            host: "m7".to_string(),
+            state: "live".to_string(),
+            fabric: "connected".to_string(),
+        }];
+        let text = render_text(&lonely);
+        assert!(
+            text.contains("no presence row on the bus"),
+            "an absent presence row is the finding:\n{text}"
+        );
+        // Another instance of THIS machine answering as another node is `local`.
+        assert_eq!(node_where(&lonely, "n-a"), "this");
+        lonely.instances[0].node = Some("n-z".to_string());
+        assert_eq!(node_where(&lonely, "n-z"), "local");
+        assert_eq!(node_where(&lonely, "n-q"), "remote");
+    }
+
+    /// A GUARDED BROKER IS READ THROUGH THE CAP'S OWN FACES: every grant under
+    /// the fleet, both modes, minus the consumer-group names — sorted, once.
+    #[test]
+    fn the_readable_faces_are_the_caps_filters_under_the_fleet() {
+        let dir = std::env::temp_dir().join(format!("atfab-faces-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let cap = dir.join("node.cap");
+        let lines: String = crate::enable::node_grants("lab", "n-a")
+            .iter()
+            .chain(std::iter::once(&"ro:/f/other/pub/>".to_string()))
+            .map(|g| format!("{g} 00\n"))
+            .collect();
+        std::fs::write(&cap, lines).expect("cap");
+        let faces = readable_faces("lab", &[cap.to_string_lossy().into_owned()]);
+        assert_eq!(
+            faces,
+            [
+                "/f/lab/fleet/>",
+                "/f/lab/in/*/*/n-a/*",
+                "/f/lab/in/n-a/>",
+                "/f/lab/pub/>",
+                "/f/lab/pub/n-a/>",
+                "/f/lab/term/n-a/*/screen",
+                "/f/lab/term/n-a/>",
+            ],
+            "no cur/ group names and no other fleet's face"
+        );
+        assert_eq!(
+            in_filters("lab", Some(&faces)),
+            ["/f/lab/in/*/*/n-a/*", "/f/lab/in/n-a/>"]
+        );
+        assert_eq!(in_filters("lab", None), ["/f/lab/in/>"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE TCP BROKER'S PID is found by the port a client dials — its own
+    /// bind, or the unspecified bind a loopback dial reaches.
+    #[test]
+    fn a_tcp_broker_is_found_by_the_address_its_clients_dial() {
+        let procs = parse_ps(
+            "  10 1 /x/aterm link broker --tcp 0.0.0.0:7000 --key-file /k --secret-file /s /l\n\
+             \x20 11 1 /x/aterm-link broker --tcp 127.0.0.1:7001 --key-file /k --secret-file /s /l\n\
+             \x20 12 1 /x/aterm link broker /r/bus.sock /r/bus.log\n",
+        );
+        assert_eq!(broker_pid_tcp(&procs, "127.0.0.1:7000"), Some(10));
+        assert_eq!(broker_pid_tcp(&procs, "127.0.0.1:7001"), Some(11));
+        assert_eq!(broker_pid_tcp(&procs, "127.0.0.1:7002"), None);
+        assert_eq!(broker_pid(&procs, "/r/bus.sock"), Some(12));
     }
 
     /// **A BROKER THAT ANSWERS AND REFUSES THE READ IS NOT `reachable yes`.**

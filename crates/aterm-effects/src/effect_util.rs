@@ -603,6 +603,12 @@ pub(crate) const TWINKLE_FLASH_HZ: f32 = TWINKLE_OMEGA / std::f32::consts::PI;
 /// WCAG 2.3.1's general-flash threshold, in Hz. Three flashes in any one second
 /// is the failing condition, so 3.2 is the bound this crate certifies against
 /// with the margin the guideline's own examples use.
+///
+/// Its second tenant is the kitty-command TRICK FLASH (`trick_flash.rs`), whose
+/// declared luminance-reversal rate is const-asserted under this same bound;
+/// the measured twin of the twinkle test below lives WITH that emitter
+/// (`the_flash_stays_under_the_photosensitivity_bound`), because it samples the
+/// flash's private colour law.
 pub(crate) const TWINKLE_FLASH_BOUND_HZ: f32 = 3.2;
 
 /// A PHOTOSENSITIVITY BOUND IS NOT A TEST CASE. Both terms are constants, so

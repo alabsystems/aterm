@@ -84,12 +84,76 @@
 //! `exec`s `bin/<program>`, which carries no prelude. Every line it prints goes to
 //! stderr and starts with `atpkg: ` — stdout is the tool's.
 //!
-//! **Windows has no landing wait (residual, documented 2026-09-16).** The `agents/` twin
-//! there is the plain `.cmd` shim ([`crate::platform::windows::twin_executable_to_env`]
-//! takes the prelude and lays none — `cmd.exe` has no `[ -f ]`/`exec` prelude to carry),
-//! so a `claude` typed during a pass runs the current build at once with no line; the
-//! per-invocation live update itself (the re-laid `bin/` and twin) holds there as
-//! everywhere. Closing it means a `.cmd` prelude of its own.
+//! **Windows carries the same wait (2026-09-17; residual R4 of 2026-09-16, closed).** The
+//! `.cmd` twin is the `.cmd` shim behind a `goto`-shaped prelude
+//! ([`crate::platform::cmd_landing_prelude`]): `@if not exist "<marker>" goto store`, the
+//! same for the embedded co-located `atpkg.exe`, then the hand-over `@"<atpkg>" __landing
+//! "<program>" "<prefix>" -- %* & @exit /b` — the `atpkg` run directly, after that ONE
+//! stat, and the batch ended on the SAME parsed line — and the label leading the twin's
+//! own exports and its forward `@"<target>" %* & @exit /b`, ended the same way
+//! ([`crate::platform::CMD_FORWARD_TAIL`]). **Why the exit shares the line** (review,
+//! 2026-09-17): `cmd.exe` executes a batch file by re-reading it at a remembered BYTE
+//! OFFSET after every line, and the twin is re-laid while it may be executing —
+//! `reconcile_agents` re-lays a twin whose bytes changed, activation re-lays `bin/` and
+//! the twin while a landing marker stands, the very moment a `claude` is inside the
+//! hand-over. The first cut's `@exit /b %errorlevel%` on a line of its own was reached
+//! by offset: a re-lay from an `atpkg` whose path is a different length moved that
+//! offset into the middle of some other line of the new file — a fragment run as a
+//! command, then `:store`, then the agent a SECOND time. A line is parsed whole before
+//! any of it runs and nothing is read after `exit /b`, so the steady state — a twin of
+//! this shape re-laid while it runs, in the hand-over or in the forward — is closed; a
+//! bare `exit /b` returns with the ERRORLEVEL the program left (what `cmd /c` exits
+//! with), where `exit /b %errorlevel%` on that line would be expanded when the line is
+//! parsed, before the program ran. **What the same-line exit could not close, the frame
+//! does (2026-09-18)**: a twin from BEFORE 2026-09-17 — `@"<target>" %*` alone on its
+//! last line, which every Windows twin was until then — that is executing at the moment
+//! of its ONE re-lay resumes, when its agent exits, at the OLD file's end-of-file offset
+//! inside the NEW file; laid bare behind the prelude, that offset landed in the prelude,
+//! and with the marker gone, `goto store` ran the agent a second time with the same
+//! arguments. Every `.cmd` atpkg writes — the twin, every `bin\` shim, alias and
+//! tombstone, and the pending stub ([`crate::stub`]) — now starts with the frame
+//! ([`crate::platform::CMD_FRAME_HEAD`]): `@goto :main`, 4080 bytes of colon-only label
+//! lines, `@exit /b`, `:main`, and only then the prelude and the body — so that resume,
+//! at any offset a legacy file can end at (the bound derived from the old writer's own
+//! caps, [`crate::platform::CMD_LEGACY_FILE_BOUND_BYTES`]), reads a label, an empty line
+//! or the bare `@exit /b`: nothing printed, the agent's own ERRORLEVEL returned. Closed
+//! by construction — the rendered text and a simulation of the resume at every offset of
+//! three legacy files are pinned by `platform`'s tests — and unverified on a Windows host
+//! like the rest. (The gaps between two consecutive line reads of the prelude carry the
+//! same offset hazard, microseconds wide, as every batch file rewritten in place does.)
+//! No parenthesised
+//! block (a `)` in a quoted path closes one early), no `call` (it would expand a `%` in
+//! the user's arguments twice), no `where atpkg` (the Unix rule); the target parser keys
+//! on the forward line's exact tail — and on the ` %*`-only tail of a shim from before,
+//! until it is re-laid — so the hand-over line (`" __landing` after its quote) is walked
+//! past: the first cut guarded it with a second `if exist` instead, and an `atpkg.exe`
+//! replaced between the two stats exited 0 with nothing run (review, 2026-09-17). Every
+//! embedded path has its `\\?\` verbatim prefix (what `canonicalize` answers on
+//! Windows) taken off ([`crate::platform::strip_verbatim_prefix`]) — `cmd` does not
+//! reliably accept that spelling — and its trailing separators trimmed: a prefix
+//! configured as `…\pkg\` rendered `"…\pkg\" -- %*`, and `\"` is an escaped quote to
+//! the exe's argv parser, so the prefix operand fused with the user's arguments and the
+//! tool never ran (review, 2026-09-17). [`crate::platform::windows::twin_executable_to_env`]
+//! lays it, `reconcile_agents` re-lays a twin from before it. The verb's Windows half
+//! runs the current `bin/<program>.cmd` as a child with inherited stdio and exits with
+//! the child's REAL code ([`crate::platform::exec_or_run`]; it answered 0 or 1 before).
+//! **Ctrl-C on Windows** (review, 2026-09-17): the wait installs a console control
+//! handler (`cli::landing_ctrl`) — the Windows twin of the `SIGINT` handler — so Ctrl-C
+//! ends the wait and runs the current build as the line promises, where the default
+//! handler used to end `atpkg.exe` outright; and the hand-over installs one that
+//! swallows Ctrl-C in the wrapper for the child's lifetime, so the first Ctrl-C typed
+//! inside the agent ("stop this turn") no longer kills the wrapper and loses the exit
+//! code (the shape rustup's proxies use). `cmd.exe`'s own `Terminate batch job (Y/N)?`
+//! after a Ctrl-C is its prompt for every `.cmd` shim, in any shell, since before this —
+//! and on the landing path there are TWO batch levels, the twin and the `bin\<program>.cmd`
+//! shim the verb spawns through `cmd /c`, so a Ctrl-C typed inside the agent can raise
+//! that prompt up to TWICE, one per level, when the agent finally exits — not the once
+//! the plain shim asks (review, 2026-09-17). **No Windows machine has run any of it**:
+//! the rendered text, the parser's answer over it and the verb's argument vector
+//! ([`HandOver`], [`shim_command`]) are pinned on this crate's Unix suite; `cmd.exe`'s
+//! reading of the file (the `goto`, the same-line `exit /b`, the offset rule) and the
+//! console handlers are written to the documented rules and are unverified until the
+//! `cfg(windows)` tests here run on a Windows box.
 
 use std::io;
 use std::path::PathBuf;
@@ -101,6 +165,58 @@ use crate::store::{Layout, ToolName};
 /// Unlisted, dispatched before the verb match and before the store lock, like
 /// `__pending` and `__reroute` — it must answer while the installer HOLDS the lock.
 pub const HIDDEN_VERB: &str = "__landing";
+
+/// The verb's operands, parsed: `<program> [<prefix>] -- [args…]` — the pure half of
+/// `cli::cmd_landing`, so what the verb would run is pinned on every platform.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HandOver<'a> {
+    /// The agent program the twin stands for (`claude`), not yet `ToolName`-vetted.
+    pub program: &'a str,
+    /// The PREFIX operand the twin's prelude passes (absolute), so the store is found
+    /// with no `HOME`; `None` from a twin laid before the operand existed.
+    pub prefix: Option<PathBuf>,
+    /// The user's arguments, verbatim, with the ONE `--` the twin inserted stripped.
+    pub args: &'a [String],
+}
+
+impl<'a> HandOver<'a> {
+    /// `None` only with no program at all. The prefix is taken when the next operand is
+    /// an ABSOLUTE path (a relative one is the user's first argument, as is `--`); the
+    /// twin inserts exactly one `--` of its own, so exactly one is stripped and a user's
+    /// own leading `--` survives.
+    #[must_use]
+    pub fn parse(rest: &'a [String]) -> Option<Self> {
+        let (program, rest) = rest.split_first()?;
+        let (prefix, rest) = match rest.split_first() {
+            Some((p, tail)) if p != "--" && std::path::Path::new(p).is_absolute() => {
+                (Some(PathBuf::from(p)), tail)
+            }
+            _ => (None, rest),
+        };
+        let args = if rest.first().is_some_and(|a| a == "--") {
+            &rest[1..]
+        } else {
+            rest
+        };
+        Some(Self {
+            program,
+            prefix,
+            args,
+        })
+    }
+}
+
+/// The command the verb runs after the wait: the CURRENT `bin/<program>` shim
+/// ([`Layout::shim`] — `bin/claude` on Unix, `bin\claude.cmd` on Windows), never the
+/// `agents/` twin (its prelude would hand over here again), with `args` verbatim. Built
+/// here, apart from the `exec`, so the argument vector is pinned on every platform;
+/// `cli::cmd_landing` hands it to [`crate::platform::exec_or_run`].
+#[must_use]
+pub fn shim_command(layout: &Layout, tool: &ToolName, args: &[String]) -> std::process::Command {
+    let mut command = std::process::Command::new(layout.shim(tool));
+    command.args(args);
+    command
+}
 
 /// How long the verb waits for the landing, in seconds. Unset or unparsable ⇒
 /// [`DEFAULT_WAIT_SECS`]; `0` ⇒ warn once and run the current build without waiting.
@@ -790,6 +906,58 @@ mod pure_tests {
         assert_eq!(HIDDEN_VERB, "__landing");
     }
 
+    /// THE VERB'S OPERANDS AND WHAT IT RUNS (pinned on every platform, 2026-09-17): the
+    /// program, the absolute prefix operand, exactly one `--` stripped, the user's own
+    /// `--` and everything after it verbatim; and the command is the `bin/` shim of the
+    /// platform (`.cmd` on Windows) with those arguments — never the `agents/` twin.
+    #[test]
+    fn the_hand_over_parses_its_operands_and_runs_the_bin_shim_verbatim() {
+        let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let prefix_str = if cfg!(windows) {
+            "C:\\Program Files (x86)\\aterm\\pkg"
+        } else {
+            "/tmp/prefix (x86)"
+        };
+        let rest = a(&["claude", prefix_str, "--", "-p", "--", "50% done", "a b"]);
+        let h = HandOver::parse(&rest).unwrap();
+        assert_eq!(h.program, "claude");
+        assert_eq!(h.prefix.as_deref(), Some(std::path::Path::new(prefix_str)));
+        assert_eq!(h.args, &a(&["-p", "--", "50% done", "a b"])[..]);
+        // A twin from before the prefix operand: `--` right after the program.
+        let old = a(&["codex", "--", "--", "x"]);
+        let h = HandOver::parse(&old).unwrap();
+        assert_eq!(h.prefix, None);
+        assert_eq!(h.args, &a(&["--", "x"])[..]);
+        // A relative first argument is the user's, not a prefix; no `--` strips nothing.
+        let rel = a(&["claude", "notes.md"]);
+        let h = HandOver::parse(&rel).unwrap();
+        assert_eq!(h.prefix, None);
+        assert_eq!(h.args, &a(&["notes.md"])[..]);
+        assert_eq!(HandOver::parse(&[]), None);
+        // The command: the bin/ shim of this platform, the arguments verbatim.
+        let layout = Layout {
+            prefix: PathBuf::from(prefix_str),
+        };
+        let tool = ToolName::new("claude").unwrap();
+        let args = a(&["-p", "--", "50% done", "a b"]);
+        let command = shim_command(&layout, &tool, &args);
+        assert_eq!(
+            command.get_program(),
+            layout.bin_dir().join(tool.shim_file()).as_os_str()
+        );
+        assert_eq!(
+            command.get_program().to_string_lossy().ends_with(".cmd"),
+            cfg!(windows),
+            "the .cmd wrapper on Windows, the sh shim elsewhere"
+        );
+        assert!(!command.get_program().to_string_lossy().contains("agents"));
+        let got: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, args);
+    }
+
     #[test]
     fn megabytes_and_percent_render_one_decimal() {
         assert_eq!(megabytes(12_300_000), "12.3");
@@ -810,9 +978,164 @@ mod pure_tests {
     }
 }
 
-/// The state machine and the marker's file half: `sh` shims, `chmod`, a symlink — the
-/// Unix twin is the only one that carries the prelude (`platform::windows` lays the
-/// plain shim), so this half is Unix-only like `activate`'s twin tests.
+/// THE `.cmd` TWIN AT RUNTIME (2026-09-17) — compiled and run ONLY on a Windows host,
+/// which no machine of this repo is: written to `cmd.exe`'s documented rules and
+/// UNVERIFIED. The argument fakes are `.cmd` files (a batch file run from a batch file
+/// without `call` takes over the rest of the run, the rest of the calling line included —
+/// so those cases assert which fake ran and with what arguments, and their code comes
+/// from the chaining, NOT from the twin's own same-line `& @exit /b`); the exit case
+/// therefore uses a REAL `.exe` (`find.exe` from `%SystemRoot%\System32`) as the embedded
+/// atpkg, so control RETURNS to the twin's hand-over line and the code observed is the
+/// ERRORLEVEL a bare `exit /b` on that line returned with (review finding, 2026-09-17:
+/// the first cut never reached its exit line). Std runs a `.cmd` program through
+/// `cmd.exe /c` with batch-safe quoting.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn temp_layout(label: &str) -> Layout {
+        let p = std::env::temp_dir().join(format!("atpkg-landing-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        Layout { prefix: p }
+    }
+
+    /// A fake that appends its arguments to `log` and exits `code`.
+    fn fake(path: &std::path::Path, log: &std::path::Path, code: u32) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut body = String::from("@echo ran %*>> \"");
+        body.push_str(&log.to_string_lossy());
+        body.push_str("\"\r\n@exit /b ");
+        body.push_str(&crate::dec_u64(u64::from(code)));
+        body.push_str("\r\n");
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// The three endings of the `.cmd` twin: no marker → the store target, its code; the
+    /// marker and the embedded atpkg → `__landing "claude" "<prefix>" -- <args>`, the
+    /// verb's code; the marker but no embedded atpkg → the store target again (never
+    /// stranded). And the verb's own hand-over: the `bin/<program>.cmd` shim as a child
+    /// whose real code comes back.
+    #[test]
+    fn the_cmd_twin_hands_over_while_the_marker_stands_and_falls_through_otherwise() {
+        let layout = temp_layout("cmd-twin");
+        let tool = ToolName::new("claude").unwrap();
+        let log = layout.prefix.join("log.txt");
+        let target = layout
+            .build_dir("claude", 2026091601)
+            .join("bin\\claude.cmd");
+        fake(&target, &log, 3);
+        let atpkg = layout.prefix.join("app dir (x86)\\atpkg.cmd");
+        let marker = layout.landing_marker(&tool);
+        let prelude =
+            crate::platform::cmd_landing_prelude("claude", &layout.prefix, &marker, &atpkg);
+        assert!(!prelude.is_empty());
+        let twin = layout.agent_shim(&tool);
+        layout.ensure_dir(&layout.agents_dir()).unwrap();
+        crate::platform::install_twin_to_env(
+            &twin,
+            &target,
+            &crate::shim_env::ShimEnv::NONE,
+            &prelude,
+        )
+        .unwrap();
+        assert_eq!(crate::platform::resolve_shim(&twin), Some(target.clone()));
+        let run = || {
+            let _ = std::fs::remove_file(&log);
+            let st = Command::new(&twin).args(["-p", "a b"]).status().unwrap();
+            (st.code(), std::fs::read_to_string(&log).unwrap_or_default())
+        };
+        // No marker: the store build runs, its code comes back.
+        let (code, logged) = run();
+        assert_eq!(code, Some(3), "{logged}");
+        assert_eq!(logged.trim(), "ran -p \"a b\"");
+        // The marker stands and the embedded atpkg is there: the hand-over, verbatim.
+        std::fs::create_dir_all(layout.landing_dir()).unwrap();
+        std::fs::write(
+            &marker,
+            "atpkg-landing-v1 build=2 pid=1 from=- version=- from_version=-\n",
+        )
+        .unwrap();
+        fake(&atpkg, &log, 5);
+        let (code, logged) = run();
+        assert_eq!(code, Some(5), "{logged}");
+        let mut want = String::from("ran __landing \"claude\" \"");
+        want.push_str(&layout.prefix.to_string_lossy());
+        want.push_str("\" -- -p \"a b\"");
+        assert_eq!(logged.trim(), want);
+        // Exactly one run: the store build did NOT run after the hand-over.
+        assert_eq!(logged.matches("ran ").count(), 1, "{logged}");
+        // The marker stands but the embedded atpkg is gone: the store build, never stranded.
+        std::fs::remove_file(&atpkg).unwrap();
+        let (code, logged) = run();
+        assert_eq!(code, Some(3), "{logged}");
+        assert_eq!(logged.trim(), "ran -p \"a b\"");
+        // THE SAME-LINE EXIT, reached: a second twin (`codex`) whose embedded atpkg is a
+        // REAL exe — a copy of `find.exe`, which answers the hand-over's arguments
+        // (`__landing` is not a quoted search string) with `FIND: Parameter format not
+        // correct` and exit code 2, its documented parameter-error code — so control
+        // returns to the hand-over line and its `& @exit /b` is what `cmd /c` reports:
+        // 2 (the ERRORLEVEL find.exe left), never the store fake's 3 and never a pre-run
+        // 0. The store fake must not have run at all.
+        let codex = ToolName::new("codex").unwrap();
+        let codex_target = layout.build_dir("codex", 2026091601).join("bin\\codex.cmd");
+        fake(&codex_target, &log, 3);
+        let real_exe = layout.prefix.join("app dir (x86)\\atpkg.exe");
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        std::fs::copy(
+            std::path::Path::new(&system_root).join("System32\\find.exe"),
+            &real_exe,
+        )
+        .unwrap();
+        let codex_marker = layout.landing_marker(&codex);
+        std::fs::write(
+            &codex_marker,
+            "atpkg-landing-v1 build=2 pid=1 from=- version=- from_version=-\n",
+        )
+        .unwrap();
+        let codex_prelude =
+            crate::platform::cmd_landing_prelude("codex", &layout.prefix, &codex_marker, &real_exe);
+        let codex_twin = layout.agent_shim(&codex);
+        crate::platform::install_twin_to_env(
+            &codex_twin,
+            &codex_target,
+            &crate::shim_env::ShimEnv::NONE,
+            &codex_prelude,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&log);
+        let st = Command::new(&codex_twin)
+            .args(["-p", "a b"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(
+            st.code(),
+            Some(2),
+            "the hand-over line's bare `exit /b` returned with find.exe's ERRORLEVEL"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap_or_default(),
+            "",
+            "the store build did not run after the hand-over returned"
+        );
+        // The verb's hand-over: the bin/ shim as a child, its real exit code.
+        let shim = layout.shim(&tool);
+        std::fs::create_dir_all(layout.bin_dir()).unwrap();
+        crate::platform::install_shim_to(&shim, &target).unwrap();
+        let _ = std::fs::remove_file(&log);
+        let args = vec![String::from("--"), String::from("x")];
+        let st = shim_command(&layout, &tool, &args).status().unwrap();
+        assert_eq!(st.code(), Some(3));
+        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "ran -- x");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+}
+
+/// The state machine and the marker's file half: `sh` shims, `chmod`, a symlink — this
+/// half is Unix-only like `activate`'s twin tests (the `.cmd` twin's runtime test is
+/// `windows_tests` above; its rendered text is pinned in `platform`).
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests for the release-credentials profile + the Dev-ID refusal preflights
-//! (release spec §6 `sign.rs`, absorbing tools/release-conf.sh +
-//! apps/aterm-mac/notarize.sh):
+//! (release spec §6 `sign.rs`, absorbing the retired tools/release-conf.sh +
+//! apps/aterm-mac/notarize.sh — both deleted with the shell pipeline, named
+//! here for provenance only):
 //!   * the ONE credentials profile named by `--release-credentials`;
 //!   * the ported stat refusals (ownership + group/other-writable), proven
 //!     against real fixture files with bad modes;

@@ -5666,8 +5666,21 @@ impl NativeAppModel for EditorApp {
                 editor_cursor_label_with(&lines, buffer)
             })
         });
-        let footer_chars =
-            (((editor_rect.width - 88.0).max(112.0) / 7.0).floor() as usize).clamp(16, 256);
+        // The footer message paints from `rect.x + 72` and keeps a 16 px right
+        // gutter — the slot `paint_text_viewport` reports as
+        // `footer-available`.
+        //
+        // TWO FACES SHARE THAT SLOT, and only one of them may be budgeted in
+        // CHARACTERS. `footer_chars` is the monospace minibuffer's: 7.0 px is
+        // the Mono caption advance (the cursor label beside it charges 6.6),
+        // so the count is exact-to-conservative for that face. The status is
+        // the proportional Ui face and is fitted BY MEASURE below, against the
+        // same slot. Charging its glyphs the monospace advance is what cut
+        // every config diagnostic about a third early — and because the status
+        // is composed prefix-first, what a tail elide always sacrificed was
+        // the remedy.
+        let footer_width = (editor_rect.width - 88.0).max(112.0);
+        let footer_chars = ((footer_width / 7.0).floor() as usize).clamp(16, 256);
         let minibuffer = view
             .buffer
             .as_ref()
@@ -5680,7 +5693,7 @@ impl NativeAppModel for EditorApp {
         );
         let status = semantic_status
             .as_deref()
-            .map(|label| bounded_markdown_label(label, footer_chars));
+            .map(|label| crate::native_ui::fit_native_status_label(label, footer_width));
         let document_preedit = if view
             .buffer
             .as_ref()
@@ -8158,6 +8171,92 @@ mod markdown_reader_tests {
             reachable,
             (0..assist.completions.len()).collect::<std::collections::BTreeSet<_>>()
         );
+    }
+
+    /// The Manual's LANDING FRAME, end to end, at the geometry a default 80x24
+    /// window presents (viewport 744x420): caret at Ln 1 Col 1, where opening
+    /// the page leaves it, which is a key position, so the assist offers all
+    /// eight metadata-derived keys before the user has typed anything.
+    ///
+    /// Measured on glass before this was fixed: `editor/config-assist` 262 px
+    /// against an `editor/buffer` of 94 px — 62% of the window for the help and
+    /// ONE painted line for the file the page exists to edit, with the config's
+    /// only error two lines below the fold.
+    #[test]
+    fn manual_landing_paints_the_config_file_not_only_its_completion_list() {
+        let mut source = String::from("theme = \"Draculla\"\nbidi = \"sidewayz\"\n");
+        for index in 1..=16 {
+            source.push_str(&format!("# note {index}\n"));
+        }
+        let (mut app, view, snapshot) = editor_fixture(&source, "aterm.toml");
+        app.config_editor = true;
+        app.config_analysis = Some(crate::native_config_language::analyze(&source));
+        app.config_analysis_revision = snapshot.seq.0;
+
+        let viewport = LogicalRect::new(0.0, 0.0, 744.0, 420.0);
+        let compiled = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    config_revision: 1,
+                    update_revision: 1,
+                    animation_phase_ms: 720,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 12.0,
+                    terminal_theme: aterm_render::Theme::default(),
+                    semantic_font: None,
+                    document: Some(&snapshot),
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+
+        let assist = compiled
+            .semantic(&UiKey::new("editor/config-assist"))
+            .expect("unrequested config assist on the landing frame");
+        let buffer = compiled
+            .semantic(&UiKey::new("editor/buffer"))
+            .expect("config editor buffer");
+        assert!(
+            buffer.rect.height > assist.rect.height,
+            "the edited file gets {} px and its unrequested help {} px",
+            buffer.rect.height,
+            assist.rect.height
+        );
+
+        let projection = editor_spec(&compiled)
+            .projection
+            .as_ref()
+            .expect("document projection");
+        assert!(projection.total_lines >= 18, "18-line fixture config");
+        assert!(
+            projection.lines.len() >= 6,
+            "landing frame projects {} of {} document lines",
+            projection.lines.len(),
+            projection.total_lines
+        );
+
+        // Projected is not painted: the last projected row is the reveal-ahead
+        // overscan row, which the viewport clips. Count the rows the glass
+        // actually carries and put the file's only error inside them.
+        let geometry = crate::native_ui::text_viewport_geometry(buffer.rect);
+        let painted_rows = (geometry.body_h / geometry.line_h).floor() as usize;
+        assert!(
+            painted_rows >= 6,
+            "{painted_rows} painted document rows in a {} px buffer",
+            buffer.rect.height
+        );
+        let erroring = projection
+            .lines
+            .iter()
+            .position(|line| !line.diagnostics.is_empty())
+            .expect("the fixture's invalid `bidi` value is diagnosed");
+        assert!(
+            erroring < painted_rows,
+            "the config's only error (line 2) sits at painted row {erroring} of {painted_rows}"
+        );
+        compiled.validate_parity().unwrap();
     }
 
     #[test]

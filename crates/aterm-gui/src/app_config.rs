@@ -388,16 +388,35 @@ pub(crate) struct Config {
     pub(crate) cursor_fire_shimmer: Option<bool>,
     /// M3 phase B — EDR cursor glow (macOS + GPU + a wide-gamut/HDR panel).
     /// DEFAULT ON. When available, new windows get an `Rgba16Float` swapchain
-    /// tagged extended-linear-sRGB (wgpu auto-sets
-    /// `wantsExtendedDynamicRangeContent`) and the LUMEN cursor aurora is
+    /// tagged extended-linear-sRGB (the first-party Metal swapchain derives
+    /// `wantsExtendedDynamicRangeContent` from `format == Rgba16Float`, as
+    /// wgpu-hal does on the oracle arm) and the LUMEN cursor aurora is
     /// re-emitted ABOVE SDR reference white — real light, bounded by the
     /// screen's `maximumExtendedDynamicRangeColorComponentValue` (re-queried on
-    /// monitor changes). The GRID stays reference-white SDR (proven clamp), the
+    /// monitor changes and, throttled to 250 ms, as the window redraws).
+    /// "Available" is decided per window against the SCREEN it sits on: a
+    /// window attached while its screen reports no EDR potential
+    /// (`maximumPotentialExtendedDynamicRangeColorComponentValue` of 1.0 — an
+    /// SDR-only monitor) gets the cheaper 8-bit swapchain and so, with
+    /// `cursor_glow_sdr_boost` above 0 on a dark theme, the SDR glow-boost
+    /// crown, which an f16 swapchain on that screen suppresses. Such a window
+    /// is re-picked to f16 once its screen reports potential above 1.0: when
+    /// it changes monitors (a drag, an unplug, an undock), and on the same
+    /// monitor at its next redraw-time re-query (e.g. after High Dynamic
+    /// Range is turned on for that monitor, should macOS then report a higher
+    /// potential). It never drops back to 8-bit live: an f16 window dragged
+    /// onto an SDR screen draws neither the >1.0 aurora nor the SDR crown
+    /// there. That was the pre-gate behaviour on every SDR screen, and it now
+    /// differs from a window opened on that screen. The GRID stays
+    /// reference-white SDR (proven clamp), the
     /// offscreen/readback source of truth is untouched, and with this off the
     /// present is byte-identical to pre-M3 (the `HdrPresentGate` proof +
     /// aterm-gpu's `hdr_gate` suite). Hot-reloadable: turning it OFF kills
     /// the >1.0 emission immediately; turning it ON lets an existing f16-capable
-    /// Windows surface upgrade when the live output HDR probe admits it.
+    /// Windows surface upgrade when the live output HDR probe admits it, and on
+    /// macOS lets a window that attached 8-bit while it was off take f16 at
+    /// its next redraw-time re-query, if its screen reports EDR potential
+    /// above 1.0 (windows opened after the reload attach with the new value).
     /// See [`Config::hdr_glow_or_default`].
     pub(crate) hdr_glow: Option<bool>,
     /// SDR glow-boost strength (0..=1): how much additive crown the cursor glow
@@ -1297,6 +1316,8 @@ pub(crate) struct SparkleWordsConfig {
     pub(crate) feline: Option<SparkleFelineConfig>,
     /// The typed-word DOG cameo sub-table.
     pub(crate) canine: Option<SparkleCanineConfig>,
+    /// The typed KITTY-COMMAND sub-table (`sit`, `kitty jump`, `good kitty`).
+    pub(crate) tricks: Option<SparkleTricksConfig>,
     /// Retained compatibility-only Orca sub-table. It parses and round-trips,
     /// but `ORCA_SUSPENDED` makes the whole subtree have no runtime effect.
     pub(crate) orca: Option<SparkleOrcaConfig>,
@@ -1396,6 +1417,19 @@ fn read_and_fingerprint_path_feed_with_reader(
 #[derive(Clone)]
 pub(crate) struct PreparedSparkleRuntime {
     resolved: Option<crate::word_decorations::Resolved>,
+    /// THE KITTY-COMMAND VOCABULARY (`aterm_lexicon::TrickLexicon`), compiled
+    /// here — off the keystroke path, on the same worker and from the same
+    /// `[sparkle_words] languages` as the word lexicon — and NOT a member of
+    /// [`Resolved`](crate::word_decorations::Resolved): the sparkle master and
+    /// the family bits decide whether the WORD ENGINE runs, and the trick
+    /// table must never keep it alive for a flash, nor go away with it. It
+    /// is compiled whatever the master says (a few hundred surfaces; the
+    /// dispatch gates read the master themselves), so the input path holds
+    /// one `Arc` per generation and never a `None` it has to explain. The
+    /// typed-line listener asks for it only at a word boundary on a still-pure
+    /// line (`TrickListener::needs_lexicon`), and re-keying a config
+    /// generation replaces the `Arc` — no per-press refcount traffic.
+    tricks: std::sync::Arc<aterm_lexicon::TrickLexicon>,
 }
 
 /// One bounded, internally consistent generation of every path-backed effect
@@ -1410,6 +1444,13 @@ pub(crate) struct PreparedPathFeedGeneration {
 }
 
 impl PreparedSparkleRuntime {
+    /// The compiled kitty-command vocabulary of this generation (see the
+    /// field). Borrowed, never cloned, by the input path: the borrow lives for
+    /// one press and the generation cannot be replaced under it.
+    pub(crate) fn tricks(&self) -> &aterm_lexicon::TrickLexicon {
+        &self.tricks
+    }
+
     /// Exact custom-spec consumers admitted for this already-prepared runtime
     /// generation. The resolved table includes valid Toy Packs followed by
     /// inline overrides, so Settings can disclose live dependencies without
@@ -2354,6 +2395,34 @@ pub(crate) struct SparkleCanineConfig {
     /// Extra whole words to treat as canine (added to the lexicon).
     pub(crate) extra_words: Option<Vec<String>>,
     /// Folded surfaces to never treat as canine.
+    pub(crate) ignore_words: Option<Vec<String>>,
+}
+
+/// `[sparkle_words.tricks]` — KITTY COMMANDS: a pet-command word typed at a
+/// word boundary on a line of nothing but pet talk (`sit␣`, `kitty jump␣`,
+/// `good kitty␣`) flashes rainbow and the cursor pet performs it. Like the
+/// dog it draws nothing from the screen scanner — the typed-line listener
+/// (`aterm_effects::typed_tricks`) is fed on the input path only, so program
+/// output, a paste and a controller's raw bytes never command the cat. Its
+/// vocabulary is the lexicon crate's SEPARATE trick table, compiled from the
+/// same `[sparkle_words] languages` as the word lexicon (English is never
+/// gated), and it is its own table because these words (`sit`, `down`,
+/// `play`) must never be surfaces the ambient scanner decorates.
+///
+/// Config-file-only, like `[sparkle_words.canine]`: no Settings leaf. The
+/// `enabled` bit rides UNDER the `[sparkle_words] enabled` master and is
+/// independent of every other family, so a user who keeps only the cat can
+/// still talk to it.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct SparkleTricksConfig {
+    /// Let typed kitty commands move the pet and flash the word. Default TRUE
+    /// (takes effect only when the sparkle master is on).
+    pub(crate) enabled: Option<bool>,
+    /// Folded trick surfaces that never count as a command — for someone with a
+    /// real `sit` or `play` program on their PATH. The line is still judged
+    /// (the listener does not know the list); only the answer is withheld,
+    /// and with it the exit-127 forgiveness a submitted pet-only line earns.
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
@@ -3376,6 +3445,50 @@ impl Config {
         self.robi.unwrap_or(false)
     }
 
+    /// THE KITTY-COMMAND GATE, resolved: `[sparkle_words] enabled` (the
+    /// master, read through its one resolved owner
+    /// [`Self::sparkle_words_enabled_or_default`] so this never re-types its
+    /// default) AND `[sparkle_words.tricks] enabled` (default on). Read on the
+    /// input path once per press — three `Option` reads, resolved beside the
+    /// Serious Mode policy before the window is borrowed — and spent only at a
+    /// listener EVENT (a fire, a confirmation, a submitted pet-only line).
+    /// Never a reason not to feed the listener: line state is maintained
+    /// whatever this says (the `tone_tracker` window-maintenance law).
+    /// Serious Mode is the caller's second gate, from the policy, so the two
+    /// answers cannot drift. Independent of the FAMILY bits on purpose: with
+    /// every sparkle family off the word engine does not run and nothing can
+    /// flash, but the pet still obeys (`aterm help kitty` says so).
+    pub(crate) fn kitty_tricks_enabled(&self) -> bool {
+        self.sparkle_words_enabled_or_default()
+            && self
+                .sparkle_words
+                .as_ref()
+                .and_then(|sw| sw.tricks.as_ref())
+                .and_then(|t| t.enabled)
+                .unwrap_or(true)
+    }
+
+    /// Whether `word` — a trick token AS TYPED (`SIT`, `goooood`) — is on
+    /// `[sparkle_words.tricks] ignore_words`. Both sides are folded with the
+    /// lexicon's own fold so the list matches the way the vocabulary does;
+    /// the elongation fold is deliberately not applied (a user who lists
+    /// `purr` has said nothing about `purrrrr`). Costs nothing with the list
+    /// absent or empty (the default): the fold allocates only when there is
+    /// something to compare against, and this runs once per FIRE, not per key.
+    pub(crate) fn kitty_trick_ignored(&self, word: &str) -> bool {
+        let Some(ignore) = self
+            .sparkle_words
+            .as_ref()
+            .and_then(|sw| sw.tricks.as_ref())
+            .and_then(|t| t.ignore_words.as_deref())
+            .filter(|words| !words.is_empty())
+        else {
+            return false;
+        };
+        let folded = aterm_lexicon::fold(word);
+        ignore.iter().any(|w| aterm_lexicon::fold(w) == folded)
+    }
+
     /// Secure Keyboard Entry (`secure_keyboard_entry`): fail-closed default OFF
     /// like every other security opt-in — the OS mechanism has real side
     /// effects (it suppresses other apps' global hotkeys while active), so it
@@ -4100,8 +4213,22 @@ impl Config {
 
     fn prepare_sparkle_runtime_with_fingerprint(&self) -> (PreparedSparkleRuntime, u64) {
         let (parts, fingerprint) = self.sparkle_runtime_parts_with_fingerprint();
+        let langs = self.sparkle_languages();
+        // THE KITTY-COMMAND VOCABULARY rides the same worker and the same
+        // `languages` as the word lexicon, and is compiled whether or not the
+        // master resolved a word engine (see `PreparedSparkleRuntime::tricks`).
+        // Its data problems are reported like the lexicon's: the embedded table
+        // is pinned conflict-free under every language set by its own tests, so
+        // a line here is a build that shipped bad data, never a user's fault.
+        let tricks = {
+            let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
+            let tricks = aterm_lexicon::TrickLexicon::with_languages(&refs);
+            for conflict in tricks.conflicts() {
+                crate::logging::stderr_line!("aterm-gui: kitty commands vocabulary: {conflict}");
+            }
+            std::sync::Arc::new(tricks)
+        };
         let resolved = parts.map(|(cfg, override_toml)| {
-            let langs = self.sparkle_languages();
             let refs: Vec<&str> = langs.iter().map(String::as_str).collect();
             let lexicon = aterm_lexicon::Lexicon::with_languages_and_override(
                 &refs,
@@ -4121,7 +4248,7 @@ impl Config {
                 lexicon: std::sync::Arc::new(lexicon),
             }
         });
-        (PreparedSparkleRuntime { resolved }, fingerprint)
+        (PreparedSparkleRuntime { resolved, tricks }, fingerprint)
     }
 
     /// Prepare every path-backed effect consumer and identify it from the exact
@@ -4171,17 +4298,14 @@ impl Config {
     /// ORDINARY output that the minimal-fast directive rules out. If that one path
     /// ever wants a Windows answer, the aim is `supernova_chance`, not this master.
     ///
-    /// TEST-ONLY, and gated to say so. It landed in `3dc6c33c` as the resolved
-    /// owner of this default and its callers are the `[sparkle_words] enabled`
-    /// assertions below — the shipping resolver reaches the same key through
-    /// `sparkle_deco_config_with_pack_specs`, which reads its own already-cloned
-    /// `sw`. An ungated definition with only `#[cfg(test)]` callers is a
-    /// `dead_code` finding in the LIB target, so the definition is gated to
-    /// match the callers rather than deleted: the sibling below
-    /// (`sparkle_deco_config`) has carried exactly this shape all along. If a
-    /// shipping caller ever wants it, delete the attribute — nothing else here
-    /// has to change.
-    #[cfg(test)]
+    /// It landed in `3dc6c33c` as the resolved owner of this default with
+    /// only the `[sparkle_words] enabled` assertions below as callers (the
+    /// shipping resolver reaches the same key through
+    /// `sparkle_deco_config_with_pack_specs`, which reads its own
+    /// already-cloned `sw`), and was `#[cfg(test)]` for as long as that held.
+    /// The kitty-command gate ([`Self::kitty_tricks_enabled`]) is its first
+    /// shipping caller: the pet's answer to a typed command rides this master
+    /// and must not re-type its default.
     pub(crate) fn sparkle_words_enabled_or_default(&self) -> bool {
         self.sparkle_words
             .as_ref()
@@ -7533,22 +7657,31 @@ pub(crate) fn launch_config_notice(
     }
 }
 
-/// Set once by [`load_config`] when the launch load failed, read by the config
-/// watcher so a later reload refusal says the running settings are the DEFAULTS
-/// from a launch that could not read the file — not "kept unchanged" as if a
-/// loaded configuration were being protected.
-static LAUNCH_LOAD_FAILED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Set once by [`load_config`] when the launch load failed — the [`launch_config_notice`]
+/// it printed, kept verbatim rather than reduced to a bool. Read by the config watcher,
+/// so a later reload refusal says the running settings are the DEFAULTS from a launch
+/// that could not read the file — not "kept unchanged" as if a loaded configuration were
+/// being protected — and by `--diagnose` / `--show-config`, which have to say on STDOUT
+/// both that the file was rejected and why.
+static LAUNCH_LOAD_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn note_launch_load_failed(notice: String) {
-    LAUNCH_LOAD_FAILED.store(true, std::sync::atomic::Ordering::Release);
+    // First failure wins: `load_config` runs more than once per process, and the
+    // launch's own reason is the one the reports must name.
+    let _ = LAUNCH_LOAD_FAILURE.set(notice.clone());
     crate::config_notice::queue_deferred(notice);
 }
 
 /// Whether this process launched WITHOUT its `aterm.toml` (unreadable or invalid
 /// at start), so every setting is at its default until the file loads.
 pub(crate) fn launch_load_failed() -> bool {
-    LAUNCH_LOAD_FAILED.load(std::sync::atomic::Ordering::Acquire)
+    launch_load_failure().is_some()
+}
+
+/// WHY this process launched without its `aterm.toml` — the same sentence the
+/// console and the window banner carry, so a stdout-only report can carry it too.
+pub(crate) fn launch_load_failure() -> Option<&'static str> {
+    LAUNCH_LOAD_FAILURE.get().map(String::as_str)
 }
 
 /// The `agents_auto_prime` knob alone, read WITHOUT [`load_config`]'s user-visible
@@ -10186,6 +10319,36 @@ impl App {
             self.publish_native_config_snapshot(&config_snapshot);
             self.refresh_path_feeds(fresh_feeds);
             self.finish_native_config_external_admission(&admitted_baseline);
+            // …AND THE TEXT-DERIVED DIAGNOSTICS, which this return used to eat.
+            //
+            // The dedupe's whole justification is that re-applying an identical
+            // parsed config is side-effect churn. These two notices are not
+            // derived from the parsed config at all — they read the raw TEXT,
+            // which is precisely the thing that DID change. A misspelled key
+            // leaves no trace in `Config`, so adding one (the commonest case:
+            // a setting the user has never set before, typed wrong) parses
+            // EQUAL, returned here, and said nothing — on stderr or in the
+            // window — while the identical file at launch warns. That defeats
+            // `ignored_key_notices`'s own documented contract, that "startup
+            // and reload both call this so a typo introduced by a live edit is
+            // reported exactly like one that was there at launch".
+            //
+            // Emitting a possibly-EMPTY notice is also correct and is the
+            // second half of the fix: `ConfigNotice::new` clears a stale banner,
+            // so fixing the typo now takes the warning down even when the parse
+            // is otherwise unchanged.
+            let mut warns = ignored_key_notices(&config_snapshot.text);
+            warns.extend(unaccepted_value_notices(&config_snapshot.text, &warns));
+            for w in &warns {
+                crate::logging::stderr_line!("aterm-gui: {w}");
+            }
+            self.config_notice =
+                crate::config_notice::ConfigNotice::new(warns, std::time::Instant::now());
+            for ws in self.windows.values() {
+                if let Some(w) = ws.os_window.as_ref() {
+                    w.request_redraw();
+                }
+            }
             return;
         }
 
@@ -10463,10 +10626,30 @@ impl App {
         // W5h: an unresolvable `font_family` warns (like themes) instead of
         // silently reducing to the built-in candidates. Uses the same
         // effective family (env > config > platform default) the rebuild will try.
-        let requested_effective_family = prepared_fonts
-            .as_ref()
-            .and_then(|prepared| prepared.family.clone())
-            .or_else(|| self.font_family.clone());
+        // THE WORKER'S ANSWER IS AUTHORITATIVE, `None` INCLUDED. This used to
+        // `.or_else(|| self.font_family.clone())`, which conflated the catalog
+        // worker's two very different `None`s — except only one of them is a
+        // `None`, which is what made the conflation invisible:
+        //
+        // * REJECTED a bad family: the worker returns `previous_family` (SOME)
+        //   and warns "keeping the current working face". Trusting it verbatim
+        //   preserves that, which is the documented intent — a rejected family
+        //   is not a request to swap to a built-in face.
+        // * REVERTED to the built-in candidates, because the user CLEARED
+        //   `font_family` (deleted the key, or turned every Settings ▸ Display
+        //   Faces toggle off, which clears `display_font`): the worker returns
+        //   `None` as its explicit verdict, having already resolved the
+        //   built-ins. The `.or_else` resurrected the removed family here, so
+        //   `App.font_family` stayed pinned to it for the life of the process
+        //   and was fed straight back as the next reload's `previous_family`.
+        //
+        // So: when the worker RAN, take what it said. Fall back to the current
+        // family only when no font work happened this reload at all, where
+        // nothing about the family can have changed.
+        let requested_effective_family = match prepared_fonts.as_ref() {
+            Some(prepared) => prepared.family.clone(),
+            None => self.font_family.clone(),
+        };
         warns.append(&mut font_prepare_warnings);
         // An unrecognized `cursor_trail_style` silently draws the DEFAULT style
         // instead of the requested one — warn on the same banner, or the
@@ -13075,6 +13258,77 @@ mod cfg_engine_tests {
             "the event-loop reducer must consume the worker's immutable fingerprint"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A TYPO ADDED BY A LIVE EDIT IS REPORTED LIKE ONE THAT WAS THERE AT LAUNCH
+    /// — which is `ignored_key_notices`'s own documented contract, and which the
+    /// semantic dedupe used to defeat.
+    ///
+    /// A misspelled key leaves NO trace in the parsed `Config`, so adding one —
+    /// the commonest case by far, a setting the user has never set before typed
+    /// wrong — parses EQUAL to what is already applied. The reload then took the
+    /// dedupe's early return and said nothing at all: no banner, and no stderr
+    /// line either. The same file at launch warns. So the one edit class that
+    /// most needs telling ("I added a setting and nothing happened") was the one
+    /// class that produced no output on any launch mode.
+    ///
+    /// The empty case is asserted too, and is the second half of the fix rather
+    /// than a formality: the notice must still be PUBLISHED when there is
+    /// nothing to say, because that is what takes a stale banner down once the
+    /// typo is fixed — an edit which, again, parses equal.
+    #[test]
+    fn a_misspelled_key_added_by_a_live_edit_still_warns_through_the_dedupe() {
+        fn apply(app: &mut crate::App, dir: &std::path::Path, text: &str) {
+            let path = dir.join("aterm.toml");
+            std::fs::write(&path, text).expect("write config");
+            let observation =
+                crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                    .expect("observe");
+            let config: Config = aterm_toml::from_str(text).expect("valid toml");
+            let assets = config.resolve_asset_catalog();
+            let path_feed_fps = config.path_feed_fingerprints();
+            let sparkle = config.prepare_sparkle_runtime();
+            app.apply_prepared_config_generation(
+                crate::native_font_catalog::PreparedConfigGeneration {
+                    observation,
+                    config,
+                    values: std::collections::BTreeMap::new(),
+                    assets,
+                    path_feed_fps,
+                    sparkle,
+                    fonts: None,
+                    warnings: Vec::new(),
+                },
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!("aterm-typo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut app = crate::App::headless_for_test();
+
+        // A key this build does not know, and NOTHING else — so the parse is
+        // equal to what is already applied and the dedupe fires.
+        apply(&mut app, &dir, "windw_padding = 20\n");
+        let notice = app
+            .config_notice
+            .as_ref()
+            .expect("a misspelled key must warn even when the parse dedupes");
+        assert!(
+            notice.lines.iter().any(|l| l.contains("windw_padding")),
+            "the banner names the key that was ignored: {:?}",
+            notice.lines
+        );
+
+        // NEGATIVE CONTROL / the clearing half: fixing the typo also parses
+        // equal, and must take the banner back down rather than leave it up.
+        apply(&mut app, &dir, "# fixed\n");
+        assert!(
+            app.config_notice.is_none(),
+            "removing the bad key clears the banner: {:?}",
+            app.config_notice.as_ref().map(|n| n.lines.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

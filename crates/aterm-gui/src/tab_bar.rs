@@ -2903,6 +2903,7 @@ fn image_data(primitives: &[TabIconPrimitive], color: [u8; 3], cols: u16) -> Arc
         rows: 1,
         z_index: 0,
         band_lift_px: 0,
+        pixel_exact: false,
     })
 }
 
@@ -4644,6 +4645,7 @@ pub(crate) mod pixel_band {
             // land on the chrome lip above the grid (the renderers' chrome-band
             // lift). 0 only where the strip has no lip of its own.
             band_lift_px: lift as u16,
+            pixel_exact: false,
         });
 
         // Coverage: every column EXCEPT the fallback segments'. A covered cell's
@@ -5878,6 +5880,7 @@ pub(crate) mod pixel_band {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
+                pixel_exact: false,
             });
             let mk = |col: u16| {
                 (

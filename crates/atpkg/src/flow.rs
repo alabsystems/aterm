@@ -3269,10 +3269,15 @@ pub fn rollback(
         .iter()
         .rev()
         .copied()
-        .find(|&b| b >= floor_for_program && !crate::gate::is_yanked(ch, program, b))
+        .find(|&b| {
+            b >= floor_for_program
+                && !crate::gate::is_yanked(ch, program, b)
+                && build_can_be_rolled_onto(layout, program, b)
+        })
         .ok_or_else(|| {
             FlowError::Rollback(format!(
-                "no retained build below {current} that satisfies the floor/yank gate"
+                "no retained build below {current} that satisfies the floor/yank gate \
+                 and still holds the tools it was installed with"
             ))
         })?;
     // 7. Re-point via the tested primitive (symlinks only; no tree mutation). reloc:None —
@@ -3863,6 +3868,45 @@ fn staged_download_path(layout: &Layout, program: &str, asset: &str) -> Result<P
         return Err(FlowError::VendorRefused(why));
     }
     Ok(layout.staging_dir(program).join(asset))
+}
+
+/// Whether `build` of `program` is a build a rollback may actually LAND ON: its `bin/` still
+/// holds at least one file [`rollback_member`] could re-point a shim at.
+///
+/// **THE GATE THAT WAS MISSING WHEN A CORPSE WAS THE ROLLBACK TARGET.** Selection above
+/// reads [`crate::ops::list_installed`], which counts a build as installed on the strength
+/// of its `<n>.ready` marker. A marker is a file; the tools are the tree; and on m3 the two
+/// disagreed — `store/trust/8595/` with no `bin/` at all, 417 MB of orphaned `lib/`, and
+/// `8595.ready` beside it still saying `ok` (2026-09-17). Selected, that build reaches
+/// [`rollback_member`], whose restore loop asks `target.exists()` of every tool and takes
+/// the `else` arm — `remove_file(layout.shim(tool))` — for every one of them. The verb would
+/// have reported a successful rollback and left the machine with no compiler, no verifier
+/// and no `ay`: a disarm, reported as a success.
+///
+/// Two fixes stand behind this one and neither makes it redundant. The corpse can no longer
+/// be MADE ([`crate::store::discard_build`], [`crate::ops::uninstall`]: the marker comes
+/// down before the tree goes), and a marker written from now on RECORDS its `bin/` and is
+/// refuted by the disk when that `bin/` is gone (the `contents=` record
+/// [`crate::store::build_is_complete`] checks). This is the clause that also covers the builds
+/// ALREADY on disk, whose markers were written by a version that recorded nothing, and every
+/// way a tree can lose its contents that neither of those reaches — a person's interrupted
+/// `rm -rf`, a restored backup, a volume that dropped a directory.
+///
+/// The predicate is deliberately weak: ONE surviving entry is enough. It is not this
+/// function's job to decide that a build is complete — [`crate::store::build_is_complete`]
+/// owns that question and has the marker to reason from — only to refuse the one shape that
+/// turns a rollback into a disarm, and to refuse it without ever declining a build whose
+/// `bin/` this process merely cannot read: `read_dir` failing for any reason other than
+/// `NotFound` is a bound on what we may know, and answers `true`.
+fn build_can_be_rolled_onto(layout: &Layout, program: &str, build: u64) -> bool {
+    let bin = layout.build_dir(program, build).join("bin");
+    match std::fs::read_dir(&bin) {
+        Ok(entries) => entries.flatten().next().is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // EACCES on a shared prefix, macOS privacy consent, EIO: nobody looked, so nothing
+        // is refuted. A rollback onto such a build behaves exactly as it did before.
+        Err(_) => true,
+    }
 }
 
 /// Roll a flipped (or partially-flipped) member back to the build it pointed at before this
@@ -8650,6 +8694,83 @@ mod tests {
             crate::ops::which(&layout, "alab-ay"),
             crate::ops::which(&layout, "ay"),
             "the alias is restored with its primary"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE DISARM THAT WAS ONE `aterm pkg rollback trust` AWAY (m3, 2026-09-17).
+    ///
+    /// `store/trust/8595/` held 417 MB of orphaned `lib/`, no `bin/` at all, and a
+    /// `8595.ready` beside it still saying `ok`. Selection reads `list_installed`, which
+    /// counts a build on the strength of that marker, so 8595 was the highest retained build
+    /// below current and therefore the rollback target. `rollback_member` then asks
+    /// `target.exists()` of every tool and takes the `else` arm — `remove_file(shim)` — for
+    /// every one of them: the verb reports a successful rollback and the machine is left
+    /// with no compiler, no verifier and no `ay`.
+    ///
+    /// The marker is now refuted by the tree it vouches for, and corpses like this one can
+    /// no longer be made — but a build already on disk carries a marker written by a version
+    /// that recorded nothing, so selection asks the tree directly as well. The fixture
+    /// forges exactly that: a LEGACY marker (a bare `ok\n`, which every older atpkg wrote)
+    /// over a gutted tree.
+    #[test]
+    fn rollback_refuses_a_target_whose_tools_are_gone_and_takes_the_one_below() {
+        let dir = scratch("rollback-gutted");
+        let layout = layout(&dir);
+        let fake = rollback_index(0, &[]);
+        seed_build(&layout, "ay", 16, false);
+        seed_build(&layout, "ay", 17, false);
+        seed_build(&layout, "ay", 18, true); // active
+        // Gut 17 the way an interrupted removal does, and re-mark it the way every atpkg
+        // before the contents record did: a bare `ok`, vouching for a tree with no `bin/`.
+        std::fs::remove_dir_all(layout.build_dir("ay", 17).join("bin")).unwrap();
+        std::fs::write(
+            layout.build_dir("ay", 17).with_file_name("17.ready"),
+            b"ok\n",
+        )
+        .unwrap();
+        assert!(
+            crate::ops::list_installed(&layout).contains(&("ay".to_string(), 17)),
+            "the fixture must leave 17 looking installed, or it proves nothing"
+        );
+
+        let r = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0).unwrap();
+        assert_eq!(
+            r.to_build, 16,
+            "the gutted build is skipped and the rollback lands on one that can run"
+        );
+        assert_eq!(
+            crate::ops::which(&layout, "ay").unwrap(),
+            tool_bin(&layout.build_dir("ay", 16), "ay"),
+            "and the shim points at a binary that is actually there"
+        );
+
+        // …and when the gutted build is the ONLY candidate, the verb REFUSES rather than
+        // disarming the machine. Nothing may be removed on the way to that refusal.
+        std::fs::remove_dir_all(layout.build_dir("ay", 16).join("bin")).unwrap();
+        std::fs::write(
+            layout.build_dir("ay", 16).with_file_name("16.ready"),
+            b"ok\n",
+        )
+        .unwrap();
+        crate::activate::activate_channel(&layout, "stable", &layout.build_dir("ay", 18)).unwrap();
+        crate::activate::install_shims(
+            &layout,
+            &layout.build_dir("ay", 18),
+            &["ay".to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
+        let err = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0)
+            .expect_err("no landable build below current");
+        assert!(
+            err.to_string().contains("still holds the tools"),
+            "the refusal says WHY, not just that the gate failed: {err}"
+        );
+        assert_eq!(
+            crate::ops::which(&layout, "ay").unwrap(),
+            tool_bin(&layout.build_dir("ay", 18), "ay"),
+            "a refused rollback leaves the live shim exactly where it was"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

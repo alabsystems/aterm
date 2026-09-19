@@ -27,7 +27,7 @@ use crate::{SessionCtx, term_lock};
 
 /// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per
 /// session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0>
-/// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|->`.
+/// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> identity=<name|->`.
 /// On a single-session window this is exactly one line == the lone session (the
 /// zero-regression base case). The store snapshot is cloned out before formatting,
 /// so this never holds the registry lock across a `Terminal` lock.
@@ -49,6 +49,14 @@ use crate::{SessionCtx, term_lock};
 /// no roster. `detail=` (F5: who lives here) is the sanitized running command,
 /// the same [`crate::session_status::executing_detail`] the `status` record
 /// carries, read under a per-session `try_lock` (`-` when contended or idle).
+///
+/// `identity=<name|->` (session identities, 2026-09-17) is the LAST column: the
+/// agent identity the session was spawned under (`SessionHandle::identity`,
+/// spawn-time and immutable — `spawn identity=<name>`), `-` for the human's own
+/// agent config, and for a shell adopted from a build without the field, which
+/// keeps its env and drops the label. Additive like every column before it:
+/// aterm-ctl's `roster_tail` reads the tail by key back to `meta=`, so `ls` and
+/// `windows` need no change, and the `identities` verb explains the names.
 pub(crate) fn cmd_sessions(
     _self_ctx: &SessionCtx,
     store: &Store,
@@ -173,9 +181,16 @@ pub(crate) fn sessions_lines(
         let detail = detail
             .as_deref()
             .map_or_else(|| "-".to_string(), pct_encode);
+        // The identity is a handle field (never a lock): the name the session
+        // was spawned under, already in the grammar `[a-z0-9][a-z0-9._-]*`, so
+        // the codec leaves it as it is — it is applied for uniformity, not need.
+        let identity = h
+            .identity
+            .as_deref()
+            .map_or_else(|| "-".to_string(), pct_encode);
         out.push_str(&format!(
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
-             wfocus={wfocus} detail={detail}\n",
+             wfocus={wfocus} detail={detail} identity={identity}\n",
             h.local_id,
             h.sid.as_str(),
             parent,
@@ -3081,6 +3096,7 @@ mod tests {
             term: term.clone(),
             master: -1,
             ctx,
+            identity: None,
         }
     }
 
@@ -3125,15 +3141,15 @@ mod tests {
         assert_eq!(lines[0], "OK 3");
         assert_eq!(
             tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=0 detail=-"
+            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=0 detail=- identity=-"
         );
         assert_eq!(
             tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=3 active=0 wfocus=1 detail=-"
+            "1 - alive tab-1 meta=0 window=3 active=0 wfocus=1 detail=- identity=-"
         );
         assert_eq!(
             tail(lines[3]),
-            "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=-"
+            "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=- identity=-"
         );
     }
 
@@ -3156,11 +3172,11 @@ mod tests {
         assert_eq!(lines[0], "OK 2");
         assert_eq!(
             tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=- active=- wfocus=- detail=-"
+            "0 - alive tab-0 meta=0 window=- active=- wfocus=- detail=- identity=-"
         );
         assert_eq!(
             tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=- active=- wfocus=- detail=sleep"
+            "1 - alive tab-1 meta=0 window=- active=- wfocus=- detail=sleep identity=-"
         );
     }
 
@@ -3206,7 +3222,7 @@ mod tests {
         let rows = vec![row(0, 0, true, true)];
         let out = sessions_lines(&snapshot, Ok(&rows));
         assert!(
-            out.ends_with(" window=0 active=1 wfocus=1 detail=targo%20test\n"),
+            out.ends_with(" window=0 active=1 wfocus=1 detail=targo%20test identity=-\n"),
             "{out}"
         );
         assert!(
@@ -3216,12 +3232,71 @@ mod tests {
 
         let held = term.lock().unwrap();
         let out = sessions_lines(&snapshot, Ok(&rows));
-        assert!(out.ends_with(" detail=-\n"), "contended reads `-`: {out}");
+        assert!(
+            out.ends_with(" detail=- identity=-\n"),
+            "contended reads `-`: {out}"
+        );
         drop(held);
 
         term.lock().unwrap().process(b"done\n\x1b]133;D;0\x07");
         let out = sessions_lines(&snapshot, Ok(&rows));
-        assert!(out.ends_with(" detail=-\n"), "complete reads `-`: {out}");
+        assert!(
+            out.ends_with(" detail=- identity=-\n"),
+            "complete reads `-`: {out}"
+        );
+    }
+
+    /// IDENTITY (session identities, phase 1): the roster's LAST column names the
+    /// agent identity each session was spawned under, `-` for the human's own —
+    /// the golden PAIR, a handle carrying `worker` beside one carrying none. It
+    /// sits immediately AFTER `detail=`, and last, so aterm-ctl's `roster_tail`
+    /// (which reads the tail by key back to `meta=`) is unmoved and an older
+    /// client keying on the sid field ignores it.
+    #[test]
+    fn sessions_lines_carry_the_identity_after_detail_as_a_name_or_a_dash() {
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let t1 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let mut worker = handle(0, &t0);
+        worker.identity = Some(Arc::from("worker"));
+        let snapshot = vec![worker, handle(1, &t1)];
+        let rows = vec![row(0, 0, true, true), row(1, 0, false, true)];
+        let out = sessions_lines(&snapshot, Ok(&rows));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "OK 2");
+        assert_eq!(
+            tail(lines[1]),
+            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=1 detail=- identity=worker"
+        );
+        assert_eq!(
+            tail(lines[2]),
+            "1 - alive tab-1 meta=0 window=0 active=0 wfocus=1 detail=- identity=-"
+        );
+        for line in &lines[1..] {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let detail_at = fields
+                .iter()
+                .position(|f| f.starts_with("detail="))
+                .expect("detail= column");
+            assert!(
+                fields[detail_at + 1].starts_with("identity="),
+                "identity= sits right after detail=: {line}"
+            );
+            assert_eq!(
+                fields.len(),
+                detail_at + 2,
+                "identity= is the LAST column: {line}"
+            );
+        }
+        // The failed-hop arm carries it too: the label is a handle field, not
+        // a main-thread answer.
+        let out = sessions_lines(&snapshot, Err("no event loop"));
+        assert!(
+            out.lines()
+                .nth(1)
+                .unwrap()
+                .ends_with(" detail=- identity=worker"),
+            "{out}"
+        );
     }
 
     /// The verb over a real store with no event loop to ask: the roster prints
@@ -3238,7 +3313,7 @@ mod tests {
         assert_eq!(lines[0], "OK 1");
         assert_eq!(
             tail(lines[1]),
-            "4 - alive tab-4 meta=0 window=- active=- wfocus=- detail=-"
+            "4 - alive tab-4 meta=0 window=- active=- wfocus=- detail=- identity=-"
         );
         // The placement fold agrees with the line: no row is DETACHED.
         let p = placement_of(&handle(4, &term), &[]);

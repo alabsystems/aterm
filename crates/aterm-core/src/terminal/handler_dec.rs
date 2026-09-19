@@ -548,6 +548,25 @@ impl TerminalHandler<'_> {
     )]
     fn enter_alternate_screen(&mut self) {
         if self.modes.alternate_screen {
+            // A SECOND 1049 SET IS NOT A NO-OP. xterm's arm is three calls —
+            // `CursorSave(xw); ToAlternate(xw, True); ClearScreen(xw);`
+            // (charproc.c `srm_OPT_ALTBUF_CURSOR`) — and only the MIDDLE one
+            // stands down when the alt screen is already up (`ToAlternate`:
+            // `if (screen->whichBuf == 0)`). The save still runs, into the
+            // CURRENT buffer's slot (`screen->sc[whichBuf]`, the alt slot), so
+            // the main slot that 1049 RESET restores is left alone; and the
+            // clear still runs. Returning early here left a second smcup
+            // showing the PREVIOUS app's screen — a full-screen app restarting,
+            // or one that re-arms 1049 defensively, inherited the old content.
+            self.cursor_save.alt = Some(self.snapshot_cursor_state());
+            // `ClearScreen` is an ordinary BCE clear that ends in `ResetWrap`
+            // and moves no cursor — the same shape the fresh-grid path below
+            // uses for the first entry.
+            self.grid.set_cursor_template(
+                crate::grid::Cell::bce_blank(self.style.cached_colors()),
+                self.style.bce_bg_rgb(),
+            );
+            self.grid.erase_screen();
             return;
         }
 

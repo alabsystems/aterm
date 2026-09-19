@@ -436,6 +436,74 @@ pub(crate) fn parent_layer_of<W: raw_window_handle::HasWindowHandle>(target: &W)
     }
 }
 
+/// The EDR POTENTIAL of the screen the target's window is on —
+/// `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`, the
+/// brightness-independent "can this screen ever show extended range" answer
+/// (1.0 on an SDR-only screen). `None` for a non-AppKit handle, a view with no
+/// window yet, or a window on no screen. Two callers read it, and they read
+/// `None` differently. The attach (`GpuRenderer::create_window_surface`) gates
+/// the `Rgba16Float` pick through
+/// `format_plan::hdr_swapchain_wants_f16_on_screen`, where `None` keeps the
+/// unconditional pick. The screen re-pick
+/// (`GpuRenderer::upgrade_surface_for_screen`, called with the live `&Window`
+/// from the frontend's monitor-change hook and from its throttled headroom
+/// re-query) gates the upgrade of an 8-bit window through
+/// `format_plan::hdr_screen_upgrade_wants_f16`, where `None` upgrades
+/// nothing. Nothing is cached: every call walks `-window` and `-screen`
+/// afresh, so it answers from the `NSScreen` AppKit reports for the window
+/// now (Apple fixes the potential per `NSScreen` object, not per monitor).
+/// Measured (2026-09-06, macOS 13.7, x86_64): a freshly created,
+/// not-yet-ordered-front `NSWindow` already answers `screen` (the screen its
+/// frame lands on), so the attach sees the real value. Main thread only, like
+/// [`parent_layer_of`] (AppKit property reads); both callers run there.
+pub(crate) fn screen_edr_potential_of<W: raw_window_handle::HasWindowHandle>(
+    target: &W,
+) -> Option<f32> {
+    let raw = target.window_handle().ok()?.as_raw();
+    let raw_window_handle::RawWindowHandle::AppKit(h) = raw else {
+        return None;
+    };
+    let view: ffi::Id = h.ns_view.as_ptr().cast();
+    // SAFETY: `ns_view` is a live NSView pointer for as long as `target` is
+    // borrowed: raw-window-handle 0.6's `window_handle()` returns a
+    // `WindowHandle<'_>` that borrows `target`, and `target: &W` stays
+    // borrowed for this whole call. Both callers (the attach, and the screen
+    // re-pick the frontend runs from its monitor-change hook and its
+    // redraw-time headroom re-query) run on the main thread, where these
+    // AppKit reads belong. `-window` and `-screen` are `-(id)` +0 property reads,
+    // nil-checked before use (a nil receiver would answer zero anyway). The
+    // potential getter is `API_AVAILABLE(macos(10.15))` in the SDK's
+    // NSScreen.h and the app bundle declares `LSMinimumSystemVersion` 11.0
+    // (apps/aterm-mac/Info.plist), so the selector exists on every system the
+    // app launches on. It is `-(CGFloat)`, a `double` on every 64-bit Apple
+    // ABI, returned in the FP register `objc_msgSend` (not `_fpret`, which
+    // x86_64 reserves for `long double`) already hands back. Nothing is
+    // retained: every object read here is owned by AppKit for longer than
+    // this call.
+    unsafe {
+        let obj: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::msg();
+        let window = obj(view, ffi::sel(c"window"));
+        if window.is_null() {
+            return None;
+        }
+        let screen = obj(window, ffi::sel(c"screen"));
+        if screen.is_null() {
+            return None;
+        }
+        let f64_of: unsafe extern "C" fn(ffi::Id, ffi::Sel) -> f64 = ffi::msg();
+        let potential = f64_of(
+            screen,
+            ffi::sel(c"maximumPotentialExtendedDynamicRangeColorComponentValue"),
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a headroom multiplier of a few units (1.0 to 16.0); the f32 rounding is far below any display step"
+        )]
+        let potential = potential as f32;
+        Some(potential)
+    }
+}
+
 /// Why a Metal acquire vended nothing — the typed pre-image of
 /// [`SurfacePresentFailure`].
 #[derive(Debug)]

@@ -753,12 +753,43 @@ impl Parser {
     /// semicolons, etc.). PURE in the parser state (`&[u8]`, not `&mut self`).
     #[inline(never)]
     fn parse_osc_general<S: ActionSink>(data: &[u8], sink: &mut S, bel_terminated: bool) {
+        // THE LAST SLOT CARRIES THE REMAINDER VERBATIM, semicolons and all.
+        //
+        // This used to `break` when the buffer filled, DISCARDING every segment
+        // past the cap. That is the same defect #7268 fixed by raising the cap
+        // from 8 to 16 — raising it only moves the cliff, it does not remove it,
+        // and the payloads that carry semicolons have no bound to raise it to.
+        //
+        // It is not a cosmetic loss, because the consumers that matter re-JOIN:
+        // `set_title` joins `params[1..]` and `handle_osc_8` joins `params[2..]`
+        // with ';', added deliberately so titles and URIs containing literal
+        // semicolons survive. Past 15 semicolons the tail was simply gone — and
+        // for OSC 8 the TRUNCATED uri still passed the length/scheme/control
+        // gate, was stored on the cells, and was what the click path opened. A
+        // Cmd-click went to a URL the emitter never wrote.
+        //
+        // Keeping the tail in the final slot makes `join(';')` reconstruct the
+        // original exactly, at any number of semicolons, with no allocation and
+        // no larger buffer. A handler that indexes a FIXED early param is
+        // unaffected: the change only ever alters the CONTENT of the last slot,
+        // which previously held a truncated prefix of the same payload.
         let mut params: ArrayVec<&[u8], MAX_OSC_PARAMS> = ArrayVec::new();
-        for segment in data.split(|&b| b == b';') {
-            if params.is_full() {
+        let mut rest = data;
+        loop {
+            if params.len() + 1 == MAX_OSC_PARAMS {
+                params.push(rest);
                 break;
             }
-            params.push(segment);
+            match rest.iter().position(|&b| b == b';') {
+                Some(k) => {
+                    params.push(&rest[..k]);
+                    rest = &rest[k + 1..];
+                }
+                None => {
+                    params.push(rest);
+                    break;
+                }
+            }
         }
         sink.osc_dispatch_with_terminator(pty_wrap_ref(params.as_slice()), bel_terminated);
     }

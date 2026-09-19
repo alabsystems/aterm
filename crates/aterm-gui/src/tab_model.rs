@@ -478,6 +478,51 @@ impl<T: Copy + Eq> SplitTree<T> {
             Self::Split { first, .. } => first.first_leaf(),
         }
     }
+
+    /// The LAST leaf in tree order — the bottom/right-most one, the mirror of
+    /// [`Self::first_leaf`]. Used to find the leaf that touches a divider from
+    /// the side above/left of it ([`Self::absorbing_neighbor`]).
+    #[must_use]
+    pub(crate) fn last_leaf(&self) -> T {
+        match self {
+            Self::Leaf(value) => *value,
+            Self::Split { second, .. } => second.last_leaf(),
+        }
+    }
+
+    /// The leaf that INHERITS `target`'s space when [`Self::remove_leaf`] collapses
+    /// `target`'s parent onto its sibling — and, of that sub-tree, the leaf pressed
+    /// right up against the divider `target` shared with it. That is the "nearest
+    /// surviving leaf" focus must re-seat on: the pane that visibly grows into the
+    /// hole is the pane the person's eyes (and next keystrokes) follow.
+    ///
+    /// The near edge is the mirror of `target`'s own side of the divider: when
+    /// `target` is the FIRST child the sibling lies below/right of it, so its
+    /// `first_leaf` touches the seam; when `target` is the SECOND child the sibling
+    /// lies above/left, so its `last_leaf` does. `None` when `target` is not a leaf
+    /// of this tree, or is the whole tree (nothing survives to inherit).
+    ///
+    /// THE DEFECT THIS REPLACES: both close paths used to re-point focus at
+    /// `root.first_leaf()` — the tree's GLOBAL top-left leaf, which for anything
+    /// closed outside the first sub-tree is the opposite corner of the window.
+    /// Closing the bottom-right pane of `a | (b / c)` threw the keyboard across to
+    /// `a` while `b` silently took the freed space, so the next command ran in a
+    /// different live shell than the one the freed space pointed at.
+    #[must_use]
+    pub(crate) fn absorbing_neighbor(&self, target: T) -> Option<T> {
+        let Self::Split { first, second, .. } = self else {
+            return None;
+        };
+        if matches!(&**first, Self::Leaf(value) if *value == target) {
+            return Some(second.first_leaf());
+        }
+        if matches!(&**second, Self::Leaf(value) if *value == target) {
+            return Some(first.last_leaf());
+        }
+        first
+            .absorbing_neighbor(target)
+            .or_else(|| second.absorbing_neighbor(target))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1602,11 +1647,19 @@ impl Tab {
     /// Remove one leaf and repair focus to the nearest deterministic survivor.
     /// The final leaf is left in place so the tab owner can run its close
     /// transaction before removing the whole tab.
+    ///
+    /// "Nearest" is [`SplitTree::absorbing_neighbor`] — the leaf on the far side of
+    /// the divider the removed leaf shared, i.e. inside the sub-tree that takes its
+    /// space. Read BEFORE the removal, because the collapse is what erases the
+    /// parent that names the sibling. `first_leaf` is only the last-resort answer
+    /// for a tree that has no such neighbour (a stale focus repaired on a tree the
+    /// removed view was never in).
     pub(crate) fn remove_view(&mut self, view: ViewId) -> RemoveLeaf {
+        let heir = self.root.absorbing_neighbor(view);
         let removed = self.root.remove_leaf(view);
         if removed == RemoveLeaf::Removed {
             if self.focus == view || !self.root.contains(self.focus) {
-                self.focus = self.root.first_leaf();
+                self.focus = heir.unwrap_or_else(|| self.root.first_leaf());
             }
             self.zoomed = false;
         }
@@ -2082,7 +2135,11 @@ mod tests {
         let before = tab.root.clone();
         assert!(!tab.set_divider_ratio(&nested, 0.8));
         assert_eq!(tab.root, before, "stale topology handles fail closed");
-        assert_eq!(tab.focus, views[0], "close repairs focus deterministically");
+        assert_eq!(
+            tab.focus, views[1],
+            "close repairs focus deterministically onto the leaf that inherits the \
+             removed leaf's space, not the tree's first leaf"
+        );
     }
 
     /// THE SHRINK RULE, canonical half. `pane::PaneTree` and this planner are the
@@ -2225,6 +2282,47 @@ mod tests {
         );
         assert_eq!(aggregate.conn, Some(TabConnRole::Both));
         assert!(!aggregate.closable);
+    }
+
+    /// The mixed native/terminal close path repairs focus by the SAME rule as
+    /// `pane::PaneTree` — onto the leaf that inherits the removed leaf's space,
+    /// across the divider the two shared. Both engines used to answer
+    /// `root.first_leaf()`, the tab's top-left leaf, so a fix to only one of them
+    /// would leave the heterogeneous tab throwing the keyboard across the window.
+    #[test]
+    fn remove_view_repairs_focus_onto_the_leaf_that_inherits_the_space() {
+        let (_, views) = view_store_with(4);
+        let mut tab = Tab::new(
+            TabId::from_stored(1),
+            views[0],
+            TabPresentation::terminal("one"),
+        );
+        // 0 | (1 / 2), focused on 2 — the bottom-right leaf.
+        assert!(tab.split_focused(SplitAxis::Horizontal, views[1]));
+        assert!(tab.split_focused(SplitAxis::Vertical, views[2]));
+        assert_eq!(tab.focus, views[2]);
+        assert_eq!(tab.remove_view(views[2]), RemoveLeaf::Removed);
+        assert_eq!(
+            tab.focus, views[1],
+            "focus follows the space to view 1, not back to the first leaf 0"
+        );
+
+        // 0 | (1 / 2) again, but closing the leaf that is NOT focused must still
+        // leave the typist alone — the repair only fires for the focused leaf.
+        let (_, views) = view_store_with(3);
+        let mut tab = Tab::new(
+            TabId::from_stored(2),
+            views[0],
+            TabPresentation::terminal("one"),
+        );
+        assert!(tab.split_focused(SplitAxis::Horizontal, views[1]));
+        assert!(tab.split_focused(SplitAxis::Vertical, views[2]));
+        assert!(tab.set_focus(views[0]));
+        assert_eq!(tab.remove_view(views[2]), RemoveLeaf::Removed);
+        assert_eq!(
+            tab.focus, views[0],
+            "a background leaf closing never steals the keyboard"
+        );
     }
 
     #[test]

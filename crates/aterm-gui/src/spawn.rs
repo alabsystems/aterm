@@ -808,6 +808,13 @@ pub(crate) struct Adopted {
     /// `frozen_path`; marked on the registry at `App::register_session`, counted for
     /// the managed-current row, carried on by the next handoff.
     pub frozen_path: bool,
+    /// IDENTITY (session identities, 2026-09-17): the agent identity this shell
+    /// was spawned under (`spawn identity=<name>`), from the handoff record —
+    /// the shell still runs with that identity's env (an adopted shell's env
+    /// cannot be re-injected), and only the LABEL rides here, onto
+    /// `Session::identity` and the registry handle, so `sessions` keeps saying
+    /// whose the tab is and `identities forget` keeps seeing it live.
+    pub identity: Option<String>,
 }
 
 #[allow(
@@ -839,6 +846,18 @@ pub(crate) fn spawn_session(
     // newborn's shell env (identity only, see [`provision_observe_env`]).
     // `None` for every non-connected spawn.
     observe: Option<&SessionId>,
+    // IDENTITY (session identities, 2026-09-17): `Some(name)` spawns the shell
+    // under that agent identity — each agent's home variable pointed into
+    // `<state>/identities/<name>/<agent dir>` through `env_add`, which the pty
+    // seam applies AFTER the deny pass, so the parent's value is gone and the
+    // identity's is what the child sees. The identity must already EXIST
+    // (`agent_identity::ensure(name, false)`): the wire verb creates it before
+    // it spawns, a cold restore never creates one (`agent_identity::restorable`),
+    // and a missing dir here fails the spawn with its reason rather than
+    // starting a session without its env. `None` = the human's own agent
+    // config, the historical default. Ignored on an adopted shell (its env is
+    // already what it is; the label comes from `Adopted::identity`).
+    identity: Option<&str>,
     // SEAMLESS UPDATE (Rung 1b): `Some(_)` RE-ADOPTS a live shell handed across the update
     // re-exec — reuse its PTY master fd + pid and restore its identity instead of forking a
     // fresh shell. `None` = the normal fork-a-new-shell path (every existing caller).
@@ -852,6 +871,13 @@ pub(crate) fn spawn_session(
     }
     let handoff_local_id = adopt.as_ref().map(|adopted| adopted.local_id);
     let frozen_path = adopt.as_ref().is_some_and(|adopted| adopted.frozen_path);
+    // The identity LABEL this session wears: the name it is spawned under, or —
+    // for an adopted shell, whose env is what it was — the one its record
+    // carried across the handoff.
+    let identity_label: Option<String> = match &adopt {
+        Some(adopted) => adopted.identity.clone(),
+        None => identity.map(str::to_owned),
+    };
     // Per-tab shell integration: a FRESH nonce per session. Reusing a nonce
     // across tabs would let tab A's (untrusted) output emit tab B's authorized
     // OSC 133/633 marks; a distinct nonce per engine prevents that cross-tab
@@ -918,6 +944,18 @@ pub(crate) fn spawn_session(
         // only; adoption aside — a re-adopted shell keeps its original env).
         if let Some(origin) = observe {
             env_add.extend(provision_observe_env(origin));
+        }
+        // IDENTITY SEAM (session identities, 2026-09-17): appended with the
+        // other identity env, after the shell-integration vars, and applied by
+        // `build_child_env` AFTER its deny pass — so the parent's
+        // `CLAUDE_CONFIG_DIR`/`CODEX_HOME` never reach the child and the
+        // identity's do. Not gated on `exec_command`: `-e claude` is exactly
+        // the case that needs it. The dir must exist already (the verb created
+        // it); a missing one is the spawn's failure, never a shell without its env.
+        if let Some(name) = identity {
+            let dir = crate::agent_identity::ensure(name, false)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("identity {name}: {e}")))?;
+            env_add.extend(crate::agent_identity::env(&dir));
         }
     }
     // A one-shot `-e <cmd>` session never hosts an inner aterm, so skip child
@@ -1215,6 +1253,7 @@ pub(crate) fn spawn_session(
         pid,
         handoff_local_id,
         frozen_path,
+        identity: identity_label,
         ctx,
         child_proxy_sid,
         output_wake_pending,
@@ -3953,6 +3992,9 @@ impl crate::App {
             term: session.term.clone(),
             master: session.master,
             ctx: session.ctx.clone(),
+            // The identity label rides the handle (a field, not a side table):
+            // every roster reads handles, and the next handoff record projects it.
+            identity: session.identity.as_deref().map(Arc::from),
         };
         let mut registry = store.write().unwrap_or_else(|p| p.into_inner());
         registry.register(handle);

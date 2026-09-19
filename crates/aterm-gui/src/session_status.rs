@@ -2071,6 +2071,15 @@ impl crate::App {
         let hold = u8::from(pooled.ctx.fabric.hold().is_some());
         let fabric = crate::fabric::fabric_state();
         let fabric_tail = crate::fabric::fabric_status_tail();
+        // IDENTITY (session identities, 2026-09-17), additive and LAST: the
+        // agent identity the session was spawned under — the same word the
+        // `sessions` roster carries, from the same spawn-time field — `-` for
+        // the human's own agent config. A plain field read on the pooled
+        // session; this polled record pays nothing for it.
+        let identity = pooled
+            .identity
+            .as_deref()
+            .map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
         let pin = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             meta.presentation_value("title")
@@ -2141,7 +2150,7 @@ impl crate::App {
                 "schema=1 sid={session} subject={} subject_source={subject_source} observed=false \
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
-                 revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail}",
+                 revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} identity={identity}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -2178,7 +2187,7 @@ impl crate::App {
             "schema=1 sid={session} subject={} subject_source={subject_source} observed=true \
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
-             conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail}",
+             conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} identity={identity}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -3119,7 +3128,7 @@ mod tests {
         assert!(record.contains(" fabric=absent "), "{record}");
         // The round-13 tail: no bridge, so no ack and no age.
         assert!(
-            record.ends_with(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=-"),
+            record.ends_with(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=-"),
             "{record}"
         );
         assert!(
@@ -3143,6 +3152,57 @@ mod tests {
         let record = app.session_status_record(0).expect("live session");
         assert!(record.contains(" observed=true "), "{record}");
         assert!(record.contains(" hold=1 "), "{record}");
+        assert!(!record.contains('\n'), "one line, always");
+    }
+
+    /// IDENTITY (session identities, phase 1): the record's LAST field is the
+    /// agent identity the session was spawned under — the word the `sessions`
+    /// roster carries, from the same spawn-time field — `-` for the human's
+    /// own agent config. It rides BOTH arms after `fabric_link_age_ms=`,
+    /// additive, `schema=1` unmoved.
+    #[test]
+    fn the_status_record_carries_the_identity_after_the_fabric_tail() {
+        crate::fabric::with_link_reset(
+            the_status_record_carries_the_identity_after_the_fabric_tail_body,
+        );
+    }
+
+    fn the_status_record_carries_the_identity_after_the_fabric_tail_body() {
+        let mut app = crate::App::headless_for_test();
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" observed=false "), "the unobserved arm");
+        assert!(
+            record.ends_with(" fabric_link_age_ms=- identity=-"),
+            "{record}"
+        );
+
+        app.pool
+            .sessions
+            .get_mut(&0)
+            .expect("session 0")
+            .session
+            .identity = Some("worker".to_string());
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.ends_with(" fabric_link_age_ms=- identity=worker"),
+            "{record}"
+        );
+        assert!(
+            record.starts_with("schema=1 "),
+            "additive, not a new schema"
+        );
+
+        // The OBSERVED arm carries it too, from the same field.
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" observed=true "), "{record}");
+        assert!(
+            record.ends_with(" fabric_link_age_ms=- identity=worker"),
+            "{record}"
+        );
         assert!(!record.contains('\n'), "one line, always");
     }
 
@@ -3193,13 +3253,14 @@ mod tests {
         let record = app.session_status_record(0).expect("live session");
         // `enabled=` was the LAST field when this was written, and the assertion
         // said so with `ends_with`. Four ADDITIVE fabric fields now follow it
-        // (`hold=`, `fabric=`, `fabric_rtt_ms=`, `fabric_link_age_ms=`), which is
+        // (`hold=`, `fabric=`, `fabric_rtt_ms=`, `fabric_link_age_ms=`), and
+        // `identity=` (session identities) after those, which is
         // exactly what the record's own help promises a consumer — fields are
         // appended and never bump `schema=`. So pin the VALUE, and let the tail
         // keep growing.
         assert!(record.contains(" enabled=false "), "{record}");
         assert!(
-            record.ends_with(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=-"),
+            record.ends_with(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=-"),
             "{record}"
         );
 

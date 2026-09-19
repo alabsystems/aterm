@@ -20,8 +20,15 @@
 use std::ffi::{CStr, c_char, c_uint, c_void};
 
 /// An Objective-C object pointer. Null is the ObjC `nil` and is always a valid
-/// value to send a message to (it returns zero), so this wraps a raw pointer
-/// rather than a `NonNull`.
+/// value to send a message to, so this wraps a raw pointer rather than a
+/// `NonNull`. What a nil send RETURNS is zero for every register-class value
+/// (integers, pointers, floats, and structs that fit registers: CGPoint, CGSize,
+/// NSRange) — but an INDIRECT struct return (`objc_msgSend_stret` on x86_64:
+/// CGRect and anything over 16 bytes or unaligned) is left UNINITIALISED by
+/// libobjc there, while arm64 hands the same CGRect back in zeroed d0-d3. The
+/// typed `send_rect*` helpers nil-check for exactly that case (measured
+/// 2026-09-06 on an Intel Mac); a hand-cast `msg()` returning a struct must
+/// do the same.
 ///
 /// # Why this is a NEWTYPE and not `*mut c_void`
 ///

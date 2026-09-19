@@ -2402,6 +2402,392 @@ fn a_report_is_charged_to_the_wake_budget() {
     assert_eq!(reports(&w, &b).len(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// Round 16 addendum — the report is what the worker DISPLAYED
+// ---------------------------------------------------------------------------
+
+/// Standard padded base64 — the test side of the hook's decoder.
+fn b64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// One length-delimited protobuf field.
+fn proto(number: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = vec![(number << 3) | 2];
+    let mut len = value.len();
+    loop {
+        let byte = (len & 0x7f) as u8;
+        len >>= 7;
+        if len == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+    out.extend_from_slice(value);
+    out
+}
+
+/// A SYNTHETIC `thinking` signature in the shape measured on Claude Code
+/// 2.1.267 — field numbers and wire types only, every byte made up here: the
+/// payload's header carries the block's kind at its field 8.
+fn signature(kind: &str) -> String {
+    let mut header = vec![0x08, 0x01, 0x18, 0x02, 0x38, 0x01];
+    header.extend(proto(8, kind.as_bytes()));
+    let mut payload = proto(1, &header);
+    payload.extend(proto(2, &[0xa5; 12]));
+    payload.extend(proto(3, &[0x5a; 12]));
+    payload.extend(proto(4, &[0x3c; 48]));
+    let opaque: Vec<u8> = (0..96u8).map(|i| i.wrapping_mul(37)).collect();
+    payload.extend(proto(5, &opaque));
+    let mut top = vec![0x08, 0x02];
+    top.extend(proto(2, &payload));
+    top.extend([0x18, 0x01]);
+    b64(&top)
+}
+
+/// One assistant line of a SYNTHETIC transcript in this build's shape: one
+/// content block, the message's id shared by its lines.
+fn block_line(uuid: &str, id: &str, block: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","uuid":"{uuid}","isSidechain":false,"message":{{"id":"{id}","role":"assistant","content":[{block}]}}}}"#
+    )
+}
+
+fn thinking_block(text: &str, signature: &str) -> String {
+    format!(
+        r#"{{"type":"thinking","thinking":{},"signature":{}}}"#,
+        aterm_link::json::string(text),
+        aterm_link::json::string(signature)
+    )
+}
+
+fn text_block(text: &str) -> String {
+    format!(
+        r#"{{"type":"text","text":{}}}"#,
+        aterm_link::json::string(text)
+    )
+}
+
+/// The head of a turn — a prompt, a message with hidden reasoning (with
+/// text, so a leak would show), a text line and a tool call, then narration
+/// and another tool call — each line's uuid and id led by `tag`.
+fn turn_head(tag: &str, secret: &str) -> Vec<String> {
+    let narr = signature("narration");
+    let hid = signature("thinking");
+    let tool = r#"{"type":"tool_use","id":"t","name":"Bash","input":{"command":"true"}}"#;
+    let result = |n: u8| {
+        format!(
+            r#"{{"type":"user","uuid":"{tag}-r{n}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"ok"}}]}}}}"#
+        )
+    };
+    vec![
+        format!(
+            r#"{{"type":"user","uuid":"{tag}-u","message":{{"role":"user","content":"run the rehearsal"}}}}"#
+        ),
+        block_line(
+            &format!("{tag}-a1"),
+            &format!("{tag}-m1"),
+            &thinking_block(secret, &hid),
+        ),
+        block_line(
+            &format!("{tag}-a2"),
+            &format!("{tag}-m1"),
+            &text_block("Starting the rehearsal."),
+        ),
+        block_line(&format!("{tag}-a3"), &format!("{tag}-m1"), tool),
+        result(1),
+        block_line(
+            &format!("{tag}-a4"),
+            &format!("{tag}-m2"),
+            &thinking_block("", &hid),
+        ),
+        block_line(
+            &format!("{tag}-a5"),
+            &format!("{tag}-m2"),
+            &thinking_block("The rehearsal finished; checking its outcome:", &narr),
+        ),
+        block_line(&format!("{tag}-a6"), &format!("{tag}-m2"), tool),
+        result(2),
+    ]
+}
+
+/// The vendor's `Stop` input with its own `last_assistant_message`.
+fn stop_input_saying(path: &str, last: &str) -> String {
+    format!(
+        "{{\"session_id\":\"x\",\"transcript_path\":{},\"hook_event_name\":\"Stop\",\"stop_hook_active\":false,\"last_assistant_message\":{}}}",
+        aterm_link::json::string(path),
+        aterm_link::json::string(last)
+    )
+}
+
+/// **THE REPORT IS WHAT THE WORKER DISPLAYED, NEVER ITS HIDDEN REASONING**
+/// (round 16 addendum), through the shipped binary against a live instance:
+///
+/// 1. a turn that ends in narration (a `thinking` block with Claude Code's
+///    narration mark) posts the narration — not the earlier text line the
+///    round-14 reader took — and not the hidden block beside it;
+/// 2. a turn whose last message is hidden reasoning alone posts nothing and
+///    says why, never the text and never an older message;
+/// 3. a transcript that LAGS the turn — the vendor's `last_assistant_message`
+///    in the input, the final lines landing 300 ms after the hook started —
+///    posts the final message, not the stale narration the file held when
+///    `Stop` fired (what the live worker's report posted on 2026-09-15);
+/// 4. final lines that never land: after the 2 s catch-up the vendor's text
+///    is posted, and stderr says so.
+///
+/// No report body anywhere carries the hidden block's text.
+#[test]
+fn the_report_posts_what_the_worker_displayed_and_never_its_hidden_reasoning() {
+    const SECRET: &str = "HIDDENREASONINGSENTINEL";
+    let w = World::boot("report16", &["h-andrew"]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let state = ledger_dir(&w, "report16").display().to_string();
+    let to = format!("@{b}");
+    let run = |input: &str| -> Output {
+        hook(
+            &w,
+            input,
+            &[
+                "run",
+                "stop",
+                "--session",
+                &a,
+                "--state",
+                &state,
+                "--report-to",
+                &to,
+                "--timeout",
+                "0.2",
+            ],
+        )
+    };
+    let write = |name: &str, lines: &[String]| -> String {
+        let path = w.tmp.join(name);
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
+        path.display().to_string()
+    };
+    let newest_body = |n: usize| -> String {
+        let got = until("the report to land", || {
+            let r = reports(&w, &b);
+            (r.len() >= n).then_some(r)
+        });
+        let newest = got.iter().max_by_key(|r| row_id(r)).expect("a report");
+        body_of(&w, &b, row_id(newest))
+    };
+    let narr = signature("narration");
+    let hid = signature("thinking");
+
+    // 1. Narration ends the turn.
+    let mut lines = turn_head("n", SECRET);
+    lines.push(block_line("n-a7", "n-m3", &thinking_block(SECRET, &hid)));
+    lines.push(block_line(
+        "n-a8",
+        "n-m3",
+        &thinking_block("All 12 cases pass; the branch is merged.", &narr),
+    ));
+    let path = write("r16-narration.jsonl", &lines);
+    let out = run(&stop_input(&path, false));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(newest_body(1), "All 12 cases pass; the branch is merged.");
+
+    // 2. Hidden reasoning alone ends the turn.
+    let mut lines = turn_head("h", SECRET);
+    lines.push(block_line("h-a7", "h-m3", &thinking_block(SECRET, &hid)));
+    let path = write("r16-hidden.jsonl", &lines);
+    let out = run(&stop_input(&path, false));
+    assert_eq!(code(&out), 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be told from hidden reasoning")
+            && stderr.contains("nothing posted"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(SECRET), "{stderr}");
+
+    // 3. The transcript lags the turn.
+    let fin = "Done: 12 of 12 cases pass; merged.";
+    let path = write("r16-lagging.jsonl", &turn_head("l", SECRET));
+    let tail = [
+        block_line("l-a7", "l-m3", &thinking_block("", &hid)),
+        block_line("l-a8", "l-m3", &text_block(fin)),
+    ];
+    let writer = {
+        let path = path.clone();
+        let tail = tail.join("\n") + "\n";
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open to append");
+            f.write_all(tail.as_bytes())
+                .expect("append the final lines");
+        })
+    };
+    let out = run(&stop_input_saying(&path, fin));
+    writer.join().expect("the writer");
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(newest_body(2), fin);
+
+    // 4. The final lines never land.
+    let said = "Done; said in memory only.";
+    let path = write("r16-never.jsonl", &turn_head("v", SECRET));
+    let out = run(&stop_input_saying(&path, said));
+    assert_eq!(code(&out), 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("did not show the turn's last message within 2000 ms")
+            && stderr.contains("posting the vendor's last_assistant_message"),
+        "{stderr}"
+    );
+    assert_eq!(newest_body(3), said);
+
+    let all = reports(&w, &b);
+    assert_eq!(all.len(), 3, "{all:?}");
+    for row in &all {
+        assert!(!body_of(&w, &b, row_id(row)).contains(SECRET), "{row}");
+    }
+}
+
+/// The vendor's `Stop` input for a stop the WAKE caused (`stop_hook_active`),
+/// with its own `last_assistant_message`.
+fn refired_stop_saying(path: &str, last: &str) -> String {
+    format!(
+        "{{\"session_id\":\"x\",\"transcript_path\":{},\"hook_event_name\":\"Stop\",\"stop_hook_active\":true,\"last_assistant_message\":{}}}",
+        aterm_link::json::string(path),
+        aterm_link::json::string(last)
+    )
+}
+
+/// **A REPLY AFTER A WAKE IS REPORTED, EVEN IN THE SAME WORDS** (review
+/// defect A, through the shipped binary against a live instance). Stop #1
+/// reports the worker's message; the hook's wake keeps the turn alive, so
+/// the vendor writes its `Stop hook feedback:` line (`isMeta`), an attachment
+/// and the `stop_hook_summary`, and the worker replies — in the same words —
+/// and Stop #2 fires (`stop_hook_active: true`) before that reply is on
+/// disk. The round-16 reader took the pre-wake line as "caught up", keyed it
+/// the same, and dropped the reply as a re-fire ("this message was already
+/// reported"): one report where there were two. Then a re-fire of Stop #2
+/// posts nothing, as it must.
+#[test]
+fn a_reply_after_a_wake_is_reported_even_in_the_same_words() {
+    let w = World::boot("wake16", &["h-andrew"]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let state = ledger_dir(&w, "wake16").display().to_string();
+    let to = format!("@{b}");
+    let run = |input: &str| -> Output {
+        hook(
+            &w,
+            input,
+            &[
+                "run",
+                "stop",
+                "--session",
+                &a,
+                "--state",
+                &state,
+                "--report-to",
+                &to,
+                "--timeout",
+                "0.2",
+            ],
+        )
+    };
+    let said = "Idle; waiting for the next task.";
+    let path = w.tmp.join("r16-wake.jsonl");
+    let mut lines = vec![
+        r#"{"type":"user","uuid":"k-u1","message":{"role":"user","content":"take the next task"}}"#
+            .to_string(),
+        block_line("k-a2", "k-m2", &text_block(said)),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
+    let path = path.display().to_string();
+
+    // Stop #1: the message is reported.
+    let out = run(&stop_input_saying(&path, said));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let first = until("the first report", || {
+        let r = reports(&w, &b);
+        (!r.is_empty()).then_some(r)
+    });
+    assert_eq!(first.len(), 1, "{first:?}");
+
+    // The wake, as the vendor writes it; then Stop #2, the reply not on disk.
+    lines.push(format!(
+        r#"{{"type":"user","uuid":"k-u3","isMeta":true,"message":{{"role":"user","content":{}}}}}"#,
+        aterm_link::json::string("Stop hook feedback:\n[aterm fabric] 1 new message for s-x.")
+    ));
+    lines.push(r#"{"type":"attachment","uuid":"k-at"}"#.to_string());
+    lines.push(r#"{"type":"system","subtype":"stop_hook_summary","uuid":"k-ss"}"#.to_string());
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write the wake");
+    let writer = {
+        let path = path.clone();
+        let reply = block_line("k-a4", "k-m4", &text_block(said)) + "\n";
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open to append");
+            f.write_all(reply.as_bytes()).expect("append the reply");
+        })
+    };
+    let started = std::time::Instant::now();
+    let out = run(&refired_stop_saying(&path, said));
+    let took = started.elapsed();
+    writer.join().expect("the writer");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 0, "{stderr}");
+    assert!(
+        !stderr.contains("already reported"),
+        "the reply after the wake was dropped as a re-fire (in {took:?}): {stderr}"
+    );
+    let both = until("the reply's report", || {
+        let r = reports(&w, &b);
+        (r.len() >= 2).then_some(r)
+    });
+    assert_eq!(both.len(), 2, "{both:?}");
+    let newest = both.iter().max_by_key(|r| row_id(r)).expect("a report");
+    assert_eq!(body_of(&w, &b, row_id(newest)), said);
+
+    // A re-fire of Stop #2, the reply now on disk: nothing more.
+    let out = run(&refired_stop_saying(&path, said));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already reported"), "{stderr}");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(reports(&w, &b).len(), 2);
+}
+
 /// **THE INSTALLER WRITES THE FLAG ON THE STOP COMMAND, PROVES IT, AND
 /// REFUSES A RECIPIENT THE INSTANCE DOES NOT HOST.** The self-test line for
 /// `Stop` ends `report-to=<sid>`; the other three commands do not carry the

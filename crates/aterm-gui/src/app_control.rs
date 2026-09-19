@@ -1246,6 +1246,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The Manual's diagnostic footer is fitted to the width it OWNS, in the
+    /// face it PAINTS. A `bidi` value error's complete remedy measures far
+    /// inside the footer slot of a default 80x24 window, so none of it may be
+    /// elided there — the reader is told what is wrong and what is legal in the
+    /// one place the Manual promises to say it.
+    ///
+    /// The regression this pins: the footer budget was a character count
+    /// (`width / 7.0`) calibrated for the monospace minibuffer that shares the
+    /// slot, while the status beside it paints in the proportional Ui face at
+    /// about 4.8 px per glyph. That under-counted the strip by roughly a third
+    /// — on glass at 80x24, ink stopped at x=526 of a footer usable to x=732 —
+    /// and since the status is composed prefix-first, a tail elide always
+    /// sacrificed the remedy.
+    #[test]
+    fn manual_diagnostic_footer_keeps_a_remedy_that_fits_the_default_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-control-manual-footer-fit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        std::fs::write(&path, "bidi = \"sideways\"\n").unwrap();
+
+        // Measure in PRODUCTION typography: the defect is a face/measure
+        // mismatch, and a font-cold harness charges the proportional Ui face
+        // the same ~0.6 em the monospace fallback uses, which is precisely the
+        // confusion under test.
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        if let Some(window) = app.windows.get_mut(&wid) {
+            window.cols = 80;
+            window.rows = 24;
+        }
+        app.ensure_and_open_config_editor_path_in_window(wid, &path)
+            .unwrap();
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let lines = app
+            .inspect_app(InspectRequest::View {
+                view,
+                projection: InspectionProjection::Audit,
+            })
+            .unwrap();
+
+        const REMEDY: &str = "bidi must be one of: implicit, disabled, explicit";
+        let status = lines
+            .iter()
+            .find(|line| line.starts_with("editor-status "))
+            .expect("editor-status");
+        assert!(status.contains(REMEDY), "{status}");
+
+        let painted = lines
+            .iter()
+            .find(|line| line.starts_with("editor-painted-status "))
+            .expect("editor-painted-status");
+        assert!(
+            painted.contains(REMEDY),
+            "the remedy fits the default footer and must be painted: {painted}"
+        );
+        assert!(painted.contains("truncated=false"), "{painted}");
+
+        // The painter's own measure agrees: what is painted fits the slot.
+        let audit = lines
+            .iter()
+            .find(|line| line.starts_with("paint-editor "))
+            .expect("paint-editor audit");
+        let measured = |key: &str| -> f32 {
+            audit
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix(key))
+                .unwrap_or_else(|| panic!("{key} in {audit}"))
+                .parse()
+                .unwrap()
+        };
+        assert!(
+            measured("footer-required=") <= measured("footer-available="),
+            "the whole diagnostic fits the slot it is painted into: {audit}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn tabs_inspection_uses_effective_smart_title_with_stable_fallback() {
         let mut app = App::headless_for_test();

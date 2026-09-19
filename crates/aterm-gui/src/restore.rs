@@ -103,6 +103,15 @@ pub(crate) struct TerminalLeafRestore {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<String>,
+    /// IDENTITY (session identities, 2026-09-17; additive, absent tolerated):
+    /// the agent identity the session was spawned under, so a cold restore
+    /// respawns the leaf's shell under it — `create = false`
+    /// (`agent_identity::restorable`): a forgotten identity falls back to a
+    /// default shell with one stderr line; restore never creates one. On a
+    /// seamless update the adopted shell keeps its env and the label rides the
+    /// handoff record instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 impl TerminalLeafRestore {
@@ -360,6 +369,13 @@ impl RestoredView {
 /// Recursive, content-agnostic persisted split tree.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "node", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the leaf IS the tree's payload (a terminal leaf grew past the lint's 200-byte \
+              line with its `identity` field, 2026-09-17); every node below the root is \
+              already boxed by `Split`, so the inline leaf costs one root-sized slot per \
+              tab, and boxing it would put a deref on every match over a restored view"
+)]
 pub(crate) enum RestoredSplitTree {
     Leaf {
         view: RestoredView,
@@ -722,6 +738,19 @@ impl WindowLayout {
         }
     }
 
+    /// The agent identity of the pane this window's BOOTSTRAP session fills —
+    /// the leaf [`Self::bootstrap_local_id`] names, by the same pick as
+    /// [`Self::bootstrap_cwd`] — so the session spawned for it runs under that
+    /// identity from its first fork: a shell's env cannot be re-injected
+    /// afterwards, and the graft (`App::restore_terminal_leaf`) refuses a
+    /// bootstrap that does not wear what the pane names. Measured 2026-09-17
+    /// (review): before this pick, window 0's first leaf came back under the
+    /// human's login, labeled `identity=-`. Only the canonical tree carries
+    /// the field; the legacy `tabs` mirror names none.
+    pub(crate) fn bootstrap_identity(&self) -> Option<&str> {
+        self.bootstrap_terminal_leaf()?.identity.as_deref()
+    }
+
     /// The canonical tree's first terminal leaf, in rebuild order: the leaf
     /// the deferred restore grafts this window's bootstrap session onto.
     fn bootstrap_terminal_leaf(&self) -> Option<&TerminalLeafRestore> {
@@ -866,6 +895,7 @@ impl RestoredTab {
                         icon: None,
                         role: None,
                         attention: None,
+                        identity: None,
                     }))
                 }
                 PaneLayout::Split {
@@ -1024,6 +1054,13 @@ impl RestoreManifest {
     /// with its own cwd).
     pub(crate) fn first_leaf_cwd(&self) -> Option<&str> {
         self.windows.first()?.bootstrap_cwd()
+    }
+
+    /// The agent identity of the pane the bootstrap session 0 becomes — the
+    /// FIRST window's [`WindowLayout::bootstrap_identity`] — so its spawn can
+    /// run under it (`main_entry`, beside [`Self::first_leaf_cwd`]).
+    pub(crate) fn first_leaf_identity(&self) -> Option<&str> {
+        self.windows.first()?.bootstrap_identity()
     }
 
     pub(crate) fn to_toml(&self) -> Result<String, String> {
@@ -1927,6 +1964,7 @@ metadata = "opaque=copy-me"
                     icon: None,
                     role: None,
                     attention: None,
+                    identity: None,
                 },
             ))),
         };
@@ -1950,6 +1988,7 @@ metadata = "opaque=copy-me"
             icon: None,
             role: None,
             attention: None,
+            identity: None,
         }));
         for _ in 0..=MAX_SPLIT_DEPTH {
             root = RestoredSplitTree::Split {
@@ -1967,6 +2006,7 @@ metadata = "opaque=copy-me"
                         icon: None,
                         role: None,
                         attention: None,
+                        identity: None,
                     },
                 ))),
             };

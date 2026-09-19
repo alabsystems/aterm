@@ -401,6 +401,11 @@ impl App {
                         icon: user_meta.icon,
                         role: user_meta.role,
                         attention: user_meta.attention,
+                        // The spawn-time identity, so the respawn is under it.
+                        identity: self
+                            .pool
+                            .get(terminal.session)
+                            .and_then(|s| s.identity.clone()),
                     },
                 ))
             }
@@ -784,9 +789,30 @@ impl App {
             // once, so it is still waiting here; were it taken, the window's bootstrap
             // would be a fresh stand-in, which `carry_restored_identity` gives no identity.
             let adopt = take_handed_off_shell(&mut self.seamless_adopt, wl.bootstrap_local_id());
+            // IDENTITY (session identities; review 2026-09-17): a bootstrap that
+            // is FORKED here runs under the identity the pane it fills names —
+            // the same pick as its cwd — while that identity still exists
+            // (`restorable`: create = false, one stderr line when it is gone).
+            // The graft refuses a bootstrap that does not wear what its pane
+            // names, so a bootstrap forked without this came back as the
+            // human's login under a `worker` tab. An adopted shell's env is
+            // what it was; its label rides `Adopted::identity`.
+            let identity0: Option<String> = if adopt.is_none() {
+                wl.bootstrap_identity()
+                    .and_then(crate::agent_identity::restorable)
+            } else {
+                None
+            };
             let outer = (wl.outer_x, wl.outer_y);
             let maximized = wl.maximized;
-            let Some(wid) = self.create_window_internal(el, cwd0.as_deref(), adopt) else {
+            let Some(wid) = self.create_window_internal_connected(
+                el,
+                cwd0.as_deref(),
+                adopt,
+                None,
+                None,
+                identity0.as_deref(),
+            ) else {
                 // A window create fails on spawn or GPU-surface trouble — both likely to
                 // repeat. Keep what restored rather than looping on failures. RESIDUAL
                 // RISK (rare): if this window carried an adopted shell as its first leaf,
@@ -975,6 +1001,7 @@ impl App {
             let mut session = crate::stub_session(id);
             session.handoff_local_id = Some(adopted.local_id);
             session.frozen_path = adopted.frozen_path;
+            session.identity = adopted.identity;
             return Ok(session);
         }
         let proxy = self
@@ -992,6 +1019,7 @@ impl App {
             &proxy,
             None,
             None, // not a connected controller spawn
+            None, // adopted: the shell keeps its env; the label rides `Adopted::identity`
             Some(adopted),
         )
     }
@@ -1602,9 +1630,37 @@ impl App {
         // re-adopted a session below was ever re-seeded. Which shell the leaf's
         // identity lands on is `carry_restored_identity`'s business, and what it
         // may overwrite there is `graft_restored_user_meta`'s.
-        if let Some((view, session)) = reusable_terminal.take() {
-            self.carry_restored_identity(terminal, FillingShell::Registered(session), ids);
-            return Ok(view);
+        //
+        // THE AGENT IDENTITY IS THE SHELL'S, NOT THE LEAF'S. A shell's env is
+        // set at its fork and cannot be re-injected, so on a COLD restore the
+        // bootstrap fills this pane only if it already runs under the identity
+        // the leaf names (`main_entry` and `apply_restore_manifest` fork it
+        // under `bootstrap_identity`, by the same pick as its cwd). Measured
+        // 2026-09-17 (review): grafting regardless put a `worker` tab's first
+        // leaf on the human's login, labeled `identity=-`. A bootstrap that
+        // wears something else stays in `reusable_terminal` for a later pane
+        // that names what it wears, or is retired unconsumed
+        // (`restore_recursive_into_window`); this pane forks its own shell
+        // below. A handoff's bootstrap is the adopted shell its leaf names
+        // (or a stand-in forked under that leaf's identity), and its label is
+        // the shell's own — grafted as before.
+        if let Some((view, session)) = *reusable_terminal {
+            let from_handoff = ids == LeafIds::Retired && self.handoff_successor;
+            if from_handoff || self.bootstrap_wears_leaf_identity(session, terminal) {
+                *reusable_terminal = None;
+                self.carry_restored_identity(terminal, FillingShell::Registered(session), ids);
+                return Ok(view);
+            }
+            crate::logging::stderr_line!(
+                "aterm-gui: session restore: the window's bootstrap shell runs under identity \
+                 {} and the pane names {}; the pane gets its own shell, and the bootstrap \
+                 fills a later pane that names its identity or is retired",
+                self.pool
+                    .get(session)
+                    .and_then(|live| live.identity.as_deref())
+                    .unwrap_or("-"),
+                terminal.identity.as_deref().unwrap_or("-")
+            );
         }
         // RE-ATTACH ONLY TO AN ID THIS PROCESS MINTED. A closed-tab record names a
         // session of OURS, and ids are never reused within a run, so a pool hit is
@@ -1648,6 +1704,13 @@ impl App {
             {
                 session.handoff_local_id = Some(shell.local_id);
                 session.frozen_path = shell.frozen_path;
+                session.identity = shell.identity;
+            } else {
+                // A cold restore's stand-in: the leaf's identity, create=false.
+                session.identity = terminal
+                    .identity
+                    .as_deref()
+                    .and_then(crate::agent_identity::restorable);
             }
             self.carry_restored_identity(terminal, FillingShell::Unregistered(&session), ids);
             let view = self
@@ -1669,6 +1732,19 @@ impl App {
             .map(|window| (window.rows, window.cols))
             .ok_or_else(|| "restore window disappeared".to_string())?;
         let adopt = take_handed_off_shell(&mut self.seamless_adopt, terminal.local_id);
+        // IDENTITY on a COLD restore (session identities, 2026-09-17): the leaf
+        // names the identity its shell ran under; respawn under it only if it
+        // still exists (`create = false` — restore never creates one; a
+        // forgotten identity is a default shell and one stderr line). An
+        // adopted shell needs none of this: its env is what it was.
+        let identity = if adopt.is_none() {
+            terminal
+                .identity
+                .as_deref()
+                .and_then(crate::agent_identity::restorable)
+        } else {
+            None
+        };
         let session = spawn_session(
             id,
             wid,
@@ -1680,6 +1756,7 @@ impl App {
             &proxy,
             terminal.cwd.as_deref(),
             None, // not a connected controller spawn
+            identity.as_deref(),
             adopt,
         )
         .map_err(|error| error.to_string())?;
@@ -1692,6 +1769,28 @@ impl App {
         Self::register_session(&self.store, &session, None);
         self.pool.insert(session);
         Ok(view)
+    }
+
+    /// Whether the window's bootstrap session `session` runs under the agent
+    /// identity restore leaf `leaf` names — what a COLD restore may graft. The
+    /// leaf's name counts only while the identity still exists
+    /// (`agent_identity::existing`, the silent read: `main_entry` already
+    /// said so when it forked the bootstrap); a forgotten identity is a
+    /// default shell on both sides, so they match.
+    fn bootstrap_wears_leaf_identity(
+        &self,
+        session: u64,
+        leaf: &restore::TerminalLeafRestore,
+    ) -> bool {
+        let wears = self
+            .pool
+            .get(session)
+            .and_then(|live| live.identity.as_deref());
+        let names = leaf
+            .identity
+            .as_deref()
+            .and_then(crate::agent_identity::existing);
+        wears == names.as_deref()
     }
 
     /// Re-seed a freshly-respawned session's USER metadata (`meta set` fields)
@@ -2401,6 +2500,7 @@ impl App {
                 &proxy,
                 leaf.cwd(),
                 None, // not a connected controller spawn
+                None, // a legacy (RESTORE-1) layout carries no identity
                 adopt,
             ) {
                 Ok(s) => {
@@ -2813,6 +2913,7 @@ mod tests {
             icon: Some("🚀".to_string()),
             role: Some("operator".to_string()),
             attention: Some("⚠ waiting on approval".to_string()),
+            identity: None,
         };
         let session = crate::stub_session(9);
         App::seed_restored_user_meta(&session, &leaf);
@@ -2834,6 +2935,7 @@ mod tests {
             icon: None,
             role: None,
             attention: None,
+            identity: None,
         };
         App::seed_restored_user_meta(&session, &bare);
         assert_eq!(
@@ -2856,6 +2958,7 @@ mod tests {
             icon: Some(format!("\u{2066}{family}\u{2069}")),
             role: Some("operator\u{200b}".to_string()),
             attention: Some("  needs\u{2028}human  ".to_string()),
+            identity: None,
         };
         let session = crate::stub_session(9);
         App::seed_restored_user_meta(&session, &leaf);
@@ -3347,6 +3450,7 @@ mod tests {
                         icon: None,
                         role: None,
                         attention: None,
+                        identity: None,
                     }),
                 )),
                 second: Box::new(restore::RestoredSplitTree::leaf(
@@ -3437,6 +3541,7 @@ mod tests {
                 icon: None,
                 role: None,
                 attention: None,
+                identity: None,
             },
         ))
     }
@@ -3935,6 +4040,7 @@ mod tests {
             icon: None,
             role: None,
             attention: None,
+            identity: None,
         }
     }
 
@@ -4499,6 +4605,292 @@ mod tests {
         assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
     }
 
+    /// THE IDENTITY CARRY (session identities, 2026-09-17), end to end. Across
+    /// a seamless update the record's label reaches the session and the
+    /// registry handle through both adoption paths (the leaf naming the shell,
+    /// and the orphan net) — the shell keeps the identity's env, the label is
+    /// what rides. Across a quit, a leaf naming an identity respawns under it
+    /// only if it still exists: `create = false` — a leaf naming a forgotten
+    /// identity comes back as a default shell, and nothing is created for it.
+    #[test]
+    fn an_identitys_label_rides_the_adoption_and_a_cold_restore_never_creates_one() {
+        let state = std::env::temp_dir().join(format!(
+            "aterm-restore-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&state).unwrap();
+        let labels = |app: &App| -> Vec<(Option<u64>, Option<String>, Option<String>)> {
+            let store = app.store.read().unwrap();
+            let mut rows: Vec<_> = app
+                .pool
+                .sessions
+                .iter()
+                .map(|(&session, pooled)| {
+                    (
+                        pooled.session.handoff_local_id,
+                        pooled.session.identity.clone(),
+                        store
+                            .by_local(session)
+                            .and_then(|h| h.identity.as_deref().map(str::to_owned)),
+                    )
+                })
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        let under = |shell: u64, name: &str| {
+            restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+                restore::TerminalLeafRestore {
+                    local_id: Some(shell),
+                    identity: Some(name.to_string()),
+                    ..bare_leaf()
+                },
+            ))
+        };
+        aterm_log::env::scoped("ATERM_STATE_HOME", &state, || {
+            // Seamless, the leaf path: the record says `worker`, the session and
+            // its handle say `worker`; the stand-in for leaf 0 says nothing.
+            let mut new = App::headless_for_test();
+            new.handoff_successor = true;
+            let mut shell = handed_off_shell(3);
+            shell.identity = Some("worker".to_string());
+            new.seamless_adopt = vec![shell];
+            new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0), leaf_naming(3)]));
+            assert!(new.seamless_adopt.is_empty(), "the leaf adopted shell 3");
+            assert_eq!(
+                labels(&new),
+                vec![
+                    (None, None, None),
+                    (
+                        Some(3),
+                        Some("worker".to_string()),
+                        Some("worker".to_string())
+                    ),
+                ]
+            );
+            // Seamless, the orphan net: the same carry.
+            let mut new = App::headless_for_test();
+            new.handoff_successor = true;
+            new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0)]));
+            let mut shell = handed_off_shell(1);
+            shell.identity = Some("reviewer".to_string());
+            new.seamless_adopt = vec![shell, handed_off_shell(2)];
+            new.adopt_orphan_shells_as_tabs(&[]);
+            assert_eq!(
+                labels(&new),
+                vec![
+                    (None, None, None),
+                    (
+                        Some(1),
+                        Some("reviewer".to_string()),
+                        Some("reviewer".to_string())
+                    ),
+                    (Some(2), None, None),
+                ]
+            );
+            // Cold: `worker` exists (the verb created it); `ghost` never did.
+            crate::agent_identity::ensure("worker", true).expect("the verb's create");
+            let mut cold = App::headless_for_test();
+            cold.restore_into_window(
+                WindowId(0),
+                window_of(vec![leaf_naming(0), under(7, "worker"), under(8, "ghost")]),
+            );
+            assert_eq!(
+                labels(&cold),
+                vec![
+                    (None, None, None),
+                    (None, None, None),
+                    (None, Some("worker".to_string()), Some("worker".to_string())),
+                ],
+                "the leaf under `worker` respawns under it; the one under `ghost` is a default shell"
+            );
+            assert!(
+                state.join("identities").join("worker").is_dir()
+                    && !state.join("identities").join("ghost").exists(),
+                "restore never creates an identity"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// REVIEW (separation lens, 2026-09-17): ON A COLD RESTORE, THE WINDOW'S
+    /// FIRST LEAF KEEPS ITS IDENTITY. The window's bootstrap shell is grafted
+    /// onto its first terminal leaf, and the graft carried only the USER meta:
+    /// a tab that was `identity=worker` in window 0's first leaf came back as
+    /// `identity=-`, its bootstrap forked under the human's login — measured
+    /// `[(None, None), (Some("worker"), Some("worker"))]` for two leaves both
+    /// naming `worker`. The agent identity is the SHELL's: the graft now
+    /// takes the bootstrap only when it wears what the pane names
+    /// (`main_entry` forks it under `first_leaf_identity` so it does), a
+    /// bootstrap wearing something else fills a later pane that names its
+    /// identity or is retired, and the pane forks its own shell under the
+    /// identity — in every case each pane's shell wears what its leaf names.
+    #[test]
+    fn a_cold_restore_keeps_the_identity_of_the_windows_first_leaf() {
+        let state = std::env::temp_dir().join(format!(
+            "aterm-restore-first-leaf-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&state).unwrap();
+        // `(local id, the session's label, the registry handle's label)`, by id.
+        let rows = |app: &App| -> Vec<(u64, Option<String>, Option<String>)> {
+            let store = app.store.read().unwrap();
+            let mut rows: Vec<_> = app
+                .pool
+                .sessions
+                .iter()
+                .map(|(&session, pooled)| {
+                    (
+                        session,
+                        pooled.session.identity.clone(),
+                        store
+                            .by_local(session)
+                            .and_then(|h| h.identity.as_deref().map(str::to_owned)),
+                    )
+                })
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        let under = |shell: u64, name: Option<&str>| {
+            restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+                restore::TerminalLeafRestore {
+                    local_id: Some(shell),
+                    identity: name.map(str::to_owned),
+                    ..bare_leaf()
+                },
+            ))
+        };
+        let worker = || Some("worker".to_string());
+        aterm_log::env::scoped("ATERM_STATE_HOME", &state, || {
+            crate::agent_identity::ensure("worker", true).expect("the verb's create");
+            // The reviewer's shape: both leaves name `worker`; the bootstrap (a
+            // stub, the human's own) wears none. Neither pane takes it — each
+            // forks its own shell under `worker` — and it is retired unconsumed.
+            let mut cold = App::headless_for_test();
+            cold.restore_into_window(
+                WindowId(0),
+                window_of(vec![under(7, Some("worker")), under(8, Some("worker"))]),
+            );
+            assert_eq!(
+                rows(&cold),
+                vec![(1, worker(), worker()), (2, worker(), worker())],
+                "both panes under `worker`; the bootstrap that wore none is gone"
+            );
+            // A later pane names what the bootstrap wears: it fills THAT pane.
+            let mut cold = App::headless_for_test();
+            cold.restore_into_window(
+                WindowId(0),
+                window_of(vec![under(7, Some("worker")), under(8, None)]),
+            );
+            assert_eq!(
+                rows(&cold),
+                vec![(0, None, None), (1, worker(), worker())],
+                "the bootstrap (session 0) fills the second pane; the first forked its own"
+            );
+            // A bootstrap already under `worker` — what `main_entry` forks for
+            // this layout, by `first_leaf_identity` — is grafted: no extra fork.
+            let mut cold = App::headless_for_test();
+            cold.pool
+                .sessions
+                .get_mut(&0)
+                .expect("the headless bootstrap")
+                .session
+                .identity = worker();
+            cold.restore_into_window(
+                WindowId(0),
+                window_of(vec![under(7, Some("worker")), under(8, Some("worker"))]),
+            );
+            let mut ids: Vec<u64> = cold.pool.sessions.keys().copied().collect();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec![0, 1],
+                "session 0 was grafted, one fork for the second pane"
+            );
+            assert!(
+                cold.pool
+                    .sessions
+                    .values()
+                    .all(|p| p.session.identity == worker()),
+                "every pane's shell wears `worker`"
+            );
+            // A forgotten identity is a default shell on both sides: the leaf
+            // naming `ghost` takes the bootstrap that wears none.
+            let mut cold = App::headless_for_test();
+            cold.restore_into_window(
+                WindowId(0),
+                window_of(vec![under(7, Some("ghost")), under(8, Some("worker"))]),
+            );
+            assert_eq!(rows(&cold), vec![(0, None, None), (1, worker(), worker())]);
+            assert!(!state.join("identities").join("ghost").exists());
+        });
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// THE BOOTSTRAP IS FORKED UNDER THE IDENTITY OF THE PANE IT FILLS. The
+    /// pick is `bootstrap_local_id`'s — the canonical tree's first terminal
+    /// leaf in rebuild order, behind native and placeholder leaves — so
+    /// `main_entry` (`first_leaf_identity`) and `apply_restore_manifest`
+    /// (`bootstrap_identity`) fork each window's bootstrap under exactly the
+    /// identity the graft will look for. The legacy mirror names none.
+    #[test]
+    fn the_bootstrap_identity_is_the_identity_of_the_leaf_the_bootstrap_fills() {
+        let under = |shell: u64, name: &str| {
+            restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+                restore::TerminalLeafRestore {
+                    local_id: Some(shell),
+                    identity: Some(name.to_string()),
+                    ..bare_leaf()
+                },
+            ))
+        };
+        let layout = window_of(vec![
+            settings_leaf(),
+            split_of(
+                restore::RestoredSplitTree::leaf(restore::RestoredView::Placeholder(
+                    restore::PlaceholderLeafRestore {
+                        restore_tag: "markdown".to_string(),
+                        reason: "Document could not be reopened".to_string(),
+                        metadata: String::new(),
+                    },
+                )),
+                under(4, "worker"),
+            ),
+            under(5, "reviewer"),
+        ]);
+        assert_eq!(
+            (layout.bootstrap_local_id(), layout.bootstrap_identity()),
+            (Some(4), Some("worker")),
+            "the same leaf, behind the settings tab and the placeholder"
+        );
+        let mut manifest = App::headless_for_test().capture_restore_manifest();
+        manifest.windows = vec![layout];
+        assert_eq!(manifest.first_leaf_identity(), Some("worker"));
+        // A pane naming no identity, and a legacy (mirror-only) layout — a
+        // capture with its canonical tabs dropped, so only the `tabs` mirror
+        // names the bootstrap's pane: none.
+        let plain = window_of(vec![leaf_naming(0)]);
+        assert_eq!(plain.bootstrap_identity(), None);
+        let mut legacy = App::headless_for_test()
+            .capture_restore_manifest()
+            .windows
+            .remove(0);
+        legacy.restored_tabs.clear();
+        assert_eq!(
+            (legacy.bootstrap_local_id(), legacy.bootstrap_identity()),
+            (Some(0), None)
+        );
+    }
+
     /// THE ROW BUILT BEFORE THE ADOPTION NAMES THE FROZEN TAB (review,
     /// 2026-09-16). The atpkg launch pass starts from `main_entry` before the
     /// event loop, and on a warm machine prints `managed-current:` within tens
@@ -4586,6 +4978,7 @@ mod tests {
             checkpoint: None,
             control: None,
             frozen_path: false,
+            identity: None,
         }
     }
 
@@ -4618,6 +5011,7 @@ mod tests {
                 icon: identity.icon,
                 role: identity.role,
                 attention: identity.attention,
+                identity: None,
             },
         ))
     }

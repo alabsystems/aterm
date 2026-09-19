@@ -318,12 +318,31 @@ fn stub_content_sh_with(
 /// 127` throughout — the stub contract is "the tool did not run" regardless
 /// of which fallback answered. Tool names are `ToolName`-vetted and the atpkg
 /// path rides plain double quotes, the exact conventions of the real `.cmd`
-/// shim writer (`platform::cmd_shim_content`).
+/// shim writer (`platform::cmd_shim_content`). Laid behind the same resume-proof
+/// frame as every other `.cmd` this crate writes ([`crate::platform::cmd_framed`],
+/// 2026-09-18): a stub of the pre-frame shape that is executing its `where atpkg`
+/// line (the one line of it `cmd` reads back after running something, the
+/// `__pending` calls sitting inside blocks `cmd` parses whole and exits from) at
+/// the moment it is re-laid resumes in the padding and returns silently, instead of
+/// inside the new body. `stub_kind`/`stub_requires` scan every line for the `rem`
+/// markers, so a framed stub is recognized, rewritten and removed exactly as before;
+/// [`CMD_STUB_FIRST_LINE`] is the first line AFTER `:main`. Unverified on a Windows host.
 #[cfg(test)]
 #[must_use]
 fn stub_content_cmd(tool: &ToolName, atpkg: &Path, kind: StubKind) -> String {
     stub_content_cmd_with(tool, atpkg, kind, &[])
 }
+
+/// The first line of the batch stub's body, `@echo off` and its CRLF: 11 bytes. The
+/// tightest case of the frame's head argument: `cmd` resumes a rewritten batch file only
+/// after a line end of the OLD file, and the only old line end that can fall inside the
+/// head ([`crate::platform::CMD_FRAME_HEAD`], 13 bytes) is the FIRST line's (every later
+/// end is further along) — a pre-frame stub's ends exactly on the head's own CRLF, byte
+/// 11, which reads as an empty line; a byte shorter would end on `n` of `:main` and run
+/// the body again. Pinned at compile time below and by the stub's resume simulation.
+const CMD_STUB_FIRST_LINE: &str = "@echo off\r\n";
+
+const _: () = assert!(CMD_STUB_FIRST_LINE.len() >= crate::platform::CMD_FRAME_HEAD.len() - 2);
 
 /// [`stub_content_cmd`] with the requires marker line (behind `rem`, like the others).
 #[must_use]
@@ -335,7 +354,8 @@ fn stub_content_cmd_with(
 ) -> String {
     let name = tool.as_str();
     let atpkg = atpkg.to_string_lossy();
-    let mut s = String::from("@echo off\r\nrem ");
+    let mut s = String::from(CMD_STUB_FIRST_LINE);
+    s.push_str("rem ");
     s.push_str(STUB_MARKER);
     s.push_str("\r\n");
     if kind == StubKind::Extra {
@@ -358,7 +378,7 @@ fn stub_content_cmd_with(
     s.push_str(&format!(
         "echo {STUB_UNREACHABLE_MSG} 1>&2\r\nexit /b 127\r\n"
     ));
-    s
+    crate::platform::cmd_framed(&s)
 }
 
 /// Whether `name` can ride a batch script without becoming syntax:
@@ -382,17 +402,28 @@ fn cmd_stub_name_safe(name: &str) -> bool {
 /// The co-located `atpkg` alias beside the running executable — fallback 1's
 /// embedded path. Canonicalized so an argv0 alias (`atpkg` → `aterm`) or a
 /// `~/.local/bin` symlink resolves to the real bundle before the sibling join.
+///
+/// On Windows `canonicalize` answers the VERBATIM spelling (`\\?\C:\…`), and this path
+/// is embedded in `.cmd` files — the pending stub's, the `agents/` twin's landing
+/// prelude — where `cmd.exe`'s `if exist` and its command launch do not reliably accept
+/// it; the prefix is taken off there ([`crate::platform::strip_verbatim_prefix`],
+/// review finding 2026-09-17; no Windows box has rendered a real one).
 pub(crate) fn embedded_atpkg_path() -> std::path::PathBuf {
     // `EXE_SUFFIX` (".exe" on Windows, "" elsewhere): a bare `atpkg` join
     // embedded a path that exists on no Windows install — the same probe bug
     // the GUI's co-located resolver fixed — so fallback 1 always missed there
     // and every stub run leaned on PATH luck.
     let atpkg = format!("atpkg{}", std::env::consts::EXE_SUFFIX);
-    std::env::current_exe()
+    let path = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .ok()
         .and_then(|exe| exe.parent().map(|d| d.join(&atpkg)))
-        .unwrap_or_else(|| std::path::PathBuf::from(atpkg))
+        .unwrap_or_else(|| std::path::PathBuf::from(atpkg));
+    if cfg!(windows) {
+        crate::platform::strip_verbatim_prefix(&path)
+    } else {
+        path
+    }
 }
 
 /// Whether `line` is `marker` in either spelling — bare (the sh body) or behind a
@@ -578,18 +609,60 @@ pub(crate) fn pending_stub_executable_at(
     requires: &[String],
     shim: std::path::PathBuf,
 ) -> io::Result<Option<crate::lay::Executable>> {
+    let measured = shim.clone();
+    pending_stub_executable_at_with(
+        layout,
+        tool,
+        kind,
+        requires,
+        shim,
+        move || crate::provenance::carries_provenance(&measured),
+        crate::lay::lay_clears_provenance,
+    )
+}
+
+/// [`pending_stub_executable_at`] with its two ENVIRONMENT measurements handed in — the
+/// stub's own `com.apple.provenance`, and whether a lay from THIS process would land clean
+/// — exactly as [`crate::lay::lay_executables_with`] takes its tracking measurement, so
+/// both halves of the re-lay rule are exercisable from a test on a machine that can
+/// produce only one of them. Both stay lazy: the xattr is read only for a byte-identical
+/// stub, and the lane probe only when that stub is tagged.
+pub(crate) fn pending_stub_executable_at_with(
+    layout: &Layout,
+    tool: &ToolName,
+    kind: StubKind,
+    requires: &[String],
+    shim: std::path::PathBuf,
+    tagged: impl FnOnce() -> bool,
+    lay_clears_tag: impl FnOnce() -> bool,
+) -> io::Result<Option<crate::lay::Executable>> {
     let body = stub_content_with(tool, &embedded_atpkg_path(), kind, requires);
     match std::fs::symlink_metadata(&shim) {
         Err(_) => {} // absent: ours to claim
         Ok(_) if is_pending_stub(&shim) => {
-            // Ours already. Byte-identical and untagged: nothing to lay — the
+            // Ours already. Byte-identical and needing no re-lay: nothing to lay — the
             // reroute stubs' rule (`reroute::lay`, audit 2026-09-14). Every seed runs
             // the adoption lay and every install pass reconciles twice, so a name that
             // stays wanted-and-absent (a disk-gated tuple, a deferred member) re-laid
             // identical bytes each time: from a tracked app, a launchd job and a
             // whole-bundle copy per call. A body that differs — the embedded atpkg
-            // path, the kind or the requires changed — or a tagged stub is rewritten.
-            if stub_is_current(&shim, &body, crate::provenance::carries_provenance(&shim)) {
+            // path, the kind or the requires changed — is rewritten.
+            //
+            // A TAGGED stub is rewritten only when the rewrite would CLEAR the tag
+            // ([`identical_stub_needs_relay`], which was written for this call site and
+            // which the reroute stubs and the agents twins already read). A
+            // provenance-tracked process with no untracked lane
+            // ([`crate::lay::Lane::Unavailable`] — a test harness, a foreign embedding of
+            // this crate) lays every byte tagged by construction, so re-laying its own
+            // tagged stub converges on nothing: same bytes, same tag, every pass for ever,
+            // one launchd job or whole-bundle copy each time, and the byte-identical skip
+            // was dead there. A tracked process that HAS a lane still re-lays: the lane
+            // writes the file clean, which is a real repair.
+            if stub_is_current(
+                &shim,
+                &body,
+                identical_stub_needs_relay(tagged, lay_clears_tag),
+            ) {
                 return Ok(None);
             }
         }
@@ -602,17 +675,19 @@ pub(crate) fn pending_stub_executable_at(
 }
 
 /// Whether the pending stub at `shim` is CURRENT — the exact bytes this pass would
-/// render (`body`), and CLEAN. `tagged` is that file's measured `com.apple.provenance`
-/// ([`crate::provenance::carries_provenance`]), handed in rather than taken here so both
-/// halves of the rule are exercisable from a test whose own writes are tagged by the
-/// session running it — the tag can be neither minted nor removed by hand, and
-/// [`crate::lay::lay_executables_with`] takes its tracking measurement as a parameter for
-/// exactly this reason. A tagged stub is NOT current however identical its bytes: it is a
-/// file the kernel execs, so it tracks every program it runs (law m21, [`crate::lay`]),
-/// and re-laying it is the only way the untracked lane gets to replace it with a clean
-/// one.
-fn stub_is_current(shim: &Path, body: &str, tagged: bool) -> bool {
-    !tagged && std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
+/// render (`body`), and not in need of a re-lay. `needs_relay` is the caller's answer to
+/// "must a byte-identical stub be written again anyway?"
+/// ([`identical_stub_needs_relay`]): a stub carrying `com.apple.provenance` is a file the
+/// kernel execs, so it tracks every program it runs (law m21, [`crate::lay`]) and wants
+/// replacing — but only by a pass that can actually lay it clean, because a rewrite that
+/// lands tagged again repairs nothing and re-lays identical bytes for ever.
+///
+/// Handed in rather than measured here so both halves of the rule are exercisable from a
+/// test whose own writes are tagged by the session running it — the tag can be neither
+/// minted nor removed by hand, and [`crate::lay::lay_executables_with`] takes its
+/// tracking measurement as a parameter for exactly this reason.
+fn stub_is_current(shim: &Path, body: &str, needs_relay: bool) -> bool {
+    !needs_relay && std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
 }
 
 /// Remove `program`'s stub iff the name still resolves to a pending stub — the
@@ -923,7 +998,15 @@ mod tests {
             Path::new(r"C:\Program Files\aterm\atpkg.exe"),
             StubKind::DefaultSet,
         );
-        assert!(body.starts_with("@echo off\r\n"), "batch, not sh: {body}");
+        // The frame first (2026-09-18), then the batch body `@echo off` opens.
+        let frame = crate::platform::cmd_frame();
+        assert!(body.starts_with(&frame), "framed: {body}");
+        assert!(
+            body[frame.len()..].starts_with("@echo off\r\n"),
+            "batch, not sh: {body}"
+        );
+        assert_eq!(body.matches("@goto :main").count(), 1);
+        assert_eq!(body.matches("\r\n:main\r\n").count(), 1);
         assert!(!body.contains("#!/bin/sh"), "no POSIX in a .cmd file");
         let exist = body.find("if exist").unwrap();
         let where_probe = body.find("where atpkg").unwrap();
@@ -957,6 +1040,135 @@ mod tests {
         for fine in ["trust", "ay", "clean-2", "a'b", "a b"] {
             assert!(cmd_stub_name_safe(fine), "{fine:?} is batch-inert quoted");
         }
+    }
+
+    /// THE RESUME SIMULATION for the pending stub (review finding, 2026-09-18: the stub
+    /// was the one `.cmd` this crate laid without the frame). A stub of the pre-frame
+    /// shape — the body alone, which is what every Windows stub was until 2026-09-18 —
+    /// re-laid to its framed successor while it executes: at every line end of the old
+    /// file (the only offsets `cmd` can resume at) and at every offset up to its
+    /// end-of-file, the new file reads a colon label, an empty line or `@exit /b`. The
+    /// longest stub the writer lays — a `MAX_PATH` atpkg path at three UTF-8 bytes a
+    /// unit, embedded twice, an extra marker and a requires line — still ends inside the
+    /// padding. As the control, the same old stub over an UNFRAMED successor resumes
+    /// into a command line. A model of `cmd`'s documented rules, not a run on Windows.
+    #[test]
+    fn a_pre_frame_cmd_stub_re_laid_while_executing_resumes_into_the_frame() {
+        use crate::platform::{
+            CMD_FRAME_HEAD, CMD_LEGACY_TARGET_BOUND_BYTES, CMD_PADDING_END_BYTES, cmd_frame,
+            cmd_resumed_line, cmd_resumed_line_is_inert,
+        };
+        let frame = cmd_frame();
+        let long_atpkg = std::path::PathBuf::from(format!(
+            "C:\\{}\\atpkg.exe",
+            "p".repeat(CMD_LEGACY_TARGET_BOUND_BYTES - "C:\\\\atpkg.exe".len())
+        ));
+        assert_eq!(
+            long_atpkg.to_string_lossy().len(),
+            CMD_LEGACY_TARGET_BOUND_BYTES
+        );
+        let reqs: Vec<String> = ["clt", "brew", "trust", "codex", "claude", "aterm"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let cases = [
+            (
+                "default-set stub, a Program Files atpkg",
+                stub_content_cmd_with(
+                    &tool("trust"),
+                    Path::new(r"C:\Program Files (x86)\aterm\app\atpkg.exe"),
+                    StubKind::DefaultSet,
+                    &[],
+                ),
+            ),
+            (
+                "extra stub with requires, the longest atpkg path",
+                stub_content_cmd_with(&tool("vendorx"), &long_atpkg, StubKind::Extra, &reqs),
+            ),
+        ];
+        for (what, new) in &cases {
+            assert!(new.starts_with(&frame), "{what}");
+            // The pre-frame shape: the same body, laid bare.
+            let old = &new[frame.len()..];
+            assert!(old.starts_with("@echo off\r\n"), "{what}");
+            let old = old.as_bytes();
+            let new = new.as_bytes();
+            assert!(
+                old.len() <= CMD_PADDING_END_BYTES,
+                "{what}: {} bytes",
+                old.len()
+            );
+            let ends: Vec<usize> = old
+                .iter()
+                .enumerate()
+                .filter(|&(_, &b)| b == b'\n')
+                .map(|(i, _)| i + 1)
+                .collect();
+            assert_eq!(ends.last().copied(), Some(old.len()), "{what}");
+            // The only old line end that can fall inside the head is the first one; the
+            // stub's lands exactly on the head's CRLF (11), the tightest case there is,
+            // and reads empty. (`)` lines are 3 bytes, but their ends are cumulative.)
+            assert_eq!(ends[0], CMD_STUB_FIRST_LINE.len(), "{what}");
+            assert_eq!(
+                ends[0],
+                CMD_FRAME_HEAD.len() - 2,
+                "{what}: on the head's CRLF"
+            );
+            assert_eq!(
+                cmd_resumed_line(new, ends[0]).as_deref(),
+                Some(""),
+                "{what}: the first old line end reads the head's CRLF as empty"
+            );
+            assert!(
+                !cmd_resumed_line_is_inert(cmd_resumed_line(new, ends[0] - 1).as_deref()),
+                "{what}: one byte shorter would not be"
+            );
+            assert_eq!(
+                cmd_resumed_line(new, 0).as_deref(),
+                Some("@goto :main"),
+                "{what}: the fresh run"
+            );
+            for offset in CMD_FRAME_HEAD.len() - 2..=old.len() {
+                let line = cmd_resumed_line(new, offset);
+                assert!(
+                    cmd_resumed_line_is_inert(line.as_deref()),
+                    "{what}: a resume at offset {offset} of {} reads {line:?}",
+                    old.len()
+                );
+            }
+            for end in &ends {
+                assert!(
+                    cmd_resumed_line_is_inert(cmd_resumed_line(new, *end).as_deref()),
+                    "{what}: old line end {end}"
+                );
+            }
+        }
+        // THE CONTROL: the old (bare) stub over an UNFRAMED successor whose embedded
+        // atpkg path moved 30 bytes longer (an app relocated) — the old end-of-file
+        // offset lands 60 bytes short of the new end, inside the `echo …` line: a
+        // fragment run as a command, the shape before the frame.
+        let old = &cases[0].1[frame.len()..];
+        let moved = stub_content_cmd_with(
+            &tool("trust"),
+            Path::new(&format!(
+                r"C:\Program Files (x86)\aterm\app\{}\atpkg.exe",
+                "m".repeat(29)
+            )),
+            StubKind::DefaultSet,
+            &[],
+        );
+        let bare = &moved[frame.len()..];
+        assert_eq!(bare.len(), old.len() + 60);
+        let line = cmd_resumed_line(bare.as_bytes(), old.len());
+        assert!(
+            !cmd_resumed_line_is_inert(line.as_deref()),
+            "laid bare, the resume lands in the body: {line:?}"
+        );
+        assert_eq!(
+            cmd_resumed_line(moved.as_bytes(), old.len()).as_deref(),
+            Some(&":".repeat(78)[(old.len() - CMD_FRAME_HEAD.len()) % 80..]),
+            "framed, the same resume reads a colon label"
+        );
     }
 
     /// A stub written with the batch marker is still a stub to every consumer:
@@ -1097,14 +1309,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// A TAGGED BUT IDENTICAL STUB IS REWRITTEN ONLY WHEN THE REWRITE WOULD CLEAR THE TAG.
+    /// The pending path used to pass the raw `com.apple.provenance` measurement as its
+    /// "not current" input, so a provenance-tracked process with NO untracked lane
+    /// ([`crate::lay::Lane::Unavailable`] — a test harness, a foreign embedding of this
+    /// crate), which lays every byte tagged by construction, rewrote and fsynced the same
+    /// stub on every pass for ever: same bytes, same tag, one launchd job or whole-bundle
+    /// copy each time, converging on nothing. [`identical_stub_needs_relay`] was written
+    /// for exactly this call site (and is what the reroute stubs and the agents twins
+    /// already read); this pins that the pending stubs read it too.
+    #[cfg(unix)]
+    #[test]
+    fn a_tagged_identical_stub_is_relaid_only_when_the_relay_would_clear_the_tag() {
+        let l = layout("tagged-identical");
+        let t = tool("trust");
+        write_pending_stub_with(&l, &t, StubKind::DefaultSet, &[]).unwrap();
+        assert!(
+            is_pending_stub(&l.shim(&t)),
+            "the stub this test judges is ours"
+        );
+        let plan = |kind: StubKind, tagged: bool, clears: bool| {
+            pending_stub_executable_at_with(
+                &l,
+                &t,
+                kind,
+                &[],
+                l.shim(&t),
+                move || tagged,
+                move || clears,
+            )
+            .unwrap()
+        };
+        assert!(
+            plan(StubKind::DefaultSet, false, false).is_none(),
+            "identical and untagged: nothing to lay"
+        );
+        assert!(
+            plan(StubKind::DefaultSet, false, true).is_none(),
+            "identical and untagged: nothing to lay, whatever this process's lane"
+        );
+        assert!(
+            plan(StubKind::DefaultSet, true, false).is_none(),
+            "tagged, but a lay from here would land tagged again: the rewrite repairs \
+             nothing and must not happen"
+        );
+        assert!(
+            plan(StubKind::DefaultSet, true, true).is_some(),
+            "tagged, and this pass can lay it CLEAN: a real repair"
+        );
+        assert!(
+            plan(StubKind::Extra, false, false).is_some(),
+            "a changed body is laid whatever the tag says"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     /// A stub already on disk with the exact bytes the pass would render AND clean is not
     /// re-laid: `pending_stub_executable` answers `Ok(None)` (the reconcile keeps the
     /// name), so a steady-state seed or install pass hands `lay_executables` an empty
     /// list — no launchd job and no bundle copy from a tracked app. A stub whose body
     /// changed (kind flip, new requires) is still rewritten — and so is one that carries
-    /// `com.apple.provenance`, on purpose: a tagged stub is a file the kernel execs, so
-    /// it tracks every program it runs, and re-laying it is how the untracked lane gets
-    /// to replace it with a clean one ([`stub_is_current`], `reroute::lay`, law m21).
+    /// `com.apple.provenance` WHEN this pass could lay it clean: a tagged stub is a file
+    /// the kernel execs, so it tracks every program it runs, and re-laying it is how the
+    /// untracked lane gets to replace it with a clean one ([`stub_is_current`],
+    /// [`identical_stub_needs_relay`], `reroute::lay`, law m21).
     ///
     /// THE TAG IS AN ENVIRONMENT FACT, NOT A CHOICE (audit 2026-09-15). Every file this
     /// test writes inherits the tag when the session running it is provenance-tracked (an
@@ -1117,9 +1385,12 @@ mod tests {
     ///   the measurement instead of letting it take one — identical-and-clean is current,
     ///   identical-but-tagged is not, a changed body is never current;
     /// * the END TO END half (a real file through the reconcile and the adoption lay)
-    ///   asserts the full outcome for the tag this session actually produces: the inode is
-    ///   KEPT under an untracked session, and the stub is re-laid — same bytes, new inode,
-    ///   `Ok(Some)` — under a tracked one. Which case ran is printed, never assumed.
+    ///   asserts the full outcome for what this session actually produces, reading the
+    ///   SAME TWO measurements the rule reads: the inode is KEPT when this session's writes
+    ///   come back clean (nothing to repair) and kept when they come back tagged with no
+    ///   lane that could clean them (a re-lay would land tagged again — `08faa0245`), and
+    ///   the stub is re-laid — same bytes, new inode, `Ok(Some)` — only when it is tagged
+    ///   AND a lay of ours would clear it. Which case ran is printed, never assumed.
     #[cfg(unix)]
     #[test]
     fn an_identical_stub_is_left_alone_and_a_changed_one_is_rewritten() {
@@ -1144,8 +1415,8 @@ mod tests {
         );
         assert!(
             !stub_is_current(&shim, &body, true),
-            "byte-identical but TAGGED: re-laid on purpose, so the untracked lane can put \
-             a clean file there"
+            "byte-identical but needing a re-lay (tagged, and this pass can lay it clean): \
+             rewritten on purpose, so the untracked lane can put a clean file there"
         );
         let flipped = stub_content_with(&t, &embedded_atpkg_path(), StubKind::Extra, &[]);
         assert!(
@@ -1156,11 +1427,25 @@ mod tests {
         // session really produces: an untracked one keeps the inode (temp+rename would
         // give it a new one), a tracked one re-lays the same bytes.
         let tagged = crate::provenance::carries_provenance(&shim);
+        // THE RULE READS TWO MEASUREMENTS, so this half must read both (`08faa0245`): a
+        // tagged identical stub is re-laid only when a lay from THIS process would come
+        // back clean. A provenance-tracked test binary with no untracked lane
+        // (`lay::Lane::Unavailable`) is exactly the case that commit fixed — it lays every
+        // byte tagged, so a re-lay converges on nothing and the stub is LEFT ALONE.
+        // Measured 2026-09-17 on a provenance-tracked Intel Mac, where this test read the
+        // pre-08faa0245 outcome and failed with "a tagged stub is re-laid even
+        // byte-identical" while the code was doing the new, right thing.
+        let clean_lay = crate::lay::lay_clears_provenance();
         eprintln!(
-            "an_identical_stub_is_left_alone: this session writes {} files, so the {} case \
-             is the one exercised end to end",
+            "an_identical_stub_is_left_alone: this session writes {} files and a lay from it \
+             comes back {}, so the {} case is the one exercised end to end",
             if tagged { "TAGGED" } else { "clean" },
-            if tagged { "re-lay" } else { "skip" }
+            if clean_lay { "CLEAN" } else { "tagged" },
+            if tagged && clean_lay {
+                "re-lay"
+            } else {
+                "skip"
+            }
         );
         let ino = std::fs::metadata(&shim).unwrap().ino();
         let wanted: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
@@ -1173,16 +1458,28 @@ mod tests {
             "the bytes are the rendered ones either way"
         );
         let after = std::fs::metadata(&shim).unwrap().ino();
-        if tagged {
+        if tagged && clean_lay {
             assert!(
                 pending_stub_executable(&l, &t, StubKind::DefaultSet, &[])
                     .unwrap()
                     .is_some(),
-                "a tagged stub is re-laid even byte-identical"
+                "a tagged stub a clean lay can repair is re-laid even byte-identical"
             );
             assert_ne!(
                 after, ino,
-                "a tagged stub is re-laid: temp+rename, new inode"
+                "a tagged stub a clean lay can repair is re-laid: temp+rename, new inode"
+            );
+        } else if tagged {
+            assert!(
+                pending_stub_executable(&l, &t, StubKind::DefaultSet, &[])
+                    .unwrap()
+                    .is_none(),
+                "a tagged stub NO lay of ours can clean is left alone: re-laying it would \
+                 land tagged again, every pass for ever"
+            );
+            assert_eq!(
+                after, ino,
+                "left alone means left alone: the inode is kept, no temp+rename"
             );
         } else {
             assert!(

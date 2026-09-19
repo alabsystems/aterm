@@ -290,6 +290,7 @@ mod platform_win;
 /// CoreGraphics on macOS, `softbuffer` everywhere else.
 mod present;
 mod press_custody_conformance;
+mod provenance_repair;
 mod relaunch_notice;
 mod status_bars;
 // The cursor aurora + sparkle-words engines (color math, genome, cat baker, nova
@@ -303,6 +304,8 @@ use aterm_effects::{
     cursor_beam, cursor_comet, cursor_droplet, cursor_fireball, cursor_glow, cursor_phaser,
     cursor_rainbow, cursor_trail, kitty_cursor, matrix_rain, output_streak, word_decorations,
 };
+/// Session identities (phase 1): a session can carry its own agent identity.
+mod agent_identity;
 mod app_control;
 mod app_documents;
 mod app_restore;
@@ -1050,9 +1053,16 @@ fn effect_tick_interval(panel: Option<Duration>) -> Duration {
 }
 
 /// How many PANEL periods one effect-only present is allowed to occupy — the
-/// drawable-pool headroom divisor. `2` means the effect lane presents at half
-/// the panel rate (60 Hz on a 120 Hz panel) and `1` restores the pre-fix
-/// behaviour of chasing every refresh.
+/// drawable-pool headroom divisor — on a panel FASTER than 60 Hz, on a panel
+/// whose refresh is unknown, on every host other than an Intel Mac (an arm64
+/// Mac, Linux, Windows), and on an Intel Mac once the window's own acquire has
+/// parked. `2` means the effect lane presents at half the panel rate: 60 Hz on
+/// a 120 Hz panel, and 30 Hz on a 60 Hz panel. `1` is the pre-fix behaviour of
+/// chasing every refresh. [`effect_present_panel_periods`] is the platform's
+/// decision for a panel and [`WindowState::effect_present_interval`] the
+/// window's; the 60 Hz panel's own arm is [`EFFECT_LANE_PANEL_RATE_AT_60HZ`],
+/// and the sections at the end of this doc are why it exists and why it is
+/// opportunistic.
 ///
 /// WHY THE EFFECT LANE MAY NOT RUN AT PANEL RATE. macOS has no Mailbox present
 /// mode, so `get_current_texture()` is the throttle: a `CAMetalLayer` hands out
@@ -1078,18 +1088,185 @@ fn effect_tick_interval(panel: Option<Duration>) -> Duration {
 /// times a second on a 120 Hz panel instead of 120. Every engine decays on wall
 /// time, so the pixels of any given frame are unchanged; only the number of
 /// intermediate frames drops.
+///
+/// THE LAW IS A WALL-CLOCK ONE, NOT A REFRESH-COUNT ONE — which is what the
+/// 60 Hz panel turns on. The measurement above was taken on a 120 Hz panel,
+/// where "half the panel rate" is 60 presents a second. Read as a count of
+/// refreshes it says a 60 Hz panel parks at 60/s too and must animate at
+/// 30 fps, and that is what this divisor did on every 60 Hz panel: a 60-90 ms
+/// meteor flight in 2-3 discrete steps beside content presenting at 60 Hz.
+///
+/// Measured on a 60 Hz panel (2017 MacBook Pro, macOS 13.7.8, the Intel HD 630
+/// that `Device::preferred()` picks) with a standalone `CAMetalLayer` in the
+/// SHIPPED swapchain config: `Rgba16Float` with
+/// `wantsExtendedDynamicRangeContent` and the extended-linear sRGB space —
+/// `hdr_glow_or_default()` is true, so `renderer.rs`'s attach picks the f16
+/// EDR pool on this SDR panel too — `maximumDrawableCount` 3,
+/// `displaySyncEnabled` NO, `framebufferOnly` YES, opaque, `presentDrawable:`
+/// before `commit`, at the panel's own backing size (3360x2100 px: the
+/// "looks like 1680x1050" scale of a 2880x1800 panel), driven in the
+/// scheduler's own wake→acquire→render→present shape, 180 presents per arm
+/// after 30 of warm-up, load average 4-27 (three runs each at the ~3, ~6 and
+/// ~8 ms frames, one at ~11 ms; each run drives the 30/s and 60/s arms twice
+/// and the 120/s over-drive arm once). What decides the answer is the GPU
+/// cost of ONE frame against the ~16.7 ms period. Counts are presents of 180
+/// that waited over 4 ms — the park threshold — with the over-1 ms count in
+/// brackets:
+///
+/// * ~3 ms (a clear): 30/s acquire p50 0.04-0.07 p95 0.08-0.13 max ≤ 0.28 ms;
+///   60/s p50 0.09-0.11 p95 0.18-0.24 max 0.26-1.97 ms — 0 over 4 ms in all
+///   six arms (7 of 1,080 over 1 ms).
+/// * ~6 ms: 30/s p50 0.04-0.07 p95 0.07-0.17 max ≤ 0.37 ms; 60/s p50
+///   0.08-0.15, p95 0.17-2.97, p99 0.22-15.25, max 1.31-18.71 ms — four arms
+///   at 0 over 4 ms (1-2 over 1 ms) and two, at load ~20, at 7 and 8 (12-13
+///   over 1 ms): the pool keeps up with this frame most of the time, not all
+///   of it.
+/// * ~8 ms: 30/s p50 0.04-0.07 p95 0.07-0.19 max 0.15-0.36 ms in four of the
+///   six arms; the other two PARKED — one 34 ms wait at load ~24 (1 over
+///   4 ms), and one arm at load 9 that stalled around its 113th present (7
+///   over 4 ms, p99 66 ms, max 185 ms), which its repeat did not reproduce (0
+///   of 180). 60/s p50 0.08-0.17, p95 0.20-18.4, p99 3.7-27.6, max
+///   4.2-31.1 ms — 1 to 58 of 180 over 4 ms (7-66 over 1 ms).
+/// * ~11 ms: 30/s p95 0.15-0.23 max ≤ 0.29 ms; 60/s p50 13.8-15.9 ms, 144-160
+///   of 180 over 4 ms (154-168 over 1 ms) — the pool is simply too slow for
+///   panel rate.
+/// * 120/s over-drive (the presents-per-millisecond the M3's 120 Hz panel
+///   saw) parks at the MEDIAN in two of the three ~3 ms clears (p50 3.81,
+///   4.03 and 0.17 ms) and at p95 in all three (19-25 ms; 74-92 of 180 over
+///   4 ms).
+///
+/// The first pass, BGRA8 at 2560x1600 under a load average above 100, agreed
+/// where it looked: 60/s p50 0.06-0.07 with a ~5-6 ms frame and a rare 3-20 ms
+/// park, 120/s p50 1.5-10.6 ms. So a cheap frame's drawable is held for
+/// roughly two 60 Hz-class frames of wall time whatever the panel refreshes
+/// at, one present per ~16.7 ms then leaves one free, and "half the panel
+/// rate" was the 120 Hz spelling of "no faster than 60 a second" — but the
+/// pool keeps up with 60/s only while the frame stays well inside the period,
+/// and the frame's cost (window size, the f16 blit, whatever is on glass) is
+/// nothing this code can know before it presents. CONTENT presents already
+/// run at panel rate on this same pool (and at half a period while
+/// `input_hot`), so a 60/s effect lane is no faster than the lane every
+/// keystroke's echo already takes; the difference is that the effect lane is
+/// VOLUNTARY and can give the headroom back.
+///
+/// Hence the arm is OPPORTUNISTIC. On an Intel Mac a KNOWN panel at or below
+/// 60 Hz presents the effect lane at PANEL rate
+/// ([`EFFECT_LANE_PANEL_RATE_AT_60HZ`]) until a present on that window waits
+/// [`EFFECT_LANE_ACQUIRE_PARK_NS`] for a drawable, after which the window
+/// keeps this halving for the rest of the effect episode
+/// (`WindowState::effect_present_interval`). The probe's cost is that one
+/// park, once per episode: on a frame the pool cannot keep up with, a fresh
+/// 60/s train fills the 3-drawable pool on its first presents and parks
+/// early. The four contended ~8 ms 60/s arms that logged a first park (the
+/// probe's column is the first wait over 1 ms, counted from the arm's first
+/// present, warm-up included) put it at present #3, #4, #6 and #13, of 21.9,
+/// 30.5, 1.27 and 8.4 ms — three of the four are the 8-31 ms park the latch
+/// fires on; the 1.27 ms one was jitter, and that arm's first wait over 4 ms
+/// came later (2 of its 180, max 18 ms). A downclocked GPU's first frames
+/// after an idle hold their drawables longest. On the ~3 ms frame the lane
+/// never waited 4 ms in 1,080 presents (six arms, worst 1.97 ms), and on the
+/// ~6 ms frame four arms of six never did either (720 presents, worst
+/// 3.30 ms) — only the sporadic 1-3 ms the content lane's own panel-rate
+/// presents already see. The 30/s arm parks RARELY — two of its twenty arms
+/// did, both at the ~8 ms frame (the 34 ms wait and the 185 ms stall above),
+/// none of the other eighteen at any frame cost — so a clean 30/s present
+/// carries no information about whether the frame got cheap again; that is
+/// why the retry is per episode and not per present (a blind per-present
+/// retry parks every second or third frame on a dear frame, which is worse
+/// than either arm). A faster panel keeps this halving; and every other host
+/// keeps it on every panel, because a 60 Hz external on an M-series Mac is
+/// unmeasured and the halving is the arm the M3 numbers vouch for.
+///
+/// THE ARM'S LANDING GATE, owed by the finding that asked for it and not yet
+/// paid, because the probe is a standalone layer and not the app: the daily
+/// driver's acquire p95/p99/max and input p50/p99 with the default `rainbow
+/// kitty pet` on, under sustained typing, on the halved build and then on
+/// this one. The rollback trigger is per-keystroke or per-episode parks of
+/// 8 ms or more appearing under typing where the halved build shows none.
+/// The remedy is a wall-clock FLOOR on the episode reset — have
+/// `park_terminal_effect_scheduler` keep `effect_lane_parked` unless the lane
+/// has been idle for longer than the pool takes to drain, so a typing burst
+/// whose keystrokes come faster than that is ONE episode and pays one park —
+/// or, failing that, dropping the arm (`EFFECT_LANE_PANEL_RATE_AT_60HZ` to
+/// false), which restores the halving byte for byte.
 const EFFECT_PRESENT_PANEL_PERIODS: u32 = 2;
 
-/// The cap above, as the law rather than a preference. `ATERM_EFFECT_PACE` used
-/// to be able to restore the uncapped panel-rate lane in the same binary, which
-/// was how the A/B was run; it is DELETED now that the measurement is settled.
-/// Shipping it would have shipped a way to silently put ~9 ms back on every
-/// keystroke, and an env var that re-breaks typing latency is not a safety
-/// valve — it is a trap. The parameterised
-/// [`effect_present_interval_with`] keeps the arithmetic testable at any period
+/// The slowest panel period the halving still applies to. A KNOWN panel at or
+/// above this period — 60 Hz is 16_666_666 ns as `refresh_frame_interval`
+/// computes it from 60_000 mHz; 59.94 Hz and 50 Hz TVs; a 30 Hz display — is
+/// "at or below 60 Hz"; anything shorter (61 Hz up to ProMotion's 120) keeps
+/// [`EFFECT_PRESENT_PANEL_PERIODS`]. 16.6 ms rather than 1e12/60_000 ns so a
+/// 60 Hz panel reported a hair fast is not thrown back to the halving by a
+/// few hundred nanoseconds; the gap down to 61 Hz (16.39 ms) is 200 µs wide.
+const EFFECT_LANE_PANEL_RATE_MIN_PERIOD: Duration = Duration::from_micros(16_600);
+
+/// Whether a known panel at or below 60 Hz presents the effect lane at PANEL
+/// rate instead of stretching it by [`EFFECT_PRESENT_PANEL_PERIODS`] — TRUE
+/// on an Intel Mac, where that lane was measured leaving a drawable free while
+/// the frame is cheap and parking once, then yielding, when it is not (the
+/// numbers are in that constant's doc), FALSE on every other host — an arm64
+/// Mac, Linux, Windows — where the halving is the arm the measurements vouch
+/// for. Precisely: the arm is the x86_64 SLICE. `Cargo.toml`'s release notes
+/// `lipo` that slice into the universal binary, so an Apple-silicon Mac that
+/// opens aterm under Rosetta on a 60 Hz panel (an M1/M2 Air's built-in) takes
+/// this arm unmeasured; the per-window park latch is what bounds that to one
+/// park per effect episode there too.
+///
+/// A compile-time platform arm and not an env var, as the law rather than a
+/// preference: `ATERM_EFFECT_PACE` used to be able to restore the uncapped
+/// panel-rate lane in the same binary, which was how the 120 Hz A/B was run,
+/// and it is DELETED now that the measurement is settled. Shipping it would
+/// have shipped a way to silently put ~9 ms back on every keystroke, and an
+/// env var that re-breaks typing latency is not a safety valve — it is a
+/// trap. The parameterised [`effect_present_panel_periods_with`] and
+/// [`effect_present_interval_with`] keep both arms testable on either host
 /// without a process-wide switch.
-const fn effect_present_panel_periods() -> u32 {
-    EFFECT_PRESENT_PANEL_PERIODS
+const EFFECT_LANE_PANEL_RATE_AT_60HZ: bool = cfg!(all(target_os = "macos", target_arch = "x86_64"));
+
+/// The swapchain-acquire wait, in ns, at which a present counts as PARKED for
+/// the effect lane's purposes (`WindowState::note_acquire_wait`): 4 ms, a
+/// quarter of the 60 Hz period the panel-rate arm applies to. The bands it
+/// separates, measured on the shipped f16 EDR pool (the constant's doc
+/// above): a 60/s lane the pool keeps up with acquires in ≤ 0.24 ms at p95
+/// and never waits 4 ms — the ten such arms (the ~3 ms frame, and four of six
+/// at ~6 ms) are 1,800 presents with a worst wait of 3.30 ms — and the
+/// sporadic 1-3 ms waits it does see (1-3 per 180 at a sane load, the first
+/// of them anywhere from the 2nd present to the 178th) are the compositor's
+/// jitter, which the content lane's own panel-rate presents already pay. A
+/// lane the pool does not keep up with parks 8-31 ms within its first
+/// presents in three of the four contended arms that logged a first park
+/// (21.9, 30.5 and 8.4 ms at presents #3, #4 and #13, warm-up counted; the
+/// fourth's first wait over 1 ms was 1.27 ms at #6 and its first over 4 ms
+/// came later), with a p99 of 3.7-27.6 ms. The daily driver's own histogram,
+/// on the halved lane, reads p99 0.66 ms with a 6.16 ms max (n=544). So 4 ms
+/// is above every clean acquire and below three of those four first parks
+/// (the fourth arm is caught by its next wait over 4 ms); a threshold at the
+/// 1 ms the finding suggested would demote the good regime within a second of
+/// every episode for jitter that costs a keystroke less than one frame's CPU
+/// work. It is deliberately NOT
+/// `gpu_backpressure_excess_ns`'s threshold: that one forgives a whole frame
+/// interval as pacing before it charges the load-shed EMA, whereas here a wait
+/// past the clean band IS the signal — the effect lane is voluntary and gives
+/// its headroom back first.
+const EFFECT_LANE_ACQUIRE_PARK_NS: u64 = 4_000_000;
+
+/// The drawable-pool headroom divisor for ONE window, from the panel it sits
+/// on: `1` — panel rate — for a known panel at or below 60 Hz where
+/// [`EFFECT_LANE_PANEL_RATE_AT_60HZ`] holds, [`EFFECT_PRESENT_PANEL_PERIODS`]
+/// otherwise. An UNKNOWN refresh keeps the halving: the 60 fps fallback is a
+/// guess about the panel, not a measurement of it, and a guess does not get to
+/// spend the pool's headroom.
+fn effect_present_panel_periods(panel: Option<Duration>) -> u32 {
+    effect_present_panel_periods_with(panel, EFFECT_LANE_PANEL_RATE_AT_60HZ)
+}
+
+/// Pure core of [`effect_present_panel_periods`], so both platform arms are
+/// testable on either host.
+fn effect_present_panel_periods_with(panel: Option<Duration>, panel_rate_at_60hz: bool) -> u32 {
+    match panel {
+        Some(period) if panel_rate_at_60hz && period >= EFFECT_LANE_PANEL_RATE_MIN_PERIOD => 1,
+        _ => EFFECT_PRESENT_PANEL_PERIODS,
+    }
 }
 
 /// The effect lane's PRESENT period for one window: [`effect_tick_interval`]
@@ -1100,30 +1277,51 @@ const fn effect_present_panel_periods() -> u32 {
 /// the arm and the latch that must outlive it cannot disagree about how long
 /// one lane period is.
 fn effect_present_interval(panel: Option<Duration>) -> Duration {
-    effect_present_interval_with(panel, effect_present_panel_periods())
+    effect_present_interval_with(panel, effect_present_panel_periods(panel))
 }
 
-/// Pure core of [`effect_present_interval`], so both arms of the kill switch are
-/// testable without touching process environment.
+/// Pure core of [`effect_present_interval`], so any divisor is testable at any
+/// period without touching process environment.
 fn effect_present_interval_with(panel: Option<Duration>, periods: u32) -> Duration {
     effect_tick_interval(panel) * periods.max(1)
 }
 
-/// How many frame intervals ONE animating decoration frame keeps the chrome-
-/// decoration lane armed (see `WindowState::deco_anim_until`).
+/// How many LANE periods ONE animating decoration frame keeps the chrome-
+/// decoration lane armed (see `WindowState::deco_anim_until`) — counted in
+/// the LONGEST lane the window can take during the episode, the halved one
+/// (`WindowState::deco_anim_hold`), never in the lane it happens to be on.
 ///
 /// It has to exceed the round trip it is covering, which is one full lane
 /// period: the redraw refreshes the latch at `frame_started`, `about_to_wait`
 /// arms `fired + interval`, that slot fires, and only THEN does the next redraw
 /// refresh the latch again. So the latch must outlive `render + interval +
 /// render` — 4 intervals leaves a whole interval of slack for two frames' render
-/// cost, i.e. it holds as long as a frame renders in under ~3x the panel period.
+/// cost, i.e. it holds as long as a frame renders in under ~3x the lane period.
 /// A loop slower than that is not idle, so a stimulus is arriving anyway.
 ///
+/// WHY THE LONGEST LANE AND NOT THE CURRENT ONE: on an Intel Mac's panel-rate
+/// arm ([`EFFECT_LANE_PANEL_RATE_AT_60HZ`]) the lane can STRETCH mid-latch.
+/// The very redraw that refreshed the latch can park in acquire (the 8-31 ms
+/// first parks in [`EFFECT_PRESENT_PANEL_PERIODS`]'s doc — the decoration
+/// sites run before the present, `note_acquire_wait` after it), set
+/// `effect_lane_parked` and double the lane from 16.7 to 33.3 ms. A latch
+/// counted in the panel-rate lane (4 × 16.7 = 66.7 ms) is then TWO stretched
+/// periods, under the three the round trip needs: `phase_locked_effect_deadline`
+/// re-arms at `now + interval` once a redraw outran `last_fire + interval`, so
+/// a ≥ 33 ms redraw (compose, that park, encode) lands the next tick at or
+/// after the 66.7 ms expiry, and any non-redraw turn in the gap takes the
+/// else-arm park and deletes `next_trail_tick` — the permanent freeze
+/// `deco_anim_until` exists to prevent. Counted in the halved lane the latch
+/// is 133 ms at 60 Hz, three stretched periods with slack, and off the Intel
+/// arm — where the window's lane IS the halved one — it is the number it
+/// always was.
+///
 /// Bigger is not free in the other direction: this is exactly the tail a stopped
-/// decoration pays before the lane parks (4 early-out redraws, ~67 ms at 60 Hz,
-/// no presents — the RepaintKey is unchanged by definition once it stopped
-/// moving). 4 is the smallest value that covers the round trip with slack.
+/// decoration pays before the lane parks (4 early-out redraws at the halved
+/// lane — ~67 ms on a 120 Hz panel, ~133 ms on a 60 Hz one, where an Intel
+/// Mac's un-parked lane makes that 8 redraws in the same 133 ms — and no
+/// presents: the RepaintKey is unchanged by definition once it stopped moving).
+/// 4 is the smallest value that covers the round trip with slack.
 const DECO_ANIM_LEVEL_FRAMES: u32 = 4;
 
 /// Throttle for re-querying the panel's live EDR headroom
@@ -1132,7 +1330,11 @@ const DECO_ANIM_LEVEL_FRAMES: u32 = 4;
 /// the SAME monitor (brightness slider / auto-brightness) with no screen-parameter
 /// or `Moved` event — so the aurora path re-samples it at most this often rather
 /// than only on an actual monitor change, keeping the >1.0 EDR boost matched to
-/// the live headroom without crossing into AppKit every animation frame.
+/// the live headroom without crossing into AppKit every animation frame. The
+/// same throttled call runs the screen re-pick of an 8-bit GPU window
+/// ([`repick_gpu_surface_for_screen`]), so a window whose screen gains EDR
+/// potential without a monitor change takes the f16 swapchain within one
+/// interval of a redraw.
 const EDR_REQUERY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Whether the panel EDR headroom is DUE for a re-query: never sampled (`last ==
@@ -1142,6 +1344,110 @@ const EDR_REQUERY_INTERVAL: Duration = Duration::from_millis(250);
 /// headroom on the SAME monitor).
 fn edr_requery_due(last: Option<Instant>, now: Instant, interval: Duration) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= interval)
+}
+
+/// Throttle for re-READING the occupied monitor's refresh rate on the SAME
+/// monitor (`refresh_frame_interval`). The read stays ahead of the
+/// monitor-identity guard (W6: a mode change keeps the identity), but it is not
+/// always the "two user32 calls" the Windows cost model budgeted. On a macOS
+/// panel whose `CGDisplayModeGetRefreshRate` answers 0, vendored winit falls
+/// back to a CVDisplayLink create + nominal-period query + release on EVERY
+/// call — measured on a 2017 15" MacBook Pro's built-in 60 Hz panel (Intel HD
+/// 630 / Radeon Pro 560, macOS 13.7.8) with `tools/displaylink-cost-probe/`
+/// (N = 200 calls per loop, live app running): 200/200 calls took the fallback
+/// on every run; per-call mean 0.23–0.51 ms and worst 3.2–6.5 ms across the
+/// runs of 2026-09-06 and 2026-09-08 (load-dependent — `runs.txt` there is the
+/// captured 09-08 set), against 0.013–0.03 ms for the CG-only path a panel
+/// whose CG mode reports its rate takes. `Moved` streams continuously during a
+/// drag, so the unthrottled read put that on the thread that dispatches
+/// keystrokes. Same period as [`EDR_REQUERY_INTERVAL`], and like it
+/// event-gated, not a timer: on the same monitor the read recurs on the first
+/// `Moved` that arrives at least this long after the previous read — within
+/// the interval during a drag, on the next event (as before the throttle) on a
+/// stationary window — while `Focused(true)`, the single-monitor heal route,
+/// forces the read on every call. The drag stream in between pays only the
+/// `current_monitor()` identity check it always paid: `-[NSWindow screen]` ->
+/// `-deviceDescription` -> `objectForKey:` -> `unsignedIntValue` (unmeasured,
+/// pre-existing per-`Moved` cost this throttle neither adds nor removes), then
+/// `CGDisplayCreateUUIDFromDisplayID` + a UUID-bytes compare — that tail alone
+/// is the probe's third loop, mean 0.012–0.03 ms.
+const REFRESH_RATE_REREAD_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether `refresh_frame_interval` READS the refresh rate on this call. Two
+/// bypasses skip the throttle, and both are decided HERE rather than folded
+/// into one flag by the caller, so each is unit-tested with the other off: a
+/// monitor change (`same_monitor == false`) always reads — the new panel's
+/// cadence is taken on the very event that reports the transition, however
+/// recent the last read — and so does a forced call (`force_read`:
+/// `Focused(true)`, the single-monitor W6 heal route, which arrives at human
+/// cadence). Otherwise — same monitor, not forced: the `Moved` stream — the
+/// read recurs on the [`REFRESH_RATE_REREAD_INTERVAL`] throttle: never read, or
+/// at least `interval` elapsed since `last_read` (the boundary is inclusive),
+/// so a mode change that keeps the monitor's identity (W6) is still healed by
+/// the `Moved` stream too. Pure so the gate is unit-tested without a display: a
+/// headless window has no `os_window`, and `refresh_frame_interval` itself
+/// returns before reaching this.
+fn refresh_rate_read_due(
+    same_monitor: bool,
+    force_read: bool,
+    last_read: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    force_read || !same_monitor || last_read.is_none_or(|t| now.duration_since(t) >= interval)
+}
+
+/// The screen re-pick of an 8-bit GPU window, and the attach's colour-space
+/// replay when it takes. Two callers, one sequence: the monitor-change hook
+/// (`App::refresh_frame_interval`'s different-monitor branch) and the
+/// throttled headroom re-query (`App::refresh_edr_headroom`), which covers a
+/// screen that gains EDR potential with no monitor change (`hdr_glow`
+/// hot-reloaded on; a display-settings change, should AppKit then report a
+/// higher potential for the window's screen). Free-standing rather than
+/// `&mut self` so both can call it while they hold a window's `present`
+/// borrowed out of `self.windows`.
+///
+/// `GpuRenderer::upgrade_surface_for_screen` reads the window's screen's EDR
+/// potential (the macOS Metal arm; `false` everywhere else) and, on a
+/// positive answer, moves the swapchain to f16 AND flips the live layer
+/// before it returns (`Swapchain::configure` names the pixel format,
+/// `wantsExtendedDynamicRangeContent` and the extended-linear colorspace, in
+/// that order — the verb the attach ran). So the scRGB tag replayed here
+/// lands on a layer that already holds f16 + scRGB: a same-value re-set,
+/// which is what the attach's caller (`app_window.rs`, after
+/// `create_window_surface`) does too. The ordering is the point: an scRGB
+/// tag on a layer still presenting 8-bit sRGB is the state
+/// `Swapchain::configure`'s note forbids, so the tag runs only on `true`,
+/// which means the LAYER moved; a refused flip returns `false` and nothing is
+/// tagged. The capture space is re-resolved through the attach's seam
+/// (`capture_space_after_surface_tag`), the window's current capture space
+/// standing in when the tag fails (the hot-retag contract). An HDR surface
+/// returns before the backend is touched (`BackendSlot::gpu_mut` panics on a
+/// not-yet-joined slot; a GPU present implies a joined one), and the caller
+/// seeds the headroom afterwards off `is_hdr()`, as the attach does.
+fn repick_gpu_surface_for_screen(
+    backend: &mut BackendSlot,
+    apprt: &platform::PlatformAppRt,
+    window_colorspace: app_config::WindowColorspace,
+    window_gpu: &mut aterm_gpu::WindowGpu,
+    gpu_surface: &mut aterm_gpu::GpuSurface,
+    window: &Window,
+) {
+    if gpu_surface.is_hdr() {
+        return;
+    }
+    if let Some(gpu) = backend.gpu_mut()
+        && gpu.upgrade_surface_for_screen(window_gpu, gpu_surface, window)
+    {
+        let effective_colorspace = apprt.window_set_surface_colorspace(
+            window,
+            crate::platform::resolve_surface_colorspace(window_colorspace, true),
+        );
+        window_gpu.set_capture_color_space(crate::platform::capture_space_after_surface_tag(
+            effective_colorspace,
+            window_gpu.capture_color_space(),
+        ));
+    }
 }
 
 /// Settings-card cursor-effect DEMO cadence (~30 fps). Each tick bumps the open
@@ -3708,6 +4014,12 @@ enum Wake {
         /// decided on the control thread by `raise_after_spawn` (control_media.rs)
         /// (an explicit `raise=` wins; otherwise only an un-aimed spawn raises).
         raise: bool,
+        /// `identity=<name>|-` (session identities): the agent identity the
+        /// newborn spawns under, `Some(Default)` to opt an aimed spawn out of
+        /// inheriting, `None` to inherit the aimed session's (`@<sid> spawn`)
+        /// or, un-aimed, to spawn none. Resolved on the main thread
+        /// (`App::spawn_session_aimed`), where the aimed handle is.
+        identity: Option<control::IdentitySpec>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     /// `spawn connected=controlled|controller place=window|tab of=<sid>`
@@ -3723,6 +4035,9 @@ enum Wake {
         origin: aterm_session::SessionId,
         /// Optional cwd override; `None` defaults to the ORIGIN session's cwd.
         cwd: Option<String>,
+        /// `identity=<name>|-`: as on `SpawnSession`; `None` inherits the
+        /// ORIGIN's identity (the `of=` session is the aimed one here).
+        identity: Option<control::IdentitySpec>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     /// `@<sid> close` (control socket): retire a session by id — the death half of
@@ -4291,24 +4606,13 @@ enum Wake {
     /// claims a toolchain the machine does not have, and the failure pill hides the
     /// programs that did arrive.
     PkgSeedPartial { detail: String },
-    /// `lock-waiting:` — the launch-time child found another atpkg process holding
-    /// the store lock (a sibling window's pass, the first instance's pass after the
-    /// macOS Full Disk Access grant quit and re-opened the app, a self-update
-    /// predecessor, the session lane's detached pass, a terminal `aterm pkg
-    /// install`) and is QUEUED behind it (`--wait-lock`, 2026-09-10). Neither a pass
-    /// start nor a terminal answer: it opens the non-terminal waiting row
-    /// (`StatusBars::toolchain_waiting`), which the sibling's tailed progress, this
-    /// child's own markers, its own acquisition ([`Wake::PkgLockAcquired`]) or this
-    /// child's exit retires — except a `Busy` exit (75), which leaves the row for
-    /// the child that queues next behind the same holder.
+    /// atpkg's `lock-waiting:` line: this launch child is QUEUED behind another
+    /// atpkg process at the store lock (`--wait-lock`, 2026-09-10). One INFO log
+    /// line; NO row since 2026-09-18 (the row asserted "another aterm" for a
+    /// holder that is, after a self-update, this app's own predecessor's pass).
     PkgLockWaiting { detail: String },
-    /// `lock-acquired:` — the announced wait ENDED IN THE LOCK (2026-09-14): the
-    /// holder let go and this child runs its verb now. Neither a pass start nor a
-    /// terminal answer, like the wait it answers: it retires the waiting row (and
-    /// a wait remembered behind another row — `StatusBars::toolchain_wait_over`)
-    /// and nothing else. Without it, a child that waited and then ran a QUIET verb
-    /// kept "waiting for another aterm's install" up for the whole of its own work
-    /// under the lock (a seed's index read: 6–18 s online, minutes offline).
+    /// …and its answer (2026-09-14): the wait ended in the lock. One INFO log
+    /// line, so the queued interval is on record.
     PkgLockAcquired { detail: String },
     /// The waited-on sibling did not finish inside the child's bound (atpkg exit 75):
     /// the pass is DEFERRED, not failed — the loop retries on a short backoff.
@@ -4384,14 +4688,91 @@ enum Wake {
 }
 
 /// MEM-ACCT-3(b) shed policy: the low scrollback watermark (bytes) to evict down to when
-/// the OS raises memory pressure, given the session's current `budget`. WARN trims to a
-/// quarter, CRITICAL to an eighth, with a 1 MiB floor so a tiny budget never rounds to a
-/// pathologically small store. Pure, so the policy is unit-tested without a live session.
+/// the OS raises memory pressure, given the session's current `budget`. WARN trims to
+/// half ([`PRESSURE_WARN_KEEP_DIVISOR`]), CRITICAL to an eighth
+/// ([`PRESSURE_CRITICAL_KEEP_DIVISOR`]), with a 1 MiB floor so a tiny budget never rounds
+/// to a pathologically small store. Pure, so the policy is unit-tested without a live
+/// session.
 #[must_use]
 fn pressure_shed_budget(budget: usize, critical: bool) -> usize {
-    let divisor = if critical { 8 } else { 4 };
-    (budget / divisor).max(1 << 20)
+    (budget / pressure_shed_divisor(critical)).max(1 << 20)
 }
+
+/// The tier → fraction mapping behind [`pressure_shed_budget`]: the divisor of the
+/// session's budget a pressure tier evicts down to. WARN keeps 1/2, CRITICAL keeps 1/8.
+///
+/// The two libdispatch tiers are set by different kernel conditions, well apart. Read from
+/// xnu-8796.101.5 (macOS 13.3; the reference box runs 13.7.8) `osfmk/vm/vm_pageout.c`,
+/// `VM_PRESSURE_NORMAL_TO_WARNING` / `VM_PRESSURE_WARNING_TO_CRITICAL`: with the
+/// compressor active (every shipping Mac), WARN begins the moment non-compressed memory
+/// drops under `VM_PAGE_COMPRESSOR_COMPACT_THRESHOLD` — the compressor's own
+/// minor-compaction trigger, which with the >3 GiB macOS divisors (`vm_compressor.c`
+/// `vm_compressor_init`: 20/25/35/50) is half of non-wired memory, i.e. WARN = "the
+/// compressor's resident pages outnumber everything else that is not wired". CRITICAL
+/// begins only under 1.2× the swap-UNTHROTTLE threshold (≈34% of non-wired memory) or
+/// with the compressor pool nearing its cap (`vm_compressor_low_on_space()`): the tier
+/// just before the swapper's I/O is unthrottled (`SWAPPER_NEEDS_TO_UNTHROTTLE()`, ≈29%).
+/// It is not the start of paging to disk: macOS's `COMPRESSOR_NEEDS_TO_SWAP()`
+/// (`vm_compressor.h`) already swaps under `VM_PAGE_COMPRESSOR_SWAP_THRESHOLD` (divisor
+/// 25: 40%), inside the WARN band. The WARN policy rests on that definition and on the
+/// SDK's `dispatch/source.h`, which tells registrants to answer elevated pressure by
+/// capping FUTURE growth and that they "should NOT traverse and discard existing
+/// caches", as that aggravates the pressure.
+/// So WARN trims only the sessions already above half their ceiling, and only their
+/// oldest half: half the budget is also the store's own yellow-exit level
+/// (`aterm_scrollback::YELLOW_EXIT_PERCENT`), the occupancy it already calls relaxed,
+/// so the tier borrows an existing number rather than inventing one. CRITICAL keeps its
+/// eighth — it is the tier nearing the swap-unthrottle / compressor-pool limits, and the
+/// aggregate 4 GiB lane (`enforce_global_scrollback_cap`) sheds at the same fraction.
+/// What stands behind CRITICAL on macOS is the low-swap path, not the embedded
+/// page-shortage jetsam. In xnu-8796.101.5 `CONFIG_JETSAM` is an embedded-only option
+/// (`config/MASTER`: "enable jetsam - used on embedded"); neither `MASTER.x86_64` nor
+/// `MASTER.arm64.MacOSX` sets it, and of the two kills only
+/// `memorystatus_kill_on_VM_page_shortage` (`vm_pageout.c`, under
+/// `CONFIG_MEMORYSTATUS && CONFIG_JETSAM`) is gated by it.
+/// `memorystatus_kill_on_VM_compressor_space_shortage` is not: it is declared outside the
+/// `CONFIG_JETSAM` block of `bsd/sys/kern_memorystatus.h`, defined unconditionally in
+/// `bsd/kern/kern_memorystatus.c`, and reached on macOS through
+/// `vm_compressor_take_paging_space_action` (`vm_compressor.c`, non-jetsam arm; entered from
+/// `c_seg_allocate` once `vm_compressor_low_on_space()`, and from the compaction check once
+/// swap is low) → `no_paging_space_action()` (`bsd/kern/kern_proc.c`), which in order
+/// (a) SIGKILLs the largest process without a pcontrol policy if it holds more than 50% of
+/// every compressed page ("low swap: killing largest compressed process", reason
+/// `JETSAM_REASON_LOWSWAP`); (b) else, if any process sits in a band up to
+/// `max_kill_priority` (`JETSAM_PRIORITY_IDLE` without jetsam), posts that compressor-space
+/// kill to the memorystatus thread asynchronously — a flag the non-jetsam
+/// `memorystatus_health_check` never reads, so the thread wakes, finds the system healthy
+/// and kills nothing for it; (c) else throttles, suspends or kills the largest
+/// pcontrol-marked process per its policy (`proc_dopcontrol`). After (b) or (c) — not
+/// after (a) — `memorystatus_send_low_swap_note()` raises the "out of application memory"
+/// dialog. These actions are the "jetsam" the rest of this file names (Apple's own reason
+/// codes are `OS_REASON_JETSAM`). (a) needs this process to own over half of all
+/// compressed pages, which a terminal's bounded scrollback does not plausibly reach, so
+/// for aterm the CRITICAL eighth trades the oldest seven eighths against unthrottled swap,
+/// the low-swap actions and the dialog.
+#[must_use]
+const fn pressure_shed_divisor(critical: bool) -> usize {
+    if critical {
+        PRESSURE_CRITICAL_KEEP_DIVISOR
+    } else {
+        PRESSURE_WARN_KEEP_DIVISOR
+    }
+}
+
+/// WARN keeps `budget / 2` — the earlier, milder tier may evict at most the oldest half of
+/// a session. See [`pressure_shed_divisor`].
+const PRESSURE_WARN_KEEP_DIVISOR: usize = 2;
+
+/// CRITICAL keeps `budget / 8` — the later tier's 87.5% cut, unchanged; the aggregate cap
+/// lane rides this fraction too. See [`pressure_shed_divisor`].
+const PRESSURE_CRITICAL_KEEP_DIVISOR: usize = 8;
+
+// The invariant behind the two tiers, pinned where the numbers live (a const context, so
+// it is not an `assertions_on_constants` in a test): WARN keeps at least half, and
+// CRITICAL never sheds softer than WARN.
+const _: () = assert!(
+    PRESSURE_WARN_KEEP_DIVISOR <= 2 && PRESSURE_CRITICAL_KEEP_DIVISOR >= PRESSURE_WARN_KEEP_DIVISOR
+);
 
 /// Process-wide emergency target for reclaimable scrollback bytes summed across ALL live
 /// sessions. Each session's tiered store is INDIVIDUALLY capped (100 MB default), but N
@@ -4524,16 +4905,33 @@ mod global_cap_tests {
 
 #[cfg(test)]
 mod pressure_shed_tests {
-    use super::pressure_shed_budget;
+    use super::{pressure_shed_budget, pressure_shed_divisor};
 
-    /// MEM-ACCT-3(b): WARN trims to a quarter, CRITICAL to an eighth, never below the
+    /// The tier → fraction mapping: WARN is the earlier tier on macOS (from the
+    /// compressor's minor-compaction threshold) and may evict at most the oldest half of a
+    /// session; CRITICAL is the later tier (near the swap-unthrottle and compressor-pool
+    /// limits) and keeps its eighth. The ordering invariant
+    /// (WARN keeps at least half; CRITICAL never sheds softer than WARN) is a `const`
+    /// assertion beside the divisors, not a test.
+    #[test]
+    fn pressure_tier_to_fraction_mapping() {
+        assert_eq!(pressure_shed_divisor(false), 2, "WARN keeps half");
+        assert_eq!(pressure_shed_divisor(true), 8, "CRITICAL keeps an eighth");
+        // 100 MiB budget: WARN evicts at most 50 MiB, CRITICAL at most 87.5 MiB.
+        let mib = 1usize << 20;
+        let budget = 100 * mib;
+        assert_eq!(budget - pressure_shed_budget(budget, false), 50 * mib);
+        assert_eq!(budget - pressure_shed_budget(budget, true), 175 * mib / 2);
+    }
+
+    /// MEM-ACCT-3(b): WARN trims to half, CRITICAL to an eighth, never below the
     /// 1 MiB floor, and never above the current budget (so the restore step can't grow it).
     #[test]
     fn pressure_shed_budget_policy() {
         let mib = 1usize << 20;
-        // 100 MiB budget: WARN → 25 MiB, CRITICAL → 12.5 MiB.
-        assert_eq!(pressure_shed_budget(100 * mib, false), 25 * mib);
-        assert_eq!(pressure_shed_budget(100 * mib, true), (100 * mib) / 8);
+        // 100 MiB budget: WARN → 50 MiB, CRITICAL → 12.5 MiB.
+        assert_eq!(pressure_shed_budget(100 * mib, false), 50 * mib);
+        assert_eq!(pressure_shed_budget(100 * mib, true), 25 * mib / 2);
         // The 1 MiB floor holds for a tiny budget (never rounds toward zero).
         assert_eq!(pressure_shed_budget(2 * mib, true), mib, "floor at 1 MiB");
         assert_eq!(
@@ -5912,6 +6310,148 @@ const fn defer_font_seal(headless: bool) -> bool {
     headless
 }
 
+/// What one [`App::ensure_pixel_backend`] did, leg by leg, in milliseconds —
+/// the material of the ONE info line it writes (see
+/// [`pixel_backend_redemption_line`]). Every leg is optional because the
+/// redemption stops at the first leg that settles the question: a `--cpu`
+/// headless run seals and returns, a fork failure or a missing device returns
+/// before the install.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct PixelBackendRedemptionLegs {
+    /// The deferred font seal (three font files read and parsed on this
+    /// thread; Apple Color Emoji alone is 190 MB), when one was owed.
+    seal_ms: Option<f64>,
+    /// Forking the CPU face the device will be handed.
+    fork_ms: Option<f64>,
+    /// `GpuRenderer::new_with_family`, with its answer: `Ok(name (backend))`
+    /// or the error the CPU renderer kept serving through. NOT just the
+    /// device: `new_with_family` spawns a font thread
+    /// (`Renderer::from_system_with_family` — font resolution, file read,
+    /// parse — then `prewarm_ascii`), builds the GPU context on this thread,
+    /// JOINS the font thread, and only then calls `from_parts`, so the leg is
+    /// max(context, font thread) plus `from_parts`. On the wgpu arms the
+    /// context is the instance, the adapter, the device and the context's
+    /// tail, and `from_parts`, after the join, compiles the shader and builds
+    /// the pipelines. On the macOS Metal arm `GpuContext::new` only NAMES the
+    /// preferred device and keeps only the name — on the system-default pick
+    /// that naming IS `MTLCreateSystemDefaultDevice` — while `MetalArmLive`
+    /// mints the device (calling `Device::preferred` again: on that pick, a
+    /// second `MTLCreateSystemDefaultDevice`), queue and `cell.metal` at the
+    /// first armed frame, after this leg, and `from_parts`' shader and
+    /// pipeline legs are `cfg(wgpu_arm)`; so there
+    /// the leg is max(device name, font discovery + parse + prewarm) plus a
+    /// struct-assembly tail — which is why the two fields below split it.
+    device: Option<(f64, Result<String, String>)>,
+    /// The font thread's own wall time inside the device leg
+    /// (`startup_probe::Leg::FontThread`). The probe slots are process-global
+    /// and first-write-wins, so this is read only when both were UNSET going
+    /// into `new_with_family` — true of every headless run, whose launch
+    /// deferred its only build to here — and left `None` otherwise.
+    font_thread_ms: Option<f64>,
+    /// The wait the device leg paid at the join (`Leg::FontJoin`): however
+    /// much of the font thread did not fit under the context build. Same
+    /// first-write-wins rule as `font_thread_ms`; `None` too when the context
+    /// failed before the join (the thread is then never joined).
+    font_join_ms: Option<f64>,
+    /// Installing the forked face and the carried geometry on the new device.
+    install_ms: Option<f64>,
+}
+
+impl PixelBackendRedemptionLegs {
+    /// Split the device leg the way `startup_probe` recorded it — but only
+    /// when `unset_before` says the slots were empty going in, so a build
+    /// that preceded this redemption (never headless; guarded anyway) cannot
+    /// be mistaken for it. A slot still 0 never ran and stays `None`.
+    fn note_font_legs(&mut self, unset_before: bool) {
+        use aterm_gpu::startup_probe::{Leg, leg_ns};
+        if !unset_before {
+            return;
+        }
+        let ms = |ns: u64| (ns != 0).then_some(ns as f64 / 1e6);
+        self.font_thread_ms = ms(leg_ns(Leg::FontThread));
+        self.font_join_ms = ms(leg_ns(Leg::FontJoin));
+    }
+}
+
+/// Whether the font-thread probe slots are still untouched, i.e. whether the
+/// build about to run is the process's first — read BEFORE `new_with_family`.
+fn font_legs_unset() -> bool {
+    use aterm_gpu::startup_probe::{Leg, leg_ns};
+    leg_ns(Leg::FontThread) == 0 && leg_ns(Leg::FontJoin) == 0
+}
+
+/// Milliseconds since `since`, as the log line prints them.
+fn elapsed_ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1e3
+}
+
+/// The one line a redemption leaves in `aterm.log`, beside any stall line the
+/// watchdog wrote during it. It exists because the 2026-09-06 first-launch
+/// stall (`no heartbeat for 5.045556453s while inside \`UserEvent\``) fell
+/// INSIDE this redemption on a headless instance's first capture — the line
+/// was written at 14:29:36.4, the instance's stderr named its device (the
+/// Radeon Pro 560) only at 14:29:40.7, and the PNG was created at 14:29:41.7,
+/// so the reported window lies in the seal, fork and `new_with_family` legs
+/// and the first frame's Metal mint was in the 945 ms tail (with the
+/// install, the frame, the encode and the write; nothing timed it alone) —
+/// and nothing in the log said which leg, or what any of them had cost. The
+/// device leg is split further (font thread, join wait) because on the macOS
+/// Metal arm it is max(device name, font discovery + parse + prewarm) plus a
+/// struct-assembly tail, and the line could not otherwise tell a slow Metal
+/// device from slow font discovery. The numbers are what they are — the line
+/// neither warns nor apologizes — so the next reader can compare them against
+/// what `watchdog::Phase::PixelBackendRedeem` records.
+fn pixel_backend_redemption_line(legs: &PixelBackendRedemptionLegs, total_ms: f64) -> String {
+    let mut line =
+        format!("headless pixel backend redeemed on the main thread in {total_ms:.0} ms:");
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ms) = legs.seal_ms {
+        parts.push(format!("font seal {ms:.0} ms"));
+    }
+    if let Some(ms) = legs.fork_ms {
+        parts.push(format!("face fork {ms:.0} ms"));
+    }
+    // The device leg's split, inside its own parentheses: `font thread N ms,
+    // join wait M ms; ` — either half alone when only one was recorded,
+    // nothing when neither was.
+    let font_legs = {
+        let mut split: Vec<String> = Vec::new();
+        if let Some(ms) = legs.font_thread_ms {
+            split.push(format!("font thread {ms:.0} ms"));
+        }
+        if let Some(ms) = legs.font_join_ms {
+            split.push(format!("join wait {ms:.0} ms"));
+        }
+        if split.is_empty() {
+            String::new()
+        } else {
+            format!("{}; ", split.join(", "))
+        }
+    };
+    match &legs.device {
+        Some((ms, Ok(adapter))) => {
+            parts.push(format!("GPU device {ms:.0} ms ({font_legs}{adapter})"));
+        }
+        Some((ms, Err(error))) => parts.push(format!(
+            "GPU device {ms:.0} ms ({font_legs}unavailable: {error}; the CPU renderer keeps \
+             serving)"
+        )),
+        None if legs.fork_ms.is_some() => {
+            parts.push(
+                "no device built (the face fork failed; the CPU renderer keeps serving)".into(),
+            );
+        }
+        None => parts.push("no GPU intent (the CPU renderer serves)".into()),
+    }
+    if let Some(ms) = legs.install_ms {
+        parts.push(format!("install {ms:.0} ms"));
+    }
+    line.push(' ');
+    line.push_str(&parts.join(", "));
+    line.push_str(" — the first pixel demand of a headless run pays this once");
+    line
+}
+
 /// PROCESS-GLOBAL twin of [`App::backend_kind_undecided`], for the capability
 /// readers that have no `&App` to ask. Native Settings projects availability from
 /// FREE view functions (`setting_row`, `page`, `manual_override_disclosure`, …)
@@ -6133,6 +6673,89 @@ mod headless_gpu_deferral_tests {
         assert!(!super::defer_gpu_build(true, false), "windowed GPU launch");
         assert!(!super::defer_gpu_build(false, true), "headless --cpu");
         assert!(!super::defer_gpu_build(false, false), "windowed --cpu");
+    }
+
+    /// The redemption's log line says what each leg cost and how the device
+    /// question settled, for every shape the redemption can take — the
+    /// evidence the 2026-09-06 stall line was missing.
+    #[test]
+    fn the_redemption_line_names_every_leg_and_the_device_verdict() {
+        use super::{PixelBackendRedemptionLegs, pixel_backend_redemption_line};
+        // An ILLUSTRATIVE shape, not a measurement: the legs are invented so
+        // the device leg's split has something to say — here the font thread,
+        // with the device name hidden under it — which is what the split
+        // exists to tell when the seconds land in that leg. No surviving
+        // 2026-09-06 artifact carries a split line; the two real redemption
+        // lines that evening (509 and 533 ms) predate the split.
+        let built = PixelBackendRedemptionLegs {
+            seal_ms: Some(131.4),
+            fork_ms: Some(12.0),
+            device: Some((9012.0, Ok("Intel(R) HD Graphics 630 (Metal)".into()))),
+            font_thread_ms: Some(8990.4),
+            font_join_ms: Some(8980.0),
+            install_ms: Some(8.2),
+        };
+        assert_eq!(
+            pixel_backend_redemption_line(&built, 9163.6),
+            "headless pixel backend redeemed on the main thread in 9164 ms: font seal 131 ms, \
+             face fork 12 ms, GPU device 9012 ms (font thread 8990 ms, join wait 8980 ms; \
+             Intel(R) HD Graphics 630 (Metal)), install 8 ms — the first pixel demand of a \
+             headless run pays this once"
+        );
+        // A build that was NOT the process's first leaves the split unread:
+        // the device clause is the adapter alone.
+        let unsplit = PixelBackendRedemptionLegs {
+            font_thread_ms: None,
+            font_join_ms: None,
+            ..built.clone()
+        };
+        let line = pixel_backend_redemption_line(&unsplit, 9163.6);
+        assert!(
+            line.contains("GPU device 9012 ms (Intel(R) HD Graphics 630 (Metal)), install"),
+            "{line}"
+        );
+        // The context failed before the join: the font thread ran (and may
+        // have landed its slot) but was never joined, so only its half prints.
+        let unavailable = PixelBackendRedemptionLegs {
+            seal_ms: Some(120.0),
+            fork_ms: Some(11.0),
+            device: Some((5.0, Err("no Metal device on this machine".into()))),
+            font_thread_ms: Some(4.0),
+            font_join_ms: None,
+            install_ms: None,
+        };
+        let line = pixel_backend_redemption_line(&unavailable, 136.0);
+        assert!(
+            line.contains(
+                "GPU device 5 ms (font thread 4 ms; unavailable: no Metal device on this \
+                 machine; the CPU renderer keeps serving)"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("install"), "{line}");
+        let fork_failed = PixelBackendRedemptionLegs {
+            seal_ms: None,
+            fork_ms: Some(3.0),
+            device: None,
+            font_thread_ms: None,
+            font_join_ms: None,
+            install_ms: None,
+        };
+        let line = pixel_backend_redemption_line(&fork_failed, 3.0);
+        assert!(
+            line.contains("no device built (the face fork failed"),
+            "{line}"
+        );
+        let cpu_only = PixelBackendRedemptionLegs {
+            seal_ms: Some(118.0),
+            ..PixelBackendRedemptionLegs::default()
+        };
+        assert_eq!(
+            pixel_backend_redemption_line(&cpu_only, 118.0),
+            "headless pixel backend redeemed on the main thread in 118 ms: font seal 118 ms, \
+             no GPU intent (the CPU renderer serves) — the first pixel demand of a headless \
+             run pays this once"
+        );
     }
 
     /// A pixel demand on a launch with NO deferred intent must construct
@@ -6749,6 +7372,13 @@ struct Session {
     /// never frozen. Mirrored onto the registry at registration, where the
     /// managed-current row counts the live ones and the next handoff carries them.
     frozen_path: bool,
+    /// IDENTITY (session identities, 2026-09-17): the agent identity this
+    /// session was spawned under (`spawn identity=<name>`; `agent_identity`),
+    /// or `None` for the human's own agent config. Spawn-time and immutable
+    /// (`meta set identity` is refused); mirrored onto the registry handle at
+    /// registration, carried by the handoff record across a seamless update
+    /// and by the restore leaf across a quit.
+    identity: Option<String>,
     ctx: Arc<SessionCtx>,
     /// The proxy-table key for the child this session spawned (Item 5b), retained
     /// so `Drop` can deregister it — otherwise the process-wide `PROXIES` map grows
@@ -9084,6 +9714,23 @@ struct WindowState {
     /// only on the committed key-press path — it never sees screen content, so
     /// `cat`ing a file full of "kitty" cannot fire it.
     kitty_summon: crate::kitty_summon::TypedKittySummon,
+    /// THE KITTY-COMMAND LISTENER (`aterm_effects::typed_tricks`): the typed
+    /// LINE this window is on — its open token, its purity, the tentative fire
+    /// it may be holding — keyed to the session each press went to. Fed on the
+    /// committed key-press path only, ALWAYS (feature on or off, Serious Mode
+    /// included: a line the listener did not watch being edited is a line it
+    /// would call pure by mistake); the host gates what an EVENT is allowed to
+    /// do. Per-window like the detector above it; the serious drain leaves it
+    /// ALONE where it resets the detector, for the same reason it is fed
+    /// (see `drain_serious_effects`) — the host's memory of its last fire,
+    /// below, is what the drain drops.
+    trick_listener: aterm_effects::typed_tricks::TrickListener,
+    /// What the host did with the last kitty-command FIRE on the listener's
+    /// current line — the memory a later `Confirm` or `Revoke` of that fire
+    /// needs, since neither carries the word. `None` before any fire on the
+    /// line; written at EVERY fire (a rejected one clears it), so it always
+    /// describes the fire being confirmed or revoked.
+    trick_fire: crate::app_input::TrickLineFire,
     /// TYPED-word DOG cameo lifecycle (`aterm_effects::dog_cameo`): the
     /// envelope + rolled breed for the canine summon `kitty_summon` fires once
     /// its typed-a-lot gate opens. Pure presentation state — dogs are never
@@ -9426,6 +10073,25 @@ struct WindowState {
     /// frame doublets. An anchor older than one interval falls back to
     /// `now + interval` (an overloaded frame never bursts to catch up).
     last_trail_fire: Option<Instant>,
+    /// THE DRAWABLE POOL HAS PARKED THIS WINDOW during the current effect
+    /// episode: a successful present's swapchain acquire waited at least
+    /// [`EFFECT_LANE_ACQUIRE_PARK_NS`]. While set, [`Self::effect_present_interval`]
+    /// keeps [`EFFECT_PRESENT_PANEL_PERIODS`] even where
+    /// [`EFFECT_LANE_PANEL_RATE_AT_60HZ`] would present at panel rate; it clears
+    /// when the lane idles (`park_terminal_effect_scheduler`), so the next
+    /// episode probes the pool again. Set from the wait the renderer MEASURED
+    /// on the present's own acquire (`App::last_acquire_wait_ns`, rewritten on
+    /// every successful acquire; never inferred), by
+    /// `App::finalize_successful_present` — the success boundary the routes
+    /// share — on the two routes that draw cursor effects: the terminal route
+    /// (`redraw_window_with_layout`) and the heterogeneous one
+    /// (`redraw_heterogeneous_window`: a mixed native + terminal tab, whose
+    /// focused terminal leaf runs this lane on the same drawable pool). The
+    /// native route draws no cursor effect and does not feed it. Nor does a
+    /// REFUSED acquire (a timeout, an occluded surface): that present failed
+    /// before its wait was recorded, so a pool still full is heard through
+    /// the retry's own wait.
+    effect_lane_parked: bool,
     /// CHROME-DECORATION MOTION, as a LEVEL with an expiry: "a redraw drew a
     /// decoration mid-motion no longer ago than this instant". Robi walking his
     /// round, the typed dog's bounce/fade envelope, the reduced-motion sing still
@@ -9688,7 +10354,9 @@ struct WindowState {
     /// override is the feature — no instance count can make it wrong.
     frame_interval: Option<Duration>,
     /// The monitor `frame_interval` was sampled from; `Moved` fires continuously
-    /// during a drag, so re-sample only when the handle actually changes.
+    /// during a drag, so the expensive tail of `refresh_frame_interval` (EDR
+    /// re-query, retry re-arm, forced redraw) runs only when the handle actually
+    /// changes.
     monitor: Option<winit::monitor::MonitorHandle>,
     /// Last time the panel's EDR headroom was re-queried for the aurora boost
     /// (`None` = never). `maximumExtendedDynamicRange…` tracks the display's
@@ -9697,6 +10365,13 @@ struct WindowState {
     /// re-samples it on a throttle ([`EDR_REQUERY_INTERVAL`]) rather than only on
     /// an actual monitor change.
     last_edr_query: Option<Instant>,
+    /// Last time this window's refresh RATE was read from its monitor (`None` =
+    /// never). `refresh_frame_interval` reads it on every monitor change, on
+    /// every forced call (`Focused(true)`), and otherwise on a throttle
+    /// ([`REFRESH_RATE_REREAD_INTERVAL`]); the const carries the measured
+    /// CVDisplayLink cost that made an every-`Moved` read a bad deal on a panel
+    /// whose CG display mode reports no refresh rate.
+    last_refresh_rate_read: Option<Instant>,
     /// Next settings-card effect-demo tick ([`DEMO_TICK_INTERVAL`]), armed only
     /// while the open Settings overlay focuses a cursor-effect row; `None` disarms
     /// (pure `Wait`) like every other animation deadline.
@@ -10570,8 +11245,68 @@ impl WindowState {
             .map(|engine| Duration::from_millis(engine.current_period_ms()))
     }
 
+    /// THE EFFECT LANE'S PRESENT PERIOD FOR THIS WINDOW — the one quantity the
+    /// scheduler arms (`plan_terminal_effect_lane`), the decoration latch counts
+    /// in ([`DECO_ANIM_LEVEL_FRAMES`]) and the tests measure, so none of them
+    /// can disagree about how long one lane period is. The free
+    /// [`effect_present_interval`] is the same arithmetic for a window whose
+    /// pool has not parked; this adds the window's own evidence: once a present
+    /// on THIS window waited for a drawable (`effect_lane_parked`), the
+    /// panel-rate arm of [`EFFECT_LANE_PANEL_RATE_AT_60HZ`] yields to
+    /// [`EFFECT_PRESENT_PANEL_PERIODS`] for the rest of the effect episode.
+    /// Off that arm the latch changes nothing — the halving was already the
+    /// answer — so every other host is byte-identical with or without it.
+    fn effect_present_interval(&self) -> Duration {
+        if self.effect_lane_parked {
+            effect_present_interval_with(self.frame_interval, EFFECT_PRESENT_PANEL_PERIODS)
+        } else {
+            effect_present_interval(self.frame_interval)
+        }
+    }
+
+    /// A successful present on this window just measured its swapchain-acquire
+    /// wait (fed by `App::finalize_successful_present` on the terminal and
+    /// heterogeneous routes, the two that draw cursor effects). A wait of
+    /// [`EFFECT_LANE_ACQUIRE_PARK_NS`] or more is the pool saying
+    /// it is full — a drawable is being held longer than this window's present
+    /// cadence leaves room for — and the effect lane answers by giving the
+    /// headroom back ([`Self::effect_present_interval`]). Content presents are
+    /// measured too, on purpose: a park is a park whichever lane paid it, and
+    /// the effect lane is the only lane with headroom to give.
+    ///
+    /// Monotone within an episode. The demoted lane parks RARELY (measured:
+    /// two of twenty 30/s arms, both stalls at a ~8 ms frame, none at any
+    /// other frame cost — the constant's doc), so a clean 30/s present says
+    /// nothing about whether the frame got cheap again: a retry is a blind
+    /// probe that costs a park on the winit main thread — the very cost the
+    /// halving exists to avoid — so it is spent once per episode, at the next
+    /// one's start, not once per clean present (which would park every other
+    /// frame on a frame that is simply too dear for panel rate).
+    fn note_acquire_wait(&mut self, acquire_wait_ns: u64) {
+        if acquire_wait_ns >= EFFECT_LANE_ACQUIRE_PARK_NS {
+            self.effect_lane_parked = true;
+        }
+    }
+
+    /// THE CHROME-DECORATION LATCH'S HOLD for this window:
+    /// [`DECO_ANIM_LEVEL_FRAMES`] of the LONGEST lane period the window can
+    /// take in an effect episode — the halved lane,
+    /// [`EFFECT_PRESENT_PANEL_PERIODS`] panel periods — and not
+    /// [`Self::effect_present_interval`], the lane it is on right now. On the
+    /// Intel arm the two differ while the pool has not parked, and the park
+    /// that makes them agree can arrive on the very present of the redraw that
+    /// refreshed the latch (the decoration sites run before the present,
+    /// [`Self::note_acquire_wait`] after it), so the latch must already be
+    /// long enough for the lane it is about to be on. Off that arm the two are
+    /// the same number. The constant's doc has the freeze this prevents.
+    fn deco_anim_hold(&self) -> Duration {
+        effect_present_interval_with(self.frame_interval, EFFECT_PRESENT_PANEL_PERIODS)
+            * DECO_ANIM_LEVEL_FRAMES
+    }
+
     /// A redraw just drew a CHROME DECORATION mid-motion: hold the shared effects
-    /// lane open for [`DECO_ANIM_LEVEL_FRAMES`] more frame intervals.
+    /// lane open for [`DECO_ANIM_LEVEL_FRAMES`] more lane periods
+    /// ([`Self::deco_anim_hold`]).
     ///
     /// Called from the five decoration sites in `redraw_window`/`redraw_compose`,
     /// each of them UPSTREAM of that path's RepaintKey early-out — a pose whose
@@ -10583,7 +11318,7 @@ impl WindowState {
     /// (a dog cameo over a walking Robi) the longer hold wins regardless of the
     /// order the arms run in.
     fn note_deco_animating(&mut self, now: Instant) {
-        let until = now + effect_present_interval(self.frame_interval) * DECO_ANIM_LEVEL_FRAMES;
+        let until = now + self.deco_anim_hold();
         if self.deco_anim_until.is_none_or(|held| held < until) {
             self.deco_anim_until = Some(until);
         }
@@ -10717,15 +11452,19 @@ impl WindowState {
         //
         // The cadence is [`effect_present_interval`] — the panel's own refresh
         // DIVIDED by the drawable-pool headroom divisor, so the effect lane
-        // presents strictly slower than the display refreshes. It used to be the
-        // panel period flat, on the ground that a 60 fps train hands a 120 Hz
-        // ProMotion panel the same comet twice. That is true and it is not worth
-        // what it cost: a lane presenting once per refresh keeps the Metal
-        // drawable pool empty (no Mailbox on macOS), so the winit main thread
-        // spent `acquire_p50` 7.34-8.39 ms of every ~8.1 ms period blocked inside
-        // `nextDrawable`, with the user's next keyDown queued in the OS behind it
-        // — the trail's entire measured +8 ms on key->present-return. Half the
-        // effect frames buys back the whole park; see the constant's doc.
+        // presents strictly slower than the display refreshes on any panel
+        // faster than 60 Hz (a known panel at or below 60 Hz presents at panel
+        // rate on an Intel Mac until this window's own acquire parks; the
+        // divisor's doc has that measurement). It
+        // used to be the panel period flat, on the ground that a 60 fps train
+        // hands a 120 Hz ProMotion panel the same comet twice. That is true and
+        // it is not worth what it cost: a lane presenting once per refresh
+        // keeps the Metal drawable pool empty (no Mailbox on macOS), so the
+        // winit main thread spent `acquire_p50` 7.34-8.39 ms of every ~8.1 ms
+        // period blocked inside `nextDrawable`, with the user's next keyDown
+        // queued in the OS behind it — the trail's entire measured +8 ms on
+        // key->present-return. Half the effect frames buys back the whole park;
+        // see the constant's doc.
         // THE FRAME LANE'S OWN ANSWER, resolved before the arms so that arm 1
         // can REFUSE a train nobody asked for. The predicate is a LEVEL (light
         // is on glass), but the wake it owes is a question the owners answer
@@ -10774,7 +11513,7 @@ impl WindowState {
             // busy loop. The held slot below preserves an already-armed edge.
             .map(|deadline| {
                 if deadline <= now {
-                    now + effect_present_interval(self.frame_interval)
+                    now + self.effect_present_interval()
                 } else {
                     deadline
                 }
@@ -10789,7 +11528,7 @@ impl WindowState {
                     recording_watcher,
                 )))
         .then(|| {
-            let aurora_interval = effect_present_interval(self.frame_interval);
+            let aurora_interval = self.effect_present_interval();
             // RESPONSIVENESS: collapse the multi-second 60 fps forge-ember tail.
             // If the ONLY live cursor effect is the glow's slowly-cooling ember
             // (no moving light, no rainbow/cat/trail/deco, no fade), poll at the
@@ -10967,6 +11706,11 @@ impl WindowState {
     fn park_terminal_effect_scheduler(&mut self) {
         self.next_trail_tick = None;
         self.last_trail_fire = None;
+        // The pool-park latch is per EPISODE: the pool drains while the lane is
+        // idle, so the next episode starts at the platform arm and re-measures.
+        // A park is the one cost of that probe, and it is paid at most once per
+        // episode (see `note_acquire_wait`).
+        self.effect_lane_parked = false;
         // The decoration latch rides the same lane, so it parks with it. Reaching
         // here means the lane's own predicate said no, which for the decorations
         // is one of two things: the latch already expired (this is a no-op), or
@@ -11017,6 +11761,22 @@ impl WindowState {
         self.music_notes = aterm_effects::kitty_sing::MusicNotes::default();
         self.sing_riff_bar = None;
         self.kitty_summon = crate::kitty_summon::TypedKittySummon::default();
+        // THE KITTY-COMMAND LISTENER IS LEFT ALONE — on purpose, unlike the
+        // detector above it. It owns no timer, no render channel and no
+        // charge: it is the bookkeeping of the typed LINE under the caret
+        // (`npm run ` so far; `sit ` with a tentative fire), fed on every
+        // press whatever the gates say, and that truth is exactly what a
+        // drain must not destroy. This drain runs on EVERY frame while
+        // Serious Mode holds, so a reset here would call every line pure the
+        // moment it lifts — `sit␣` typed after `npm run ` would fire inside
+        // it, the purity model's motivating bug — and a poison here would
+        // leave the first line after it lifts deaf until the hand ends it,
+        // so `sit⏎` there would be an unforgiven `command not found`. What
+        // the listener can still say after a drain — the confirmation of a
+        // fire it holds from before — reaches no pet, because the host's
+        // memory of that fire is the charge, and it is dropped here: the
+        // dispatch confirms only a fire it remembers admitting.
+        self.trick_fire = crate::app_input::TrickLineFire::default();
         self.word_decos.hard_reset();
         self.matrix_rain = None;
         self.stream_fade.reset();
@@ -11423,6 +12183,8 @@ impl WindowState {
             cursor_cat: crate::kitty_cursor::CursorCat::default(),
             cursor_pet: aterm_effects::kitty_pet::PetBrain::default(),
             kitty_summon: crate::kitty_summon::TypedKittySummon::default(),
+            trick_listener: aterm_effects::typed_tricks::TrickListener::default(),
+            trick_fire: crate::app_input::TrickLineFire::default(),
             dog_cameo: aterm_effects::dog_cameo::DogCameo::default(),
             dog_cameo_session: None,
             robi_show: aterm_effects::robi::RobiShow::default(),
@@ -11494,6 +12256,7 @@ impl WindowState {
             next_rain_tick: None,
             next_trail_tick: None,
             last_trail_fire: None,
+            effect_lane_parked: false,
             deco_anim_until: None,
             next_autoscroll: None,
             scroll_glide: None,
@@ -11534,6 +12297,7 @@ impl WindowState {
             frame_interval: None,
             monitor: None,
             last_edr_query: None,
+            last_refresh_rate_read: None,
             next_demo_tick: None,
             next_native_preview_tick: None,
             current_title: "aterm".to_string(),
@@ -12590,6 +13354,11 @@ struct PendingUpdateHandoff {
     child_pid: Option<u32>,
     mode: native_updater_service::ApplyMode,
     apply_attempt: Option<native_updater_service::ApplyAttemptTicket>,
+    /// Which ticket-less authority this attempt ran under, if any — the QA seam or a
+    /// provenance repair. Carried so the completion reduction can tell them apart
+    /// instead of inferring "seam" from an absent ticket, which stopped being a sound
+    /// inference when the repair lane was added (2026-09-17).
+    same_image: Option<app_update_handoff::SameImageHandoff>,
     target_build: u64,
     target_commit: String,
     layout: restore::RestoreManifest,
@@ -13979,6 +14748,16 @@ struct App {
     /// While present, second manual/debug applies are rejected and clean quit is
     /// deferred until the proof completion returns to the main thread.
     pending_update_handoff: Option<PendingUpdateHandoff>,
+    /// The one-shot provenance self-repair latch ([`crate::provenance_repair`]): whether
+    /// this process may ask to be replaced by itself because it is provenance-TRACKED
+    /// while the bundle it runs from is clean. Measured OFF the event loop, consumed at
+    /// most once, and never re-armed — the module explains why every unmeasurable
+    /// reading refuses.
+    provenance_repair: crate::provenance_repair::RepairPosture,
+    /// Where the prober publishes its verdict: the outer `Option` is "has it answered",
+    /// the inner is the refusal reason (`None` = eligible). Read with `try_lock` on the
+    /// GUI thread, never a blocking `lock`.
+    provenance_repair_verdict: std::sync::Arc<std::sync::Mutex<Option<Option<&'static str>>>>,
     /// Resident operator authority used only to fence process replacement. The
     /// reversible token is acquired at the final update seam, never retained in
     /// ordinary rendering/input state.
@@ -14239,6 +15018,29 @@ impl App {
         )
     }
 
+    /// The PTY half of [`Self::automatic_update_activity_quiet`] alone: every
+    /// live session's latest output is at least one quiet epoch old. What the
+    /// PAST-GRACE automatic lane still waits for (2026-09-18): that lane gave up
+    /// waiting for a machine-wide idle moment (the daily driver — an agent
+    /// streaming in one pane while the human works in another app — never
+    /// offers one), but landing while a program is mid-line stalls that program
+    /// against a full PTY buffer for the whole park->Commit freeze, which the
+    /// owner ruled an interruption. Output pauses constantly (a prompt, a tool
+    /// call), so this holds the lane for moments, not minutes; the typing hold
+    /// still bounds it.
+    fn automatic_update_output_quiet(&self, now: Instant) -> bool {
+        let now_ns = u64::try_from(now.saturating_duration_since(self.lat_epoch).as_nanos())
+            .unwrap_or(u64::MAX);
+        self.pool.iter().all(|session| {
+            automatic_output_activity_quiet(
+                now_ns,
+                session
+                    .latest_output_activity_ns
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+        })
+    }
+
     /// Deterministic core of [`Self::automatic_update_activity_quiet`]. Keeping
     /// the platform input-source observation at the boundary lets the regression
     /// harness drive the genuine session clocks without depending on ambient
@@ -14351,6 +15153,20 @@ impl App {
     /// The hold is checked FIRST, before the focus shortcut, on purpose: a
     /// system consent dialog takes focus away from every aterm window, which is
     /// precisely the case the shortcut answers `true` for.
+    /// Whether an aterm window with a real OS surface has keyboard focus. The
+    /// per-window `focused` flag alone is not trusted: a logical window is born
+    /// believing it has focus and only a real `WindowEvent::Focused` corrects it,
+    /// so a surfaceless window (`os_window == None`) would read as focused
+    /// forever — `recompute_focus_boost` gates the same predicate the same way.
+    /// The one input to "is the user looking at aterm" for the automatic update
+    /// lanes (2026-09-18): whether the successor is ACTIVATED, and whether the
+    /// past-grace lane holds for a gap in terminal output.
+    pub(crate) fn any_os_window_focused(&self) -> bool {
+        self.windows
+            .values()
+            .any(|ws| ws.focused && ws.os_window.is_some())
+    }
+
     fn update_apply_hands_off_keys(&self, now: Instant) -> bool {
         // A warm-up worker is mid-gesture. Bounded by `[privacy]
         // warmup_hold_ms` inside `holds_automatic_apply`, so this refusal
@@ -15069,8 +15885,10 @@ impl App {
 
     /// MEM-ACCT-3(b): shed reclaimable memory when the OS signals memory pressure. Trim
     /// each live session's scrollback by evicting to a low watermark, then RESTORE its
-    /// budget so future scrollback can still grow — the old lines are sacrificed (the
-    /// correct trade to avoid a jetsam kill) but the session is not permanently crippled.
+    /// budget so future scrollback can still grow — the old lines are sacrificed (at WARN,
+    /// the earlier tier, at most the oldest half; at CRITICAL seven eighths, the trade
+    /// against unthrottled swap, a full compressor pool and the low-swap actions behind
+    /// them — see `pressure_shed_divisor`) but the session is not permanently crippled.
     /// Runs on the main thread (which owns the sessions), posted from the libdispatch
     /// pressure source. CRITICAL sheds harder than WARN. The GPU atlas is already bounded
     /// (device-max ceiling + visible-set repack), so scrollback — the surface SCROLL-1
@@ -15552,13 +16370,19 @@ impl App {
     /// occupies. `resumed` samples only the PRIMARY monitor once, which over- or
     /// under-paces any window living on a different-refresh display (a 120 Hz
     /// laptop panel next to a 60 Hz external, or the reverse); this keeps each
-    /// window coalescing at its own display's cadence. The refresh-rate read runs
-    /// on EVERY call (a mode change keeps the monitor's identity — W6, see the
-    /// inline note), while the cached-`MonitorHandle` compare still gates the
-    /// expensive tail (EDR re-query, retry re-arm, forced redraw), so the
-    /// continuous `Moved` stream during a drag pays two user32 reads per event
-    /// and nothing more.
-    fn refresh_frame_interval(&mut self, wid: WindowId) {
+    /// window coalescing at its own display's cadence. The refresh-rate read is
+    /// NOT hidden behind the monitor-identity guard (a mode change keeps the
+    /// monitor's identity — W6, see the inline note) but it IS throttled on the
+    /// same monitor ([`REFRESH_RATE_REREAD_INTERVAL`], via
+    /// [`refresh_rate_read_due`]) unless `force_read` is set, while the
+    /// cached-`MonitorHandle` compare still gates the expensive tail (EDR
+    /// re-query, retry re-arm, forced redraw). `Moved` passes `force_read =
+    /// false`, so the continuous stream during a drag pays one
+    /// `current_monitor()` identity compare per event, a rate read at most four
+    /// times a second, and nothing more; `Focused(true)` — the catch-all
+    /// single-monitor heal route, at human cadence — passes `true` and reads on
+    /// every call, exactly as before the throttle.
+    fn refresh_frame_interval(&mut self, wid: WindowId, force_read: bool) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -15566,6 +16390,7 @@ impl App {
             return;
         };
         let mon = w.current_monitor();
+        let same_monitor = mon == ws.monitor;
         // W6: the refresh-RATE read does NOT hide behind the monitor-identity
         // guard below. The identity is the HMONITOR on Windows, and a display
         // MODE change (Settings ▸ 60→144 Hz, a game flipping the rate, a TV
@@ -15574,18 +16399,46 @@ impl App {
         // equal, `Focused(true)` compared equal, no `WM_DISPLAYCHANGE` arm exists
         // in vendored winit, and on a single-monitor machine there is no other
         // display to drag to. With a Mailbox swapchain the CPU floor IS the frame
-        // rate, so the staleness was visible, not theoretical. The read is two
-        // user32 calls (`GetMonitorInfoW` + `EnumDisplaySettingsExW`), cheap
-        // enough for the continuous `Moved` stream during a drag — the same
-        // guard-for-the-expensive-half shape as `refresh_edr_headroom` and
-        // `verify_chrome_appearance`. Same period math as `resumed`:
-        // refresh_rate_millihertz is Hz×1000, so the period is 1e12/mHz ns.
+        // rate, so the staleness was visible, not theoretical. On Windows the
+        // read is two user32 calls (`GetMonitorInfoW` + `EnumDisplaySettingsExW`),
+        // cheap enough for the continuous `Moved` stream during a drag — but that
+        // cost model does not hold on macOS: a panel whose CG display mode reports
+        // no refresh rate sends vendored winit through a CVDisplayLink
+        // create/query/release per call (mean 0.23–0.51 ms, worst 3.2–6.5 ms
+        // across runs on a 2017 MacBook Pro's built-in panel —
+        // `tools/displaylink-cost-probe/`, see `REFRESH_RATE_REREAD_INTERVAL`).
+        // So the read keeps its W6 place ahead of the guard, but on the SAME
+        // monitor the `Moved` stream reads on a throttle rather than per event.
+        // The throttle is event-gated, not a timer: the read recurs on the first
+        // `Moved` at least `REFRESH_RATE_REREAD_INTERVAL` after the previous
+        // read — within that interval during a drag, on the next event (as
+        // before) on a stationary window. A monitor change reads immediately,
+        // `Focused(true)` (`force_read`) reads on every call as before, and the
+        // drag stream in between pays only the `current_monitor()` identity
+        // compare above — the same guard-for-the-expensive-half shape as
+        // `refresh_edr_headroom` and `verify_chrome_appearance`.
+        let now = Instant::now();
+        if !refresh_rate_read_due(
+            same_monitor,
+            force_read,
+            ws.last_refresh_rate_read,
+            now,
+            REFRESH_RATE_REREAD_INTERVAL,
+        ) {
+            return;
+        }
+        // Same period math as `resumed`: refresh_rate_millihertz is Hz×1000, so
+        // the period is 1e12/mHz ns.
         let interval = mon
             .as_ref()
             .and_then(|m| m.refresh_rate_millihertz())
             .filter(|&mhz| mhz > 0)
             .map(|mhz| Duration::from_nanos(1_000_000_000_000u64 / u64::from(mhz)));
-        if mon == ws.monitor {
+        // Stamped whether or not the query answered: a driver mid-modeswitch
+        // answering `None` retries on the next throttle window, not on every
+        // `Moved` of the drag it is failing under.
+        ws.last_refresh_rate_read = Some(now);
+        if same_monitor {
             // Same panel: apply a GOOD reading (the heal this exists for), but
             // keep the current interval across a transiently failing query — a
             // driver mid-modeswitch answering None must not wipe a known-good
@@ -15606,19 +16459,39 @@ impl App {
         // monitor transition so the new surface is populated immediately.
         let redraw = ws.os_window.clone();
         // M3 phase B: the window landed on a DIFFERENT monitor (this branch is
-        // only reached on an actual change) — re-query the new panel's EDR
-        // headroom for the aurora boost. HDR swapchains only; the renderer's
-        // sanitizer keeps everything else provably inert. Same disjoint-field
-        // borrow as above (`self.apprt` vs `self.windows`).
+        // only reached on an actual change). First the LIVE half of the
+        // attach's screen gate, through the sequence the throttled headroom
+        // re-query shares (`repick_gpu_surface_for_screen`): a window that
+        // attached 8-bit because ITS screen could not show EDR (or with
+        // `hdr_glow` off) is re-picked for the screen it now sits on, the live
+        // layer flipping to f16 + scRGB before the attach's colour-space tag
+        // is replayed. One direction only: an f16 window on an SDR screen
+        // stays f16, and there it draws neither the >1.0 aurora nor the SDR
+        // glow-boost crown — the pre-gate behaviour on every SDR screen. A
+        // window attached on that screen holds 8-bit and draws the crown.
+        // Then re-query the new panel's EDR headroom for the aurora boost —
+        // HDR swapchains only; an 8-bit present never runs the aurora pass, so
+        // the headroom would feed nothing. Disjoint-field borrows throughout
+        // (`self.backend` / `self.apprt` vs `self.windows`).
         if let Some(PresentTarget::Gpu {
             gpu_surface,
             window_gpu,
         }) = &mut ws.present
-            && gpu_surface.is_hdr()
             && let Some(w) = ws.os_window.as_ref()
         {
-            window_gpu.set_edr_max(self.apprt.screen_edr_max(w));
-            window_gpu.set_sdr_white_scale(self.apprt.screen_sdr_white_scale(w));
+            let window: &Window = w;
+            repick_gpu_surface_for_screen(
+                &mut self.backend,
+                &self.apprt,
+                self.window_colorspace,
+                window_gpu,
+                gpu_surface,
+                window,
+            );
+            if gpu_surface.is_hdr() {
+                window_gpu.set_edr_max(self.apprt.screen_edr_max(window));
+                window_gpu.set_sdr_white_scale(self.apprt.screen_sdr_white_scale(window));
+            }
         }
         let _ = rearm_present_and_request(&mut ws.present_retry, true, || {
             if let Some(window) = redraw {
@@ -15636,31 +16509,57 @@ impl App {
     /// bounded by a cached headroom that no longer matches the panel, so the aurora
     /// over- or under-utilizes the live range until an actual monitor change. This
     /// re-samples it on the aurora present path, throttled to [`EDR_REQUERY_INTERVAL`]
-    /// so the ~60 fps aurora tail doesn't cross into AppKit every frame. HDR GPU
-    /// swapchains only — the renderer's sanitizer keeps every other path inert, so a
-    /// non-HDR present pays only the cheap early-outs.
+    /// so the ~60 fps aurora tail doesn't cross into AppKit every frame.
+    ///
+    /// The same due call runs the screen re-pick of an 8-bit GPU window
+    /// ([`repick_gpu_surface_for_screen`], the sequence the monitor-change hook
+    /// runs) before the headroom is read, because a window's screen can gain
+    /// EDR potential with no monitor change: `hdr_glow` hot-reloaded on, or a
+    /// display-settings change (High Dynamic Range turned on for an external
+    /// monitor) should AppKit then report a higher potential for the window's
+    /// screen — Apple fixes the value per `NSScreen` object, not per monitor.
+    /// This gate used to skip 8-bit surfaces, so such a window stayed 8-bit
+    /// until it changed monitors. What an 8-bit window pays per due call is
+    /// the re-pick's early-outs, plus, on the macOS Metal arm with `hdr_glow`
+    /// on, one `-window` / `-screen` / potential read. The headroom itself is
+    /// read for HDR GPU swapchains only — including one the re-pick just
+    /// moved; an 8-bit present never runs the aurora pass.
     fn refresh_edr_headroom(&mut self, wid: WindowId, now: Instant) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        // Cheap gate before any AppKit crossing: an HDR GPU present that has not
-        // been re-sampled within the throttle window.
-        let hdr = matches!(
-            &ws.present,
-            Some(PresentTarget::Gpu { gpu_surface, .. }) if gpu_surface.is_hdr()
-        );
-        if !hdr || !edr_requery_due(ws.last_edr_query, now, EDR_REQUERY_INTERVAL) {
+        // Cheap gate before any AppKit crossing: a GPU present (8-bit ones
+        // included, for the screen re-pick) that has not been re-sampled
+        // within the throttle window.
+        let gpu = matches!(&ws.present, Some(PresentTarget::Gpu { .. }));
+        if !gpu || !edr_requery_due(ws.last_edr_query, now, EDR_REQUERY_INTERVAL) {
             return;
         }
-        // Disjoint-field borrow (`self.apprt` vs `self.windows`), as in
-        // `refresh_frame_interval`; `ws.present` and `ws.os_window` are disjoint
-        // fields. Idempotent when the headroom is unchanged — the renderer only
-        // invalidates the aurora present when the value actually moves.
-        if let Some(PresentTarget::Gpu { window_gpu, .. }) = &mut ws.present
+        // Disjoint-field borrows (`self.backend` / `self.apprt` vs
+        // `self.windows`), as in `refresh_frame_interval`; `ws.present` and
+        // `ws.os_window` are disjoint fields. The re-pick first, so a surface it
+        // moves to f16 is seeded below in the same call. Idempotent when the
+        // headroom is unchanged — the renderer only invalidates the aurora
+        // present when the value actually moves.
+        if let Some(PresentTarget::Gpu {
+            gpu_surface,
+            window_gpu,
+        }) = &mut ws.present
             && let Some(w) = ws.os_window.as_ref()
         {
-            window_gpu.set_edr_max(self.apprt.screen_edr_max(w));
-            window_gpu.set_sdr_white_scale(self.apprt.screen_sdr_white_scale(w));
+            let window: &Window = w;
+            repick_gpu_surface_for_screen(
+                &mut self.backend,
+                &self.apprt,
+                self.window_colorspace,
+                window_gpu,
+                gpu_surface,
+                window,
+            );
+            if gpu_surface.is_hdr() {
+                window_gpu.set_edr_max(self.apprt.screen_edr_max(window));
+                window_gpu.set_sdr_white_scale(self.apprt.screen_sdr_white_scale(window));
+            }
         }
         ws.last_edr_query = Some(now);
     }
@@ -16867,6 +17766,8 @@ impl App {
             auto_apply_physical_retry: None,
             handoff_preverified: std::sync::Arc::default(),
             pending_update_handoff: None,
+            provenance_repair: crate::provenance_repair::RepairPosture::default(),
+            provenance_repair_verdict: std::sync::Arc::new(std::sync::Mutex::new(None)),
             operator_control: None,
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
@@ -17096,7 +17997,7 @@ impl App {
         let Some(owner) = self.frontmost_window else {
             return Err("no window to split".to_string());
         };
-        self.split_focused_pane_in_window(owner, dir, cwd_override)
+        self.split_focused_pane_in_window(owner, dir, cwd_override, None)
     }
 
     /// [`Self::split_focused_pane_in`] on an EXPLICIT owner window: the aimed
@@ -17109,6 +18010,9 @@ impl App {
         owner: WindowId,
         dir: pane::SplitDir,
         cwd_override: Option<String>,
+        // The agent identity the newborn pane spawns under (`spawn split=…
+        // identity=<name>`); `None` for every chord and menu split.
+        identity: Option<&str>,
     ) -> Result<(), String> {
         // Splitting is a terminal command. A native leaf can coexist with live
         // terminals in this window, but none of those hidden/sibling sessions is
@@ -17178,6 +18082,7 @@ impl App {
             &proxy,
             cwd.as_deref(),
             None, // not a connected controller spawn
+            identity,
             None, // fresh shell (not a seamless-update adoption)
         ) {
             Ok(session) => {
@@ -18781,14 +19686,41 @@ impl App {
     /// CPU run instead of re-attempting on every capture. On failure the CPU
     /// renderer keeps serving — the same fail-soft the boot build has always had.
     pub(crate) fn ensure_pixel_backend(&mut self) {
+        // The common call — windowed, or headless after its first pixel demand
+        // — owes nothing and must cost nothing: no phase, no clock, no line.
+        // (Both redemptions below are their own no-ops on a settled debt; this
+        // only keeps the bookkeeping off the per-capture path.)
+        if !self.deferred_font_seal && !self.deferred_gpu {
+            return;
+        }
+        // Announced for the watchdog, because this is where a headless run does
+        // hundreds of milliseconds of work on the main thread BY DESIGN — and
+        // where the 2026-09-06 stall's reported window fell; see
+        // `watchdog::Phase::PixelBackendRedeem` for the legs and the timeline,
+        // and `Phase::ImageCapture` for the GPU mint the macOS Metal arm defers
+        // past this point (under that phase only when the demand is an `image`
+        // capture) — and metered leg by leg for the one info line at
+        // every exit (`pixel_backend_redemption_line`). The two facts that
+        // stall line lacked: which work `UserEvent` was doing, and what it cost.
+        let _phase = crate::watchdog::phase(crate::watchdog::Phase::PixelBackendRedeem);
+        let started = Instant::now();
+        let mut legs = PixelBackendRedemptionLegs::default();
         // The FONT half of the same headless deferral, redeemed first and
         // unconditionally: it is owed on every headless launch, including the
         // `--cpu` ones that have no GPU intent at all and return below. Sealing
         // before the fork also keeps `cpu_renderer_from_admitted`'s precondition
         // — a sealed generation to rebuild from — exactly as the eager path left
         // it.
-        self.redeem_deferred_font_seal();
+        if self.deferred_font_seal {
+            let seal_started = Instant::now();
+            self.redeem_deferred_font_seal();
+            legs.seal_ms = Some(elapsed_ms(seal_started));
+        }
         if !self.deferred_gpu {
+            aterm_log::info!(
+                "{}",
+                pixel_backend_redemption_line(&legs, elapsed_ms(started))
+            );
             return;
         }
         self.set_deferred_gpu(false);
@@ -18800,21 +19732,35 @@ impl App {
         // be rebuilt is a reason not to swap backends at all, and finding that out
         // first costs nothing while finding it out second would strand a live
         // device with no admitted face to install.
+        let fork_started = Instant::now();
         let prepared = match self
             .backend
             .cpu_renderer_from_admitted(self.font_px, self.theme)
         {
             Ok(prepared) => prepared,
             Err(error) => {
+                legs.fork_ms = Some(elapsed_ms(fork_started));
                 crate::logging::stderr_line!(
                     "aterm-gui: deferred GPU build declined ({error}); \
                      the CPU renderer keeps serving captures"
                 );
                 self.settle_on_cpu_renderer();
+                aterm_log::info!(
+                    "{}",
+                    pixel_backend_redemption_line(&legs, elapsed_ms(started))
+                );
                 return;
             }
         };
+        legs.fork_ms = Some(elapsed_ms(fork_started));
         let family = self.font_family.clone();
+        // `new_with_family` overlaps a font thread with the context build and
+        // joins it; `startup_probe` times both halves, first-write-wins. Read
+        // whether the slots are still empty BEFORE the call, so what is read
+        // after it is this leg's own split and not an earlier build's — the
+        // split that tells a slow Metal device from slow font discovery.
+        let font_legs_were_unset = font_legs_unset();
+        let device_started = Instant::now();
         let mut gpu = match aterm_gpu::GpuRenderer::new_with_family(
             family.as_deref(),
             self.font_px,
@@ -18827,12 +19773,24 @@ impl App {
                 crate::logging::stderr_line!(
                     "aterm-gui: GPU unavailable ({error}); using CPU renderer"
                 );
+                legs.device = Some((elapsed_ms(device_started), Err(error)));
+                legs.note_font_legs(font_legs_were_unset);
                 self.settle_on_cpu_renderer();
+                aterm_log::info!(
+                    "{}",
+                    pixel_backend_redemption_line(&legs, elapsed_ms(started))
+                );
                 return;
             }
         };
         let (name, adapter_backend) = gpu.adapter();
+        legs.device = Some((
+            elapsed_ms(device_started),
+            Ok(format!("{name} ({adapter_backend})")),
+        ));
+        legs.note_font_legs(font_legs_were_unset);
         crate::logging::stderr_line!("aterm-gui: GPU rendering on {name} ({adapter_backend})");
+        let install_started = Instant::now();
         gpu.install_prepared_font(family, prepared, self.theme);
         // Geometry is renderer state, and a fresh backend starts at zero.
         let pad = self.backend.pad();
@@ -18850,6 +19808,11 @@ impl App {
         // join uses, so a redeemed backend and a joined one are pinned alike.
         self.pin_gpu_effect_config();
         self.pin_backend_render_config_core();
+        legs.install_ms = Some(elapsed_ms(install_started));
+        aterm_log::info!(
+            "{}",
+            pixel_backend_redemption_line(&legs, elapsed_ms(started))
+        );
         // NO `reset_gpu_window_caches` and NO `sync_chrome_fonts` here, and both
         // omissions are reasoned rather than saved effort. There is nothing
         // GPU-side to invalidate: this is the first device this process has had,
@@ -20080,6 +21043,26 @@ impl ApplicationHandler<Wake> for App {
             .is_some_and(|intent| Instant::now() >= intent.retry_at)
         {
             self.try_pending_native_auto_apply(false);
+        }
+        // PROVENANCE SELF-REPAIR, on the same fold and deliberately AFTER the auto-apply
+        // poll: a real staged update always gets the tick first, and a repair only ever
+        // runs on a tick where that lane already declined. No new timer, thread source or
+        // wake exists for it — the measurement is one off-thread shot whose verdict is
+        // collected here, and everything after it refuses rather than forces
+        // (`crate::provenance_repair`).
+        #[cfg(target_os = "macos")]
+        {
+            self.spawn_provenance_repair_probe();
+            // `try_lock`, never `lock`: the GUI thread must not block on the prober.
+            if let Ok(mut slot) = self.provenance_repair_verdict.try_lock()
+                && let Some(refusal) = slot.take()
+            {
+                if let Some(reason) = refusal {
+                    aterm_log::info!("provenance self-repair: not eligible — {reason}");
+                }
+                self.provenance_repair.record(refusal);
+            }
+            self.try_provenance_self_repair();
         }
         // OVERLAP HANDOFF reveal fallback: a window still hidden past its
         // deadline (its presents kept dropping — e.g. a GPU that refuses
@@ -21861,6 +22844,14 @@ impl ApplicationHandler<Wake> for App {
                     .drain(..)
                     .collect();
                 for req in reqs {
+                    // Announced for the watchdog: a capture is the control verb
+                    // the 2026-09-06 stall was inside (`video` and `snapshot`
+                    // render on this thread too, and announce only the
+                    // redemption they nest) — and, headless, the first one
+                    // redeems the deferred pixel backend inside it
+                    // (`ensure_pixel_backend` announces that nested phase
+                    // itself).
+                    let _phase = crate::watchdog::phase(crate::watchdog::Phase::ImageCapture);
                     self.render_image(req);
                 }
             }
@@ -22632,24 +23623,25 @@ impl ApplicationHandler<Wake> for App {
                 );
                 self.sync_status_bars();
             }
-            // QUEUED BEHIND ANOTHER ATPKG PASS at the store lock (2026-09-10): a
-            // live Info row, never the failure bar — the incident rendered this
-            // exact event as "⚠ ALab toolchain install failed". The row is retired
-            // by the sibling's tailed progress, this child's own markers, or its
-            // exit — not a `Busy` exit (75), which leaves the row to the child that
-            // queues next; a wait that runs out is the deferred notice below.
+            // QUEUED BEHIND ANOTHER ATPKG PASS at the store lock (2026-09-10): one
+            // INFO line and NO ROW (2026-09-18). It used to raise a live Info row
+            // ("Another aterm is installing the ALab toolchain · this window
+            // continues when it finishes"), and the owner read it with one aterm on
+            // the machine: after a self-update the holder is this app's own
+            // predecessor's launch pass, so "another aterm" was false and "this
+            // window continues" named a wait the window never had. Nothing on the
+            // glass needs the user here: a holder with a plan shows through the
+            // tailer's meter, a no-op holder is nothing to show, and a wait that
+            // runs out is the deferred notice below. Never the failure bar — the
+            // 2026-09-10 incident rendered this exact event as "⚠ ALab toolchain
+            // install failed".
             Wake::PkgLockWaiting { detail } => {
                 aterm_log::info!("atpkg is queued behind another atpkg pass: {detail}");
-                self.status_bars.toolchain_waiting(Instant::now());
-                self.sync_status_bars();
             }
-            // THE WAIT ENDED IN THE LOCK (2026-09-14): the row that said another
-            // process held it comes down now, not at this child's exit — its verb
-            // may be quiet for the whole of its work under the lock.
+            // THE WAIT ENDED IN THE LOCK (2026-09-14): logged, so the interval the
+            // child spent queued is on record; there is no row to retire.
             Wake::PkgLockAcquired { detail } => {
                 aterm_log::info!("atpkg took the store lock after its wait: {detail}");
-                self.status_bars.toolchain_wait_over();
-                self.sync_status_bars();
             }
             Wake::PkgLockTimedOut { detail } => {
                 aterm_log::info!("the ALab toolchain pass is deferred: {detail}");
@@ -22884,9 +23876,10 @@ impl ApplicationHandler<Wake> for App {
                 cwd,
                 split,
                 raise,
+                identity,
                 reply,
             } => {
-                let _ = reply.send(self.spawn_session_aimed(aim, cwd, split, raise));
+                let _ = reply.send(self.spawn_session_aimed(aim, cwd, split, raise, identity));
             }
             Wake::CloseSession { session, by, reply } => {
                 // Exit-ledger attribution for everything this close retires.
@@ -22951,10 +23944,12 @@ impl ApplicationHandler<Wake> for App {
                 place,
                 origin,
                 cwd,
+                identity,
                 reply,
             } => {
-                let _ =
-                    reply.send(self.spawn_connected_session(el, kind, place, &origin, cwd, "wire"));
+                let _ = reply.send(
+                    self.spawn_connected_session(el, kind, place, &origin, cwd, "wire", identity),
+                );
             }
             Wake::SetSettingsField { key, value, reply } => {
                 self.queue_control_settings_field(key, value, reply);
@@ -23304,9 +24299,10 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::RedrawRequested => self.redraw_window(wid),
             // The window landed somewhere else: re-sample its frame-pacing interval
-            // from the monitor it now occupies (a cheap no-op unless the monitor
-            // actually changed — `Moved` streams continuously during a drag).
-            WindowEvent::Moved(_) => self.refresh_frame_interval(wid),
+            // from the monitor it now occupies (cheap unless the monitor actually
+            // changed or the throttled rate re-read is due — `Moved` streams
+            // continuously during a drag, so it does NOT force the read).
+            WindowEvent::Moved(_) => self.refresh_frame_interval(wid, false),
             WindowEvent::Focused(f) => {
                 if f {
                     if cfg!(target_os = "macos") && !self.headless {
@@ -23323,8 +24319,10 @@ impl ApplicationHandler<Wake> for App {
                     }
                     // Catch-all interval refresh (covers first focus after creation
                     // and monitor changes that produced no `Moved`, e.g. a display
-                    // unplugged beneath the window).
-                    self.refresh_frame_interval(wid);
+                    // unplugged beneath the window). Focus arrives at human cadence
+                    // and is the single-monitor W6 heal route, so it forces the
+                    // rate read past the same-monitor throttle `Moved` is under.
+                    self.refresh_frame_interval(wid, true);
                     // Track focus order (MRU) so a later close of the front window
                     // re-points to the window the OS will raise, not the lowest id.
                     self.note_window_focused(wid);
@@ -24242,8 +25240,8 @@ const SEED_RETRIES_WITHOUT_LOOP: u32 = 5;
 /// the download — curl's own per-file ceiling can exceed this on a slow link — so a
 /// wait that runs out is retried ([`ContentionBackoff`]), never reported as a failed
 /// install. The child is idle while it waits, and the child-scoped tailer follows the
-/// SIBLING's `progress.json` through the foreign-pid path meanwhile. The waiting row's
-/// cap (`status_bars::WAIT_STALE`) must outlast this; a test there pins it.
+/// SIBLING's `progress.json` through the foreign-pid path meanwhile; the wait itself
+/// is a log line, never a row (2026-09-18).
 pub(crate) const ATPKG_WAIT_LOCK_SECS: u64 = 30 * 60;
 
 /// The update loop's first park after a pass that timed out waiting on the store
@@ -24267,7 +25265,7 @@ const CONTENTION_WEDGE_CYCLES: u32 = 3;
 /// password, the typed install finishes or dies — and a window parked for the
 /// interval on it sat out the rest of the six hours with an incomplete store after
 /// the holder let go (the incident's shape, one step removed). An hour keeps the
-/// waiting row off the glass most of the time and still picks the work up within
+/// deferred notice off the glass most of the time and still picks the work up within
 /// the hour; a test pins it above the backoff parks.
 const CONTENTION_WEDGE_PARK: Duration = Duration::from_secs(60 * 60);
 
@@ -25306,6 +26304,7 @@ mod pass_verdict_tests {
             layout: None,
             post: move |e| sink.lock().unwrap().push(e),
             wait_row_open: true,
+            seed_announced_work: false,
             backoff: ContentionBackoff::default(),
         }
     }
@@ -25337,21 +26336,29 @@ mod pass_verdict_tests {
         );
         assert_eq!(
             deferred_detail(&posted),
-            "another install is still running — trying again in 30 s (each try waits up to 30 min)"
+            "an earlier toolchain pass is still running — trying again in 30 s (each try waits up to 30 min)"
         );
         let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy, six_hours);
         assert_eq!(park, Some(Duration::from_secs(60)));
         assert_eq!(
             deferred_detail(&posted),
-            "another install is still running — trying again in 1 min (each try waits up to 30 min)"
+            "an earlier toolchain pass is still running — trying again in 1 min (each try waits up to 30 min)"
         );
         let park = lane.park_after_timed_out_wait(PassVerb::Update, &busy, six_hours);
         assert_eq!(park, Some(Duration::from_secs(3600)), "the wedge: an hour");
         assert!(lane.backoff.wedged());
+        let detail = deferred_detail(&posted);
         assert_eq!(
-            deferred_detail(&posted),
-            "another install has held the store lock for over an hour with no visible progress — \
+            detail,
+            "an earlier toolchain pass has been running for over an hour with no visible progress — \
              this window tries again in 1 h"
+        );
+        // No "lock", "blocked" or "another aterm" on the glass (owner rulings
+        // 2026-09-14 / 2026-09-18): the notice names the pass, not the mechanism.
+        let words = detail.to_lowercase();
+        assert!(
+            !words.contains("lock") && !words.contains("blocked") && !words.contains("another"),
+            "{words}"
         );
         // A once-pass at the wedge has no park: it stands down for this launch.
         let mut lane = busy_lane(&posted);
@@ -25363,7 +26370,7 @@ mod pass_verdict_tests {
         assert!(lane.backoff.wedged());
         assert_eq!(
             deferred_detail(&posted),
-            "another install has held the store lock for over an hour with no visible progress — \
+            "an earlier toolchain pass has been running for over an hour with no visible progress — \
              this window will not retry; run: aterm pkg seed"
         );
     }
@@ -25470,12 +26477,14 @@ impl PassRun {
 /// The child QUEUES behind a sibling's pass instead of refusing: the macOS Full
 /// Disk Access grant quits the app and opens it again while the first window's
 /// pass still holds the store lock (13 s apart, measured), and so does a
-/// self-update re-exec or a window opened by hand. The first window's child is
-/// not detached on purpose — it dies at its next line of output once its window
-/// is gone (its stdout is a pipe nobody reads; the store is crash-consistent under
-/// that, see `atpkg::lock`) — and this child's wait is what picks the work up:
-/// atpkg polls the lock for the bound, announces the wait once (`lock-waiting:`)
-/// and exits 75 if it runs out. A waiter whose spawner is no longer this pid
+/// self-update handoff or a window opened by hand. The first window's child KEEPS
+/// RUNNING once its window is gone (atpkg's orphan watch re-points its stdio at
+/// `orphan-pass.log`, 2026-09-14; it used to die at its next print), so it holds
+/// the lock for the whole of its pass — and this child's wait is what follows it:
+/// atpkg polls the lock for the bound, announces the wait once (`lock-waiting:`, a
+/// log line here, never a row), stands down after the wait when the holder
+/// finished a pass on this store meanwhile, and exits 75 if the wait runs out. A
+/// waiter whose spawner is no longer this pid
 /// stands down (the edge's own `getppid` races a parent that dies inside the
 /// child's startup; the spawner's pid does not).
 ///
@@ -25566,8 +26575,10 @@ fn read_pass_stderr<R: std::io::Read>(mut pipe: R) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// The lane's WAITING ROW across a child's exit. A `lock-waiting:` line opened it,
-/// and the row belongs to the LANE, not to the child that opened it — it is
+/// The lane's WAITED-CHILD flag across a child's exit — what a `lock-waiting:` line
+/// sets (it used to open a waiting row; since 2026-09-18 the wait is a log line and
+/// this flag only decides the exit-time clear below). It belongs to the LANE, not
+/// to the child that set it — it is
 /// carried across the seed child and every update child. A waited pass that then
 /// RAN (or died) retires its own row: `toolchain_snapshot(None)` clears only a
 /// non-terminal bar, so a terminal outcome — this child's marker, the sibling's
@@ -25679,9 +26690,17 @@ struct PkgLane<'a, P> {
     /// resolvable home) runs the children untailed.
     layout: Option<&'a atpkg::store::Layout>,
     post: P,
-    /// Whether a `lock-waiting:` line has opened the waiting row and nothing has
-    /// retired it yet.
+    /// Whether a `lock-waiting:` line marked a child of this lane as having queued
+    /// behind another pass ([`carry_wait_row`]): at that child's exit the lane's
+    /// live bar (a holder's tailed meter) is cleared. No row is opened by the wait
+    /// itself (2026-09-18).
     wait_row_open: bool,
+    /// Whether the launch seed ANNOUNCED work (`seed-starting:`) — it installed
+    /// from the sealed registry. The store it leaves has never been checked
+    /// against the network, and its own writes move the record: the launch
+    /// update runs at once behind it, whatever [`launch_pass_park`] would say
+    /// (2026-09-18).
+    seed_announced_work: bool,
     backoff: ContentionBackoff,
 }
 
@@ -25727,6 +26746,7 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
         let Some(run) = self.run(PassVerb::Seed) else {
             return false;
         };
+        self.seed_announced_work = run.seen.saw_start;
         if run.ran() {
             report_pass_verdict(PassVerb::Seed, &run, self.layout, |e| self.post(e));
             return false;
@@ -25767,8 +26787,10 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
             }
             let bound = wait_bound();
             self.post(Wake::PkgLockTimedOut {
+                // No "lock" on the glass (owner ruling 2026-09-14): the row names
+                // the pass, not the mechanism.
                 detail: format!(
-                    "another install held the store lock for {bound} \
+                    "an earlier toolchain pass was still running after {bound} \
                      \u{2014} automatic updates are off; run: aterm pkg seed"
                 ),
             });
@@ -25808,7 +26830,7 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
                 );
                 self.post(Wake::PkgLockTimedOut {
                     detail: format!(
-                        "another install has held the store lock for over \
+                        "an earlier toolchain pass has been running for over \
                          an hour with no visible progress \u{2014} this \
                          window tries again in {}",
                         human_park(park)
@@ -25825,7 +26847,7 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
                 );
                 self.post(Wake::PkgLockTimedOut {
                     detail: format!(
-                        "another install has held the store lock for over \
+                        "an earlier toolchain pass has been running for over \
                          an hour with no visible progress \u{2014} this \
                          window will not retry; run: aterm pkg {verb}"
                     ),
@@ -25840,7 +26862,7 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
             );
             self.post(Wake::PkgLockTimedOut {
                 detail: format!(
-                    "another install is still running \u{2014} trying \
+                    "an earlier toolchain pass is still running \u{2014} trying \
                      again in {} (each try waits up to {bound})",
                     human_park(backoff_park)
                 ),
@@ -25893,6 +26915,134 @@ fn spawn_machine_settings_once(atpkg: std::path::PathBuf, proxy: EventLoopProxy<
         });
     if let Err(e) = spawned {
         aterm_log::warn!("atpkg machine apply: no thread ({e})");
+    }
+}
+
+/// The park a LAUNCH owes before its first UPDATE pass (2026-09-18; the launch
+/// seed always runs):
+/// `Some(remaining)` when the store's last ATTEMPTED pass (`status.toml`
+/// `updated_at`, moved by every pass whether it succeeded or failed — the same
+/// stamp the session lane reads) is younger than `interval`, `None` when a pass
+/// is due now: never attempted, older than the interval, or the once-pass knob
+/// (`interval == 0`), which always runs. Pure over the age so the rule is pinned
+/// without a store.
+fn launch_pass_park_from(last_attempt_age_secs: Option<u64>, interval: u64) -> Option<Duration> {
+    if interval == 0 {
+        return None;
+    }
+    let age = last_attempt_age_secs?;
+    (age < interval).then(|| Duration::from_secs(interval - age))
+}
+
+/// [`launch_pass_park_from`] over the store's record, keyed on the last pass
+/// that SUCCEEDED: `last_success_at` is stamped only by an update-class pass
+/// that resolved the index and ran to its end, while `updated_at` moves on every
+/// write — a failed resolve, a seed's own install, a typed `install <p>`. So a
+/// record whose last attempt is LATER than its last success (the last pass
+/// failed) owes a pass now — the failure ladder's minutes-scale retry, not a
+/// six-hour park — and a machine never checked (no store, no record, no
+/// success) is due at once.
+fn launch_pass_park(
+    layout: Option<&atpkg::store::Layout>,
+    interval: u64,
+    now_unix: u64,
+) -> Option<Duration> {
+    let text = std::fs::read_to_string(layout?.status()).ok()?;
+    let success = aterm_update_core::pkg_check::last_success_at(&text)
+        .and_then(|stamp| aterm_update_core::pkg_check::rfc3339_to_unix(&stamp))?;
+    let attempt = aterm_update_core::pkg_check::last_attempt_at(&text)
+        .and_then(|stamp| aterm_update_core::pkg_check::rfc3339_to_unix(&stamp))
+        .unwrap_or(success);
+    if attempt > success {
+        return None;
+    }
+    let now = i64::try_from(now_unix).ok()?;
+    let age = u64::try_from(now.saturating_sub(success)).unwrap_or(0);
+    launch_pass_park_from(Some(age), interval)
+}
+
+#[cfg(test)]
+mod launch_pass_park_tests {
+    use super::*;
+
+    /// I1 (2026-09-18): a launch whose store was checked inside the interval owes
+    /// no pass now — it parks for the remainder; a never-checked or stale store
+    /// runs at once; the once-pass knob always runs.
+    #[test]
+    fn a_fresh_record_parks_for_the_remainder_and_a_stale_or_absent_one_runs_now() {
+        let six_hours = 6 * 60 * 60;
+        assert_eq!(
+            launch_pass_park_from(Some(20), six_hours),
+            Some(Duration::from_secs(six_hours - 20)),
+            "a successor seconds after its predecessor's pass owes nothing"
+        );
+        assert_eq!(
+            launch_pass_park_from(Some(six_hours - 1), six_hours),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            launch_pass_park_from(Some(six_hours), six_hours),
+            None,
+            "due"
+        );
+        assert_eq!(launch_pass_park_from(Some(u64::MAX), six_hours), None);
+        assert_eq!(
+            launch_pass_park_from(None, six_hours),
+            None,
+            "never checked"
+        );
+        assert_eq!(launch_pass_park_from(Some(0), 0), None, "once-pass knob");
+        assert_eq!(launch_pass_park_from(None, 0), None);
+    }
+
+    /// The store-backed reader: no layout is a pass due; a record whose last
+    /// SUCCESS is inside the interval parks for the remainder; a record with no
+    /// success, or whose last attempt came after its last success (it failed),
+    /// is due now.
+    #[test]
+    fn the_store_record_decides_on_the_last_success_not_the_last_write() {
+        assert_eq!(launch_pass_park(None, 100, 1_700_000_000), None);
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let layout = atpkg::store::Layout {
+            prefix: dir.path().join("pkg"),
+        };
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        assert_eq!(
+            launch_pass_park(Some(&layout), 100, 1_700_000_000),
+            None,
+            "no status.toml: never checked"
+        );
+        // 2023-11-14T22:13:20Z is 1_700_000_000.
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2023-11-14T22:13:20Z\"\nenabled = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            launch_pass_park(Some(&layout), 100, 1_700_000_030),
+            None,
+            "a write with no success on record (a seed's install, a failure): due"
+        );
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2023-11-14T22:13:20Z\"\nenabled = true\n\
+             last_success_at = \"2023-11-14T22:13:20Z\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            launch_pass_park(Some(&layout), 100, 1_700_000_030),
+            Some(Duration::from_secs(70))
+        );
+        assert_eq!(launch_pass_park(Some(&layout), 100, 1_700_000_100), None);
+        // The last attempt came AFTER the last success: it failed — the failure
+        // ladder's retry is owed now, never a six-hour park.
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2023-11-14T22:13:50Z\"\nenabled = true\n\
+             last_success_at = \"2023-11-14T22:13:20Z\"\n",
+        )
+        .unwrap();
+        assert_eq!(launch_pass_park(Some(&layout), 100, 1_700_000_060), None);
     }
 }
 
@@ -25971,21 +27121,56 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     let _ = proxy.send_event(event);
                 },
                 wait_row_open: false,
+                seed_announced_work: false,
                 backoff: ContentionBackoff::default(),
             };
+            // The launch seed ALWAYS runs: its work under the lock is this build's
+            // own stub / reroute / rustup-seam / exec-root reconcile — about a
+            // second on a provisioned Mac — which a self-update's successor owes
+            // for the binary it now is. It may queue behind the predecessor's
+            // in-flight pass; that wait is a log line, never a row (2026-09-18).
             let mut seed_pending = lane.run_launch_seed(run_update_loop);
             if !run_update_loop {
                 // `auto_update = false`: the batteries went in above, and that
                 // is all this thread was asked to do.
                 return;
             }
-            // THE FIRST UPDATE RUNS AT ONCE, after a seed too: `atpkg update` moves
-            // bytes only for a program whose published pin drifted, and a cut DMG
-            // is stale by construction (the cut gate wants ≥30 days of shelf life
-            // left), so the pins that moved since the cut are exactly the ones to
-            // fetch; the cost of being wrong is one index fetch.
+            // THE FIRST UPDATE RUNS AT ONCE, after a seed too — WHEN IT IS OWED
+            // (2026-09-18). `atpkg update` moves bytes only for a program whose
+            // published pin drifted, and a cut DMG is stale by construction (the
+            // cut gate wants ≥30 days of shelf life left), so the pins that moved
+            // since the cut are exactly the ones to fetch; the cost of being wrong
+            // is one index fetch. But every process start used to run it — a
+            // self-update's successor included, seconds after its predecessor's
+            // own update: the successor queued behind the predecessor's orphaned
+            // pass at the store lock (12.7 s on the owner's machine) and then
+            // re-did ~14 s of lock work on a store that had just been checked. The
+            // store's own record decides instead, the way the session lane already
+            // does (`pkg_check::session_pass_due`): a last ATTEMPT younger than
+            // the interval owes nothing now, and the loop's first park is the
+            // remainder of that interval — so the six-hour cadence survives
+            // handoffs and relaunches instead of restarting at each. Read AFTER
+            // the seed, not at thread start: on a launch-time self-update the
+            // predecessor's pass is still in flight when this thread starts and
+            // stamps the record while the seed queues behind it. A machine never
+            // checked, or checked longer ago than the interval, updates at once
+            // as before; the once-pass knob (`interval == 0`) always runs; a seed
+            // still owed (it stood aside at the lock) runs ahead of the update
+            // regardless.
             let mut bump_watch = BumpWatch::default();
             let mut failure_backoff = Backoff::FAILURE;
+            if !seed_pending
+                && !lane.seed_announced_work
+                && let Some(park) = launch_pass_park(layout.as_ref(), interval, pkg_unix_now())
+            {
+                aterm_log::info!(
+                    "atpkg launch update skipped: the store's last successful pass is younger \
+                     than the {} interval — the next runs in {}",
+                    human_park(Duration::from_secs(interval)),
+                    human_park(park)
+                );
+                sleep_interval_watching_bump(layout.as_ref(), park, &mut bump_watch);
+            }
             loop {
                 // `update`, or `seed` again while the seed is still owed: the
                 // retried seed rides this lane's wait, tailer, backoff and wedge
@@ -26037,9 +27222,29 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         );
                         if seed_pending {
                             // The retried seed RAN (or died, its card raised above):
-                            // the seed is no longer owed, and the update follows AT
-                            // ONCE — no park — as it does after a first seed that ran.
+                            // the seed is no longer owed, and the update follows —
+                            // at once when it is owed, else after the same park the
+                            // launch takes (2026-09-18): the retried seed queued
+                            // behind a holder that may have checked this store.
                             seed_pending = false;
+                            lane.seed_announced_work = run.seen.saw_start;
+                            if !lane.seed_announced_work
+                                && let Some(park) =
+                                    launch_pass_park(layout.as_ref(), interval, pkg_unix_now())
+                            {
+                                aterm_log::info!(
+                                    "atpkg launch update skipped after the retried seed: the \
+                                     store's last successful pass is younger than the {} \
+                                     interval — the next runs in {}",
+                                    human_park(Duration::from_secs(interval)),
+                                    human_park(park)
+                                );
+                                sleep_interval_watching_bump(
+                                    layout.as_ref(),
+                                    park,
+                                    &mut bump_watch,
+                                );
+                            }
                             continue;
                         }
                     } else {
@@ -28225,8 +29430,20 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // fact for the quiet cursor-themed notice on the first window and CLEAR the env HERE
     // — still single-threaded, before any session/shell spawn — so it never leaks to the
     // user's shell children.
-    let just_updated = std::env::var_os("ATERM_UPDATED_FROM").is_some();
-    if just_updated {
+    let updated_from = std::env::var_os("ATERM_UPDATED_FROM");
+    // LATCH BEFORE THE UNSET. A same-image successor — the QA seam's, or a provenance
+    // repair's — is recognised by this variable naming OUR OWN build, and the unset two
+    // lines below is what would otherwise make that unknowable by the time the repair
+    // trigger runs (`crate::provenance_repair::same_image_successor`, which fails closed).
+    crate::provenance_repair::latch_same_image_successor(updated_from.as_deref());
+    // A SAME-IMAGE handoff is not a level-up, and must not claim one: the successor of a
+    // repair is the build it replaced. Narrowed to "present AND naming a different
+    // build", which is independently right — the QA seam has told the same small lie
+    // since it existed.
+    let just_updated = updated_from
+        .as_deref()
+        .is_some_and(|from| from != std::ffi::OsStr::new(crate::build_info::BUILD_NUMBER));
+    if updated_from.is_some() {
         // The launcher is still single-threaded here (this runs before any thread or
         // session spawn); routed through the workspace's one lock-scoped env helper.
         aterm_log::env::unset("ATERM_UPDATED_FROM");
@@ -29554,11 +30771,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // launch, and the seeded bars fold at their staleness caps like any other.
     // `=managed` / `=machine` (2026-09-10) seed the two R6 rows — the managed
     // agents in use, and the machine settings a pass changed — through their real
-    // wakes, and nothing else, so each can be captured on its own. `=waiting` /
-    // `=deferred` seed the store-lock rows the same way: the live "queued behind
-    // another install" row, and the deferred notice a timed-out wait posts.
+    // wakes, and nothing else, so each can be captured on its own. `=deferred`
+    // seeds the deferred notice a timed-out store-lock wait posts the same way
+    // (the live "waiting" row it used to pair with is gone, 2026-09-18).
     if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS")
-        && (mode == "managed" || mode == "machine" || mode == "waiting" || mode == "deferred")
+        && (mode == "managed" || mode == "machine" || mode == "deferred")
     {
         let proxy = event_loop.create_proxy();
         let _ = proxy.send_event(if mode == "managed" {
@@ -29573,16 +30790,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 "spotlight-noindex 73 dir(s) migrated; universal-control disabled".to_string(),
             ));
             Wake::PkgMachineRecordMissing
-        } else if mode == "waiting" {
-            Wake::PkgLockWaiting {
-                detail: "another atpkg process holds the store lock at ~/Library/Application \
-                         Support/aterm/pkg/store.lock \u{2014} waiting up to 1800 s for it to \
-                         finish"
-                    .to_string(),
-            }
         } else {
             Wake::PkgLockTimedOut {
-                detail: "another install is still running \u{2014} trying again in 30 s (each \
+                detail: "an earlier toolchain pass is still running \u{2014} trying again in 30 s (each \
                          try waits up to 30 min)"
                     .to_string(),
             }
@@ -29812,6 +31022,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         .as_ref()
         .and_then(|m| m.first_leaf_cwd())
         .map(String::from);
+    // IDENTITY (session identities; review 2026-09-17): a FORKED session 0 runs
+    // under the agent identity of the pane it will fill — the same pick as its
+    // cwd (`first_leaf_identity`) — while that identity still exists
+    // (`restorable`: create = false, one stderr line when it is gone). A shell's
+    // env cannot be re-injected after the fork, and the deferred restore's graft
+    // refuses a bootstrap that does not wear what its pane names; forked without
+    // this, a `worker` tab in window 0's first leaf came back as the human's
+    // login labeled `identity=-`. An adopted shell's env is what it was.
+    let restore_identity0: Option<String> = if adopt0.is_none() {
+        restore_manifest
+            .as_ref()
+            .and_then(|m| m.first_leaf_identity())
+            .and_then(agent_identity::restorable)
+    } else {
+        None
+    };
     let session0 = spawn_session(
         0,
         WindowId(0),
@@ -29827,7 +31053,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         &session_factory,
         &proxy,
         restore_cwd0.as_deref(),
-        None, // not a connected controller spawn
+        None,                         // not a connected controller spawn
+        restore_identity0.as_deref(), // the identity of the pane it fills, else the human's own
         adopt0,
     )
     .unwrap_or_else(|e| fatal_launch_error(headless, &format!("spawn failed: {e}")));
@@ -30545,6 +31772,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         auto_apply_physical_retry: None,
         handoff_preverified: std::sync::Arc::default(),
         pending_update_handoff: None,
+        provenance_repair: crate::provenance_repair::RepairPosture::default(),
+        provenance_repair_verdict: std::sync::Arc::new(std::sync::Mutex::new(None)),
         operator_control: operator_control.clone(),
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
@@ -30811,6 +32040,7 @@ fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
         pid: -1,
         handoff_local_id: None,
         frozen_path: false,
+        identity: None,
         ctx,
         child_proxy_sid: None,
         output_wake_pending: Arc::new(AtomicU64::new(0)),
@@ -31375,6 +32605,7 @@ mod overlap_handoff_tests {
             child_pid: Some(77),
             mode: crate::native_updater_service::ApplyMode::Immediate,
             apply_attempt: None,
+            same_image: None,
             target_build: crate::build_info::BUILD_NUMBER.parse().unwrap_or(0),
             target_commit: crate::build_info::GIT_COMMIT.to_string(),
             layout,
@@ -32208,6 +33439,19 @@ mod overlap_handoff_tests {
     /// runs its real branches. Every branch the park point can take is
     /// driven: the switch, the missing proxy, the busy slot, the raise, a
     /// displacement and its return, the hold's end, and the three presses.
+    ///
+    /// THE PARK POINT IS macOS-ONLY, and flipping `headless` does not change
+    /// that: `tick_macos_access_card` returns at its FIRST line on every
+    /// other target, because Full Disk Access is a TCC concept and there is
+    /// nothing here to ask for. So the lifecycle above is a macOS claim, and
+    /// every other host gets an arm that asserts what it really does — the
+    /// tick is inert in each phase the machine can hold, no card ever reaches
+    /// the glass, and the pump schedules no wake for one. That arm reads
+    /// `cfg!(target_os = "macos")` DIRECTLY and never a constant the
+    /// production gate also reads, so deleting the gate turns this test red
+    /// instead of carrying it along. The two paths with no platform gate at
+    /// all — the verdict, and the ✓ pill's slot policy — are asserted first,
+    /// on every host.
     #[test]
     fn the_macos_access_card_waits_for_the_slot_returns_when_displaced_and_confirms() {
         use super::consent_card::{
@@ -32229,6 +33473,119 @@ mod overlap_handoff_tests {
             );
             app
         };
+
+        // ASSERTED ON EVERY HOST. Neither path below reaches the park point:
+        // `decide_macos_access_card` and `show_macos_access_granted` carry no
+        // platform gate, so their claims are as true here as on a Mac.
+
+        // A verdict in DECIDING against the inert arm: the cached probe reads
+        // the denial the fixture planted, but the signing identity is cold, so
+        // a grant would be keyed to `dr=unknown` and would not survive a
+        // rebuild — quiet, nothing raised.
+        let mut app = windowed();
+        let panel = app.consent_panel_facts();
+        assert_eq!(panel.fda, aterm_containment::consent::FdaState::Denied);
+        assert!(
+            !panel.dr.grant_stable(),
+            "a cold identity promises no durable grant: {:?}",
+            panel.dr
+        );
+        assert!(app.consent_card.begin_deciding(Instant::now()));
+        app.decide_macos_access_card(None);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.is_none());
+
+        // THE ✓ PILL replaces the card or its own route pill, or fills a free
+        // slot — never another card.
+        let mut app = windowed();
+        app.notice = Some(TransientNotice::macos_access_route(
+            "route".to_string(),
+            OPENED_SETTINGS_TTL,
+            t0,
+        ));
+        assert!(app.show_macos_access_granted(t0 + Duration::from_secs(20)));
+        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
+        assert!(!app.show_macos_access_granted(t0));
+        assert!(
+            app.notice.as_ref().unwrap().admin_step_names().is_some(),
+            "never over the admin card"
+        );
+        app.notice = None;
+        assert!(app.show_macos_access_granted(t0));
+        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+
+        // THE PARK POINT'S PLATFORM. Everything past this line is reached
+        // through `tick_macos_access_card`, whose first line is the macOS
+        // gate. On this host that gate is what the product really does, so it
+        // is what gets asserted: the tick is a no-op in every phase, and no
+        // macOS access card can reach a glass that has no TCC behind it.
+        if !cfg!(target_os = "macos") {
+            let mut app = windowed();
+            assert!(app.proxy.is_none(), "no event loop under the harness");
+
+            // IDLE with the switch on: no worker is asked for, and the phase
+            // does not even settle — the tick returned before it could.
+            app.tick_macos_access_card(t0);
+            assert_eq!(app.consent_card.phase(), CardPhase::Idle);
+            assert!(app.notice.is_none());
+
+            // IDLE with the switch off: the policy retraction is out of reach
+            // too, so the machine stays where it was.
+            app.config.privacy = Some(crate::app_config::PrivacyConfig {
+                notice: Some(false),
+                ..Default::default()
+            });
+            app.tick_macos_access_card(t0);
+            assert_eq!(app.consent_card.phase(), CardPhase::Idle);
+            assert!(app.notice.is_none());
+
+            // DUE with the slot free — the one branch that could put a card on
+            // the glass.
+            let mut app = windowed();
+            assert!(app.consent_card.begin_deciding(t0));
+            assert!(app.consent_card.on_decided(&Verdict::Offer, t0));
+            app.tick_macos_access_card(t0);
+            assert_eq!(app.consent_card.phase(), CardPhase::Due);
+            assert!(
+                app.notice.is_none(),
+                "a macOS access card must never reach a non-macOS glass"
+            );
+
+            // WATCHING, displaced by an unconditional producer: no return to
+            // Due, and the producer keeps the slot.
+            app.consent_card.on_raised(t0);
+            assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
+            app.notice = Some(TransientNotice::update_status("\u{21e3} Installing", t0));
+            app.tick_macos_access_card(t0 + Duration::from_secs(3));
+            assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
+            assert!(
+                app.notice
+                    .as_ref()
+                    .is_some_and(|n| !n.is_macos_access_owned()),
+                "the other producer keeps the slot"
+            );
+
+            // CONFIRMING: the ✓ pill never arrives from the park point either.
+            app.notice = None;
+            app.consent_card.on_grant_awaiting_slot(t0);
+            assert_eq!(
+                app.consent_card.phase(),
+                CardPhase::Confirming { since: t0 }
+            );
+            app.tick_macos_access_card(t0 + Duration::from_secs(1));
+            assert_eq!(
+                app.consent_card.phase(),
+                CardPhase::Confirming { since: t0 }
+            );
+            assert!(app.notice.is_none());
+
+            // And the event loop is never woken for a card this platform
+            // cannot raise — the pump carries the same gate.
+            assert!(app.next_macos_access_card_deadline(t0).is_none());
+            return;
+        }
+
         let raised = |app: &mut App, now: Instant| {
             assert!(app.consent_card.begin_deciding(Instant::now()));
             assert!(app.consent_card.on_decided(&Verdict::Offer, now));
@@ -32259,14 +33616,6 @@ mod overlap_handoff_tests {
             CardPhase::Settled,
             "no proxy: no worker"
         );
-        assert!(app.notice.is_none());
-
-        // A verdict in DECIDING against the inert arm: the probe is
-        // `unknown`, which is not a denial — quiet, nothing raised.
-        let mut app = windowed();
-        assert!(app.consent_card.begin_deciding(Instant::now()));
-        app.decide_macos_access_card(None);
-        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
         assert!(app.notice.is_none());
 
         // DUE: the admin card holds the slot → the card waits and the admin
@@ -32372,26 +33721,6 @@ mod overlap_handoff_tests {
         assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
         assert!(app.notice.is_none());
 
-        // THE ✓ PILL replaces the card or its own route pill, or fills a free
-        // slot — never another card.
-        let mut app = windowed();
-        app.notice = Some(TransientNotice::macos_access_route(
-            "route".to_string(),
-            OPENED_SETTINGS_TTL,
-            t0,
-        ));
-        assert!(app.show_macos_access_granted(t0 + Duration::from_secs(20)));
-        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
-        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
-        assert!(!app.show_macos_access_granted(t0));
-        assert!(
-            app.notice.as_ref().unwrap().admin_step_names().is_some(),
-            "never over the admin card"
-        );
-        app.notice = None;
-        assert!(app.show_macos_access_granted(t0));
-        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
-
         // THE GRANT SEEN WHILE ANOTHER CARD HOLDS THE SLOT: the ✓ waits like
         // the card does, and shows the moment the slot frees.
         let mut app = windowed();
@@ -32434,7 +33763,20 @@ mod overlap_handoff_tests {
 
     /// Disabling notices from any tab retracts the shared access card,
     /// including a queued or displaced one. Other producers keep their slot.
+    ///
+    /// macOS ONLY — and NOT so this box stops seeing a red.
+    /// `tick_macos_access_card` returns on its first statement off macOS, so
+    /// every assertion below would be measuring that early return instead of
+    /// the retraction, and the retraction — the thing the test is named for
+    /// — would be proved on no platform at all. The card's lifecycle already
+    /// lives behind this gate: `macos_access_refresh_tests` is
+    /// `#[cfg(all(test, target_os = "macos"))]` as a whole module, and this
+    /// test had simply escaped it while sitting in a `cfg(unix)` neighbour.
+    /// What the early return owes every other unix is asserted next door, in
+    /// `macos_access_card_stays_inert_off_macos`; neither platform is left
+    /// with an empty claim.
     #[test]
+    #[cfg(target_os = "macos")]
     fn macos_access_card_honors_live_policy_without_dismissing_other_notices() {
         use super::consent_card::{CardPhase, Verdict};
         use super::notice::TransientNotice;
@@ -32461,16 +33803,124 @@ mod overlap_handoff_tests {
                         ..Default::default()
                     });
                     app.tick_macos_access_card(now);
-                    assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-                    assert_eq!(app.notice.is_some(), other_notice);
+                    if cfg!(target_os = "macos") {
+                        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+                        assert_eq!(app.notice.is_some(), other_notice);
+                    } else {
+                        assert_eq!(
+                            app.consent_card.phase(),
+                            if raised {
+                                CardPhase::Watching { since: now }
+                            } else {
+                                CardPhase::Due
+                            },
+                            "the park point is macOS-only: nothing moved"
+                        );
+                        assert_eq!(app.notice.is_some(), raised || other_notice);
+                    }
                     if other_notice {
                         assert!(app.notice.as_ref().unwrap().admin_step_names().is_some());
                     }
-                    // A delayed worker cannot resurrect an opted-out card.
+                    // A delayed worker cannot resurrect an opted-out card. This
+                    // admission is not platform-gated, so the machine settles on
+                    // every host; only the card's own notice stays on a
+                    // non-macOS glass, because clearing it is the tick's job.
                     app.decide_macos_access_card(None);
                     assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-                    assert_eq!(app.notice.is_some(), other_notice);
+                    assert_eq!(
+                        app.notice.is_some(),
+                        other_notice || (raised && !cfg!(target_os = "macos"))
+                    );
                 }
+            }
+        }
+    }
+
+    /// THE OTHER SIDE OF THAT GATE. Full Disk Access is a TCC concept: off
+    /// macOS there is no marker to read, no Security pane to route to and
+    /// nothing a card could ask for, so `tick_macos_access_card` returns
+    /// before it reads a switch, spawns a worker or so much as looks at the
+    /// shared notice slot. That early return is a PRODUCT PROMISE, not an
+    /// implementation detail — a Linux build must never raise a card telling
+    /// its owner to grant a macOS permission, and must never take or empty a
+    /// slot another producer is holding — so it is asserted here rather than
+    /// left to be implied by the macOS arm's absence.
+    ///
+    /// The third row is a deliberate mutant: a card forced past any phase
+    /// this platform can reach. The tick must still leave it EXACTLY as
+    /// found, which is what pins the guard ABOVE `admit_current_policy`
+    /// rather than somewhere inside the match.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn macos_access_card_stays_inert_off_macos() {
+        use super::consent_card::{CardPhase, Verdict};
+        use super::notice::TransientNotice;
+        use std::time::Instant;
+
+        let now = Instant::now();
+        fn app_with(enabled: bool, notice: bool) -> App {
+            let mut app = App::headless_for_test();
+            app.headless = false; // probes and gestures stay inert
+            app.config.privacy = Some(crate::app_config::PrivacyConfig {
+                enabled: Some(enabled),
+                notice: Some(notice),
+                ..Default::default()
+            });
+            app
+        }
+
+        for enabled in [false, true] {
+            for notice in [false, true] {
+                let switches = format!("enabled={enabled} notice={notice}");
+
+                // The launch one-shot's own starting phase — on macOS this is
+                // the tick that spawns the marker-reading worker.
+                let mut app = app_with(enabled, notice);
+                app.tick_macos_access_card(now);
+                assert_eq!(
+                    app.consent_card.phase(),
+                    CardPhase::Idle,
+                    "no verdict is ever asked for off macOS ({switches})"
+                );
+                assert!(
+                    app.notice.is_none(),
+                    "an inert card never writes the shared slot ({switches})"
+                );
+
+                // Another producer holds the slot: untouched in both
+                // directions, neither clobbered nor cleared.
+                let mut app = app_with(enabled, notice);
+                app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
+                app.tick_macos_access_card(now);
+                assert_eq!(app.consent_card.phase(), CardPhase::Idle, "({switches})");
+                assert!(
+                    app.notice
+                        .as_ref()
+                        .is_some_and(|n| n.admin_step_names().is_some()),
+                    "another producer keeps its slot off macOS too ({switches})"
+                );
+
+                // THE MUTANT. Even an opted-out card that is already on screen
+                // stays exactly where it stands: retracting it is the macOS
+                // arm's claim, and this platform never gets far enough to make
+                // it.
+                let mut app = app_with(enabled, notice);
+                assert!(app.consent_card.begin_deciding(now));
+                assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+                app.consent_card.on_raised(now);
+                app.notice = Some(TransientNotice::macos_access(now));
+                app.tick_macos_access_card(now);
+                assert_eq!(
+                    app.consent_card.phase(),
+                    CardPhase::Watching { since: now },
+                    "the guard runs before any policy read ({switches})"
+                );
+                assert!(
+                    app.notice
+                        .as_ref()
+                        .is_some_and(|n| n.is_macos_access_owned()),
+                    "…and before any write of the slot ({switches})"
+                );
             }
         }
     }
@@ -39152,7 +40602,7 @@ mod tests {
             head: 0,
         };
         let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
-        let interval = super::effect_present_interval(ws.frame_interval);
+        let interval = ws.effect_present_interval();
         let mut census = LaneCensus {
             interval,
             ..LaneCensus::default()
@@ -41074,6 +42524,7 @@ mod session_pool_tests {
             pid: -1,
             handoff_local_id: None,
             frozen_path: false,
+            identity: None,
             ctx,
             child_proxy_sid: None,
             output_wake_pending: Arc::new(AtomicU64::new(0)),
@@ -45038,6 +46489,7 @@ mod compose_tests {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
+                pixel_exact: false,
             }),
             cell_row: 0,
             cell_col: 0,
@@ -45967,7 +47419,8 @@ mod effect_cadence_tests {
     /// refresh rate and `nextDrawable` always finds a free drawable. Panel-rate
     /// presents are the pre-fix behaviour and are pinned here as the negative
     /// control, because that is exactly what parked the winit main thread for
-    /// 7.34-8.39 ms of every ~8.1 ms frame.
+    /// 7.34-8.39 ms of every ~8.1 ms frame. This is the 120 Hz arm; the 60 Hz
+    /// panel's own arm is pinned in the next test.
     #[test]
     fn the_effect_lane_presents_strictly_slower_than_the_panel_refreshes() {
         let promotion = Duration::from_nanos(1_000_000_000_000 / 120_000); // 120 Hz
@@ -46001,18 +47454,227 @@ mod effect_cadence_tests {
         );
     }
 
+    /// THE 60 Hz PANEL, pinned as a decision rather than left as the unstated
+    /// consequence of a law illustrated only at 120 Hz. The divisor is a
+    /// wall-clock cap ("no faster than ~60 presents a second", see the
+    /// constant's doc), so a KNOWN panel at or below 60 Hz presents the effect
+    /// lane at PANEL rate on the host where that was measured (an Intel Mac),
+    /// a faster panel keeps the halving everywhere, an unknown refresh keeps it
+    /// too (a fallback is a guess, and a guess does not spend the pool's
+    /// headroom), and every other host keeps the M3-measured `2` on any panel.
+    #[test]
+    fn a_sixty_hertz_panel_presents_effects_at_panel_rate_on_an_intel_mac() {
+        let hz = |mhz: u64| Duration::from_nanos(1_000_000_000_000 / mhz);
+        let (hz30, hz50, hz59_94, hz60, hz61, hz120) = (
+            hz(30_000),
+            hz(50_000),
+            hz(59_940),
+            hz(60_000),
+            hz(61_000),
+            hz(120_000),
+        );
+        // Both platform arms, on any host.
+        for slow in [hz30, hz50, hz59_94, hz60] {
+            assert_eq!(
+                super::effect_present_panel_periods_with(Some(slow), true),
+                1,
+                "{slow:?}: at or below 60 Hz ⇒ panel rate where the arm holds"
+            );
+            assert_eq!(
+                super::effect_present_panel_periods_with(Some(slow), false),
+                super::EFFECT_PRESENT_PANEL_PERIODS,
+                "{slow:?}: the M3-measured halving everywhere else"
+            );
+        }
+        for fast in [hz61, hz120] {
+            assert_eq!(
+                super::effect_present_panel_periods_with(Some(fast), true),
+                super::EFFECT_PRESENT_PANEL_PERIODS,
+                "{fast:?}: a panel faster than 60 Hz keeps the halving on every host"
+            );
+        }
+        assert_eq!(
+            super::effect_present_panel_periods_with(None, true),
+            super::EFFECT_PRESENT_PANEL_PERIODS,
+            "an unknown refresh is not a measured panel"
+        );
+        // The threshold sits a hair below 60 Hz's exact period and above 61 Hz's.
+        assert!(hz60 >= super::EFFECT_LANE_PANEL_RATE_MIN_PERIOD);
+        assert!(hz61 < super::EFFECT_LANE_PANEL_RATE_MIN_PERIOD);
+        // The lane the scheduler actually arms on THIS host.
+        let sixty_lane = if super::EFFECT_LANE_PANEL_RATE_AT_60HZ {
+            hz60
+        } else {
+            hz60 * 2
+        };
+        assert_eq!(super::effect_present_interval(Some(hz60)), sixty_lane);
+        assert_eq!(
+            super::effect_present_interval(Some(hz120)),
+            hz120 * 2,
+            "120 Hz panel ⇒ 60 Hz effect lane on every host"
+        );
+        assert_eq!(
+            super::effect_present_interval(None),
+            AURORA_TICK_INTERVAL * 2,
+            "unknown refresh ⇒ the 60 fps fallback, stretched, on every host"
+        );
+        assert_eq!(
+            super::EFFECT_LANE_PANEL_RATE_AT_60HZ,
+            cfg!(all(target_os = "macos", target_arch = "x86_64")),
+            "the arm is the Intel Mac and nothing else"
+        );
+    }
+
+    /// THE PARK LATCH: the panel-rate arm is opportunistic. A present on the
+    /// window whose acquire waited [`super::EFFECT_LANE_ACQUIRE_PARK_NS`] drops
+    /// that window — and only that window — to the halving for the rest of the
+    /// effect episode; a wait a nanosecond short of it changes nothing; the
+    /// lane idling clears it. Pinned on both hosts: off the Intel arm the
+    /// window's lane is the halving before and after the park, byte-identical,
+    /// which is the "no behaviour change on arm64" claim as an assertion.
+    #[test]
+    fn a_parked_acquire_drops_the_window_to_the_halving_until_the_lane_idles() {
+        let hz60 = Duration::from_nanos(1_000_000_000_000 / 60_000);
+        let mut app = super::App::headless_for_test();
+        let ws = app
+            .windows
+            .get_mut(&super::WindowId(0))
+            .expect("the headless fixture owns window 0");
+        ws.frame_interval = Some(hz60);
+        let platform = super::effect_present_interval(Some(hz60));
+        let halved = hz60 * super::EFFECT_PRESENT_PANEL_PERIODS;
+        assert_eq!(
+            ws.effect_present_interval(),
+            platform,
+            "a fresh window presents at the platform's arm"
+        );
+        ws.note_acquire_wait(super::EFFECT_LANE_ACQUIRE_PARK_NS - 1);
+        assert!(!ws.effect_lane_parked, "a clean acquire is not a park");
+        assert_eq!(ws.effect_present_interval(), platform);
+        ws.note_acquire_wait(super::EFFECT_LANE_ACQUIRE_PARK_NS);
+        assert!(ws.effect_lane_parked, "the threshold itself is a park");
+        assert_eq!(
+            ws.effect_present_interval(),
+            halved,
+            "a parked window keeps the halving on every host"
+        );
+        ws.note_acquire_wait(0);
+        assert!(
+            ws.effect_lane_parked,
+            "one clean present after a park does not retry: monotone within an episode"
+        );
+        assert_eq!(ws.effect_present_interval(), halved);
+        ws.park_terminal_effect_scheduler();
+        assert!(!ws.effect_lane_parked, "the lane idling ends the episode");
+        assert_eq!(
+            ws.effect_present_interval(),
+            platform,
+            "the next episode probes the pool again at the platform's arm"
+        );
+        // A second window is untouched by the first one's park: the latch is
+        // the window's own evidence, and only that window's pool parked.
+        ws.note_acquire_wait(super::EFFECT_LANE_ACQUIRE_PARK_NS);
+        assert_eq!(ws.effect_present_interval(), halved);
+        let sid = app.next_session_id;
+        let wid_b = app.insert_logical_window(super::stub_session(sid), 24, 80);
+        let other = app.windows.get_mut(&wid_b).expect("the second window");
+        other.frame_interval = Some(hz60);
+        assert!(!other.effect_lane_parked);
+        assert_eq!(other.effect_present_interval(), platform);
+        assert_eq!(
+            app.windows[&super::WindowId(0)].effect_present_interval(),
+            halved,
+            "the first window's park outlives the second window's arrival"
+        );
+        // The Intel arm is the only host where the latch has anything to do.
+        assert_eq!(
+            platform == halved,
+            !super::EFFECT_LANE_PANEL_RATE_AT_60HZ,
+            "off the Intel arm the platform's arm IS the halving"
+        );
+    }
+
+    /// THE LATCH IS SIZED FOR THE LANE A PARK STRETCHES IT TO. On the Intel arm
+    /// the present of the very redraw that refreshed the latch can be the park
+    /// that demotes the lane (`note_acquire_wait` runs after the present, the
+    /// decoration sites before it), so a latch counted in the panel-rate lane
+    /// — 4 × 16.7 ms — would be two stretched periods, under the three the
+    /// round trip needs, and a ≥ 33 ms redraw plus one non-redraw turn would
+    /// delete `next_trail_tick`: the permanent freeze. The hold therefore
+    /// counts in the halved lane (`deco_anim_hold`), the same wall-clock number
+    /// on every host. Pinned on both hosts: off the Intel arm the window's lane
+    /// never stretches, and the hold is what it always was.
+    #[test]
+    fn the_decoration_latch_is_sized_for_the_lane_a_park_stretches_it_to() {
+        let hz60 = Duration::from_nanos(1_000_000_000_000 / 60_000);
+        let halved =
+            super::effect_present_interval_with(Some(hz60), super::EFFECT_PRESENT_PANEL_PERIODS);
+        let panel_rate = super::effect_present_interval_with(Some(hz60), 1);
+        // The arithmetic, host-independent: counted in the panel-rate lane the
+        // latch is too short for the stretched one; counted in the halved lane
+        // it is not.
+        assert!(
+            panel_rate * super::DECO_ANIM_LEVEL_FRAMES < halved * 3,
+            "which is why the latch may not count in the lane the window is on"
+        );
+        assert!(halved * super::DECO_ANIM_LEVEL_FRAMES >= halved * 3);
+        // The window, on both hosts.
+        let mut app = super::App::headless_for_test();
+        let ws = app
+            .windows
+            .get_mut(&super::WindowId(0))
+            .expect("the headless fixture owns window 0");
+        ws.frame_interval = Some(hz60);
+        assert_eq!(
+            ws.deco_anim_hold(),
+            halved * super::DECO_ANIM_LEVEL_FRAMES,
+            "the hold is the halved lane's, on every host"
+        );
+        let t0 = std::time::Instant::now();
+        ws.note_deco_animating(t0);
+        let until = ws.deco_anim_until.expect("the decoration armed the latch");
+        // The present that drew the decoration parks; the lane stretches; the
+        // latch already armed must still cover three of the stretched periods.
+        ws.note_acquire_wait(super::EFFECT_LANE_ACQUIRE_PARK_NS);
+        assert_eq!(ws.effect_present_interval(), halved);
+        assert!(
+            until - t0 >= ws.effect_present_interval() * 3,
+            "the latch armed before the park must outlive arm → fire → redraw at \
+             the stretched lane"
+        );
+        assert_eq!(
+            until - t0,
+            ws.deco_anim_hold(),
+            "and it is exactly the hold, not longer"
+        );
+        assert!(ws.deco_anim_frame_active(
+            t0 + ws.effect_present_interval() * 3 - Duration::from_nanos(1)
+        ));
+        assert!(
+            !ws.deco_anim_frame_active(t0 + ws.deco_anim_hold()),
+            "and it still expires: a decoration that stopped moving stops paying"
+        );
+    }
+
     /// The chrome-decoration latch counts LANE periods, not panel periods. If it
     /// kept counting panel refreshes it would expire mid-deferral once the lane
     /// stretched — the permanent-freeze bug `deco_anim_until` exists to prevent.
+    /// At 120 Hz and at 60 Hz alike.
     #[test]
     fn the_decoration_latch_outlives_one_stretched_lane_period() {
         let promotion = Duration::from_nanos(1_000_000_000_000 / 120_000);
-        let lane = super::effect_present_interval_with(Some(promotion), 2);
-        let latch = lane * super::DECO_ANIM_LEVEL_FRAMES;
-        assert!(
-            latch >= lane * 3,
-            "the latch must cover arm → fire → next redraw at the LANE's period"
-        );
+        let hz60 = Duration::from_nanos(1_000_000_000_000 / 60_000);
+        for panel in [promotion, hz60] {
+            let lane = super::effect_present_interval_with(
+                Some(panel),
+                super::EFFECT_PRESENT_PANEL_PERIODS,
+            );
+            let latch = lane * super::DECO_ANIM_LEVEL_FRAMES;
+            assert!(
+                latch >= lane * 3,
+                "{panel:?}: the latch must cover arm → fire → next redraw at the LANE's period"
+            );
+        }
     }
 }
 
@@ -46454,6 +48116,195 @@ mod edr_headroom_tests {
             !monitor_change_only(Some(now)),
             "control: the old monitor-change-only path never would"
         );
+    }
+
+    /// WIRING FENCE for the screen re-pick. An 8-bit window whose screen
+    /// gains EDR potential WITHOUT a monitor change (`hdr_glow` hot-reloaded
+    /// on; a display-settings change) takes f16 only if the throttled
+    /// re-query reaches the re-pick for 8-bit surfaces. The old gate
+    /// (`!hdr || !edr_requery_due(..)`) skipped exactly those, so such a
+    /// window stayed 8-bit until it changed monitors. Checked by reading the
+    /// sources, the source-wiring idiom
+    /// `every_non_boot_spawn_site_hands_over_a_real_cell_box` uses, because
+    /// the re-pick needs a live `NSWindow` on a real screen.
+    #[test]
+    fn throttled_requery_reaches_the_screen_repick_for_8bit_windows() {
+        const THROTTLE: &str = "edr_requery_due(ws.last_edr_query, now, EDR_REQUERY_INTERVAL)";
+        let src: &'static str = include_str!("lib.rs");
+        let body_of = |sig: &str, close: &str| -> &'static str {
+            src.split_once(sig)
+                .unwrap_or_else(|| panic!("`{sig}` must remain present"))
+                .1
+                .split_once(close)
+                .unwrap_or_else(|| panic!("`{sig}` must close"))
+                .0
+        };
+        // Anything ahead of the throttle that gates on the surface being HDR
+        // keeps an 8-bit surface away from the re-pick.
+        let gates_on_hdr_first = |body: &str| {
+            body.find(THROTTLE)
+                .is_some_and(|at| body[..at].contains("is_hdr()"))
+        };
+        // NEGATIVE CONTROL: the pre-fix gate trips the same check.
+        let pre_fix = concat!(
+            "let hdr = matches!(&ws.present, Some(PresentTarget::Gpu { gpu_surface, .. }) ",
+            "if gpu_surface.is_hdr());\n",
+            "if !hdr || !edr_requery_due(ws.last_edr_query, now, EDR_REQUERY_INTERVAL) {",
+        );
+        assert!(
+            gates_on_hdr_first(pre_fix),
+            "control: the old gate kept 8-bit surfaces from the re-query"
+        );
+
+        let requery = body_of(
+            "    fn refresh_edr_headroom(&mut self, wid: WindowId, now: Instant) {",
+            "\n    }\n",
+        );
+        let throttle = requery
+            .find(THROTTLE)
+            .expect("the re-query must stay throttled");
+        assert!(
+            !gates_on_hdr_first(requery),
+            "nothing ahead of the throttle may gate on `is_hdr()`: an 8-bit surface must \
+             reach the screen re-pick"
+        );
+        let repick = requery
+            .find("repick_gpu_surface_for_screen(")
+            .expect("the throttled re-query must run the screen re-pick");
+        let seed = requery
+            .find("set_edr_max(")
+            .expect("the throttled re-query must still seed the headroom");
+        assert!(
+            throttle < repick && repick < seed,
+            "throttle, then the re-pick, then the headroom (a just-upgraded surface is seeded)"
+        );
+        let monitor = body_of(
+            "    fn refresh_frame_interval(&mut self, wid: WindowId, force_read: bool) {",
+            "\n    }\n",
+        );
+        assert!(
+            monitor.contains("repick_gpu_surface_for_screen("),
+            "the monitor-change hook must run the same re-pick"
+        );
+        // The one shared sequence: the renderer flips the layer, THEN the
+        // attach's scRGB tag, THEN the capture space off the tag's answer.
+        let helper = body_of("fn repick_gpu_surface_for_screen(", "\n}\n");
+        let upgrade = helper
+            .find(".upgrade_surface_for_screen(")
+            .expect("the re-pick must go through the renderer's screen re-pick");
+        let tag = helper
+            .find("window_set_surface_colorspace(")
+            .expect("an upgrade must replay the attach's colour-space tag");
+        let capture = helper
+            .find("capture_space_after_surface_tag(")
+            .expect("an upgrade must re-resolve the capture space off the tag");
+        assert!(
+            upgrade < tag && tag < capture,
+            "the upgrade (the layer moves), then the tag, then the capture space"
+        );
+        assert!(
+            helper.contains("resolve_surface_colorspace(window_colorspace, true)"),
+            "the replayed tag must be the HDR surface's tag"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refresh_rate_reread_tests {
+    //! `refresh_frame_interval` keeps the refresh-RATE read ahead of the
+    //! monitor-identity guard (W6) but off the per-`Moved` hot path: on a panel
+    //! whose `CGDisplayModeGetRefreshRate` is 0 the read is a CVDisplayLink
+    //! create/query/release (mean 0.23–0.51 ms, worst 3.2–6.5 ms per call across
+    //! measured runs — see [`super::REFRESH_RATE_REREAD_INTERVAL`]), and `Moved`
+    //! streams continuously during a drag. These pin the pure gate
+    //! [`super::refresh_rate_read_due`]; the method itself needs an `os_window`,
+    //! which a headless window never has. Each test drives the gate with the
+    //! `(same_monitor, force_read)` pair its event produces at the call site — a
+    //! `Moved` on the same monitor `(true, false)`, a `Moved` onto another
+    //! monitor `(false, false)`, a `Focused(true)` on the same monitor
+    //! `(true, true)` — so each bypass is pinned with the other one off, and
+    //! dropping either term from the gate fails that bypass's own test.
+    use super::{REFRESH_RATE_REREAD_INTERVAL, refresh_rate_read_due};
+    use std::time::{Duration, Instant};
+
+    /// The fix: on the SAME monitor a read just made suppresses the next `Moved`
+    /// read until the throttle elapses — the drag stream pays no display-link
+    /// round trip — and then it recurs on the first `Moved` at or past the
+    /// interval, so a mode change that keeps the monitor's identity (W6) is still
+    /// healed by the drag stream (within the interval while events flow; the gate
+    /// is event-driven, not a timer, so a stationary window heals on its next
+    /// event, as before).
+    #[test]
+    fn same_monitor_read_is_throttled_then_recurs() {
+        let now = Instant::now();
+        let interval = REFRESH_RATE_REREAD_INTERVAL;
+        // A `Moved` on the monitor the window was already on: same, not forced.
+        let moved = |last, at| refresh_rate_read_due(true, false, last, at, interval);
+        // Never read → due (the first event after creation samples the panel).
+        assert!(moved(None, now));
+        // Just read → the next `Moved` skips the read (the old shape would not).
+        assert!(!moved(Some(now), now));
+        // Half a window later → still suppressed.
+        let half = now + interval / 2;
+        assert!(!moved(Some(now), half));
+        // Exactly the interval later → DUE: the gate is `>=`, so the boundary
+        // event reads rather than slipping to the one after it.
+        let boundary = now + interval;
+        assert!(moved(Some(now), boundary));
+        // Past the interval → DUE again with no monitor change: the W6 heal
+        // recurs on a stationary window instead of being throttled forever.
+        let after = now + interval + Duration::from_millis(1);
+        assert!(moved(Some(now), after));
+    }
+
+    /// A monitor CHANGE is never throttled: the new panel's cadence is taken on
+    /// the very event that reports the transition, however recent the last read.
+    /// Driven as the `Moved` that reports it — `same_monitor = false` and NOT
+    /// forced — at the two instants where a same-monitor `Moved` is suppressed,
+    /// so only the monitor-change term can make these reads due. Without it, a
+    /// drag onto another monitor within the interval of the last read would
+    /// return early and skip the whole monitor-change tail (`ws.monitor`,
+    /// `frame_interval`, the EDR re-query, the redraw re-arm).
+    #[test]
+    fn monitor_change_always_reads() {
+        let now = Instant::now();
+        let interval = REFRESH_RATE_REREAD_INTERVAL;
+        let half = now + interval / 2;
+        // A `Moved` onto a different monitor: not the same, not forced.
+        let moved_to_other = |last, at| refresh_rate_read_due(false, false, last, at, interval);
+        // The control: the same `Moved` had the monitor NOT changed.
+        let moved_same = |last, at| refresh_rate_read_due(true, false, last, at, interval);
+        // Just read, and half a window in: throttled on the same monitor...
+        assert!(!moved_same(Some(now), now));
+        assert!(!moved_same(Some(now), half));
+        // ...but read at once when the monitor changed.
+        assert!(moved_to_other(Some(now), now));
+        assert!(moved_to_other(Some(now), half));
+        // Never read reads too.
+        assert!(moved_to_other(None, now));
+    }
+
+    /// The forced path (`Focused(true)` passes `force_read = true`): the
+    /// single-monitor W6 heal route is never throttled, so a focus that lands
+    /// inside the window of a `Moved` read still reads — the pre-throttle
+    /// behaviour on every platform. Driven on the SAME monitor, so only the
+    /// `force_read` term can make these reads due. Sibling of
+    /// `monitor_change_always_reads`.
+    #[test]
+    fn forced_read_is_never_throttled() {
+        let now = Instant::now();
+        let interval = REFRESH_RATE_REREAD_INTERVAL;
+        let half = now + interval / 2;
+        // A `Focused(true)` on the monitor the window was already on: forced.
+        let focused = |last, at| refresh_rate_read_due(true, true, last, at, interval);
+        // The control: an unforced `Moved` on that same monitor.
+        let moved = |last, at| refresh_rate_read_due(true, false, last, at, interval);
+        // Just read: the `Moved` is suppressed, the focus reads.
+        assert!(!moved(Some(now), now));
+        assert!(focused(Some(now), now));
+        // Half a window in: the same.
+        assert!(!moved(Some(now), half));
+        assert!(focused(Some(now), half));
     }
 }
 

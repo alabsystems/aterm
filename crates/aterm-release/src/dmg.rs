@@ -17,7 +17,8 @@
 //! Both digests are computed in-process via `aterm-digest`, so the digest written into
 //! the manifest is provably the digest of the file we just produced.
 //!
-//! Port of `apps/aterm-mac/make-dmg.sh`, hdiutil branch only. The signed .app
+//! Port of the retired `apps/aterm-mac/make-dmg.sh` (deleted with the shell
+//! pipeline; not in this tree), hdiutil branch only. The signed .app
 //! goes in AS-IS: run this AFTER `sign::sign_app` (both containers freeze the
 //! app's bytes), and hand the DMG to `sign::sign_and_notarize_dmg` next.
 //!

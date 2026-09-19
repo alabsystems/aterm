@@ -59,12 +59,13 @@ impl FakeRepo {
         me.script("tools/grep_guard.sh", "echo 'GUARD: PASS'; exit 0");
         me.script("tools/license_check.sh", "echo 'LICENSE: PASS'; exit 0");
         me.script("tools/test-install-channel.sh", "exit 0");
-        me.script("tools/test-atpkg-vendor-tooling.sh", "exit 0");
-        me.script("tools/test-atpkg-mirror-extras.sh", "exit 0");
-        me.script("tools/test-atpkg-auto-vendor.sh", "exit 0");
-        me.script("tools/test-atpkg-target-pins.sh", "exit 0");
-        me.script("tools/test-linux-auto-atpkg.sh", "exit 0");
-        me.script("tools/test-atpkg-pack-one-compiler.sh", "exit 0");
+        // DERIVED FROM THE ROSTER, never re-typed. This list was a hand-written copy of
+        // `ATPKG_SUITES` and the two drifted the moment the roster grew: adding a suite
+        // made every fixture here report `missing or not executable` for it, which reads
+        // as a broken change rather than as an un-updated fixture (2026-09-17).
+        for name in aterm_verify::stages::ATPKG_SUITES {
+            me.script(&format!("tools/{name}"), "exit 0");
+        }
         me.script("tools/test-trust-gate-verdict.sh", "exit 0");
         me.script("tools/test-trust-contract-probe.sh", "exit 0");
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
@@ -274,6 +275,19 @@ exit 0"#,
     }
 
     fn ctx(&self, mode: Mode, scope: Scope, selftest: bool) -> Ctx {
+        self.ctx_with(mode, scope, selftest, |_| {})
+    }
+
+    /// [`Self::ctx`] with one last say over the environment the stages read —
+    /// for the cases that MEASURE a variable's effect instead of being at its
+    /// mercy (see the `cargo_build_jobs` pin below).
+    fn ctx_with(
+        &self,
+        mode: Mode,
+        scope: Scope,
+        selftest: bool,
+        tweak: impl FnOnce(&mut EnvSnapshot),
+    ) -> Ctx {
         let mut env = EnvSnapshot::capture();
         env.trust_stage2_bin = Some(self.stage2.clone());
         // The GUI smoke measures a real window; a synthetic repo has none, so it
@@ -309,6 +323,24 @@ exit 0"#,
         // them there. The pin stays for the main lane, which still follows the
         // caller's redirect.
         env.cargo_target_dir = None;
+        // …and the caller's job count, for the same reason and with the same
+        // shape. `lane_jobs` makes an exported `CARGO_BUILD_JOBS` a CEILING on
+        // the side lanes, so the value a stage hands its child is a function of
+        // the ambient environment — and two fixtures here pin that value to a
+        // lane's own cap (`test "$CARGO_BUILD_JOBS" = 8 || exit 71`). Measured
+        // 2026-09-16: the merge gate itself exports `CARGO_BUILD_JOBS=4` on a
+        // 4-core Mac, so inside that run the driver lane capped 8 to 4 and both
+        // `sealed_lane_prepares_its_gui_before_testing_and_preserves_both_failures`
+        // and `atpkg_tooling_builds_the_atpkg_its_pack_suite_drives_and_never_takes_a_stale_one`
+        // failed at exit 71 — their stubs never reaching the build arm, so the
+        // trace was missing rows and the driven binary missing entirely. The
+        // stages were right and the fixture was reading the shell. `None` is
+        // the pin because these tests assert the CAPS; the ceiling itself is
+        // measured by `a_callers_job_count_caps_the_side_lane_child_it_reaches`,
+        // which sets the variable through [`Self::ctx_with`] rather than
+        // inheriting whatever ran the suite.
+        env.cargo_build_jobs = None;
+        tweak(&mut env);
         Ctx::new(
             self.root.clone(),
             mode,
@@ -1390,6 +1422,7 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ("skip", "gate drift (selftest: not executed)"),
             ("skip", "gate dormant (selftest: not executed)"),
             ("skip", "gate mainloop (selftest: not executed)"),
+            ("skip", "gate citations (selftest: not executed)"),
             (
                 "skip",
                 "libc-oracle/run.sh (cross-cell ABI + native runtime) (selftest: not executed)"
@@ -1428,6 +1461,19 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ),
             ("skip", "test-atpkg-auto-vendor.sh (selftest: not executed)"),
             ("skip", "test-atpkg-target-pins.sh (selftest: not executed)"),
+            (
+                "skip",
+                "test-atpkg-index-target-pins.sh (selftest: not executed)"
+            ),
+            (
+                "skip",
+                "test-atpkg-index-staging-collision.sh (selftest: not executed)"
+            ),
+            ("skip", "test-atpkg-stale-pin.sh (selftest: not executed)"),
+            (
+                "skip",
+                "test-atpkg-spec-catch-up.sh (selftest: not executed)"
+            ),
             ("skip", "test-linux-auto-atpkg.sh (selftest: not executed)"),
             (
                 "skip",
@@ -1698,6 +1744,62 @@ esac
             ),
             build_exit != 0,
             "{}",
+            report.render()
+        );
+    }
+}
+
+/// THE CEILING, end to end: a caller's `CARGO_BUILD_JOBS` reaches the side
+/// lane's own child as the smaller of the two, not as the lane's cap and not as
+/// the caller's value.
+///
+/// `lane_jobs`'s unit tests (stages.rs) prove the arithmetic; this proves the
+/// wiring — that the number a real stage puts in a real child's environment is
+/// the capped one. It is the test the 2026-09-16 gate wanted: the ceiling had
+/// landed, and the only thing that noticed it inside a run was two fixtures
+/// failing at exit 71 (see the `cargo_build_jobs` pin in `ctx_with`).
+#[test]
+fn a_callers_job_count_caps_the_side_lane_child_it_reaches() {
+    // 2 is below the driver lane's cap of 8, so the child must see 2; the two
+    // stage fixtures above pin the uncapped 8 through the same code path.
+    for (caller, want) in [("2", "2"), ("16", "8"), ("", "8"), ("none", "8")] {
+        let repo = FakeRepo::new();
+        let trace = repo.scratch.join("jobs-seen");
+        let target = repo.root.join("target-drivers");
+        repo.with_stage2(&format!(
+            r#"test "$CARGO_TARGET_DIR" = {target} || exit 70
+case "$*" in
+  '--unverified build -q -p aterm-gui -p aterm-ctl')
+    echo "$CARGO_BUILD_JOBS" >> {trace}
+    mkdir -p "$CARGO_TARGET_DIR/debug"
+    echo fresh-sealed-gui > "$CARGO_TARGET_DIR/debug/aterm-gui"
+    ;;
+  '--unverified test -p aterm-link --features sealed --test two_nodes_sealed --no-fail-fast')
+    echo "$CARGO_BUILD_JOBS" >> {trace}
+    ;;
+  *) exit 74 ;;
+esac
+"#,
+            target = sh_quote(&target.display().to_string()),
+            trace = sh_quote(&trace.display().to_string()),
+        ));
+        let ctx = repo.ctx_with(Mode::Fast, Scope::workspace(), false, |env| {
+            env.cargo_build_jobs = (caller != "none").then(|| caller.into());
+        });
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == StageId::SealedLane)
+            .expect("sealed stage");
+        let report = stages::run_stage(&ctx, &spec);
+        let seen = fs::read_to_string(&trace).expect("stage invoked the driver");
+        assert_eq!(
+            seen,
+            format!("{want}\n{want}\n"),
+            "caller {caller:?}: both children of the sealed lane see the capped count"
+        );
+        assert!(
+            !tally(std::slice::from_ref(&report)).failed(),
+            "caller {caller:?}: {}",
             report.render()
         );
     }
@@ -2043,5 +2145,84 @@ fn no_doc_driver_is_could_not_run_on_the_doctests_row() {
     assert!(
         regex.contains("(no doc driver — see the doctests line)"),
         "{regex}"
+    );
+}
+
+/// THE PIN for the 3-hour hang the ceiling ended without naming (2026-09-16).
+///
+/// The gate's aterm-gui test binary sat on
+/// `control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed` until
+/// the ceiling killed the `--tests` child, and the TIMEOUT block named only the argv — an
+/// invocation spanning 12,976 tests over 218 binaries, of which the one that hung declared
+/// 4,874. The stand-in driver here replays a fixture in that log's own shapes for the
+/// `--tests` child and then hangs; everything else it is asked for passes.
+///
+/// ONE STAGE, not the ladder: the ceiling this test needs is short, and a short ceiling
+/// applied to a whole `--fast` run would put every other stub under it too — on a
+/// saturated machine that is a red row this test never meant to produce. `run_stage`
+/// drives the Test stage alone, the way the sealed-lane and atpkg-tooling cases do, so the
+/// only child under the 8 s ceiling is the one that is supposed to hang. No new row in
+/// fast-invocations.txt: no argv changed.
+#[test]
+fn a_hung_test_run_names_the_test_in_the_ladder() {
+    let repo = FakeRepo::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hung-test-stage.log");
+    repo.with_stage2(&format!(
+        "case \"$*\" in *--tests*) cat '{}'; exec sleep 600 ;; esac\nexit 0",
+        fixture.display()
+    ));
+    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    ctx.env.stage_timeout = Some("8".into());
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+
+    let compiled = "targo test --workspace --no-run (trustdoc)";
+    let hung = "targo test --workspace --tests (trustdoc)";
+    assert!(
+        labels_with(&block, "ok").iter().any(|l| l == compiled),
+        "{block}"
+    );
+    assert!(
+        labels_with(&block, "FAIL").iter().any(|l| l == hung),
+        "{block}"
+    );
+    assert!(tally(std::slice::from_ref(&report)).failed(), "{block}");
+    for want in [
+        "aterm-verify: TIMEOUT — child killed after ",
+        "over the 8.0s wall-clock ceiling",
+        "  child: ",
+        "--unverified test --workspace --no-fail-fast --tests",
+        "  test binary: unittests src/lib.rs (target/debug/deps/aterm_gui-66cafa00b6862bbd) — \
+         it never printed its `test result:` line\n",
+        "  still running when killed (libtest reported it slow and no verdict for it followed):\n",
+        "    control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed   \
+         (slow at child line ",
+        "    re-run alone: target/debug/deps/aterm_gui-66cafa00b6862bbd --exact \
+         control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed \
+         --nocapture\n",
+        "of that binary's 4874 tests have a verdict in the log above.\n",
+        "  This stage decided NOTHING",
+    ] {
+        assert!(block.contains(want), "missing {want:?} in:\n{block}");
+    }
+    // The child's own log precedes the block, and the name whose own verdict arrived is
+    // not in it — while the one only a re-exec child reported is, said as such.
+    let note = &block[block.find("aterm-verify: TIMEOUT").expect("the block")..];
+    assert!(
+        block.find("running 4874 tests").expect("the child's log")
+            < block.find("aterm-verify: TIMEOUT").expect("the block"),
+        "{block}"
+    );
+    assert!(
+        !note.contains("native_about_byline"),
+        "its verdict arrived:\n{note}"
+    );
+    assert!(
+        note.contains("a re-exec child of this binary ran the same name"),
+        "the child-verdict case is named as such:\n{note}"
     );
 }

@@ -21,6 +21,9 @@
 //!   screen's.
 //! * [`mail`] — `watch --mail`'s lane on the manager's inbox and `task`: the
 //!   worker's report comes by mail, one line per worker turn.
+//! * [`limit`] — when a limit notice says it resets, as a Unix time: the
+//!   watcher waits for it, stretches its budget past it and probes the worker
+//!   (`watch --resume`).
 //!
 //! It moved here from a scratchpad script because every rule in it was paid for
 //! by a misclassification in a real session; a supervisor that is itself an
@@ -35,6 +38,7 @@ pub use aterm_phase::{phase, prompt};
 pub mod journal;
 pub mod ledger;
 pub mod ledger_html;
+pub mod limit;
 pub mod mail;
 pub mod report;
 pub mod run;
@@ -47,6 +51,7 @@ pub use ledger::{
     ClockAnchor, Format as LedgerFormat, Ledger, LedgerHost, LedgerOpts, gather, parse_since,
     render as render_ledger,
 };
+pub use limit::{ResetSpec, parse_reset, reset_at};
 pub use mail::{DEFAULT_IDLE_GRACE, DEFAULT_REPORT_WINDOW, MailOpts, MailRow, TaskOpts, task};
 pub use phase::{
     Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,

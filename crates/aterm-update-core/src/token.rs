@@ -23,7 +23,8 @@
 //! repo is sufficient (and is what `gh`'s token or a scoped PAT carries). Every
 //! resolved token is charset-validated ([`valid_token`]) before use — a value
 //! carrying a quote/backslash/whitespace is refused, so it can never break out of the
-//! `curl --config` line it is fed to (see `http::curl_auth`). The token is never
+//! `curl --config` line it is fed to (`http::curl_argv` places `--config -` as an
+//! OPTION before `--`, and `http::token_config_safe` writes the line). The token is never
 //! logged and never placed on a command line.
 //!
 //! # Provisioning, and what happens without it

@@ -106,19 +106,34 @@
 //! to `<sid>` as `kind=report`, so a manager parked on `aterm drive watch
 //! --mail` learns what the worker said the moment it stopped — without the
 //! worker being told to post it, and without a screen read. The message is
-//! taken from the transcript the vendor hands the hook (`transcript_path` in
-//! the stdin JSON, a JSONL file): the last line whose top-level `type` is
-//! `assistant` with a `text` content block ([`last_assistant_text`]), read
-//! from the file's tail. It is trimmed to [`REPORT_MAX`] with a marker; it
+//! the turn's final DISPLAYED message, taken from the transcript the vendor
+//! hands the hook (`transcript_path` in the stdin JSON, a JSONL file, read
+//! from its tail): the last assistant message after the turn's prompt — or
+//! after the wake that kept the turn alive, the `Stop` feedback line — that
+//! showed anything, its `text` blocks and its NARRATION joined in order
+//! ([`scan_turn`]). This Claude Code build stores the `⏺` narration it shows
+//! between tool calls as `thinking` blocks, told from hidden reasoning by a
+//! kind stamped in the block's signature ([`is_narration`]); a `thinking`
+//! block without that mark is never posted, and a turn whose last message is
+//! only that posts nothing and says so. The transcript LAGS the turn (the
+//! vendor flushes it on a timer and runs `Stop` at once), so the read waits
+//! for it to catch up ([`settle`]), with the vendor's own
+//! `last_assistant_message` as the fallback ([`displayed_message`]) — a hook
+//! that read at once posted a stale one-liner from before the turn's end
+//! (round 16 addendum, observed live on 0.86.0). It is trimmed to
+//! [`REPORT_MAX`] with a marker; it
 //! carries `re=<off>` of the newest `task` in the agent's own inbox that is
 //! unhandled or newer than its last report ([`report_task`]) when there is
 //! one; it is posted ONCE per message — the content key ([`report_key`]) of
-//! the last post is kept in the state dir, so a re-fired `Stop` (the vendor's
-//! `stop_hook_active`, a retry) posts nothing twice; and once it lands or is
+//! the last post is kept in the state dir, so a re-fired `Stop` (a retry, or
+//! the line landing after its fallback was posted) posts nothing twice, while
+//! a reply after a wake, even in the same words, is a message of its own;
+//! and once it lands or is
 //! queued it is charged to the wake budget like a wake, so a thrashing agent
 //! cannot flood its manager either. Everything about it fails open: no
-//! `transcript_path`, a transcript that is not Claude Code's, a file that
-//! cannot be read, a budget that is spent, a recipient the instance does not
+//! `transcript_path` and no vendor text, a transcript that is not Claude
+//! Code's, a file that cannot be read, a turn that displayed nothing, a
+//! budget that is spent, a recipient the instance does not
 //! host, a post the endpoint refused — the reason on stderr, nothing posted,
 //! no exit code of its own, and the wait below unchanged.
 //!
@@ -214,9 +229,13 @@ aterm-link hook — the zero-residency wake (DESIGN-aterm-fabric.md §9.1)
   --accept-from <p>,...  principals whose rows may wake a `stop`, beside every `h-*`
   --wake-budget <n>/<m>  at most <n> stop-wakes per <m> minutes (default 6/min)
   --timeout <s>          how long `stop` waits for mail (default 15; decimals allowed)
-  --report-to @<sid>     stop: BEFORE the wait, post the agent's LAST message — the last
-                         assistant text in the transcript the vendor hands the hook
-                         (transcript_path, a regular file or nothing) — to <sid> as
+  --report-to @<sid>     stop: BEFORE the wait, post the agent's LAST message — the turn's
+                         final displayed message, its text and its narration (never a
+                         thinking block without Claude Code's narration mark: hidden
+                         reasoning is not posted), from the transcript the vendor hands
+                         the hook (transcript_path, a regular file or nothing) once it
+                         has caught up (at most 2 s; else the vendor's
+                         last_assistant_message) — to <sid> as
                          kind=report, re= the newest task in the agent's inbox that is
                          unhandled or newer than its last report, trimmed to 4 KiB; once
                          per message (a re-fired Stop posts nothing twice); the recipient
@@ -1084,11 +1103,16 @@ const TRANSCRIPT_TAIL_MAX: u64 = 16 << 20;
 /// the bound (the `safe_reason` rule).
 const REPORT_MAX: usize = 4096;
 
-/// The last assistant message a transcript holds: its text and, when the
-/// transcript carries one, the line's own `uuid`.
+/// The turn's final displayed message: its text; when the transcript
+/// carries one, the `uuid` of the last line that contributed to it; and the
+/// `uuid` of the line that OPENED its segment ([`Turn::anchor`]).
 struct LastMessage {
     text: String,
     uuid: Option<String>,
+    /// The prompt, or the `Stop` hook's feedback line, that the message
+    /// follows — what tells two segments that end in the same words apart
+    /// when the message's own `uuid` is not known yet ([`report_key`]).
+    anchor: Option<String>,
 }
 
 /// `transcript_path` from the vendor's hook input, parsed as the JSON document
@@ -1103,28 +1127,56 @@ fn transcript_path(input: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The last line of the transcript at `path` whose top-level `type` is
-/// `assistant` and whose `message.content` carries a non-empty `text` block —
-/// the agent's last message, as the vendor's JSONL writer records it (one
-/// object per line; a turn's text, `tool_use` and `thinking` blocks each on a
-/// line of their own). `Ok(None)` when no line qualifies: an empty file, a
-/// transcript of another vendor's shape, a turn that ended in a tool call.
+/// `last_assistant_message` from the vendor's `Stop` input, trimmed — Claude
+/// Code's own reading of the turn's last assistant message, taken from the
+/// conversation IN MEMORY, so it is there before the transcript line is: its
+/// `text` blocks joined with a newline (measured in the 2.1.268 binary:
+/// `U=F?Pr(F.message.content,"\n").trim()||void 0`, where `F` is the last
+/// `assistant` entry and `Pr(e,n)` is `e.filter(type=="text").map(text)
+/// .join(n)`). Never a `thinking` block of any kind. `None` when the
+/// input has no such string (an older build, or a turn whose last message
+/// has no text).
+fn last_assistant_message(input: &str) -> Option<String> {
+    let doc = Json::parse(input).ok()?;
+    let text = doc.get("last_assistant_message")?.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// What the tail of a transcript says about the turn that just ended.
+#[derive(Default)]
+struct Turn {
+    /// The turn's final displayed message, when it has one.
+    message: Option<LastMessage>,
+    /// The turn's last message with anything in it held only thinking
+    /// WITHOUT the narration mark ([`is_narration`]): it cannot be told from
+    /// hidden reasoning, so it is never posted — and neither is anything
+    /// older, which would be a stale report.
+    undisplayed: bool,
+    /// The turn's LAST assistant line read the way the vendor reads
+    /// `last_assistant_message` ([`vendor_text`]) — how [`settle`] knows the
+    /// file holds the message the vendor already handed the hook. Only a
+    /// line AFTER the segment's opening line counts ([`scan_turn`]): after a
+    /// wake, the message from before it is not the reply the vendor means.
+    tail_text: Option<String>,
+    /// The `uuid` of the line that opened the segment the scan read — the
+    /// prompt, or the `Stop` hook's feedback line ([`is_wake`]) — when the
+    /// tail holds it.
+    anchor: Option<String>,
+}
+
+/// A transcript's size and modification time: the two things that move when
+/// the vendor's writer appends to it.
+type Stamp = (u64, Option<std::time::SystemTime>);
+
+/// The [`Turn`] in the last `tail_max` bytes of the transcript at `path`
+/// ([`scan_turn`]; a live hook reads [`TRANSCRIPT_TAIL_MAX`], a test pins the
+/// tail read with a small file), with the file's [`Stamp`] as it was read.
 ///
 /// # Errors
 ///
-/// The path and the I/O error, when the file cannot be opened or read.
-fn last_assistant_text(path: &str) -> Result<Option<LastMessage>, String> {
-    last_assistant_text_within(path, TRANSCRIPT_TAIL_MAX)
-}
-
-/// [`last_assistant_text`] over the last `tail_max` bytes of the file — the
-/// bound is a parameter so a test can pin the tail read with a small file.
+/// The path and the I/O error, when the file cannot be opened or read, or
+/// when it is not a regular file.
 ///
-/// EVERY LINE IS PARSED, NEVER MATCHED. A tool result that quotes
-/// `"type":"assistant"` is a string VALUE inside a `user` line, and the parser
-/// steps over it whole; the cheap `contains` is only a way to skip the lines
-/// that cannot qualify without parsing them. A sidechain line (a subagent's,
-/// should one share the file) is not the agent's own message.
 ///
 /// A REGULAR FILE, OR NOTHING — judged by `stat` BEFORE the open. The path is
 /// the vendor's to hand over and the file the agent's own, and a FIFO at it
@@ -1132,12 +1184,13 @@ fn last_assistant_text(path: &str) -> Result<Option<LastMessage>, String> {
 /// ever): nothing here is bounded by [`LANE_DEADLINE`], so the vendor's 600 s
 /// `Stop` timeout would be the only thing to end the hook. The read is capped
 /// at `tail_max` bytes besides, whatever the file has become since the `stat`.
-fn last_assistant_text_within(path: &str, tail_max: u64) -> Result<Option<LastMessage>, String> {
+fn final_message_within(path: &str, tail_max: u64) -> Result<(Turn, Stamp), String> {
     use std::io::{Seek, SeekFrom};
     let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{path}: not a regular file"));
     }
+    let stamp = (meta.len(), meta.modified().ok());
     let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let len = meta.len();
     let cut = len > tail_max;
@@ -1156,40 +1209,389 @@ fn last_assistant_text_within(path: &str, tail_max: u64) -> Result<Option<LastMe
     } else {
         &text
     };
+    Ok((scan_turn(text), stamp))
+}
+
+/// The turn that just ended, read from the END of a Claude Code transcript
+/// (JSONL, one object per line; this build writes each content block of an
+/// assistant message on a line of its own, the lines of one message sharing
+/// its `message.id`).
+///
+/// **THE TURN IS WHAT FOLLOWS THE LAST PROMPT — AND A WAKE OPENS A NEW
+/// SEGMENT OF IT.** Walking up from the end, a `user` line that is not a tool
+/// result and not `isMeta` is the prompt that opened the turn, and the walk
+/// stops there: a turn that displayed nothing reports nothing — never the
+/// previous turn's words, which is a stale report. The walk stops as well at
+/// the `Stop` hook's feedback line ([`is_wake`]): a `Stop` that blocked (this
+/// hook's own wake) keeps the TURN alive, and the reply the agent gives after
+/// it is a new message, reported by the next `Stop` — not the one before the
+/// wake, which the previous `Stop` already reported. Without this, a reply
+/// not yet flushed made the file's older message "the last one", and a
+/// reply in the same words as it was dropped as already reported.
+///
+/// **THE MESSAGE IS THE LAST ONE THAT DISPLAYED ANYTHING.** Messages that
+/// show nothing (a `tool_use`, empty text, an empty `thinking` block — hidden
+/// reasoning is stored with no text in this build) are walked past; the first
+/// message met with something in it is the one, all of its lines, and its
+/// DISPLAYED blocks are joined in order with `\n`: `text` blocks and
+/// narration ([`is_narration`]). A `thinking` block with text and no
+/// narration mark is hidden reasoning, and is never taken — when that is all
+/// the message holds, [`Turn::undisplayed`] says so and nothing is.
+///
+/// **AND THE LINE THAT OPENED THE SEGMENT IS ITS ANCHOR** ([`Turn::anchor`]):
+/// once the message is collected the walk goes on, parsing only the `user`
+/// lines that could open a segment, to the prompt or wake above it.
+///
+/// EVERY LINE IS PARSED, NEVER MATCHED. A tool result that quotes
+/// `"type":"assistant"` is a string VALUE inside a `user` line, and the parser
+/// steps over it whole; the cheap `contains` only skips lines that cannot
+/// qualify (a quote inside a string value is escaped, so the bare token
+/// `"type":"tool_result"` is structure, never text). A sidechain line (a
+/// subagent's, should one share the file) is not the agent's own.
+fn scan_turn(text: &str) -> Turn {
+    let mut turn = Turn::default();
+    // The message being collected, as its `message.id` — `Some(None)` for a
+    // line with no id, which is a message of its own — once one is found.
+    let mut group: Option<Option<String>> = None;
+    let mut parts: Vec<String> = Vec::new();
+    let mut uuid: Option<String> = None;
+    let mut hidden = false;
+    // The message is whole: the walk only looks for the segment's anchor.
+    let mut collected = false;
     for line in text.lines().rev() {
-        if !line.contains("assistant") {
+        if !line.contains("assistant") && !line.contains("\"user\"") {
+            continue;
+        }
+        if collected && (!line.contains("\"user\"") || line.contains("\"type\":\"tool_result\"")) {
             continue;
         }
         let Ok(doc) = Json::parse(line) else {
             continue;
         };
-        if doc.get("type").and_then(Json::as_str) != Some("assistant")
-            || doc.get("isSidechain") == Some(&Json::Bool(true))
-        {
+        if doc.get("isSidechain") == Some(&Json::Bool(true)) {
             continue;
         }
-        let Some(content) = doc.get("message").and_then(|m| m.get("content")) else {
-            continue;
-        };
-        let texts: Vec<&str> = match content {
-            Json::Str(s) => vec![s.as_str()],
-            Json::Array(blocks) => blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(Json::as_str) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(Json::as_str))
-                .collect(),
-            _ => Vec::new(),
-        };
-        let texts: Vec<&str> = texts.into_iter().filter(|t| !t.trim().is_empty()).collect();
-        if texts.is_empty() {
-            continue;
+        match doc.get("type").and_then(Json::as_str) {
+            Some("user") if is_prompt(&doc) || is_wake(&doc) => {
+                turn.anchor = doc.get("uuid").and_then(Json::as_str).map(str::to_string);
+                break;
+            }
+            Some("assistant") if !collected => {}
+            _ => continue,
         }
-        return Ok(Some(LastMessage {
-            text: texts.join("\n"),
-            uuid: doc.get("uuid").and_then(Json::as_str).map(str::to_string),
-        }));
+        let Some(message) = doc.get("message") else {
+            continue;
+        };
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        if turn.tail_text.is_none() {
+            turn.tail_text = Some(vendor_text(content));
+        }
+        let id = message.get("id").and_then(Json::as_str);
+        if let Some(current) = &group {
+            if current.is_none() || current.as_deref() != id {
+                collected = true;
+                continue;
+            }
+        }
+        let (shown, hides) = displayed(content);
+        if group.is_none() {
+            if shown.is_empty() && !hides {
+                continue;
+            }
+            group = Some(id.map(str::to_string));
+        }
+        hidden |= hides;
+        if !shown.is_empty() && uuid.is_none() {
+            uuid = doc.get("uuid").and_then(Json::as_str).map(str::to_string);
+        }
+        parts.extend(shown.into_iter().rev());
     }
-    Ok(None)
+    if parts.is_empty() {
+        turn.undisplayed = hidden;
+    } else {
+        parts.reverse();
+        turn.message = Some(LastMessage {
+            text: parts.join("\n"),
+            uuid,
+            anchor: turn.anchor.clone(),
+        });
+    }
+    turn
+}
+
+/// The words Claude Code opens a `Stop` hook's feedback line with.
+///
+/// MEASURED IN THE 2.1.268 BINARY: a `Stop` hook that blocks (exit 2, this
+/// hook's own wake) is answered with `Ce({content:eZe(blockingError),
+/// isMeta:!0})`, `eZe(e)` being `IIt("Stop",e.blockingError)` and
+/// `IIt(e,n)` `` `${e} hook feedback:\n${n}` ``: a `user` line, `isMeta`,
+/// whose content is a STRING that starts with these words. And on the live
+/// worker's transcript (structure only, 2026-09-15): 55 such lines, every one
+/// followed by an `attachment` line and the `stop_hook_summary`, and after
+/// the `Stop`'s final assistant line (51; a `permission-mode` line between
+/// them in 4); the agent's reply came next in 53.
+const STOP_FEEDBACK: &str = "Stop hook feedback:";
+
+/// Whether a `user` line is the `Stop` hook's FEEDBACK — the line a wake
+/// adds to the conversation ([`STOP_FEEDBACK`]). `isMeta` alone is not it:
+/// the vendor marks other lines `isMeta` in the middle of a turn (measured:
+/// a tool's images after its result, a local command's output, other
+/// injected text), and none of those opens a segment.
+fn is_wake(doc: &Json) -> bool {
+    doc.get("isMeta") == Some(&Json::Bool(true))
+        && matches!(
+            doc.get("message").and_then(|m| m.get("content")),
+            Some(Json::Str(s)) if s.starts_with(STOP_FEEDBACK)
+        )
+}
+
+/// Whether a `user` line is a PROMPT — the start of a turn — rather than a
+/// tool's result coming back or a line the vendor marks `isMeta`.
+fn is_prompt(doc: &Json) -> bool {
+    if doc.get("isMeta") == Some(&Json::Bool(true)) {
+        return false;
+    }
+    match doc.get("message").and_then(|m| m.get("content")) {
+        Some(Json::Str(_)) => true,
+        Some(Json::Array(blocks)) => !blocks
+            .iter()
+            .any(|b| b.get("type").and_then(Json::as_str) == Some("tool_result")),
+        _ => false,
+    }
+}
+
+/// The blocks of one line's `content` that Claude Code DISPLAYS, in order —
+/// non-empty `text`, and `thinking` that carries the narration mark — and
+/// whether the line also holds a `thinking` block with text and no mark
+/// (hidden reasoning, which is left out and reported as such). A bare-string
+/// `content` (the older shape) is displayed text.
+fn displayed(content: &Json) -> (Vec<String>, bool) {
+    let mut shown = Vec::new();
+    let mut hides = false;
+    match content {
+        Json::Str(s) if !s.trim().is_empty() => shown.push(s.clone()),
+        Json::Array(blocks) => {
+            for block in blocks {
+                match block.get("type").and_then(Json::as_str) {
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(Json::as_str) {
+                            if !t.trim().is_empty() {
+                                shown.push(t.to_string());
+                            }
+                        }
+                    }
+                    Some("thinking") => {
+                        let t = block.get("thinking").and_then(Json::as_str).unwrap_or("");
+                        if t.trim().is_empty() {
+                            continue;
+                        }
+                        let signature = block.get("signature").and_then(Json::as_str);
+                        if signature.is_some_and(is_narration) {
+                            shown.push(t.to_string());
+                        } else {
+                            hides = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    (shown, hides)
+}
+
+/// A line's `content` read the way the vendor computes
+/// `last_assistant_message` ([`last_assistant_message`]): every `text`
+/// block's text joined with a newline, trimmed — the binary's `Pr(content,
+/// "\n").trim()`, byte for byte, so a line of two text blocks matches.
+fn vendor_text(content: &Json) -> String {
+    match content {
+        Json::Str(s) => s.trim().to_string(),
+        Json::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Json::as_str) == Some("text"))
+            .map(|b| b.get("text").and_then(Json::as_str).unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The kind of a `thinking` block's signature that Claude Code DISPLAYS.
+const NARRATION: &[u8] = b"narration";
+
+/// Whether a `thinking` block's `signature` marks it as NARRATION — the `⏺`
+/// text this Claude Code build (2.1.267/2.1.268) shows between tool calls and
+/// stores as a `thinking` block — rather than hidden reasoning.
+///
+/// MEASURED ON STRUCTURE ONLY (2026-09-15, two real transcripts, 5,920
+/// `thinking` blocks, types, lengths and field numbers printed, never
+/// content): the signature is base64 of a protobuf whose payload (field 2)
+/// opens with a header (its field 1), and the header's field 8 is a string
+/// naming the block's kind — `narration` on every block Claude Code
+/// displayed, `thinking` on every other. The two sets split cleanly in both
+/// builds (2.1.220, whose header has more fields, and 2.1.267): every block
+/// with text in it was `narration`; every `thinking` block was empty (this
+/// build stores hidden reasoning with no text at all). The last few
+/// narration blocks were checked against the live screen, as booleans: each
+/// one was on it.
+///
+/// So the test is structural — field 2, then field 1, then field 8, equal to
+/// `narration` — never a search for the word, which could sit anywhere in
+/// the opaque rest of the payload. A signature that is not base64, not this
+/// protobuf, or of another kind is NOT narration: the rule fails closed, and
+/// a block it cannot place is hidden reasoning for the purpose of posting.
+fn is_narration(signature: &str) -> bool {
+    base64_decode(signature).is_some_and(|bytes| signature_kind(&bytes) == Some(NARRATION))
+}
+
+/// Field 8 of field 1 of field 2 of a decoded signature (see [`is_narration`]).
+fn signature_kind(bytes: &[u8]) -> Option<&[u8]> {
+    let payload = proto_field(bytes, 2)?;
+    let header = proto_field(payload, 1)?;
+    proto_field(header, 8)
+}
+
+/// The first length-delimited field numbered `want` in a protobuf message,
+/// every other field stepped over by its wire type. `None` for a message that
+/// does not parse (a wire type protobuf does not define, a length past the
+/// end) or lacks the field.
+fn proto_field(mut buf: &[u8], want: u64) -> Option<&[u8]> {
+    while !buf.is_empty() {
+        let (tag, rest) = varint(buf)?;
+        buf = match tag & 7 {
+            0 => varint(rest)?.1,
+            1 => rest.get(8..)?,
+            2 => {
+                let (len, rest) = varint(rest)?;
+                let len = usize::try_from(len).ok()?;
+                let value = rest.get(..len)?;
+                if tag >> 3 == want {
+                    return Some(value);
+                }
+                &rest[len..]
+            }
+            5 => rest.get(4..)?,
+            _ => return None,
+        };
+    }
+    None
+}
+
+/// One protobuf varint off the front of `buf`: the value and the rest.
+fn varint(buf: &[u8]) -> Option<(u64, &[u8])> {
+    let mut value = 0u64;
+    for (i, byte) in buf.iter().enumerate().take(10) {
+        value |= u64::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some((value, &buf[i + 1..]));
+        }
+    }
+    None
+}
+
+/// Standard base64 (`+/`, or the URL-safe `-_`), padding optional — `None`
+/// for any other byte. The crate carries no base64 dependency, and this is
+/// the only place it needs one.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in s.as_bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// How long the report waits for the transcript to hold the turn's end.
+///
+/// **THE TRANSCRIPT LAGS THE CONVERSATION.** Claude Code queues transcript
+/// lines and appends them on a timer (`FLUSH_INTERVAL_MS=100` in the 2.1.268
+/// binary, the `scheduleDrain` of its session writer), and runs the `Stop`
+/// hooks the moment the turn ends — nothing flushes the queue first. The
+/// vendor's own `stop_hook_summary` lines land 10-90 ms after the final
+/// message's timestamp: inside that window. A hook that reads the file at
+/// once can miss the turn's last message and walk back to an older one —
+/// the stale one-liner a live worker's report posted on 2026-09-15 while its
+/// real summary never went.
+struct Pace {
+    /// The longest the report waits, in all.
+    max: Duration,
+    /// With nothing to wait FOR, how long the file must hold still to count
+    /// as settled — past the vendor's flush interval with room for the write.
+    quiet: Duration,
+    /// How often the file's size and mtime are looked at.
+    poll: Duration,
+}
+
+/// The pace a live `Stop` hook uses. The report runs before the wait and the
+/// vendor's `Stop` timeout is 600 s: two seconds at most is nothing to it.
+const CATCH_UP: Pace = Pace {
+    max: Duration::from_secs(2),
+    quiet: Duration::from_millis(300),
+    poll: Duration::from_millis(20),
+};
+
+/// A [`Turn`] read once the transcript caught up — or once [`Pace::max`] ran
+/// out, `caught_up: false`.
+struct Settled {
+    turn: Turn,
+    caught_up: bool,
+}
+
+/// Read the turn from the transcript at `path` once the vendor's writer has
+/// caught up with it ([`Pace`]).
+///
+/// With `expect` — the vendor's `last_assistant_message` — the file has
+/// caught up when the turn's last assistant line reads the same
+/// ([`Turn::tail_text`]): then at once, and usually on the first read. Without
+/// it (an older build; a turn whose last message has no text, which is
+/// exactly the narration case) nothing says what is still to come, so the
+/// file must hold still for [`Pace::quiet`]. The file is re-read only when its
+/// size or mtime moved; the wait is bounded by [`Pace::max`] either way.
+///
+/// # Errors
+///
+/// The reason the transcript could not be read ([`final_message_within`]).
+fn settle(path: &str, expect: Option<&str>, tail_max: u64, pace: &Pace) -> Result<Settled, String> {
+    let start = Instant::now();
+    let (mut turn, mut stamp) = final_message_within(path, tail_max)?;
+    let mut still_since = Instant::now();
+    loop {
+        let caught_up = match expect {
+            Some(want) => turn.tail_text.as_deref() == Some(want),
+            None => still_since.elapsed() >= pace.quiet,
+        };
+        if caught_up || start.elapsed() >= pace.max {
+            return Ok(Settled { turn, caught_up });
+        }
+        std::thread::sleep(pace.poll);
+        let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+        if (meta.len(), meta.modified().ok()) != stamp {
+            (turn, stamp) = final_message_within(path, tail_max)?;
+            still_since = Instant::now();
+        }
+    }
 }
 
 /// The message as posted: whole when it fits [`REPORT_MAX`], else cut on a
@@ -1207,22 +1609,52 @@ fn trim_report(text: &str) -> String {
     format!("{}{marker}", &text[..cut])
 }
 
-/// The content key of one report: FNV-1a over the message's `uuid` (when the
-/// transcript gives one) and the body as posted, as 16 hex digits.
+/// The content key of one report: FNV-1a over the segment's anchor (the
+/// prompt or wake the message follows, [`Turn::anchor`]), the message's
+/// `uuid` (when the transcript gives one) and the body as posted, as 16 hex
+/// digits.
 ///
 /// THE UUID IS PART OF IT ON PURPOSE. A re-fired `Stop` re-reads the SAME
 /// transcript line, so its key is the same and nothing is posted twice; an
 /// agent that ends two turns with the same words has written two lines, and
-/// the second is a report of its own. A transcript with no `uuid` keys on the
-/// body alone, which errs towards posting once.
+/// the second is a report of its own. THE ANCHOR is what a message whose
+/// line is not on disk yet is known by — the vendor's own text, posted as
+/// the fallback ([`displayed_message`]) — and what keeps two segments that
+/// end in the same words apart then. With neither, the body alone is the
+/// key, which errs towards posting once.
 fn report_key(last: &LastMessage, body: &str) -> String {
-    let mut bytes = Vec::with_capacity(body.len() + 40);
+    let mut bytes = Vec::with_capacity(body.len() + 80);
+    if let Some(anchor) = &last.anchor {
+        bytes.extend_from_slice(anchor.as_bytes());
+    }
+    bytes.push(0);
     if let Some(uuid) = &last.uuid {
         bytes.extend_from_slice(uuid.as_bytes());
     }
     bytes.push(0);
     bytes.extend_from_slice(body.as_bytes());
     format!("{:016x}", crate::bridge::fnv1a_64(&bytes))
+}
+
+/// Whether `last` is the message `before` already reported: the same key —
+/// or, when `before` was the vendor's text posted as the FALLBACK (no uuid
+/// then), the same segment and the same words. A `Stop` that re-fires once
+/// the line has landed finds the uuid the fallback could not know; keyed on
+/// it alone, the same text went out twice.
+fn already_reported(before: &LastReport, last: &LastMessage, body: &str) -> bool {
+    if before.key == report_key(last, body) {
+        return true;
+    }
+    before.fallback
+        && before.key
+            == report_key(
+                &LastMessage {
+                    text: String::new(),
+                    uuid: None,
+                    anchor: last.anchor.clone(),
+                },
+                body,
+            )
 }
 
 /// The last report this session posted — its content key, and the newest row
@@ -1233,8 +1665,10 @@ fn report_key(last: &LastMessage, body: &str) -> String {
 /// process. Best-effort both ways: a state dir that cannot be read reads as
 /// "nothing posted yet", one that cannot be written costs the dedup and never
 /// the report — the alternative is a manager that hears nothing because a
-/// log line could not be written. Two lines, `<key>` then `high=<id>`; a
-/// file from before the second line reads as `high=0`.
+/// log line could not be written. Two lines, `<key>` then `high=<id>`, and
+/// a third, `fallback=1`, when the report was the vendor's text posted
+/// without its line's uuid ([`already_reported`]); a file from before the
+/// second line reads as `high=0`.
 struct Posted {
     path: Option<std::path::PathBuf>,
 }
@@ -1246,6 +1680,8 @@ struct LastReport {
     /// The newest `msg` row id in the inbox when it was posted: the tasks a
     /// later report may answer are the ones above it ([`report_task`]).
     high: u64,
+    /// The report was the FALLBACK — the vendor's text, keyed with no uuid.
+    fallback: bool,
 }
 
 impl Posted {
@@ -1266,11 +1702,18 @@ impl Posted {
     fn parse(text: &str) -> Option<LastReport> {
         let mut lines = text.lines().map(str::trim);
         let key = lines.next().filter(|k| !k.is_empty())?.to_string();
-        let high = lines
+        let rest: Vec<&str> = lines.collect();
+        let high = rest
+            .iter()
             .find_map(|l| l.strip_prefix("high="))
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        Some(LastReport { key, high })
+        let fallback = rest.contains(&"fallback=1");
+        Some(LastReport {
+            key,
+            high,
+            fallback,
+        })
     }
 
     fn record(&self, last: &LastReport) {
@@ -1281,7 +1724,9 @@ impl Posted {
             }
         }
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, format!("{}\nhigh={}\n", last.key, last.high)).is_ok() {
+        let fallback = if last.fallback { "fallback=1\n" } else { "" };
+        let text = format!("{}\nhigh={}\n{fallback}", last.key, last.high);
+        if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
     }
@@ -1356,6 +1801,76 @@ impl Landing {
     }
 }
 
+/// The message a `Stop` hook reports: the turn's final DISPLAYED message
+/// from the transcript, once the transcript has caught up with the turn
+/// ([`settle`]).
+///
+/// THE VENDOR'S `last_assistant_message` IS THE FALLBACK, never the first
+/// choice: it is the last message's text only (narration, which this build
+/// stores as `thinking`, is not in it), but it is in the hook's input before
+/// the transcript line is on disk. So when the transcript does not show it
+/// within [`Pace::max`], or cannot be read at all, the vendor's text is what
+/// is posted — `note` says so, with no uuid for the key — rather than a
+/// message the file still had from before. Everything that posts nothing
+/// goes through `say` with its reason: no transcript, a turn that displayed
+/// nothing, a turn whose last message is thinking without the narration mark
+/// (it cannot be told from hidden reasoning, and hidden reasoning is never
+/// posted).
+fn displayed_message(
+    input: &str,
+    pace: &Pace,
+    say: &dyn Fn(&str),
+    note: &dyn Fn(&str),
+) -> Option<LastMessage> {
+    let vendor = last_assistant_message(input);
+    let read = match transcript_path(input) {
+        Some(path) => {
+            settle(&path, vendor.as_deref(), TRANSCRIPT_TAIL_MAX, pace).map(|s| (path, s))
+        }
+        None => Err("no transcript_path in the hook input".to_string()),
+    };
+    // THE FALLBACK KEEPS THE SEGMENT'S ANCHOR: the prompt or wake the reply
+    // follows is on disk long before the reply is (it was flushed before the
+    // model answered), so a later `Stop` that finds the reply's own line keys
+    // it to the same segment ([`already_reported`]).
+    let fallback = |text: String, anchor: Option<String>, why: &str| {
+        note(&format!(
+            "{why}; posting the vendor's last_assistant_message (its text only)"
+        ));
+        Some(LastMessage {
+            text,
+            uuid: None,
+            anchor,
+        })
+    };
+    let (path, settled) = match (read, vendor) {
+        (Ok((_, settled)), Some(text)) if !settled.caught_up => {
+            let why = format!(
+                "the transcript did not show the turn's last message within {} ms",
+                pace.max.as_millis()
+            );
+            return fallback(text, settled.turn.anchor, &why);
+        }
+        (Ok(read), _) => read,
+        (Err(e), Some(text)) => return fallback(text, None, &e),
+        (Err(e), None) => {
+            say(&e);
+            return None;
+        }
+    };
+    let turn = settled.turn;
+    if turn.message.is_none() {
+        say(&if turn.undisplayed {
+            "the turn's last message is thinking without Claude Code's narration mark — it \
+             cannot be told from hidden reasoning, which is never posted"
+                .to_string()
+        } else {
+            format!("no displayed assistant message in the turn that ended, in {path}")
+        });
+    }
+    turn.message
+}
+
 /// `--report-to`: post the agent's last message to `to` as `kind=report`.
 ///
 /// FAIL-OPEN AT EVERY STEP, and every step that stops says why on stderr —
@@ -1381,19 +1896,18 @@ impl Landing {
 /// remedy; refused, neither, and the endpoint's words.
 fn report(ctl: &mut Ctl, opts: &Opts, to: &str, input: &str, ledger: &Ledger) {
     let say = |why: &str| eprintln!("aterm-link hook: report to @{to}: {why}; nothing posted");
-    let Some(path) = transcript_path(input) else {
-        return say("no transcript_path in the hook input");
-    };
-    let last = match last_assistant_text(&path) {
-        Ok(Some(last)) => last,
-        Ok(None) => return say(&format!("no assistant message with text in {path}")),
-        Err(e) => return say(&e),
+    let note = |what: &str| eprintln!("aterm-link hook: report to @{to}: {what}");
+    let Some(last) = displayed_message(input, &CATCH_UP, &say, &note) else {
+        return;
     };
     let body = trim_report(&last.text);
     let key = report_key(&last, &body);
     let posted = Posted::new(opts);
     let before = posted.last();
-    if before.as_ref().is_some_and(|b| b.key == key) {
+    if before
+        .as_ref()
+        .is_some_and(|b| already_reported(b, &last, &body))
+    {
         return say("this message was already reported (a re-fired Stop)");
     }
     if ledger.spent() {
@@ -1422,7 +1936,11 @@ fn report(ctl: &mut Ctl, opts: &Opts, to: &str, input: &str, ledger: &Ledger) {
         Ok(reply) => reply,
         Err(e) => return say(&format!("post: {e}")),
     };
-    let last = LastReport { key, high };
+    let last = LastReport {
+        key,
+        high,
+        fallback: last.uuid.is_none(),
+    };
     match Landing::of(reply.header()) {
         Landing::Landed => {
             posted.record(&last);
@@ -2495,6 +3013,17 @@ fn open(opts: &Opts, event: &str) -> Option<Ctl> {
 mod tests {
     use super::*;
 
+    /// The turn's final displayed message in the transcript at `path`, read
+    /// whole ([`final_message_within`] at the live bound).
+    fn read_final(path: &str) -> Result<Option<LastMessage>, String> {
+        read_final_within(path, TRANSCRIPT_TAIL_MAX)
+    }
+
+    /// [`read_final`] over the last `tail_max` bytes.
+    fn read_final_within(path: &str, tail_max: u64) -> Result<Option<LastMessage>, String> {
+        final_message_within(path, tail_max).map(|(turn, _)| turn.message)
+    }
+
     /// An `Opts` with nothing set, for the tests that set one or two fields.
     fn bare() -> Opts {
         Opts {
@@ -3185,28 +3714,26 @@ mod tests {
     fn the_last_assistant_text_is_taken_from_the_transcript() {
         let dir = scratch("last");
         let path = transcript(&dir, "t.jsonl", "All 248 tests pass.\nDone.");
-        let last = last_assistant_text(&path)
+        let last = read_final(&path)
             .expect("the file reads")
             .expect("a message");
         assert_eq!(last.text, "All 248 tests pass.\nDone.");
         assert_eq!(last.uuid.as_deref(), Some("a4"));
 
-        // The last text line is QUOTED inside a later user line: still the
-        // real one, never the quoted one.
+        // A prompt that QUOTES an assistant line opens the turn: the real
+        // answer under it is the message, never the quoted one.
         let path = dir.join("quoted.jsonl");
         std::fs::write(
             &path,
             concat!(
-                r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"real"}]}}"#,
-                "\n",
                 r#"{"type":"user","uuid":"u1","message":{"content":"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"QUOTED\"}]}}"}}"#,
+                "\n",
+                r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"real"}]}}"#,
                 "\n",
             ),
         )
         .unwrap();
-        let last = last_assistant_text(&path.display().to_string())
-            .unwrap()
-            .unwrap();
+        let last = read_final(&path.display().to_string()).unwrap().unwrap();
         assert_eq!(last.text, "real");
 
         // Sidechain skipped, blocks joined, the older string shape read, an
@@ -3226,9 +3753,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let last = last_assistant_text(&path.display().to_string())
-            .unwrap()
-            .unwrap();
+        let last = read_final(&path.display().to_string()).unwrap().unwrap();
         assert_eq!(last.text, "one\ntwo");
         assert_eq!(last.uuid.as_deref(), Some("s1"));
         let path = dir.join("older.jsonl");
@@ -3237,9 +3762,7 @@ mod tests {
             "{\"type\":\"assistant\",\"message\":{\"content\":\"older shape\"}}\n",
         )
         .unwrap();
-        let last = last_assistant_text(&path.display().to_string())
-            .unwrap()
-            .unwrap();
+        let last = read_final(&path.display().to_string()).unwrap().unwrap();
         assert_eq!(last.text, "older shape");
         assert_eq!(last.uuid, None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3252,7 +3775,7 @@ mod tests {
     fn a_transcript_that_is_not_claudes_yields_nothing() {
         let dir = scratch("none");
         let missing = dir.join("missing.jsonl").display().to_string();
-        assert!(last_assistant_text(&missing).is_err());
+        assert!(read_final(&missing).is_err());
         for (name, body) in [
             ("empty.jsonl", ""),
             ("prose.txt", "an assistant said hello\nand that was all\n"),
@@ -3265,7 +3788,7 @@ mod tests {
         ] {
             let path = dir.join(name);
             std::fs::write(&path, body).unwrap();
-            let got = last_assistant_text(&path.display().to_string()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let got = read_final(&path.display().to_string()).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(got.is_none(), "{name} must yield nothing");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -3286,15 +3809,544 @@ mod tests {
         std::fs::write(&path, format!("{filler}{filler}{last}")).unwrap();
         let p = path.display().to_string();
         // A tail that holds the last line and a torn piece of the one before.
-        let got = last_assistant_text_within(&p, (last.len() + 40) as u64)
+        let got = read_final_within(&p, (last.len() + 40) as u64)
             .unwrap()
             .expect("the last line is inside the tail");
         assert_eq!(got.text, "the end");
         assert_eq!(got.uuid.as_deref(), Some("new"));
         // A tail too short for even the last line: nothing, not a torn message.
-        assert!(last_assistant_text_within(&p, 20).unwrap().is_none());
+        assert!(read_final_within(&p, 20).unwrap().is_none());
         // The whole file: the same answer.
-        assert_eq!(last_assistant_text(&p).unwrap().unwrap().text, "the end");
+        assert_eq!(read_final(&p).unwrap().unwrap().text, "the end");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- what the worker DISPLAYED (round 16 addendum) --------------------
+
+    /// Standard padded base64 — the test side of [`base64_decode`].
+    fn b64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                chunk.get(1).copied().unwrap_or(0),
+                chunk.get(2).copied().unwrap_or(0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// One length-delimited protobuf field.
+    fn proto(number: u8, value: &[u8]) -> Vec<u8> {
+        let mut out = vec![(number << 3) | 2];
+        let mut len = value.len();
+        loop {
+            let byte = (len & 0x7f) as u8;
+            len >>= 7;
+            if len == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// A SYNTHETIC signature in the shape measured on this Claude Code build
+    /// — field numbers and wire types only, every byte made up here: a
+    /// varint; the payload (a header whose field 8 is `kind`, two 12-byte
+    /// fields, a 48-byte one, an opaque tail with `tail` at its end); a varint.
+    fn signature_with(kind: &str, tail: &[u8]) -> String {
+        let mut header = vec![0x08, 0x01, 0x18, 0x02, 0x38, 0x01];
+        header.extend(proto(8, kind.as_bytes()));
+        let mut payload = proto(1, &header);
+        payload.extend(proto(2, &[0xa5; 12]));
+        payload.extend(proto(3, &[0x5a; 12]));
+        payload.extend(proto(4, &[0x3c; 48]));
+        let mut opaque: Vec<u8> = (0..96u8).map(|i| i.wrapping_mul(37)).collect();
+        opaque.extend_from_slice(tail);
+        payload.extend(proto(5, &opaque));
+        let mut top = vec![0x08, 0x02];
+        top.extend(proto(2, &payload));
+        top.extend([0x18, 0x01]);
+        b64(&top)
+    }
+
+    fn signature(kind: &str) -> String {
+        signature_with(kind, &[])
+    }
+
+    /// The lines of a SYNTHETIC transcript in this build's shape — one content
+    /// block per line, the lines of one API message sharing its `message.id`.
+    fn prompt_line(uuid: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","isSidechain":false,"message":{{"role":"user","content":{}}}}}"#,
+            crate::json::string(text)
+        )
+    }
+
+    fn result_line(uuid: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"ok"}}]}}}}"#
+        )
+    }
+
+    fn block_line(uuid: &str, id: &str, block: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","isSidechain":false,"message":{{"id":"{id}","role":"assistant","content":[{block}]}}}}"#
+        )
+    }
+
+    fn text_block(text: &str) -> String {
+        format!(r#"{{"type":"text","text":{}}}"#, crate::json::string(text))
+    }
+
+    fn thinking_block(text: &str, signature: Option<&str>) -> String {
+        let text = crate::json::string(text);
+        match signature {
+            Some(sig) => format!(
+                r#"{{"type":"thinking","thinking":{text},"signature":{}}}"#,
+                crate::json::string(sig)
+            ),
+            None => format!(r#"{{"type":"thinking","thinking":{text}}}"#),
+        }
+    }
+
+    fn tool_block() -> String {
+        r#"{"type":"tool_use","id":"t","name":"Bash","input":{"command":"true"}}"#.to_string()
+    }
+
+    fn write_lines(dir: &std::path::Path, name: &str, lines: &[String]) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
+        path.display().to_string()
+    }
+
+    fn append_lines(path: &str, lines: &[String]) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open to append");
+        f.write_all((lines.join("\n") + "\n").as_bytes())
+            .expect("append");
+    }
+
+    /// The head of a turn the vendor had written when `Stop` fired, and the
+    /// final message it had not: the live 2026-09-15 shape, words made up.
+    fn lagging_turn() -> (Vec<String>, Vec<String>) {
+        let narr = signature("narration");
+        let hid = signature("thinking");
+        let head = vec![
+            prompt_line("u1", "run the rehearsal"),
+            block_line("a1", "m1", &thinking_block("", Some(&hid))),
+            block_line("a2", "m1", &text_block("Starting the rehearsal.")),
+            block_line("a3", "m1", &tool_block()),
+            result_line("u2"),
+            block_line("a4", "m2", &thinking_block("", Some(&hid))),
+            block_line(
+                "a5",
+                "m2",
+                &thinking_block("The rehearsal finished; checking its outcome:", Some(&narr)),
+            ),
+            block_line("a6", "m2", &tool_block()),
+            result_line("u3"),
+        ];
+        let tail = vec![
+            block_line("a7", "m3", &thinking_block("", Some(&hid))),
+            block_line(
+                "a8",
+                "m3",
+                &text_block("Done: 12 of 12 cases pass; merged."),
+            ),
+        ];
+        (head, tail)
+    }
+
+    /// **NARRATION IS WHAT THE WORKER SAID.** A turn whose last message is
+    /// narration — a `thinking` block with the mark, beside an empty hidden
+    /// one — reports that narration, with its line's uuid; the earlier text
+    /// block (what the round-14 reader took, the stale one-liner) is not it.
+    /// The decoder reads the measured shape, and the kind is structural.
+    #[test]
+    fn a_turn_that_ends_in_narration_reports_the_narration() {
+        let dir = scratch("narr");
+        let narr = signature("narration");
+        let hid = signature("thinking");
+        let (mut lines, _) = lagging_turn();
+        lines.push(block_line("a7", "m3", &thinking_block("", Some(&hid))));
+        lines.push(block_line(
+            "a8",
+            "m3",
+            &thinking_block("All 12 cases pass; the branch is merged.", Some(&narr)),
+        ));
+        lines.push(r#"{"type":"system","subtype":"stop_hook_summary","uuid":"s1"}"#.to_string());
+        let path = write_lines(&dir, "t.jsonl", &lines);
+        let last = read_final(&path)
+            .unwrap()
+            .expect("the narration is the message");
+        assert_eq!(last.text, "All 12 cases pass; the branch is merged.");
+        assert_eq!(last.uuid.as_deref(), Some("a8"));
+
+        assert!(is_narration(&narr));
+        assert!(!is_narration(&hid));
+        let decoded = base64_decode(&narr).expect("base64");
+        assert_eq!(b64(&decoded), narr, "the decoder inverts the encoder");
+        assert_eq!(signature_kind(&decoded), Some(&b"narration"[..]));
+        // Unpadded and URL-safe spellings decode to the same bytes.
+        let unpadded = narr.trim_end_matches('=');
+        assert_eq!(base64_decode(unpadded), Some(decoded.clone()));
+        let url = narr.replace('+', "-").replace('/', "_");
+        assert_eq!(base64_decode(&url), Some(decoded));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **HIDDEN REASONING IS NEVER POSTED.** A `thinking` block with text is
+    /// hidden unless its signature's header says `narration`: the kind
+    /// `thinking`, no signature, an empty one, one that is not base64, the
+    /// bare word base64-encoded (not the protobuf), and the marker's very
+    /// bytes planted in the opaque payload under a `thinking` kind. As the
+    /// turn's last message alone it posts NOTHING — not the older narration
+    /// under it either — and `undisplayed` says why; beside displayed blocks
+    /// of the same message, those are posted and it is not.
+    #[test]
+    fn hidden_reasoning_is_never_posted() {
+        const SECRET: &str = "HIDDEN-REASONING-SENTINEL";
+        let narr = signature("narration");
+        let hid = signature("thinking");
+        let planted = signature_with("thinking", b"\x42\x09narration");
+        let word = b64(b"narration");
+        let summary = signature("summary");
+        for (name, sig) in [
+            ("kind thinking", Some(hid.as_str())),
+            ("no signature", None),
+            ("an empty signature", Some("")),
+            ("not base64", Some("not base64 at all!")),
+            ("the word, not the field", Some(word.as_str())),
+            ("the bytes planted in the payload", Some(planted.as_str())),
+            ("another kind", Some(summary.as_str())),
+        ] {
+            let block = thinking_block(SECRET, sig);
+            let alone = [
+                prompt_line("u1", "go"),
+                block_line(
+                    "a1",
+                    "m1",
+                    &thinking_block("Earlier narration.", Some(&narr)),
+                ),
+                block_line("a2", "m1", &tool_block()),
+                result_line("u2"),
+                block_line("a3", "m2", &block),
+            ];
+            let turn = scan_turn(&alone.join("\n"));
+            assert!(turn.message.is_none(), "{name}");
+            assert!(turn.undisplayed, "{name}");
+
+            let beside = [
+                prompt_line("u1", "go"),
+                block_line("a1", "m1", &block),
+                block_line("a2", "m1", &thinking_block("Shown narration.", Some(&narr))),
+                block_line("a3", "m1", &text_block("Shown text.")),
+            ];
+            let turn = scan_turn(&beside.join("\n"));
+            let message = turn.message.expect(name);
+            assert_eq!(message.text, "Shown narration.\nShown text.", "{name}");
+            assert!(!message.text.contains(SECRET), "{name}");
+            assert_eq!(message.uuid.as_deref(), Some("a3"), "{name}");
+        }
+        assert!(!is_narration(&planted));
+        assert!(!is_narration(&word));
+        assert_eq!(base64_decode("no!"), None);
+        assert_eq!(
+            signature_kind(b"\x0a\x05abc"),
+            None,
+            "a length past the end"
+        );
+        assert_eq!(
+            signature_kind(b"\x0f"),
+            None,
+            "a wire type protobuf does not define"
+        );
+    }
+
+    /// **MIXED: THE TEXT AND THE NARRATION, IN ORDER, AND NOTHING ELSE.** One
+    /// API message over several lines (this build) and the same blocks on
+    /// ONE line (the older multi-block shape) read the same: hidden
+    /// reasoning with text, then narration, then text → narration and text.
+    /// The message before it — another `message.id` — is not part of it.
+    #[test]
+    fn a_mixed_final_message_posts_its_text_and_narration_only() {
+        const SECRET: &str = "HIDDEN-REASONING-SENTINEL";
+        let narr = signature("narration");
+        let hid = signature("thinking");
+        let lines = [
+            prompt_line("u1", "go"),
+            block_line("a1", "m1", &text_block("Looking at the suite first.")),
+            block_line("a2", "m1", &tool_block()),
+            result_line("u2"),
+            block_line("a3", "m2", &thinking_block(SECRET, Some(&hid))),
+            block_line(
+                "a4",
+                "m2",
+                &thinking_block("The suite is green.", Some(&narr)),
+            ),
+            block_line("a5", "m2", &text_block("Merged; 248 tests pass.")),
+        ];
+        let message = scan_turn(&lines.join("\n")).message.expect("a message");
+        assert_eq!(message.text, "The suite is green.\nMerged; 248 tests pass.");
+        assert_eq!(message.uuid.as_deref(), Some("a5"));
+
+        let one_line = format!(
+            r#"{{"type":"assistant","uuid":"b1","message":{{"role":"assistant","content":[{},{},{}]}}}}"#,
+            thinking_block(SECRET, Some(&hid)),
+            thinking_block("The suite is green.", Some(&narr)),
+            text_block("Merged; 248 tests pass."),
+        );
+        let lines = [prompt_line("u1", "go"), one_line];
+        let message = scan_turn(&lines.join("\n")).message.expect("a message");
+        assert_eq!(message.text, "The suite is green.\nMerged; 248 tests pass.");
+        assert!(!message.text.contains(SECRET));
+        assert_eq!(message.uuid.as_deref(), Some("b1"));
+    }
+
+    /// **THE TURN STARTS AT ITS PROMPT.** A turn that displayed nothing
+    /// reports nothing — never the previous turn's words — while a tool
+    /// result and an `isMeta` user line are inside the turn, not its start.
+    /// An empty `thinking` block and an empty text are nothing displayed.
+    #[test]
+    fn the_turn_ends_at_the_last_prompt_and_a_quiet_turn_reports_nothing() {
+        let hid = signature("thinking");
+        let lines = [
+            block_line("a1", "m1", &text_block("The previous turn's words.")),
+            prompt_line("u1", "next"),
+            block_line("a2", "m2", &thinking_block("", Some(&hid))),
+            block_line("a3", "m2", &tool_block()),
+            result_line("u2"),
+            block_line("a4", "m3", &text_block("   ")),
+        ];
+        let turn = scan_turn(&lines.join("\n"));
+        assert!(turn.message.is_none());
+        assert!(!turn.undisplayed);
+        assert_eq!(turn.tail_text.as_deref(), Some(""));
+
+        let meta = r#"{"type":"user","uuid":"m","isMeta":true,"message":{"role":"user","content":"a caveat"}}"#;
+        let lines = [
+            prompt_line("u1", "go"),
+            block_line("a1", "m1", &text_block("Said before the meta line.")),
+            meta.to_string(),
+            result_line("u2"),
+            block_line("a2", "m2", &tool_block()),
+        ];
+        let message = scan_turn(&lines.join("\n"))
+            .message
+            .expect("inside the turn");
+        assert_eq!(message.text, "Said before the meta line.");
+    }
+
+    /// `last_assistant_message` is read from the parsed `Stop` input, trimmed;
+    /// empty, absent, not a string, or a document that does not parse: none.
+    #[test]
+    fn the_vendors_last_message_is_read_from_the_stop_input() {
+        assert_eq!(
+            last_assistant_message(
+                r#"{"transcript_path":"/t","last_assistant_message":" Done. \n"}"#
+            ),
+            Some("Done.".to_string())
+        );
+        assert_eq!(
+            last_assistant_message(r#"{"last_assistant_message":"  "}"#),
+            None
+        );
+        assert_eq!(
+            last_assistant_message(r#"{"last_assistant_message":7}"#),
+            None
+        );
+        assert_eq!(
+            last_assistant_message(r#"{"a":{"last_assistant_message":"x"}}"#),
+            None
+        );
+        assert_eq!(last_assistant_message("{{{"), None);
+        assert_eq!(last_assistant_message(""), None);
+    }
+
+    /// **THE TRANSCRIPT LAGS; THE READ WAITS FOR IT.** Read at once, the file
+    /// the vendor had written when `Stop` fired says the stale narration.
+    /// With the vendor's `last_assistant_message`, [`settle`] waits until the
+    /// file's last assistant line reads the same; without it, until the file
+    /// held still for the quiet window; a message that never lands ends the
+    /// wait at `max` with `caught_up: false`; one already there costs no wait.
+    #[test]
+    fn the_report_waits_for_the_transcript_to_catch_up() {
+        let dir = scratch("settle");
+        let (head, tail) = lagging_turn();
+        let fin = "Done: 12 of 12 cases pass; merged.";
+        let stale = scan_turn(&head.join("\n")).message.expect("the stale one");
+        assert_eq!(stale.text, "The rehearsal finished; checking its outcome:");
+
+        let later = |path: &str, after: Duration| {
+            let (path, tail) = (path.to_string(), tail.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                append_lines(&path, &tail);
+            })
+        };
+
+        let path = write_lines(&dir, "vendor.jsonl", &head);
+        let writer = later(&path, Duration::from_millis(150));
+        let pace = Pace {
+            max: Duration::from_secs(20),
+            quiet: Duration::from_millis(300),
+            poll: Duration::from_millis(5),
+        };
+        let got = settle(&path, Some(fin), TRANSCRIPT_TAIL_MAX, &pace).expect("reads");
+        writer.join().expect("the writer");
+        assert!(got.caught_up);
+        let message = got.turn.message.expect("the final message");
+        assert_eq!(message.text, fin);
+        assert_eq!(message.uuid.as_deref(), Some("a8"));
+
+        let path = write_lines(&dir, "quiet.jsonl", &head);
+        let writer = later(&path, Duration::from_millis(20));
+        let pace = Pace {
+            max: Duration::from_secs(20),
+            quiet: Duration::from_millis(1500),
+            poll: Duration::from_millis(5),
+        };
+        let got = settle(&path, None, TRANSCRIPT_TAIL_MAX, &pace).expect("reads");
+        writer.join().expect("the writer");
+        assert!(got.caught_up);
+        assert_eq!(got.turn.message.expect("final").text, fin);
+
+        let path = write_lines(&dir, "never.jsonl", &head);
+        let t0 = Instant::now();
+        let pace = Pace {
+            max: Duration::from_millis(200),
+            quiet: Duration::from_millis(300),
+            poll: Duration::from_millis(5),
+        };
+        let got = settle(&path, Some("never written"), TRANSCRIPT_TAIL_MAX, &pace).expect("reads");
+        assert!(!got.caught_up);
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+
+        let whole: Vec<String> = head.iter().chain(&tail).cloned().collect();
+        let path = write_lines(&dir, "there.jsonl", &whole);
+        let t0 = Instant::now();
+        let got = settle(&path, Some(fin), TRANSCRIPT_TAIL_MAX, &CATCH_UP).expect("reads");
+        assert!(got.caught_up);
+        assert!(t0.elapsed() < CATCH_UP.max, "{:?}", t0.elapsed());
+        assert_eq!(got.turn.message.expect("final").text, fin);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **THE VENDOR'S TEXT IS THE FALLBACK, NEVER THE FIRST CHOICE.** Caught
+    /// up, the transcript's message is posted (narration included, its uuid
+    /// for the key). Not caught up in time, or no transcript at all, the
+    /// vendor's `last_assistant_message` is — with a note, no uuid. Without
+    /// it, the reason goes to `say` and nothing is returned: no
+    /// `transcript_path`, and a last message that is hidden reasoning.
+    #[test]
+    fn the_displayed_message_falls_back_to_the_vendors_text() {
+        use std::cell::RefCell;
+        let dir = scratch("fallback");
+        let (head, tail) = lagging_turn();
+        let fin = "Done: 12 of 12 cases pass; merged.";
+        let pace = Pace {
+            max: Duration::from_millis(100),
+            quiet: Duration::from_millis(50),
+            poll: Duration::from_millis(5),
+        };
+        let run = |input: &str| {
+            let said = RefCell::new(Vec::new());
+            let noted = RefCell::new(Vec::new());
+            let got = displayed_message(
+                input,
+                &pace,
+                &|w: &str| said.borrow_mut().push(w.to_string()),
+                &|w: &str| noted.borrow_mut().push(w.to_string()),
+            );
+            (got, said.into_inner(), noted.into_inner())
+        };
+        let input = |path: &str, vendor: Option<&str>| {
+            let mut doc = format!(
+                r#"{{"hook_event_name":"Stop","stop_hook_active":false,"transcript_path":{}"#,
+                crate::json::string(path)
+            );
+            if let Some(v) = vendor {
+                doc.push_str(&format!(
+                    r#","last_assistant_message":{}"#,
+                    crate::json::string(v)
+                ));
+            }
+            doc + "}"
+        };
+
+        let whole: Vec<String> = head.iter().chain(&tail).cloned().collect();
+        let there = write_lines(&dir, "there.jsonl", &whole);
+        let (got, said, noted) = run(&input(&there, Some(fin)));
+        let got = got.expect("a message");
+        assert_eq!((got.text.as_str(), got.uuid.as_deref()), (fin, Some("a8")));
+        assert!(said.is_empty() && noted.is_empty(), "{said:?} {noted:?}");
+
+        let lagging = write_lines(&dir, "lagging.jsonl", &head);
+        let (got, said, noted) = run(&input(&lagging, Some(fin)));
+        let got = got.expect("the vendor's text");
+        assert_eq!((got.text.as_str(), got.uuid), (fin, None));
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        assert!(
+            noted[0].contains("did not show the turn's last message within 100 ms"),
+            "{noted:?}"
+        );
+
+        let (got, _, noted) = run(&format!(
+            r#"{{"last_assistant_message":{}}}"#,
+            crate::json::string(fin)
+        ));
+        assert_eq!(got.map(|m| m.text).as_deref(), Some(fin));
+        assert!(
+            noted[0].starts_with("no transcript_path in the hook input; posting"),
+            "{noted:?}"
+        );
+
+        let (got, said, _) = run("{}");
+        assert!(got.is_none());
+        assert_eq!(
+            said,
+            vec!["no transcript_path in the hook input".to_string()]
+        );
+
+        let hid = signature("thinking");
+        let hidden = write_lines(
+            &dir,
+            "hidden.jsonl",
+            &[
+                prompt_line("u1", "go"),
+                block_line(
+                    "a1",
+                    "m1",
+                    &thinking_block("HIDDEN-REASONING-SENTINEL", Some(&hid)),
+                ),
+            ],
+        );
+        let (got, said, noted) = run(&input(&hidden, None));
+        assert!(got.is_none());
+        assert!(noted.is_empty());
+        assert!(
+            said[0].contains("cannot be told from hidden reasoning"),
+            "{said:?}"
+        );
+        assert!(!said[0].contains("SENTINEL"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3319,31 +4371,287 @@ mod tests {
     }
 
     /// The key tells a re-fire (the same transcript line) from a repeat (a new
-    /// line with the same words), and keys on the body alone without a uuid.
+    /// line with the same words), keys a message with no uuid on its segment
+    /// and body, and on the body alone with neither.
     #[test]
     fn the_report_key_tells_a_re_fire_from_a_repeat() {
-        let a = LastMessage {
+        let msg = |uuid: Option<&str>, anchor: Option<&str>| LastMessage {
             text: "Done.".into(),
-            uuid: Some("a1".into()),
+            uuid: uuid.map(str::to_string),
+            anchor: anchor.map(str::to_string),
         };
-        let again = LastMessage {
-            text: "Done.".into(),
-            uuid: Some("a1".into()),
-        };
-        let repeat = LastMessage {
-            text: "Done.".into(),
-            uuid: Some("a2".into()),
-        };
-        let bare = LastMessage {
-            text: "Done.".into(),
-            uuid: None,
-        };
-        assert_eq!(report_key(&a, "Done."), report_key(&again, "Done."));
+        let a = msg(Some("a1"), Some("u1"));
+        assert_eq!(
+            report_key(&a, "Done."),
+            report_key(&msg(Some("a1"), Some("u1")), "Done.")
+        );
+        let repeat = msg(Some("a2"), Some("u1"));
         assert_ne!(report_key(&a, "Done."), report_key(&repeat, "Done."));
+        let bare = msg(None, None);
         assert_ne!(report_key(&a, "Done."), report_key(&bare, "Done."));
         assert_eq!(report_key(&bare, "Done."), report_key(&bare, "Done."));
         assert_ne!(report_key(&bare, "Done."), report_key(&bare, "Done!"));
+        // No uuid: the segment tells two turns' same words apart.
+        assert_ne!(
+            report_key(&msg(None, Some("u1")), "Done."),
+            report_key(&msg(None, Some("u9")), "Done.")
+        );
+        // The two halves of the key cannot be traded for each other.
+        assert_ne!(
+            report_key(&msg(Some("x"), None), "Done."),
+            report_key(&msg(None, Some("x")), "Done.")
+        );
         assert_eq!(report_key(&a, "Done.").len(), 16);
+    }
+
+    /// **REVIEW DEFECT C: THE FALLBACK AND THE LINE ARE ONE REPORT.** A `Stop`
+    /// whose transcript never caught up posts the vendor's text with no uuid;
+    /// a `Stop` that re-fires once the line has landed reads the same words
+    /// WITH the line's uuid. Keyed on that uuid, which the fallback could not
+    /// know (the review measured `k1=ac80…` against `k2=cb3f…`), the same text
+    /// went out twice. Now the
+    /// fallback is recorded as one, and the line is that report — in the same
+    /// segment and words only: the next turn's same words are a report of
+    /// their own, and so is a reply after a wake.
+    #[test]
+    fn a_fallback_and_the_line_that_lands_later_are_one_report() {
+        use std::cell::RefCell;
+        let dir = scratch("fallback-once");
+        let (head, tail) = lagging_turn();
+        let fin = "Done: 12 of 12 cases pass; merged.";
+        let pace = Pace {
+            max: Duration::from_millis(100),
+            quiet: Duration::from_millis(50),
+            poll: Duration::from_millis(5),
+        };
+        let read = |path: &str| {
+            let noted = RefCell::new(Vec::new());
+            let input = format!(
+                r#"{{"hook_event_name":"Stop","stop_hook_active":false,"transcript_path":{},"last_assistant_message":{}}}"#,
+                crate::json::string(path),
+                crate::json::string(fin)
+            );
+            let got = displayed_message(&input, &pace, &|_: &str| {}, &|w: &str| {
+                noted.borrow_mut().push(w.to_string());
+            });
+            (got.expect("a message"), noted.into_inner())
+        };
+        let path = write_lines(&dir, "lagging.jsonl", &head);
+        let (first, noted) = read(&path);
+        assert_eq!(noted.len(), 1, "the fallback says so: {noted:?}");
+        assert_eq!(
+            (first.uuid.as_deref(), first.anchor.as_deref()),
+            (None, Some("u1")),
+            "the vendor's text, in the segment the prompt opened"
+        );
+        let body = trim_report(&first.text);
+        let posted = LastReport {
+            key: report_key(&first, &body),
+            high: 0,
+            fallback: first.uuid.is_none(),
+        };
+        // The line lands; a re-fired Stop reads it, uuid and all.
+        append_lines(&path, &tail);
+        let (again, noted) = read(&path);
+        assert!(noted.is_empty(), "{noted:?}");
+        assert_eq!(again.uuid.as_deref(), Some("a8"));
+        assert_ne!(
+            report_key(&again, &body),
+            posted.key,
+            "the review's two keys"
+        );
+        assert!(
+            already_reported(&posted, &again, &body),
+            "the same message, posted twice"
+        );
+        // Not a fallback: the uuid decides, as before.
+        let exact = LastReport {
+            fallback: false,
+            ..posted.clone()
+        };
+        assert!(!already_reported(&exact, &again, &body));
+        // The next turn ends in the same words: a report of its own.
+        let mut next = head.iter().chain(&tail).cloned().collect::<Vec<_>>();
+        next.push(prompt_line("u9", "and again"));
+        next.push(block_line("a9", "m9", &text_block(fin)));
+        let path = write_lines(&dir, "next.jsonl", &next);
+        let (later, _) = read(&path);
+        assert_eq!(later.anchor.as_deref(), Some("u9"));
+        assert!(!already_reported(&posted, &later, &body));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `Stop` hook's feedback line in the vendor's shape (measured, words
+    /// made up): a `user` line, `isMeta`, a STRING content opening with
+    /// [`STOP_FEEDBACK`].
+    fn wake_line(uuid: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","isMeta":true,"message":{{"role":"user","content":{}}}}}"#,
+            crate::json::string(
+                "Stop hook feedback:\n[aterm fabric] 1 new message for s-x past seen=0."
+            )
+        )
+    }
+
+    /// What the vendor writes after a `Stop` hook's feedback line, in the order
+    /// measured on the live transcript: an attachment, then the summary.
+    fn after_wake(n: u8) -> Vec<String> {
+        vec![
+            format!(r#"{{"type":"attachment","uuid":"at{n}"}}"#),
+            format!(r#"{{"type":"system","subtype":"stop_hook_summary","uuid":"ss{n}"}}"#),
+        ]
+    }
+
+    /// **REVIEW DEFECT A: A REPLY AFTER A WAKE IS A NEW MESSAGE, EVEN IN THE
+    /// SAME WORDS.** A `Stop` that woke the agent keeps the turn alive; the
+    /// vendor adds its feedback line (`isMeta`, not a prompt) and the agent
+    /// replies. When the second `Stop` fires, that reply may not be on disk
+    /// yet — and the file's newest assistant line is the message from BEFORE
+    /// the wake. When the reply repeats those words (`last_assistant_message`
+    /// equal to them), the read "caught up" at once on the old line, the key
+    /// was the one already recorded, and the reply was dropped as a re-fire
+    /// (the review's `455b0748…` twice). Now the feedback line opens a segment:
+    /// the read waits for the reply's own line, reports it with its own uuid,
+    /// and a post-wake segment that displayed nothing reports nothing — never
+    /// the pre-wake message again. An `isMeta` line that is NOT the feedback
+    /// (a tool's image, an attachment's text) opens nothing.
+    #[test]
+    fn a_reply_after_a_wake_is_a_new_message_even_in_the_same_words() {
+        let dir = scratch("wake");
+        let w = "Idle; waiting for the next task.";
+        let mut lines = vec![
+            prompt_line("u1", "go"),
+            block_line("a2", "m2", &text_block(w)),
+        ];
+        let path = write_lines(&dir, "wake.jsonl", &lines);
+        // Stop #1: the message before the wake, reported.
+        let first = settle(&path, Some(w), TRANSCRIPT_TAIL_MAX, &CATCH_UP).expect("reads");
+        let first = first.turn.message.expect("the first message");
+        assert_eq!(
+            (first.uuid.as_deref(), first.anchor.as_deref()),
+            (Some("a2"), Some("u1"))
+        );
+        let posted = LastReport {
+            key: report_key(&first, w),
+            high: 0,
+            fallback: false,
+        };
+        // The wake: feedback, attachment, summary — then Stop #2 fires with the
+        // reply, in the SAME words, not yet on disk.
+        lines.push(wake_line("u3"));
+        lines.extend(after_wake(3));
+        let path = write_lines(&dir, "wake.jsonl", &lines);
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                append_lines(&path, &[block_line("a3", "m3", &text_block(w))]);
+            })
+        };
+        let t0 = Instant::now();
+        let second = settle(&path, Some(w), TRANSCRIPT_TAIL_MAX, &CATCH_UP).expect("reads");
+        writer.join().expect("the writer");
+        assert!(second.caught_up, "the reply's own line landed");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(100),
+            "it waited for the reply, not the old line: {:?}",
+            t0.elapsed()
+        );
+        let reply = second.turn.message.expect("the reply");
+        assert_eq!(
+            (reply.uuid.as_deref(), reply.anchor.as_deref()),
+            (Some("a3"), Some("u3"))
+        );
+        assert!(!already_reported(&posted, &reply, w), "the review's drop");
+
+        // The reviewer's order (summary before the feedback line) reads the same.
+        let mut other = vec![
+            prompt_line("u1", "go"),
+            block_line("a2", "m2", &text_block(w)),
+        ];
+        other.extend(after_wake(3).into_iter().rev());
+        other.push(wake_line("u3"));
+        let turn = scan_turn(&other.join("\n"));
+        assert!(turn.message.is_none() && turn.tail_text.is_none());
+        assert_eq!(turn.anchor.as_deref(), Some("u3"));
+
+        // A post-wake segment that displayed nothing reports nothing — never
+        // the message from before the wake.
+        let hid = signature("thinking");
+        let mut quiet = lines.clone();
+        quiet.push(block_line("a4", "m4", &thinking_block("", Some(&hid))));
+        quiet.push(block_line("a5", "m4", &tool_block()));
+        quiet.push(result_line("u5"));
+        let turn = scan_turn(&quiet.join("\n"));
+        assert!(turn.message.is_none(), "{:?}", turn.message.map(|m| m.text));
+
+        // An isMeta line that is NOT the feedback opens nothing: a tool's
+        // images after the final text, and a string that says something else.
+        let images = r#"{"type":"user","uuid":"u6","isMeta":true,"message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}}"#;
+        let caveat = format!(
+            r#"{{"type":"user","uuid":"u7","isMeta":true,"message":{{"role":"user","content":{}}}}}"#,
+            crate::json::string("Caveat: Stop hook feedback: is quoted here, not opened")
+        );
+        let tail = [
+            prompt_line("u1", "go"),
+            block_line("a2", "m2", &text_block("the final words")),
+            images.to_string(),
+            caveat,
+        ];
+        let turn = scan_turn(&tail.join("\n"));
+        let m = turn.message.expect("the final message");
+        assert_eq!(
+            (m.text.as_str(), m.anchor.as_deref()),
+            ("the final words", Some("u1"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **REVIEW DEFECT B: THE VENDOR JOINS TEXT BLOCKS WITH A NEWLINE.** The
+    /// 2.1.268 binary computes `last_assistant_message` as `Pr(content,
+    /// "\n").trim()`; the reader joined with `.`, so a line of two text blocks
+    /// never matched it — the read waited the whole 2 s and posted the
+    /// vendor's text without the narration and without a uuid. A line of
+    /// narration and two text blocks now catches up at once.
+    #[test]
+    fn a_line_of_two_text_blocks_reads_the_way_the_vendor_joins_them() {
+        let two = format!(
+            r#"{{"type":"assistant","uuid":"a1","message":{{"id":"m1","role":"assistant","content":[{},{}]}}}}"#,
+            text_block("Part one."),
+            text_block("Part two.")
+        );
+        let doc = Json::parse(&two).expect("json");
+        let content = doc
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .expect("content");
+        assert_eq!(vendor_text(content), "Part one.\nPart two.");
+
+        let dir = scratch("two-texts");
+        let narr = signature("narration");
+        let line = format!(
+            r#"{{"type":"assistant","uuid":"a2","message":{{"id":"m2","role":"assistant","content":[{},{},{}]}}}}"#,
+            thinking_block("Checking the two parts:", Some(&narr)),
+            text_block("Part one."),
+            text_block("Part two.")
+        );
+        let path = write_lines(&dir, "two.jsonl", &[prompt_line("u1", "go"), line]);
+        let t0 = Instant::now();
+        let got = settle(
+            &path,
+            Some("Part one.\nPart two."),
+            TRANSCRIPT_TAIL_MAX,
+            &CATCH_UP,
+        )
+        .expect("reads");
+        assert!(got.caught_up, "the vendor's text matched the line");
+        assert!(t0.elapsed() < CATCH_UP.max, "{:?}", t0.elapsed());
+        let m = got.turn.message.expect("the message");
+        assert_eq!(
+            (m.text.as_str(), m.uuid.as_deref()),
+            ("Checking the two parts:\nPart one.\nPart two.", Some("a2"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `transcript_path` is read as a top-level key of a parsed document —
@@ -3381,22 +4689,25 @@ mod tests {
         let aa = LastReport {
             key: "00aa".into(),
             high: 7,
+            fallback: false,
         };
         posted.record(&aa);
         assert_eq!(posted.last(), Some(aa));
         let bb = LastReport {
             key: "00bb".into(),
             high: 9,
+            fallback: true,
         };
         posted.record(&bb);
-        assert_eq!(posted.last(), Some(bb));
+        assert_eq!(posted.last(), Some(bb), "the fallback mark survives");
         assert!(dir.join("report").join("s-x").exists());
         // A file from before the watermark line: the key alone, high=0.
         assert_eq!(
             Posted::parse("00cc\n"),
             Some(LastReport {
                 key: "00cc".into(),
-                high: 0
+                high: 0,
+                fallback: false,
             })
         );
         assert_eq!(Posted::parse("\n"), None);
@@ -3406,6 +4717,7 @@ mod tests {
         none.record(&LastReport {
             key: "zz".into(),
             high: 0,
+            fallback: false,
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3427,7 +4739,7 @@ mod tests {
         let p = fifo.display().to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(last_assistant_text(&p).map(|m| m.map(|m| m.text)));
+            let _ = tx.send(read_final(&p).map(|m| m.map(|m| m.text)));
         });
         match rx.recv_timeout(Duration::from_secs(2)) {
             Ok(got) => {
@@ -3435,13 +4747,13 @@ mod tests {
                 assert!(why.ends_with("not a regular file"), "{why}");
             }
             Err(_) => panic!(
-                "last_assistant_text blocked for 2 s on a FIFO at {}: the Stop hook would \
+                "the transcript read blocked for 2 s on a FIFO at {}: the Stop hook would \
                  hang until the vendor's 600 s Stop timeout",
                 fifo.display()
             ),
         }
         // A directory is not one either; a regular file still reads.
-        let why = last_assistant_text(&dir.display().to_string())
+        let why = read_final(&dir.display().to_string())
             .map(|m| m.map(|m| m.text))
             .expect_err("a directory");
         assert!(why.ends_with("not a regular file"), "{why}");
@@ -3451,7 +4763,7 @@ mod tests {
             "{\"type\":\"assistant\",\"uuid\":\"a\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
         )
         .unwrap();
-        let got = last_assistant_text(&plain.display().to_string()).expect("reads");
+        let got = read_final(&plain.display().to_string()).expect("reads");
         assert_eq!(got.map(|m| m.text).as_deref(), Some("hi"));
         let _ = std::fs::remove_dir_all(&dir);
     }

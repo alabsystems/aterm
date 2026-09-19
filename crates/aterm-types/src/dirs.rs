@@ -16,8 +16,11 @@ use std::path::PathBuf;
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
+        // An EMPTY or RELATIVE `$HOME` is not a home: `PathBuf::from("")` made every
+        // caller's prefix relative to the cwd (the aterm front door laid
+        // `<cwd>/Library/Application Support/aterm/pkg/agents` under it, 2026-09-18),
+        // so such a value falls through to the passwd lookup like an unset one.
+        home_from_env(std::env::var_os("HOME").as_deref())
             .or_else(|| passwd_home_dir(current_uid()))
     }
     #[cfg(windows)]
@@ -41,6 +44,16 @@ fn current_uid() -> u32 {
 unsafe extern "C" {
     #[link_name = "getuid"]
     fn libc_getuid() -> u32;
+}
+
+/// `$HOME` as a home, or `None`: an EMPTY or RELATIVE value is no home at all.
+/// `PathBuf::from("")` used to make every caller's prefix relative to the cwd (the
+/// aterm front door laid `<cwd>/Library/Application Support/aterm/pkg/agents` under
+/// it, 2026-09-18), so such a value falls through to the passwd lookup like an
+/// unset one. Pure, so the rule is testable without touching the process env.
+#[cfg(unix)]
+fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|home| home.is_absolute())
 }
 
 /// Parse `/etc/passwd` to find the home directory for a given UID.
@@ -177,6 +190,93 @@ pub fn data_dir() -> Option<PathBuf> {
     }
 }
 
+/// aterm's own STATE root — where it keeps what it owns across launches (the
+/// operator profiles, the document journal, the session identities). ONE rule,
+/// the one `aterm_agent::operator::default_state_root` and the GUI's document
+/// journal already follow, so every state reader agrees on the directory:
+///
+/// - `$ATERM_STATE_HOME` when set (absolute; a relative value is refused as
+///   `None`, never joined onto an arbitrary cwd) — the knob a headless or
+///   test instance uses to keep its state in a temp root;
+/// - **macOS**: `$HOME/Library/Application Support/aterm`;
+/// - **Linux/other Unix**: `$XDG_STATE_HOME/aterm` (absolute) or
+///   `$HOME/.local/state/aterm`;
+/// - **Windows**: `%LOCALAPPDATA%\aterm`.
+///
+/// `None` only when nothing resolves (no override and no home).
+#[must_use]
+pub fn state_dir() -> Option<PathBuf> {
+    resolve_state_dir(
+        std::env::var_os("ATERM_STATE_HOME").map(PathBuf::from),
+        StatePlatform {
+            home: home_dir(),
+            xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+            local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        },
+    )
+}
+
+/// The platform inputs [`resolve_state_dir`] reads, captured so the rule is
+/// testable without mutating the process environment.
+#[derive(Debug, Default, Clone)]
+pub struct StatePlatform {
+    /// `$HOME` (`%USERPROFILE%`), as [`home_dir`] gives it.
+    pub home: Option<PathBuf>,
+    /// `$XDG_STATE_HOME`, consulted only on non-macOS Unix.
+    pub xdg_state_home: Option<PathBuf>,
+    /// `%LOCALAPPDATA%`, consulted only on Windows.
+    pub local_app_data: Option<PathBuf>,
+}
+
+/// The pure half of [`state_dir`]: `override_root` is `$ATERM_STATE_HOME`.
+#[must_use]
+pub fn resolve_state_dir(
+    override_root: Option<PathBuf>,
+    platform: StatePlatform,
+) -> Option<PathBuf> {
+    if let Some(root) = override_root {
+        // Relative is refused, not resolved: the operator crate errors on it,
+        // and a state root that depends on the cwd is no root at all.
+        return root.is_absolute().then_some(root);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (&platform.xdg_state_home, &platform.local_app_data);
+        platform
+            .home
+            .map(|home| home.join("Library/Application Support/aterm"))
+    }
+    #[cfg(windows)]
+    {
+        let _ = (&platform.home, &platform.xdg_state_home);
+        platform
+            .local_app_data
+            .filter(|root| root.is_absolute())
+            .map(|root| root.join("aterm"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = &platform.local_app_data;
+        if let Some(root) = platform.xdg_state_home.filter(|root| root.is_absolute()) {
+            return Some(root.join("aterm"));
+        }
+        platform.home.map(|home| home.join(".local/state/aterm"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = platform;
+        None
+    }
+}
+
+/// Where session identities live: `<state_dir>/identities/<name>/` — one
+/// directory per name, each holding the agents' relocated config dirs
+/// (`.claude/`, `.codex/`, …; see `aterm_primer::agent_homes`).
+#[must_use]
+pub fn identities_dir() -> Option<PathBuf> {
+    state_dir().map(|state| state.join("identities"))
+}
+
 /// Read an XDG env var, returning `None` if unset or not an absolute path.
 #[cfg(target_os = "linux")]
 fn xdg_dir(var: &str) -> Option<PathBuf> {
@@ -195,6 +295,22 @@ mod tests {
         assert!(home_dir().is_some());
     }
 
+    /// An empty or relative `$HOME` is not a home (2026-09-18): it fell through to
+    /// a cwd-relative prefix before, and the front door laid `agents/` under it.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_or_relative_home_is_no_home() {
+        use std::ffi::OsStr;
+        assert_eq!(home_from_env(None), None);
+        assert_eq!(home_from_env(Some(OsStr::new(""))), None);
+        assert_eq!(home_from_env(Some(OsStr::new("Library"))), None);
+        assert_eq!(home_from_env(Some(OsStr::new("./home"))), None);
+        assert_eq!(
+            home_from_env(Some(OsStr::new("/Users//someone"))),
+            Some(PathBuf::from("/Users//someone"))
+        );
+    }
+
     #[test]
     fn test_config_dir_returns_some() {
         assert!(config_dir().is_some());
@@ -203,6 +319,67 @@ mod tests {
     #[test]
     fn test_data_dir_returns_some() {
         assert!(data_dir().is_some());
+    }
+
+    /// THE STATE ROOT RULE (session identities, 2026-09-17), pure: the
+    /// override wins when absolute and is refused when relative; without it the
+    /// platform default applies; and `identities_dir` is one segment below.
+    #[test]
+    fn state_dir_honours_an_absolute_override_and_refuses_a_relative_one() {
+        let platform = StatePlatform {
+            home: Some(PathBuf::from("/Users//who")),
+            xdg_state_home: Some(PathBuf::from("/xdg/state")),
+            local_app_data: Some(PathBuf::from(r"C:\Users\who\AppData\Local")),
+        };
+        assert_eq!(
+            resolve_state_dir(Some(PathBuf::from("/tmp/aterm-state")), platform.clone()),
+            Some(PathBuf::from("/tmp/aterm-state")),
+            "the override is the root itself, no `aterm` appended"
+        );
+        assert_eq!(
+            resolve_state_dir(Some(PathBuf::from("relative/state")), platform.clone()),
+            None,
+            "a relative override is refused, never joined onto the cwd"
+        );
+        let default = resolve_state_dir(None, platform.clone()).expect("a default resolves");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            default,
+            PathBuf::from("/Users//who/Library/Application Support/aterm")
+        );
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(default, PathBuf::from("/xdg/state/aterm"));
+        #[cfg(windows)]
+        assert_eq!(default, PathBuf::from(r"C:\Users\who\AppData\Local\aterm"));
+        assert!(default.is_absolute());
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(
+            resolve_state_dir(
+                None,
+                StatePlatform {
+                    xdg_state_home: Some(PathBuf::from("relative")),
+                    ..platform.clone()
+                }
+            ),
+            Some(PathBuf::from("/Users//who/.local/state/aterm")),
+            "a relative XDG_STATE_HOME falls through to the home default"
+        );
+        assert_eq!(
+            resolve_state_dir(None, StatePlatform::default()),
+            None,
+            "nothing to resolve from is None, not a panic"
+        );
+    }
+
+    #[test]
+    fn identities_dir_is_one_segment_below_the_state_root() {
+        if let (Some(state), Some(identities)) = (state_dir(), identities_dir()) {
+            assert_eq!(identities, state.join("identities"));
+            assert_eq!(
+                identities.file_name().and_then(|n| n.to_str()),
+                Some("identities")
+            );
+        }
     }
 
     #[test]

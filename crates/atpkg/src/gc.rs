@@ -313,8 +313,19 @@ fn shim_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
 /// what the user's next command executes.
 #[must_use]
 pub fn live_builds(layout: &Layout) -> LiveSet {
-    let authority = authority_claims(layout);
-    let shims = shim_claims(layout);
+    live_from_claims(&authority_claims(layout), &shim_claims(layout))
+}
+
+/// [`live_builds`]' reconciliation over claim views ALREADY READ.
+///
+/// Split out so a caller that needs the claim UNION as well — [`run_keeping_pinned_partials`],
+/// whose sweep guard is that union — reads `store/`, `channels/` and every `bin/` shim ONCE
+/// for both answers instead of twice per pass, and so the table below is provable without a
+/// prefix on disk. Pure: it reads nothing and decides nothing about what may be deleted.
+fn live_from_claims(
+    authority: &BTreeMap<String, BTreeSet<u64>>,
+    shims: &BTreeMap<String, BTreeSet<u64>>,
+) -> LiveSet {
     let mut set = LiveSet::default();
     let empty = BTreeSet::new();
     let programs: BTreeSet<&String> = authority.keys().chain(shims.keys()).collect();
@@ -474,7 +485,9 @@ struct Debris {
 /// Scratch needs no such guard. Both views parse `store/<program>/<n>` and nothing else, so no
 /// link and no shim can name a `<build>.incoming-<pid>`; and every mutating verb holds the
 /// store-wide writer lock ([`crate::lock::try_lock_store`]), so if scratch is here, the stager
-/// that owned it is gone.
+/// that owned it is gone. Gone is not the same as quiet: the untracked staging lane's
+/// extractor is a launchd job that outlives the stager which submitted it, so the sweep below
+/// stops those orphans first, exactly as [`crate::store::sweep_stage_scratch`] does.
 /// Whether `name` is stage scratch this manager produced: `<build>.incoming-<pid>` or
 /// `<build>.superseded-<pid>`, where `<build>` is a real build number.
 ///
@@ -552,9 +565,25 @@ fn interrupted_debris(layout: &Layout, claimed: &BTreeMap<String, BTreeSet<u64>>
             }
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if let Ok(build) = name.parse::<u64>() {
+            // The store's own strict reader ([`crate::store::parse_build_name`]): `+18/` and
+            // `018/` are not builds this manager ever wrote, and this arm SWEEPS what it
+            // accepts (a marker-less tree nothing claims). A name neither a build nor the
+            // producer's scratch shape falls through both arms and is left alone.
+            if let Some(build) = crate::store::parse_build_name(name) {
                 if crate::store::build_is_complete(&entry.path()) {
                     continue; // an installed build — `reclaimable` owns it
+                }
+                if crate::store::build_marks_another_slice(&entry.path()) {
+                    // A COMPLETE install of the OTHER slice of the universal binary, whose
+                    // marker `build_is_complete` refuses on purpose so THIS slice re-stages
+                    // it. That refusal is about which compiler may run, not about whether an
+                    // install ever finished — and this arm's whole premise is the latter.
+                    // Read as debris, a single `arch -x86_64` gc pass deleted the native
+                    // rollback tree (nothing claims a rollback: no `current` link, no shim)
+                    // and reported a multi-GB toolchain as an interrupted install. Re-staging
+                    // is the install path's business; this sweep's business is trees no
+                    // install ever finished writing.
+                    continue;
                 }
                 if claimed.get(&program).is_some_and(|s| s.contains(&build)) {
                     continue; // something on disk points into it: not ours to delete
@@ -675,13 +704,20 @@ pub fn run_keeping_pinned_partials(
     // through, so `live_builds`/`authority_claims` see a `current` link that resolves and
     // the sweep below reasons about a store that is whole.
     recover_interrupted_swaps(layout);
-    let live = live_builds(layout);
+    // The two claim views, read ONCE for both of the answers below: the witness needs them
+    // to AGREE, the sweep guard needs their UNION. Asking for them twice — which is what
+    // `live_builds` plus the two calls below did — cost a second walk of `store/` and
+    // `channels/` and a second resolve of every shim in `bin/`, on a pass that runs at the
+    // end of every install and every update as well as behind `atpkg gc`.
+    let authority = authority_claims(layout);
+    let shims = shim_claims(layout);
+    let live = live_from_claims(&authority, &shims);
     // The two views UNIONED, which is the right shape here and the wrong shape for a witness:
     // `live_builds` needs them to agree, the sweep only needs to know that SOMETHING points
     // into a build. A contested build has no witness but is still one the user's next command
     // executes, so it must survive.
-    let mut claimed = authority_claims(layout);
-    for (program, builds) in shim_claims(layout) {
+    let mut claimed = authority;
+    for (program, builds) in shims {
         claimed.entry(program).or_default().extend(builds);
     }
     let mut by_prog: BTreeMap<String, Vec<u64>> = BTreeMap::new();
@@ -732,6 +768,9 @@ pub fn run_keeping_pinned_partials(
         }
     }
     let mut swept_scratch: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // A dead stager's launchd-parented helper is still extracting into its scratch; stop it
+    // and wait for it before this loop deletes the directory under it.
+    crate::stage_helper::stop_orphaned_lane_jobs();
     for (program, name, path) in debris.scratch {
         // Reported only when the removal actually happened: the point of the line is to say
         // where the disk went, and a scratch dir we failed to unlink (a permissions problem,
@@ -829,6 +868,45 @@ mod tests {
         LiveBuild {
             program: program.to_string(),
             build,
+        }
+    }
+
+    /// The reconciliation table, over claim views HANDED IN rather than read off a prefix —
+    /// the shape the pass uses so one gc run reads `store/`, `channels/` and `bin/` once for
+    /// both the witness and the sweep's claim union.
+    #[test]
+    fn live_from_claims_reconciles_the_two_views() {
+        fn claims(pairs: &[(&str, &[u64])]) -> BTreeMap<String, BTreeSet<u64>> {
+            pairs
+                .iter()
+                .map(|(p, b)| ((*p).to_string(), b.iter().copied().collect()))
+                .collect()
+        }
+        let build_of = |set: &LiveSet| set.live.get("ay").map(|l| l.build);
+
+        // Agreement mints a witness…
+        let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[("ay", &[19])]));
+        assert_eq!(build_of(&set), Some(19));
+        assert!(set.diverged.is_empty());
+        // …and so does an authority whose shims are SILENT: nothing on PATH points elsewhere.
+        let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[]));
+        assert_eq!(build_of(&set), Some(19));
+        assert!(set.diverged.is_empty());
+
+        // Shims that CONTRADICT the authority block the witness: whatever the authority
+        // says, the disagreeing shim is what the user's next command executes.
+        let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[("ay", &[18])]));
+        assert!(set.live.is_empty());
+        assert_eq!(set.diverged.len(), 1);
+        // Two authorities, two shim targets, and a shim with no authority at all: no witness.
+        for (a, sh) in [
+            (claims(&[("ay", &[18, 19])]), claims(&[])),
+            (claims(&[("ay", &[19])]), claims(&[("ay", &[18, 19])])),
+            (claims(&[]), claims(&[("ay", &[19])])),
+        ] {
+            let set = live_from_claims(&a, &sh);
+            assert!(set.live.is_empty(), "no witness from {a:?} / {sh:?}");
+            assert_eq!(set.diverged.len(), 1);
         }
     }
 
@@ -1513,6 +1591,13 @@ mod tests {
             "18.pending-4242",
             "18incoming-4242",
             "18.incoming-42.42",
+            // `u64::from_str` accepts a leading `+` and leading zeros; the PRODUCER writes
+            // neither ([`crate::store::parse_build_name`]), so a user directory spelled
+            // this way is not ours to delete however much it looks like ours.
+            "+18.incoming-1",
+            "018.incoming-1",
+            "+0.incoming-1",
+            "0018.superseded-4242",
         ] {
             assert!(!is_stage_scratch(theirs), "{theirs} is NOT ours to delete");
         }
@@ -1526,11 +1611,24 @@ mod tests {
         seed(&l, "ay", 18, false);
         seed(&l, "ay", 19, true);
         let theirs = seed_scratch(&l, "ay", "notes.incoming-drafts");
+        // Build-number lookalikes, which `u64::from_str` alone would have accepted: the
+        // first as build 20's scratch (swept by the scratch arm), the second as a
+        // marker-less build 21 (swept by the partial arm).
+        let plus_scratch = seed_scratch(&l, "ay", "+20.incoming-4242");
+        let plus_build = seed_scratch(&l, "ay", "+21");
         let ours = seed_scratch(&l, "ay", "20.incoming-4242");
 
         let report = run(&l);
         assert!(!ours.exists(), "our own scratch is still swept");
         assert!(theirs.exists(), "a user directory is not ours to delete");
+        assert!(
+            plus_scratch.exists(),
+            "`+20.incoming-4242` is not a name this manager ever wrote"
+        );
+        assert!(
+            plus_build.exists(),
+            "`+21` is not a build directory this manager ever wrote"
+        );
         assert_eq!(
             report.swept_scratch,
             vec![("ay".to_string(), vec!["20.incoming-4242".to_string()])]
@@ -1554,6 +1652,50 @@ mod tests {
             "the fixture is only interesting in the two-rename window"
         );
         (dir, parked)
+    }
+
+    /// GC RUN FROM THE OTHER SLICE MUST NOT DELETE THE NATIVE INSTALL. `build_is_complete`
+    /// is per-slice by design — an `arch -x86_64` pass has to re-stage Intel trees rather
+    /// than inherit arm64 ones — but `false` there means only "not complete FOR ME", and
+    /// this sweep read it as "no install ever finished here". A rollback build is claimed
+    /// by nothing (no `current` link, no shim points at it), so one gc pass from the other
+    /// slice `discard_build`ed a whole installed toolchain and reported the loss as an
+    /// interrupted install.
+    #[test]
+    fn a_build_the_other_slice_installed_is_not_an_interrupted_install() {
+        let l = layout("other-slice");
+        seed(&l, "ay", 18, false); // the rollback build: complete, and claimed by nothing
+        seed(&l, "ay", 19, true); // ay@19 is live
+        // 18's marker as the OTHER slice wrote it: well formed, `ok` and all — simply not
+        // this slice's platform.
+        let marker = l.prefix.join("store").join("ay").join("18.ready");
+        std::fs::write(&marker, b"ok\nplatform=sparc64-solaris\n").unwrap();
+        assert!(
+            !crate::store::build_is_complete(&l.build_dir("ay", 18)),
+            "PRECONDITION: this slice reads it as not-complete and re-stages it"
+        );
+
+        let report = run(&l);
+
+        assert!(
+            l.build_dir("ay", 18).join("bin").exists(),
+            "a finished install of the other slice is not an interrupted one"
+        );
+        assert!(
+            report.swept_partial.is_empty(),
+            "and it must not be reported as reclaimed debris: {:?}",
+            report.swept_partial
+        );
+
+        // NON-VACUITY: a tree with no marker at all, claimed by nothing, is still swept.
+        let partial = seed_partial(&l, "ay", 17);
+        let report = run(&l);
+        assert!(
+            !partial.exists(),
+            "a real interrupted install is still reclaimed"
+        );
+        assert_eq!(report.swept_partial, vec![("ay".to_string(), vec![17u64])]);
+        let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
     /// A CRASH IN THE SWAP WINDOW IS RECOVERED, NOT SWEPT. Between `rename(build,

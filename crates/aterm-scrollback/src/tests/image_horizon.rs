@@ -31,6 +31,7 @@ fn placement(rows: u16, cols: u16, payload: usize) -> Arc<aterm_types::ImageData
         rows,
         z_index: 0,
         band_lift_px: 0,
+        pixel_exact: false,
     })
 }
 

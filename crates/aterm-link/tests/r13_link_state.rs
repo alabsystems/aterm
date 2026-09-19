@@ -250,8 +250,12 @@ fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
     let watch_until = Instant::now() + Duration::from_secs(3);
     while Instant::now() < watch_until {
         let s = status(&w);
+        // By key, not by the header's tail: a column appended after the fabric
+        // trio (`identity=`, 2026-09-17) is not this test's business.
         assert!(
-            s.contains(" fabric=stalled ") && s.ends_with(" fabric_rtt_ms=- fabric_link_age_ms=-"),
+            s.contains(" fabric=stalled ")
+                && kv(&s, "fabric_rtt_ms") == Some("-")
+                && kv(&s, "fabric_link_age_ms") == Some("-"),
             "{s}"
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -351,7 +355,9 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_after_the_ack_deadline() {
     assert_eq!(kv(&fs, "rtt_ms"), Some("-"), "{fs}");
     let s = status(&w);
     assert!(
-        s.contains(" fabric=stalled ") && s.ends_with(" fabric_rtt_ms=- fabric_link_age_ms=-"),
+        s.contains(" fabric=stalled ")
+            && kv(&s, "fabric_rtt_ms") == Some("-")
+            && kv(&s, "fabric_link_age_ms") == Some("-"),
         "never connected: {s}"
     );
     let _ = std::fs::remove_dir_all(&dir);

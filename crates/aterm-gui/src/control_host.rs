@@ -397,6 +397,7 @@ mod tests {
             term: term.clone(),
             master,
             ctx,
+            identity: None,
         }
     }
 

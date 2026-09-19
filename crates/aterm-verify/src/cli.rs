@@ -220,9 +220,10 @@ way for a reviewer (human or AI) to be wrong about it: run this.
 --changed : THE MISSING MIDDLE — a change-scoped tier between a bare `targo
             check` and a whole-tree run. (Until 2026-08-31 this line named the
             ~2 s pre-push L0 hook as the lower end. There is no such hook:
-            `.githooks/pre-push` was demoted to ADVISORY on 2026-08-24 and its
-            whole body is one printf and `exit 0`, so the tier below this one is
-            whatever you run by hand.) Restricts build/test/doctest/lint to
+            `.githooks/pre-push` runs no gate — since 2026-09-17 it BLOCKS a
+            push whose commit has no passing receipt from this gate, which is a
+            file read, not a tier — so the tier below this one is whatever you
+            run by hand.) Restricts build/test/doctest/lint to
             the crates this branch touches PLUS every workspace crate that
             depends on one of them (the reverse-dependency cone, read from the
             SAME dependency graph the build uses). `--base <ref>` (default

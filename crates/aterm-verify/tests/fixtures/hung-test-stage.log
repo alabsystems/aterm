@@ -1,0 +1,55 @@
+# A CONSTRUCTED log in the shapes the 2026-09-16 merge-gate stage log really wrote, with
+# its real names, so the parser's answer is pinned by a fixture a reader can hold in one
+# screen. It is NOT a verbatim excerpt: an excerpt of that log cannot be, because a child
+# section's `running 1 test` and its `test result:` line sit thousands of lines apart and
+# four of them are open at once. What each block below reproduces is named in
+# libtest.rs's `the_real_logs_shapes_name_exactly_the_hung_test`; the whole 6,023-line
+# section is checked by the opt-in test beside it (ATERM_VERIFY_HUNG_LOG).
+#
+# Lines beginning with `#` are this note; libtest writes none, and the parser ignores
+# them because they carry no shape it reads.
+     Running unittests src/lib.rs (target/debug/deps/aterm_gui-66cafa00b6862bbd)
+
+running 4874 tests
+test accessibility::tests::cursor_offset_none_when_hidden ... ok
+test backend_slot_tests::finalize_backend_rejects_unsealed_generation - should panic ... ok
+test operator_host::tests::durable_queue_full_latches_one_loud_fleet_fault ... ok
+
+# (1) THE BYLINE SHAPE: a notice, then a child re-running that very name whose verdict is
+# TORN (its word arrives later as a bare `ok`), then the child's close, then the PARENT's
+# own untorn verdict. The parent finished: the name must NOT be named.
+test native_settings::tests::native_about_byline_steps_down_to_the_longest_form_its_column_fits has been running for over 60 seconds
+
+running 1 test
+test native_settings::tests::native_about_byline_steps_down_to_the_longest_form_its_column_fits ... spec_xref_closure: ledger non-vacuous — 6 row(s) ty+kani
+spec_xref_closure: `ReleasePublisherFence` — 9 dead action(s) at the committed config
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4873 filtered out; finished in 51.17s
+
+test native_settings::tests::native_about_byline_steps_down_to_the_longest_form_its_column_fits ... ok
+
+# (2) THE FALSE-CLEAR SHAPE the review of this parser found: a notice, and then a child
+# re-running the same name whose verdict lands UNTORN inside its own section. That verdict
+# is the child's — the parent is blocked on it — so the name must still be named, and the
+# note says a child reported it.
+test native_settings::tests::visual_preview_matrix_covers_four_viewports_at_three_text_scales has been running for over 60 seconds
+
+running 1 test
+test native_settings::tests::visual_preview_matrix_covers_four_viewports_at_three_text_scales ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4873 filtered out; finished in 3.77s
+
+# (3) THE INCIDENT: the notice with no verdict of any kind, printed while two child
+# sections are open (the parent runs four threads), and the log ends there — the shape a
+# killed child leaves. This is the one name the block must print.
+running 1 test
+test seamless::carry_tests::a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss ... ok
+
+running 1 test
+test control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed has been running for over 60 seconds
+test operator_host::tests::shutdown_after_first_batch_drains_more_than_flush_budget_before_reopen ... ok
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4873 filtered out; finished in 3.57s
+test operator_host::tests::stable_profile_has_one_leader_and_reopens_its_explicit_allowlist ... ok

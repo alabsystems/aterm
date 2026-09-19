@@ -142,18 +142,17 @@ impl Fixture {
         for rel in [
             "tools/verify.sh",
             "tools/test-install-channel.sh",
-            "tools/test-atpkg-vendor-tooling.sh",
-            "tools/test-atpkg-mirror-extras.sh",
-            "tools/test-atpkg-auto-vendor.sh",
-            "tools/test-atpkg-target-pins.sh",
-            "tools/test-linux-auto-atpkg.sh",
-            "tools/test-atpkg-pack-one-compiler.sh",
             "tools/test-trust-gate-verdict.sh",
             "tools/test-trust-contract-probe.sh",
             "tools/perf-arena/test-start-compare.sh",
             "libc-oracle/run.sh",
         ] {
             script(&root.join(rel), "exit 0");
+        }
+        // The atpkg publish suites come from the ROSTER, never from a hand-written copy of
+        // it: the copy drifted the moment the roster grew (2026-09-17).
+        for name in aterm_verify::stages::ATPKG_SUITES {
+            script(&root.join("tools").join(name), "exit 0");
         }
         script(
             &root.join("tools/grep_guard.sh"),
@@ -1457,4 +1456,166 @@ fn a_sync_never_writes_through_a_symlink_in_the_snapshot() {
             "{tag}: the caller's file is kept"
         );
     }
+}
+
+/// THE GATE'S OWN LOG IS NOT THE TREE MOVING (2026-09-17).
+///
+/// `bash tools/verify.sh --fast > gate.log` inside the checkout used to make
+/// the run decide NOTHING. `gate.log` is untracked and non-ignored, so it is
+/// part of the source identity by design — and it GROWS, one ladder line at a
+/// time, for the length of the run. Every check after the first read `source:
+/// moved paths: gate.log`, every building stage answered `not run`, and the
+/// ladder still printed thirty stage headers on the way to a verdict about
+/// nothing. The run was invalidated by its own output, and nothing said so.
+///
+/// `identity::claim_own_output` stats `/dev/fd/1` and `/dev/fd/2` before the
+/// tree is read, so an UNTRACKED path with the same `(dev, ino)` is this run's
+/// log rather than a source change. This test drives the real binary, because
+/// the redirect is the point: an in-process `Vec<u8>` ladder cannot have one.
+#[test]
+fn a_run_whose_ladder_is_redirected_into_the_checkout_still_decides() {
+    let repo = Fixture::new("atv-env-ownlog");
+    repo.git_init().with_targo("true");
+    let log = repo.root.join("gate-run.out");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
+        .args(["--fast", "--in-place", "--root"])
+        .arg(&repo.root)
+        .env("PATH", path_env())
+        .env("TRUST_STAGE2_BIN", &repo.stage2)
+        .env("ATERM_SKIP_GUI_SMOKE", "1")
+        // The gate's OWN copy off: this test is about the caller's redirect.
+        .env("ATERM_VERIFY_LOG", "")
+        .env_remove(snapshot::SNAPSHOT_ENV)
+        .env_remove("ATERM_VERIFY_TIMINGS")
+        .env_remove("CARGO_TARGET_DIR")
+        .stdout(fs::File::create(&log).expect("the log opens"))
+        .status()
+        .expect("the gate binary runs");
+    let ladder = fs::read_to_string(&log).expect("the ladder was written to the log");
+
+    assert_ne!(
+        status.code(),
+        Some(exit::COULD_NOT_RUN),
+        "a redirected ladder is not a moving tree: {ladder}"
+    );
+    assert!(
+        !ladder.contains("moved during this run"),
+        "nothing moved: {ladder}"
+    );
+    assert!(
+        ladder.contains("this run's own output is being written to gate-run.out"),
+        "and the exclusion is SAID, not silent: {ladder}"
+    );
+}
+
+/// …AND A FILE THE GATE CANNOT SEE THROUGH STILL TRIPS THE RUN — with the
+/// remedy named.
+///
+/// `| tee gate.log` leaves fd 1 a pipe: the file belongs to `tee`, so the
+/// exclusion above cannot reach it and the run is genuinely unverifiable. That
+/// is the right outcome; what was missing was any way for the reader to know
+/// which of their files to move. When EVERY path that moved is untracked — a
+/// state no pull, rebase or source edit produces on its own — the label says
+/// so and names where a log may live instead.
+#[test]
+fn a_churning_untracked_file_trips_the_run_and_the_label_names_the_remedy() {
+    let repo = Fixture::new("atv-env-churn");
+    let scratch = repo.root.join("peer-scratch.out");
+    repo.git_init()
+        .with_targo(&format!("echo churn >> '{}'", scratch.display()));
+    repo.arm_trigger();
+
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
+    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
+    assert!(ladder.contains("peer-scratch.out"), "{ladder}");
+    assert!(
+        ladder.contains("every one of those is UNTRACKED"),
+        "the label names the shape: {ladder}"
+    );
+    assert!(
+        ladder.contains(identity::GATE_STATE_DIR),
+        "…and where a log may live instead: {ladder}"
+    );
+}
+
+/// A TRACKED file moving is a real edit, and gets NO log remedy — a sentence
+/// that fires on every pull is a sentence people stop reading.
+#[test]
+fn a_tracked_file_moving_gets_no_log_remedy() {
+    let repo = Fixture::new("atv-env-tracked");
+    repo.git_init()
+        .with_targo("echo 'edited mid-run' >> Cargo.toml");
+    repo.arm_trigger();
+
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
+    assert!(ladder.contains("Cargo.toml"), "{ladder}");
+    assert!(
+        !ladder.contains("every one of those is UNTRACKED"),
+        "no log remedy for a source edit: {ladder}"
+    );
+}
+
+/// THE RUN LEAVES A RECEIPT, AND IT IS ABOUT THIS COMMIT AND THIS TREE.
+///
+/// End-to-end for the push gate: `.githooks/pre-push` refuses a commit with no
+/// passing receipt, and the only thing that writes one is a finished run. If
+/// the ladder and the receipt could ever disagree about which commit was
+/// verified, the hook would be enforcing a claim about another tree — so the
+/// receipt is checked against the SAME head the ladder printed, and against the
+/// verdict it reached.
+///
+/// This fixture's ladder skips the GUI smoke (`ATERM_SKIP_GUI_SMOKE`), so the
+/// run does not discharge the merge contract and the receipt says so: a skip is
+/// not a pass, and the receipt is where that survives the run.
+#[test]
+fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
+    let repo = Fixture::new("atv-env-receipt");
+    repo.git_init().with_targo("true");
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+
+    let (ladder, _code) = repo.run(&repo.ctx());
+    assert!(
+        ladder.contains(&format!("verify: source {head} in place ")),
+        "{ladder}"
+    );
+
+    let path = aterm_verify::receipt::dir(&repo.root).join(&head);
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("no receipt at {}: {e}\n{ladder}", path.display()));
+    let r = aterm_verify::receipt::Receipt::parse(&text)
+        .unwrap_or_else(|| panic!("the receipt does not parse: {text:?}"));
+
+    assert_eq!(
+        r.head, head,
+        "the receipt is about the commit the ladder named"
+    );
+    assert_eq!(r.dirty, None, "the fixture is committed clean");
+    assert_eq!(r.mode, "fast");
+    assert_eq!(r.scope, "workspace");
+    assert_eq!(
+        r.merge_contract,
+        ladder.contains(MERGE_CONTRACT_SENTENCE),
+        "the receipt's merge-contract line and the ladder's sentence are one claim, not two"
+    );
+    assert!(
+        !r.merge_contract && r.skipped.contains("gui smoke"),
+        "a skipping run says WHICH skip cost it the contract: {r:?}"
+    );
+    // …and it lives where no TreeState can see it, which is the whole reason it
+    // may be written into the checkout at all.
+    assert!(
+        path.starts_with(repo.root.join(identity::GATE_STATE_DIR)),
+        "the receipt must live under {}: {}",
+        identity::GATE_STATE_DIR,
+        path.display()
+    );
+    let tree = TreeState::capture(&repo.root, &path_env()).expect("readable");
+    assert!(
+        tree.dirty.keys().all(|p| !p.contains("receipt")),
+        "the receipt entered the source identity: {:?}",
+        tree.dirty.keys().collect::<Vec<_>>()
+    );
 }

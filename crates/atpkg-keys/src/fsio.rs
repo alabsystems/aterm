@@ -96,7 +96,8 @@ pub fn read_bytes(path: &str) -> std::io::Result<Vec<u8>> {
 /// Write `bytes` to `path` — the one shared plain-file-write site (see [`read_bytes`]).
 ///
 /// Known Trust L0 artifact: `File::create` is a hardened raw-path boundary
-/// (`hardened_raw_path_api`, fail-closed absent capability contracts). It must stay:
+/// (Trust's own obligation kind `hardened_raw_path_api`, fail-closed absent
+/// capability contracts). It must stay:
 /// re-signing overwrites an existing `.sig`, so the non-clobbering `File::create_new`
 /// (which Trust does not flag) would be a behavior change.
 pub fn write_bytes(path: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -128,7 +129,8 @@ pub fn write_bytes(path: &str, bytes: &[u8]) -> std::io::Result<()> {
 /// removed on every failure path so a refusal leaves no litter beside a trust anchor.
 ///
 /// Known Trust L0 artifact: `OpenOptions::open` and `fs::rename` are hardened raw-path
-/// boundaries (`hardened_raw_path_api`, fail-closed absent capability contracts), the same
+/// boundaries (Trust's obligation kind `hardened_raw_path_api`, fail-closed
+/// absent capability contracts), the same
 /// residual [`stage_sibling_temp_with_mode`] carries and for the same reason — there is no
 /// non-raw-path spelling of "atomically replace this file".
 pub fn write_bytes_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -172,7 +174,8 @@ pub fn stage_sibling_temp(path: &str, bytes: &[u8]) -> std::io::Result<String> {
 /// (EOF = 0) and write-at-offset-0 coincide.
 ///
 /// Known Trust L0 artifact: `OpenOptions::open` itself is a hardened raw-path boundary
-/// (`hardened_raw_path_api`, fail-closed) that can only be discharged by capability
+/// (Trust's obligation kind `hardened_raw_path_api`, fail-closed) that can only be
+/// discharged by capability
 /// contracts, which this campaign does not add. `File::create` cannot express
 /// create-new + 0600, which the machine key requires, so the residual obligation is
 /// confined to this leaf.

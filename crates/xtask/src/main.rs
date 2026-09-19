@@ -43,6 +43,8 @@ use std::process::{Command, ExitCode};
 use aterm_spec::tla_check::TlaSpec;
 use aterm_spec::xref::{self, SpecModule};
 
+mod citations;
+mod driver;
 mod gate;
 mod help_surfaces;
 mod perf;

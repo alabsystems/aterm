@@ -18,6 +18,15 @@ use std::sync::OnceLock;
 pub(crate) const AUTHOR_ATTRIBUTION: &str = "By Andrew Yates";
 pub(crate) const COMPANY: &str = "ALab";
 pub(crate) const AUTHOR_COMPANY_BYLINE: &str = "By Andrew Yates · ALab";
+/// The author's SHORT form — initial plus surname, the last rung of the native
+/// About byline's fit ladder. It exists because the rung above it
+/// ([`aterm_types::identity::AUTHOR`]) is 164.6pt wide at the Body step under 2×
+/// Dynamic Type, which does not fit the 164.0pt hero column a 240pt host gives
+/// it: measured, the full name is not a floor. Initial + surname is the shortest
+/// form that is still the AUTHOR, which is what the narrow large-type byline
+/// keeps. [`author_short_names_the_author`] pins it to the shared identity, so a
+/// name change cannot leave a stale abbreviation behind.
+pub(crate) const AUTHOR_SHORT: &str = "A. Yates";
 /// The project site About prints in its byline (a live link) and its `Project`
 /// row — `alab.systems`, from the one identity every surface shares.
 pub(crate) const SITE: &str = aterm_types::identity::SITE;
@@ -356,6 +365,27 @@ pub fn control_line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every rung of the About byline's ladder is the SAME author, spelled
+    /// shorter: the short form is the shared identity's initial and surname, and
+    /// the long forms contain the shared identity whole. Renaming
+    /// `identity::AUTHOR` without respelling these therefore fails here rather
+    /// than shipping a hero that attributes aterm to two different people.
+    #[test]
+    fn author_short_names_the_author() {
+        let author = aterm_types::identity::AUTHOR;
+        let (given, surname) = author
+            .split_once(' ')
+            .expect("the shared author identity is given name plus surname");
+        assert_eq!(
+            AUTHOR_SHORT,
+            format!("{}. {surname}", &given[..1]),
+            "the byline's short rung is the shared author's initial and surname"
+        );
+        assert!(AUTHOR_ATTRIBUTION.ends_with(author));
+        assert!(AUTHOR_COMPANY_BYLINE.starts_with(AUTHOR_ATTRIBUTION));
+        assert!(AUTHOR_COMPANY_BYLINE.ends_with(COMPANY));
+    }
 
     /// The display version is the shared application identity — provenance
     /// (build number, commit, compiler) lives in the other rows.

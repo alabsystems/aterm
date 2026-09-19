@@ -109,7 +109,9 @@ pub mod exec;
 pub mod glob;
 pub mod identity;
 pub mod ladder;
+pub mod libtest;
 pub mod plan;
+pub mod receipt;
 pub mod sched;
 pub mod scope;
 pub mod smoke;
@@ -137,9 +139,11 @@ pub use verdict::{MERGE_CONTRACT_SENTENCE, Verdict};
 /// gate stops being read.
 ///
 /// The blocking pre-push hook reasoned about that distinction, and this comment
-/// used to cite it as the reason. It is no longer a caller — advisory since
-/// 2026-08-24 — but the reason outlived it, and the distinction now has a live
-/// consumer either way: `tools/verify.sh` documents all four codes where it
+/// used to cite it as the reason. It is no longer a caller — it was advisory
+/// from 2026-08-24, and since 2026-09-17 it reads this run's RECEIPT
+/// ([`receipt`]) rather than running the gate — but the reason outlived it, and
+/// the distinction now has a live consumer either way: `tools/verify.sh`
+/// documents all four codes where it
 /// `exec`s this binary, passes ours through untouched, and returns `3` itself
 /// whenever the gate could not be built at all.
 pub mod exit {
@@ -201,6 +205,10 @@ pub struct EnvSnapshot {
     pub verify_snapshot: Option<PathBuf>,
     /// `ATERM_VERIFY_TIMINGS` — the per-child timing TSV ([`exec::Timings`]).
     pub verify_timings: Option<PathBuf>,
+    /// `ATERM_VERIFY_LOG` — where the gate writes its own copy of the ladder.
+    /// SET-BUT-EMPTY IS MEANINGFUL and is kept, unlike every path above: it is
+    /// how a caller turns the log off, which is not the same as not asking.
+    pub verify_log: Option<PathBuf>,
 }
 
 impl EnvSnapshot {
@@ -233,6 +241,7 @@ impl EnvSnapshot {
                 .or_else(|| std::env::var_os("CARGO_BUILD_RUSTDOC")),
             verify_snapshot: var_path(snapshot::SNAPSHOT_ENV).filter(|p| !p.as_os_str().is_empty()),
             verify_timings: var_path("ATERM_VERIFY_TIMINGS").filter(|p| !p.as_os_str().is_empty()),
+            verify_log: var_path("ATERM_VERIFY_LOG"),
         }
     }
 }
@@ -637,9 +646,74 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
 
     let tally = ladder::tally(&reports);
     let verdict = verdict::verdict(ctx.mode, &ctx.scope, ctx.selftest, &tally);
+    write_receipt(ctx, &tripwire, &verdict, &tally);
     out.write_all(verdict.text.as_bytes())?;
     out.flush()?;
     Ok(verdict.exit)
+}
+
+/// Record what this run decided about this commit, where `.githooks/pre-push`
+/// can read it ([`receipt`]).
+///
+/// Only a run with a SOURCE IDENTITY leaves one: a root that is not a git
+/// checkout has no commit to key a receipt by, and a selftest decided nothing
+/// about the tree. Failures are announced on stderr and cost the next push a
+/// refusal — never this run its verdict.
+fn write_receipt(
+    ctx: &Ctx,
+    tripwire: &identity::Tripwire,
+    verdict: &verdict::Verdict,
+    tally: &ladder::Tally,
+) {
+    let identity::SourceIdentity::Git(tree) = &tripwire.source else {
+        return;
+    };
+    if ctx.selftest {
+        return;
+    }
+    let r = receipt::Receipt {
+        head: tree.head.clone(),
+        dirty: tree.dirty_digest(&ctx.path_env),
+        mode: ctx.mode.as_str().to_string(),
+        scope: match &ctx.scope {
+            Scope::Workspace => "workspace".to_string(),
+            Scope::Crate(c) => format!("crate:{c}"),
+            Scope::Changed(_) => "changed".to_string(),
+        },
+        verdict: match verdict.exit {
+            exit::PASS => "PASS",
+            exit::FAILED => "FAIL",
+            _ => "COULD-NOT-RUN",
+        }
+        .to_string(),
+        merge_contract: verdict.claims_merge_contract,
+        skipped: if tally.skips.is_empty() {
+            "none".to_string()
+        } else {
+            let shown: Vec<&str> = tally.skips.iter().take(4).map(String::as_str).collect();
+            let more = tally.skips.len().saturating_sub(shown.len());
+            let mut s = shown.join(", ");
+            if more > 0 {
+                s.push_str(&format!(" and {more} more"));
+            }
+            // One line, always: a newline here would forge a second key.
+            s.replace('\n', " ")
+        },
+        when: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    };
+    let caller = match &ctx.source_mode {
+        snapshot::SourceMode::Snapshot { caller } => caller.clone(),
+        snapshot::SourceMode::InPlace => ctx.root.clone(),
+    };
+    if let Err(e) = receipt::write(&caller, &r) {
+        eprintln!(
+            "verify: cannot write the gate receipt under {}: {e} — the next push will refuse \
+             for want of one",
+            receipt::dir(&caller).display()
+        );
+    }
 }
 
 /// The `  time  ` line under a stage: how long it ran, and when it started
@@ -670,28 +744,51 @@ fn outcome_word(report: &Report) -> &'static str {
     word
 }
 
+/// WHAT `.githooks/pre-push` DOES, in one clause — printed by [`pin_hooks`] to
+/// every operator on a fresh clone, and MEASURED against the hook itself by
+/// `tests/push_gate.rs`.
+///
+/// It is a constant rather than a literal because the previous spelling of this
+/// sentence was wrong for thirteen months in two different directions (first
+/// "L0 gate active" for a hook that ran nothing, then "ADVISORY" after the hook
+/// gained teeth), and nothing compared the words with the file.
+pub const HOOK_CLAIM: &str = "pre-push BLOCKS a push of any commit with no passing gate receipt \
+     (a tag, the release cutter's claim over origin's tip — CHANGELOG.md + RELEASES.ledger only — \
+     and a clean automatic merge of a receipted commit onto origin's tip bring no ungated code and \
+     owe none of their own); ATERM_PUSH_NO_GATE=1 is the named exception";
+
+/// Where the gate keeps its own copy of each run's ladder, under
+/// [`identity::GATE_STATE_DIR`]. Named here because `main` writes it and the
+/// tripwire's remedy sentence points at it.
+pub const LOG_DIR: &str = "logs";
+
 /// Stage 0 of the script: pin `core.hooksPath` at `.githooks`, so a clone runs
 /// the hooks this repo committed rather than the empty `.git/hooks`.
 ///
 /// WHAT THE PIN BUYS, AND WHAT IT DOES NOT — said here because the line this
 /// function PRINTS used to oversell it, and that line is read by every operator
 /// on a fresh clone. It said `(pre-push L0 gate active)`, which told them a
-/// blocking L0 gate had just been switched on for them. Nothing was.
-/// `.githooks/pre-push` has been ADVISORY since 2026-08-24: its entire body is
-/// one printf and `exit 0`, and it runs no gate at all — it was demoted on its
-/// own written rule ("a hook slow enough to be bypassed is worse than none")
-/// once `tools/paint_guard.sh` took a blocking push to twelve minutes.
+/// blocking L0 gate had just been switched on for them. Nothing was:
+/// `.githooks/pre-push` was ADVISORY from 2026-08-24 to 2026-09-17 — its entire
+/// body was one printf and `exit 0` — having been demoted on its own written
+/// rule ("a hook slow enough to be bypassed is worse than none") once
+/// `tools/paint_guard.sh` took a blocking push to twelve minutes.
 ///
-/// The pin itself is still worth doing and still true, so it is still announced:
-/// an unpinned clone runs `.git/hooks`, which is empty, so the committed hooks —
-/// advisory or not — may as well not exist, and the advisory line is the only
-/// thing that tells a new operator the merge contract exists.
+/// SINCE 2026-09-17 IT GATES AGAIN, without running anything: the hook reads
+/// the RECEIPT this run writes ([`receipt`]) and refuses a push of a commit no
+/// gate discharged the merge contract on. It is microseconds, so it cannot
+/// teach the bypass, and it races no other push, so it cannot lose a ref.
+/// [`HOOK_CLAIM`] is the sentence, and `tests/push_gate.rs` measures the hook
+/// against it — a claim about a hook that nothing checks is how this line came
+/// to say "L0 gate active" for a hook that ran nothing.
 ///
-/// The L0 obligations are enforced by exactly two mechanisms, neither of them a
-/// hook: the unconditional freeze-gate stage of THIS run
-/// ([`plan::StageId::FreezeGate`]), and `run_freeze_safety_gate` in
-/// `crates/aterm-release/src/publish.rs`, which is mandatory and runs before the
-/// ledger claim. Between an ungated commit and `origin/main` there is nothing.
+/// The pin itself is still worth doing and still true: an unpinned clone runs
+/// `.git/hooks`, which is empty, so the committed hooks may as well not exist.
+///
+/// The L0 obligations are ALSO enforced without any hook, by the unconditional
+/// freeze-gate stage of THIS run ([`plan::StageId::FreezeGate`]) and by
+/// `run_freeze_safety_gate` in `crates/aterm-release/src/publish.rs`, which is
+/// mandatory and runs before the ledger claim.
 ///
 /// Idempotent, and skipped entirely under `--selftest`, exactly as before.
 fn pin_hooks(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<()> {
@@ -714,9 +811,9 @@ fn pin_hooks(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<()> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     if current != ".githooks" && git(&["config", "core.hooksPath", ".githooks"]).is_some() {
-        out.write_all(
-            b"  hooks pinned: core.hooksPath = .githooks (pre-push is ADVISORY \
-              and blocks nothing; the L0 gate is this run's freeze stage)\n",
+        writeln!(
+            out,
+            "  hooks pinned: core.hooksPath = .githooks ({HOOK_CLAIM})"
         )?;
     }
     Ok(())

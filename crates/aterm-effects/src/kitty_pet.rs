@@ -229,10 +229,35 @@
 //! 0.67 s and the hang holds the lift and the stretch flat right through it,
 //! so the top of the arc gets `PetApex` rather than forty ticks of one
 //! unchanging bitmap. An ordinary pounce keeps its three beats.
+//!
+//! ## A word typed at the cat
+//!
+//! `sit`, `kitty jump`, `good kitty`: the host's line listener
+//! (`crate::typed_tricks`) hears a [`Trick`] word on a line of nothing but
+//! pet talk and the brain is told through [`PetBrain::note_trick`] — a LATCH,
+//! like every other stimulus, never an act. It is a request to a cat already
+//! on glass (a typed word summons nothing), it waits for the ground and for
+//! the hand to stop ([`TRICK_SETTLE`]; longer while the line may still turn
+//! into prose, and [`PetBrain::revoke_trick`] takes such a one back), and it
+//! is finite: [`TRICK_TTL`] from the user's last KEY — never from a caret
+//! move, because programs move the caret too.
+//!
+//! Every trick is two beats. The shared "heard you" perk first, because the
+//! ladder sits every cat 1.4 s after any typing and an answer that cannot be
+//! told from the idle reads as no answer; then the verb, in machinery this
+//! file already owned — no new action, no new pose, no new motion law. Three
+//! verbs are PLACES ON THE QUIET LADDER (sit, down, sleep) and are performed
+//! by moving `quiet` to the rung and declaring a level: a commanded sleep is
+//! natural sleep reached early, byte-stable deep sleep and all, and a
+//! commanded sit PARKS for its hold with the hold's end named to the coarse
+//! offer. The rest are one-shots on existing holds. None of it exists on the
+//! no-trick path: with nothing noted the brain is byte for byte the brain it
+//! was, apart from two orphaned-timer clears the commands made reachable.
 
 use core::f32::consts::TAU;
 use core::time::Duration;
 
+use aterm_lexicon::Trick;
 use aterm_time::Instant;
 
 use crate::cat_baker::CatColorKey;
@@ -1271,8 +1296,8 @@ const PET_LATCH_MAX: u8 = 3;
 /// DERIVED (2026-09-10, the room round) from the design's own cadence, not
 /// from taste: the effect lane presents at HALF panel rate
 /// (`EFFECT_PRESENT_PANEL_PERIODS = 2`, `RAINBOW-KITTY-V2.md` T7 — "2–4
-/// effect frames on a 60 Hz panel"), so ONE LANE TICK on the slowest panel
-/// the design names is `2 / 60` s = 33.3 ms. The perk edge is latched
+/// on a 60 Hz panel under the halving"), so ONE LANE TICK on the slowest
+/// panel the design names is `2 / 60` s = 33.3 ms. The perk edge is latched
 /// during the flight (the impulse is minted at the meteor's birth with
 /// `at = t₀ + T`, `Engine::pet_offer`), and the first tick at or after
 /// `at` takes it — a tick that is at most one lane tick late. The tick
@@ -1281,6 +1306,12 @@ const PET_LATCH_MAX: u8 = 3;
 /// late is a cat noticing something else. The wiring round's `0.033` was
 /// "one frame at 30 fps" by taste; the derivation lands on the same number
 /// (`2 / 60`), so the value is unchanged and the reason is now the lane's.
+/// The one lane that ticks faster at 60 Hz is an Intel Mac's
+/// (`EFFECT_LANE_PANEL_RATE_AT_60HZ`: a known panel at or below 60 Hz
+/// presents the lane at panel rate while that window's drawable pool stays
+/// free). There a tick is 16.7 ms, so this bound admits the arrival's frame
+/// and the one after it; the value stays the halving's tick, the cadence
+/// that lane falls back to when its pool parks.
 /// Nothing can hold the latch open — the offer buys no wake
 /// ([`PetBrain::needs_frames`]) — so this is what retires an edge the
 /// pet's own work ticked straight past.
@@ -1367,6 +1398,75 @@ const PET_HOLD: f32 = 1.1;
 /// eleven walk the ledger up to [`JOY_CONTENT`], where the next word jump
 /// answers with the whole screen-crossing show.
 const PET_CONTENT: f32 = 0.08;
+
+// ── the typed kitty commands (tricks) ───────────────────────────────────────
+//
+// A word typed AT the cat — `sit`, `kitty jump`, `good kitty` — is heard by
+// the host's line listener (`crate::typed_tricks`) and arrives here as ONE
+// latched [`Trick`]. It is a request, never a summon and never a teleport:
+// every performance below is a pose, a hold or a flight this file already
+// owned. What the wave adds is the latch, its two settle gates, a quiet-clock
+// level for the three verbs that are a PLACE ON THE LADDER rather than a beat
+// (sit, down, sleep), and the shared "heard you" notice every verb opens with.
+
+/// How long the caret must have been still before a CONFIRMED trick — the
+/// line named the pet, or Enter submitted a line of nothing but pet talk — is
+/// performed. DERIVED from the two windows it has to clear: the typing
+/// rhythm's own [`RHYTHM_WINDOW`] (0.6 s: a shorter pause keeps a run alive,
+/// and a verb played inside a run is a tic), and the console layer's
+/// `INPUT_HOLD` (0.65 s), inside which every tick wipes the verdict latches
+/// and wears the typing pose. 0.70 s is the first round number past both.
+const TRICK_SETTLE: f32 = 0.70;
+/// …and before a TENTATIVE one — a plain word on a line that has not named
+/// the pet, which the very next token may turn into prose (`sit tight`, `roll
+/// back the last commit`). [`PURSUIT_QUIET`]: the file's own bar for "the
+/// hand has really stopped", which a thinking pause inside a sentence rarely
+/// reaches and the listener's revoke usually beats.
+const TRICK_SETTLE_TENTATIVE: f32 = PURSUIT_QUIET;
+/// The trick latch's TTL, from its last RE-STAMP — and the re-stamp is the
+/// user's own typing ([`PetBrain::note_console_input`]: text, a delete, a
+/// submit) and NOTHING ELSE. Never the move sensor: program output moves the
+/// caret too, and a build log re-stamping the latch would hold it (and the
+/// frame lane, and the console resident's perch) for the whole cap.
+const TRICK_TTL: f32 = 4.0;
+/// …and the absolute cap from the note itself, which only ever binds while
+/// somebody types without a [`TRICK_SETTLE`] pause — a chase that owns the
+/// lane already.
+const TRICK_CAP: f32 = 20.0;
+/// How long a commanded sit or loaf is HELD before the ladder has the seat
+/// back, in seconds of quiet past the rung the verb fast-forwarded to. A
+/// level on the quiet clock ([`PetBrain::hold_end_q`]), never a timer: the
+/// cat parks through it and the coarse offer names its end.
+const TRICK_HOLD: f32 = 4.0;
+/// `play`'s frolic — two full playbow/bat alternations of [`FROLIC_HOLD`].
+const TRICK_PLAY_HOLD: f32 = 2.0 * FROLIC_HOLD;
+/// `hide` with no word in reach ducks where it stands instead: the hide's own
+/// held crouch for a third of [`HIDE_DWELL`] — long enough to read as a cat
+/// making itself small, short enough that a request answered with the
+/// fallback does not take the cat away for the whole dwell.
+const TRICK_DUCK: f32 = HIDE_DWELL / 3.0;
+/// What typed praise (`purr`, `treat` and their families) is worth to the
+/// ledger: the fast success's nudge, [`CHEER_FAST_CONTENT`] — and at most
+/// once per [`TRICK_CONTENT_COOL`], so the joy ledger cannot be farmed from
+/// the keyboard (0.06 per 20 s against a settled spend of [`CONTENT_DECAY`]
+/// 0.07 per SECOND). A scold moves nothing at all.
+const TRICK_CONTENT: f32 = CHEER_FAST_CONTENT;
+const TRICK_CONTENT_COOL: f32 = 20.0;
+/// THE EXIT-127 FORGIVENESS's window: a failure that completes this soon
+/// after a line of nothing but pet talk was submitted is the shell saying
+/// `command not found: sit`, which is not a failure the cat should grieve.
+const TRICK_SUBMIT_FORGIVEN: f32 = 2.0;
+// STRUCTURAL, not a comment: the confirmed gate clears the typing rhythm's
+// window, the tentative gate is never the shorter of the two, and the TTL
+// outlasts both — a latch that could expire before its own gate opened would
+// be a request no pause could ever answer. (The console layer's input hold
+// is private to `console_life`, which asserts its half there.)
+const _: () = assert!(
+    TRICK_SETTLE > RHYTHM_WINDOW
+        && TRICK_SETTLE_TENTATIVE >= TRICK_SETTLE
+        && TRICK_TTL > TRICK_SETTLE_TENTATIVE + PERK_HOLD
+        && TRICK_CAP > TRICK_TTL
+);
 
 // ── the interactive stimuli (wave 2) ────────────────────────────────────────
 //
@@ -2505,6 +2605,29 @@ pub struct RoomInbox {
     pub hold: bool,
 }
 
+/// **A TYPED KITTY COMMAND, LATCHED** — one not-yet-performed [`Trick`],
+/// waiting for the ground and for the hand to stop. One slot, newest wins:
+/// a cat asked to sit and then to jump jumps.
+///
+/// Deliberately NOT a [`RoomCue`]: that slot retires in under a second, is
+/// dropped by the very snap an Enter produces ([`PetBrain::clear_play_intents`])
+/// and buys no frame — three laws that are right for scenery and wrong for a
+/// thing the user asked for by name.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingTrick {
+    trick: Trick,
+    /// The request is FINAL: the line named the pet, or Enter submitted a
+    /// line of nothing but pet talk. `false` is a TENTATIVE fire — a plain
+    /// word the rest of the line may still turn into prose — which waits the
+    /// longer [`TRICK_SETTLE_TENTATIVE`] and which
+    /// [`PetBrain::revoke_trick`] may still take back.
+    confirmed: bool,
+    /// When it was first noted ([`TRICK_CAP`]'s clock, never re-stamped).
+    noted: Instant,
+    /// When the user last typed while it waited ([`TRICK_TTL`]'s clock).
+    stamped: Instant,
+}
+
 /// The airborne phase of a pounce or hop.
 #[derive(Clone, Copy, Debug)]
 struct Flight {
@@ -3051,6 +3174,63 @@ pub struct PetBrain {
     /// [`Self::next_change_deadline`] by law.
     pending_room: Option<RoomCue>,
     room_at: Option<Instant>,
+    /// **THE TYPED KITTY COMMAND** ([`Self::note_trick`]) waiting for the
+    /// ground — see [`PendingTrick`]. The wave-1 law: it IS in
+    /// [`Self::needs_frames`] (the consume gate is only reached by ticks),
+    /// so it is finite by construction — [`TRICK_TTL`] from the user's last
+    /// key, [`TRICK_CAP`] from the note — and it is dropped, not parked,
+    /// wherever there is no cat free to act it (no caret, reduced motion, a
+    /// held selection, a standing `hold on`). NOT dropped by
+    /// [`Self::clear_play_intents`] nor by the console layer's fresh-input
+    /// clear: the usual next event after the word is Enter, a row hop and a
+    /// fresh prompt, and the verb is owed to THAT prompt.
+    pending_trick: Option<PendingTrick>,
+    /// **HEARD YOU**: the latch has been consumed into the shared opening
+    /// beat — the perk in place — and this is the verb that beat owes,
+    /// performed on the tick the perk's hold lapses. Tied to its pose like
+    /// every landed beat, and to the promise the settle gate made it: a perk
+    /// taken away before it has played out, a caret that moves inside the
+    /// beat, a key that lands inside it — the hand went back to work, and
+    /// the verb goes with it (work outranks a trick). Finite by
+    /// construction: it cannot outlive one [`PERK_HOLD`].
+    trick_go: Option<Trick>,
+    /// The TENTATIVE trick the cat has already answered, and when — so the
+    /// confirmation that follows it (Enter, or the pet's name, on the same
+    /// still-pure line) UPGRADES NOTHING AND REPLAYS NOTHING: one phrase, one
+    /// trick. Written at the consume, and it counts as an ANSWER only once
+    /// `trick_go` is empty again (the verb began): while the beat still owes
+    /// the verb, a confirmation latches instead of being absorbed, and a
+    /// revoke takes the owed verb back. Forgotten by a revoke, by any other
+    /// note, by the verb being dropped unplayed, and after [`TRICK_CAP`]. A
+    /// memory, never a stimulus: it holds no frame and performs nothing.
+    trick_heard: Option<(Trick, Instant)>,
+    /// A ONE-SHOT trick is playing (a roll, a jump, a frolic, a wash…). Holds
+    /// no frame of its own — every such verb is an existing hold with its
+    /// own claim on the lane — and exists for one reader: the console
+    /// layer, which must not reseat a cat in the middle of what it was asked
+    /// to do. Cleared centrally the first tick the performance is over.
+    trick_act: bool,
+    /// **THE COMMANDED SETTLE**, a LEVEL: `Sit`, `Down` or `Sleep` and
+    /// nothing else. These three verbs are places on the quiet ladder, so
+    /// they are performed by moving `quiet` to the rung and saying so here —
+    /// the seat is then held against the ladder's own melt until
+    /// [`Self::hold_end_q`], and a console resident (a running command, a
+    /// standing result) neither swallows nor reseats it. Interrupted by
+    /// exactly what interrupts any settled pose: a caret move, fresh input,
+    /// a wake. NOT in [`Self::needs_frames`] — a commanded sit PARKS.
+    trick_settle: Option<Trick>,
+    /// The `quiet` at which a commanded sit or loaf ends — named to the
+    /// coarse offer ([`Self::next_change_secs`]). Meaningful only beside
+    /// `trick_settle`; written and zeroed with it, never alone.
+    hold_end_q: f32,
+    /// **A LINE OF NOTHING BUT PET TALK WAS SUBMITTED**
+    /// ([`Self::note_trick_submit`]) — the exit-127 forgiveness's stamp,
+    /// spent by the next completion whatever it says.
+    trick_submit_at: Option<Instant>,
+    /// The brain clock at the last praise that moved the ledger
+    /// ([`TRICK_CONTENT_COOL`]). Carried across a surface switch like
+    /// `bored_cool`: changing panes must not reopen the till.
+    trick_content_at: f64,
     /// A jump was seen; pounce as soon as the pet is free to act on it.
     pending_pounce: bool,
     /// A SCREEN-CROSSING jump was seen (or earned by joy); play the full
@@ -3330,6 +3510,16 @@ impl Default for PetBrain {
             room_inbox_seeded: false,
             pending_room: None,
             room_at: None,
+            pending_trick: None,
+            trick_go: None,
+            trick_heard: None,
+            trick_act: false,
+            trick_settle: None,
+            hold_end_q: 0.0,
+            trick_submit_at: None,
+            // Far in the past, like `last_frolic`: the first praise ever
+            // typed is never inside a cooldown nobody started.
+            trick_content_at: -1.0e9,
             pending_pounce: false,
             pending_big_jump: false,
             big_gather: false,
@@ -3583,6 +3773,11 @@ impl PetBrain {
         let mote_mark = self.mote_mark;
         let last_frolic = self.last_frolic;
         let bored_cool = self.bored_cool;
+        // A pending kitty command, its opening beat and its commanded seat
+        // are facts about the OLD surface and drop with it (`..default()`
+        // below). The praise cooldown is the same pet's, so it is carried:
+        // switching panes cannot reopen the ledger's till.
+        let trick_content_at = self.trick_content_at;
         let mut stroke = std::mem::take(&mut self.stroke);
         if let Some(now) = self.last_now {
             // Contact belongs to the old surface; the rate limit belongs
@@ -3611,6 +3806,7 @@ impl PetBrain {
             mote_mark,
             last_frolic,
             bored_cool,
+            trick_content_at,
             stroke,
             ink_spans,
             ..Self::default()
@@ -4056,16 +4252,37 @@ impl PetBrain {
     /// that ran at least [`CHEER_MIN_MS`] queues the cheer (upgraded past
     /// [`CHEER_BIG_MS`]), and a fast success only nudges.
     pub fn note_command_done(&mut self, now: Instant, failed: bool, dur_ms: Option<u64>) {
-        self.note_console_completion(now, failed);
-        // The injected clock is the idiom's signature; this stimulus keys
-        // its consumption off the ledger and the latch, not off a TTL.
-        let _ = now;
+        // **THE EXIT-127 FORGIVENESS**, decided FIRST — before the console
+        // layer is told anything. `sit` + Enter at a shell is a line of
+        // nothing but pet talk, and the shell answers `command not found`:
+        // a fast failure the user did not make and the cat must not grieve.
+        // The stamp ([`Self::note_trick_submit`]) is the listener's own fact
+        // about the SUBMITTED LINE, so an unrelated failure that merely
+        // follows a trick is not forgiven, and neither is a slow one (a real
+        // program ran). ONE-SHOT: spent by this completion whatever it says.
+        //
+        // Forgiven means the WHOLE failed reading is skipped, not just the
+        // droop: the ledger, the sulk latch, its date — a dated sulk would
+        // turn the next `ls` into THE FORGIVEN SUCCESS, the big cheer, for
+        // ten minutes — and the console layer's failed result and hush. The
+        // host's failure VOICE is not ours to silence, and should not be:
+        // the shell truthfully reported 127.
+        let pet_talk = self.trick_submit_at.take().is_some_and(|at| {
+            now.saturating_duration_since(at).as_secs_f32() <= TRICK_SUBMIT_FORGIVEN
+        });
+        let forgiven_trick = failed && pet_talk && dur_ms.is_none_or(|dur| dur < CHEER_MIN_MS);
+        if !forgiven_trick {
+            self.note_console_completion(now, failed);
+        }
         // THE VIGIL IS SPENT BY THE VERDICT, whatever the verdict says: the
         // wait is over either way, and only a GREEN one buys the strike.
         let vigil = self.vigil_t >= VIGIL_AFTER;
         self.exec_since = None;
         self.vigil_armed = false;
         self.vigil_t = 0.0;
+        if forgiven_trick {
+            return;
+        }
         if failed {
             self.content = (self.content - SULK_CONTENT).max(0.0);
             self.pending_sulk = true;
@@ -4141,6 +4358,112 @@ impl PetBrain {
     pub fn note_petted(&mut self, now: Instant) {
         self.pending_pet = self.pending_pet.saturating_add(1).min(PET_LATCH_MAX);
         self.pet_at = Some(now);
+    }
+
+    /// **A KITTY COMMAND WAS TYPED** — the host's line listener
+    /// (`crate::typed_tricks::TrickListener`) heard a [`Trick`] word at a word
+    /// boundary on a line of nothing but pet talk. `confirmed` is the
+    /// listener's `addressed`: the line named the pet, or Enter submitted it.
+    /// `false` is TENTATIVE — a plain word the rest of the line may yet turn
+    /// into prose — and the listener follows it with exactly one of a
+    /// confirmation (this call again, `confirmed = true`) or
+    /// [`Self::revoke_trick`].
+    ///
+    /// Latch, never act — the `note_bell` idiom. One slot, newest wins; the
+    /// same trick noted again only ever UPGRADES (tentative → confirmed,
+    /// never back) and keeps its first note's [`TRICK_CAP`] clock. `tick`
+    /// performs it on the ground, below every caret intent and ranked bell >
+    /// sulk > cheer > petted > TRICK > flow, once the caret has been still
+    /// for [`TRICK_SETTLE`] (confirmed) or [`TRICK_SETTLE_TENTATIVE`] — so
+    /// `sit` + Enter plays at the NEW prompt, after the row hop, never 100 ms
+    /// into it.
+    ///
+    /// **ONE PHRASE, ONE TRICK.** A confirmation that arrives after the cat
+    /// has already answered the tentative fire (`sit`, a long pause — the cat
+    /// sits — then Enter) is absorbed: it upgrades nothing and replays
+    /// nothing. ANSWERED means the verb has begun, not that the cat looked
+    /// up: a confirmation landing INSIDE the opening beat is noted by the
+    /// key handler before the tick that sees the key, and that key's own
+    /// caret move is about to take the beat's verb away — so it latches, and
+    /// whichever of the two survives plays, once (`tick`'s verb arm retires
+    /// a latch the beat's own verb has just satisfied).
+    ///
+    /// A typed word is a request to a cat ALREADY ON GLASS. It summons
+    /// nothing: with no caret to stand by the latch is dropped, exactly like
+    /// every other stimulus. The host should ask for the frame that ticks it
+    /// (the [`Self::note_petted`] precedent — the latch re-arms
+    /// [`Self::needs_frames`], but only a tick reads it).
+    pub fn note_trick(&mut self, now: Instant, trick: Trick, confirmed: bool) {
+        let heard = self.trick_heard.take();
+        if confirmed
+            && self.pending_trick.is_none()
+            && self.trick_go.is_none()
+            && heard.is_some_and(|(t, at)| {
+                t == trick && now.saturating_duration_since(at).as_secs_f32() <= TRICK_CAP
+            })
+        {
+            return;
+        }
+        self.pending_trick = Some(match self.pending_trick {
+            Some(p) if p.trick == trick => PendingTrick {
+                confirmed: p.confirmed || confirmed,
+                stamped: now,
+                ..p
+            },
+            _ => PendingTrick {
+                trick,
+                confirmed,
+                noted: now,
+                stamped: now,
+            },
+        });
+    }
+
+    /// **THE LINE TURNED INTO PROSE** (`sit tight`, `roll back the last
+    /// commit`) or was aborted: take back a TENTATIVE trick that has not been
+    /// performed yet. Drops ONLY that — a confirmed latch is a request the
+    /// user finished making, a verb already begun plays out (a revoke is not
+    /// a fright), and with nothing pending this is a no-op, so the host may
+    /// forward every revoke the listener reports without asking what it hit.
+    ///
+    /// NOT PERFORMED YET covers the opening beat: a tentative word the cat
+    /// has looked up at, whose verb is still owed, is taken back with it —
+    /// the perk plays out and nothing follows. (The key that made the line
+    /// prose usually takes the beat away first; this is the same answer for
+    /// a revoke that arrives with no caret move behind it.)
+    pub fn revoke_trick(&mut self) {
+        if self.pending_trick.is_some_and(|p| !p.confirmed) {
+            self.pending_trick = None;
+        }
+        // The tentative phrase is over either way: nothing is left for a
+        // later confirmation of the same word to be the echo of. The memory
+        // is only ever `Some` for a TENTATIVE consume, so a beat it still
+        // matches is a tentative verb nobody has seen begin.
+        if let Some((heard, _)) = self.trick_heard.take()
+            && self.trick_go == Some(heard)
+        {
+            self.trick_go = None;
+        }
+    }
+
+    /// **THE WHOLE SUBMITTED LINE WAS PET TALK** (`sit` + Enter at a shell) —
+    /// the listener's `submit_pet_only`. Stamps THE EXIT-127 FORGIVENESS: the
+    /// shell is about to answer `command not found: sit`, and
+    /// [`Self::note_command_done`] does not grieve a fast failure that lands
+    /// inside [`TRICK_SUBMIT_FORGIVEN`] of this stamp. One-shot — the next
+    /// completion spends it, whatever it says.
+    pub fn note_trick_submit(&mut self, now: Instant) {
+        self.trick_submit_at = Some(now);
+    }
+
+    /// The latched, not-yet-performed trick — host observability on
+    /// [`Self::pending_pets`]'s precedent: the typed-word seam's unit tests
+    /// assert the latch moved without driving a frame. `None` once the cat
+    /// has HEARD it (the opening beat has begun), and after a drop, a revoke
+    /// or the TTL.
+    #[must_use]
+    pub fn pending_trick(&self) -> Option<Trick> {
+        self.pending_trick.map(|p| p.trick)
     }
 
     /// **THE HAND FOUND ITS FLOW** — the human crossed into flow state (24
@@ -4619,6 +4942,19 @@ impl PetBrain {
                 && self.pet_at.is_none()
                 && self.pending_bat.is_none()
                 && self.pending_look.is_none()
+                // THE TYPED KITTY COMMAND joins on the wave-1 terms: the
+                // latch IS in `needs_frames`, so one noted at a hidden cat
+                // must meet the slow arm — which DROPS it, with its opening
+                // beat, its playing flag and its commanded seat — and may
+                // never ride this path into the next appearance.
+                // (`hold_end_q` and `trick_heard` have no term: the first is
+                // only ever written beside `trick_settle`, the second only
+                // at a consume on the LIVE path, and the slow arm that must
+                // run before this one can zeroes both.)
+                && self.pending_trick.is_none()
+                && self.trick_go.is_none()
+                && !self.trick_act
+                && self.trick_settle.is_none()
                 && self.motes.iter().all(Option::is_none)
                 && self.departures.iter().all(Option::is_none)
             {
@@ -4698,6 +5034,11 @@ impl PetBrain {
             self.pending_pet = 0;
             self.pet_at = None;
             self.pet_hold_t = 0.0;
+            // …and the typed kitty command, whole: a word typed at a cat
+            // nobody can see is a request to nobody (and a typed word never
+            // summons), and a commanded seat is a pose about a body that is
+            // not on glass.
+            self.drop_tricks();
             // The wave-2 heat too: a hidden caret means no stream on this
             // surface worth watching, and a stale watch must not resume
             // against a fresh sighting.
@@ -4928,6 +5269,19 @@ impl PetBrain {
                 self.spawn_wake_pop(width);
             }
             self.quiet = 0.0;
+            // A COMMANDED SEAT IS A SETTLED POSE, and "settled" is this
+            // file's word for the states a caret move interrupts: the level
+            // stands down with the quiet clock it was written on. So does
+            // the verb a "heard you" beat still owes — the settle gate
+            // promised the verb a hand that had stopped, and a caret that
+            // moves inside the beat has broken that promise even when the
+            // step is too small to take the perk away (a roll begun then
+            // would hold the cat on its back for two seconds while the
+            // caret typed off down the line). The LATCH does neither — a
+            // move is what it is waiting out — and it is never re-stamped
+            // from here ([`TRICK_TTL`]): program output moves the caret too.
+            self.clear_trick_settle();
+            self.drop_trick_go();
         } else {
             self.quiet += elapsed;
         }
@@ -5015,6 +5369,43 @@ impl PetBrain {
             self.catch_cool = 0.0;
             self.mote_rgb = None;
             self.pet_hold_t = 0.0;
+            // THE TYPED KITTY COMMAND is bookkeeping here too: no notice, no
+            // verb, no held seat — the opening beat, the playing flag and
+            // the commanded level are all zeroed, and praise still warms the
+            // ledger (the petting precedent above: what affection would have
+            // bought lands, behind its own cooldown). ONE verb is honoured,
+            // because it is not motion at all: `sleep` is a still-pose swap,
+            // and this arm already picks Sit or Sleep from `quiet` alone —
+            // so a pending sleep fast-forwards the quiet clock and the last
+            // lines of this arm do the rest. It waits out its settle gate
+            // like anywhere else (a pose that swapped on the word's last
+            // letter and back on the next key would be the one flicker this
+            // arm exists to refuse), and the latch's TTL is swept HERE,
+            // because this arm returns before the live path's sweep and the
+            // host still honours `needs_frames` under a load shed.
+            self.trick_go = None;
+            self.trick_heard = None;
+            self.trick_act = false;
+            self.clear_trick_settle();
+            self.sweep_trick_latch(sense.now);
+            if let Some(p) = self.pending_trick {
+                if p.trick == Trick::Sleep {
+                    if self.quiet >= Self::trick_settle_after(p.confirmed) {
+                        self.pending_trick = None;
+                        self.quiet = self.quiet.max(SLEEP_AFTER);
+                    }
+                } else {
+                    self.pending_trick = None;
+                    self.praise(p.trick);
+                }
+            }
+            // …and THE ORPHANED HOLDS the commands made reachable: a roll or
+            // a hide that was live when reduced motion (or a load shed)
+            // engaged has no arm left to spend it — this one pins the pose
+            // to Sit or Sleep — and both hold `needs_frames` open.
+            self.wriggle_t = 0.0;
+            self.hide_to = None;
+            self.hiding = false;
             // Wave 2 is theater and theater only: no perk at a stream under
             // reduced motion, no pointer play, and no heat left behind to
             // fire either later.
@@ -5084,6 +5475,38 @@ impl PetBrain {
         if self.action != PetAction::Land {
             self.scrabble = false;
         }
+        // THE SAME LAW FOR THE ROLL AND THE HIDE, which had no central clear
+        // because nothing could take their pose away: the bored vignettes
+        // that arm them need eight seconds of quiet, and a user eight
+        // seconds idle is not about to press Enter. A COMMANDED roll happens
+        // at the keyboard — `roll` + Enter, then `git status` + Enter inside
+        // [`WRIGGLE_DUR`] — and the jump's Perk strands `wriggle_t` above
+        // zero with `needs_frames` pinned until the ladder happens to deal
+        // Loaf again, whereupon the stale roll REPLAYS. A pose a re-anchor
+        // hop owes back is a pose the cat is still in (`grieving`'s rule),
+        // so the roll survives being hopped off arriving ink.
+        if self.action != PetAction::Loaf && !matches!(self.resume, Some((PetAction::Loaf, _))) {
+            self.wriggle_t = 0.0;
+        }
+        if self.action != PetAction::Crouch {
+            self.hiding = false;
+        }
+        // THE KITTY COMMAND's three pose-tied facts. The verb a "heard you"
+        // beat owes lives exactly as long as the Perk it rides: a perk taken
+        // away (the hand went back to work, a hop off arriving ink) takes
+        // the verb with it — work outranks a trick, and an owed verb with no
+        // pose behind it would pin the lane. The commanded seat stands down
+        // the tick its pose is no longer the cat's. And the playing flag
+        // drops the first tick the one-shot it marks is over.
+        if self.action != PetAction::Perk {
+            self.drop_trick_go();
+        }
+        if !self.trick_settle_posed() {
+            self.clear_trick_settle();
+        }
+        if self.trick_act && self.trick_act_over() {
+            self.trick_act = false;
+        }
         self.pet_hold_t = (self.pet_hold_t - dt).max(0.0);
         // The wave-1 latch TTLs, on the injected clock (never dt, which is
         // motion-clamped): a bell that outlived its window mid-flight
@@ -5100,6 +5523,9 @@ impl PetBrain {
             self.pending_pet = 0;
             self.pet_at = None;
         }
+        // The kitty command's two clocks ([`TRICK_TTL`] from the user's last
+        // key, [`TRICK_CAP`] from the note), and the room's standing halt.
+        self.sweep_trick_latch(sense.now);
         // The FLOW latch's TTL: the cat notices the hand finding its flow AT
         // the moment it happens or not at all. Expiring here — on every
         // non-deep-sleep frame, before `consume_stimuli` — is also what keeps
@@ -5609,11 +6035,24 @@ impl PetBrain {
         // ── HIDE-BEHIND-WORDS walk (wave 4c): the target is the spot behind
         // the word; arrival drops into the crouched hide. Any travel latch
         // clears the trip (the play-clear below).
+        //
+        // THE SPOT IS CLAMPED TO WHERE A BODY CAN STAND. It is computed from
+        // the word alone, and a short word at the margin (`>>>`, a two-glyph
+        // prompt: `first − 0.3·width` is negative) or one that runs to the
+        // right wall (`end − 0.7·width` is past `cols − width`) puts it off
+        // the pane — where `emit`'s position clamp stops the walk more than
+        // [`ARRIVED`] short of it, so the trip never arrived and `hide_to`
+        // held `needs_frames` open for good, the cat treading against the
+        // wall. The bored vignette could always deal this; a typed `hide` at
+        // a Python prompt reaches it with one word. In range the clamp is
+        // the identity, so every trip that used to end is byte for byte the
+        // trip it was.
         let (target, target_row) = if let Some(dest) = self.hide_to
             && !self.pending_pounce
             && !self.pending_big_jump
             && self.flight.is_none()
         {
+            let dest = dest.clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
             if (dest - self.col).abs() <= ARRIVED {
                 self.hide_to = None;
                 self.hiding = true;
@@ -6200,7 +6639,15 @@ impl PetBrain {
                     // the flight is dropped and `pending_cheer` stays exactly
                     // where it was, for the ordinary perk-and-frolic below.
                 }
-                if self.vigil_t >= VIGIL_AFTER && !self.pending_sulk && self.pending_cheer.is_none()
+                // …and so does a TYPED KITTY COMMAND: the cat at the door is
+                // being talked to, so it gets up and answers like it would
+                // answer the verdict — the vigil's entry (below, in the
+                // arrived ladder) stands aside until it has, then takes the
+                // door again.
+                if self.vigil_t >= VIGIL_AFTER
+                    && !self.pending_sulk
+                    && self.pending_cheer.is_none()
+                    && self.pending_trick.is_none()
                 {
                     self.facing_left = f32::from(cc) < self.col + width * 0.5;
                     self.speed = 0.0;
@@ -6369,6 +6816,65 @@ impl PetBrain {
                     && self.ink_overlaps(self.col, self.row, width))
                 {
                     self.speed = 0.0;
+                    return self.emit(sense, width);
+                }
+            }
+            PetAction::Perk if self.trick_go.is_some() => {
+                // **THE VERB.** The "heard you" beat has played out (the arm
+                // above returned for every tick of it), so the cat does what
+                // it was asked — HERE, on the tick the hold lapses, and not
+                // from the arrived ladder the latch was consumed in. The
+                // station is not still while the beat plays: the keep-ahead
+                // lead eases home over [`VEL_TAU`] and snaps shut with the
+                // rhythm window, and a console repair freezes those clocks
+                // and releases them late. Measured with an observed world:
+                // the station slid 0.87 cells under a perking cat, the chase
+                // below walked it home, and the walk took the perk — and the
+                // verb with it — a request heard and never answered. A cat
+                // performs where it stands; the chase has it home afterwards.
+                //
+                // Nothing that matters is skipped by not waiting for the
+                // ladder: the caret has not moved since the latch was heard
+                // (the move sensor drops the verb) and no key has landed
+                // (the console layer does), a flight returned long above,
+                // and the ink eviction has already had this tick. A bell or
+                // a verdict that landed inside the beat waits out the verb,
+                // exactly as it would wait out any other hold.
+                let trick = self.trick_go.take().expect("checked by the guard");
+                // ONE PHRASE, ONE TRICK: a confirmation of this very word
+                // that landed inside the beat latched it again
+                // ([`Self::note_trick`] cannot know whether the beat will
+                // survive the key that confirmed it). The beat survived, so
+                // the verb about to play IS the answer and the latch is spent
+                // with it.
+                if self.pending_trick.is_some_and(|p| p.trick == trick) {
+                    self.pending_trick = None;
+                }
+                self.speed = 0.0;
+                self.perform_trick(trick, cc, width, dt);
+                // A ONE-SHOT returns: it is a hold now, and holds own their
+                // ticks. A SEAT VERB (sit, down, sleep) does NOT — it is a
+                // level on the ladder, and a settled pose PARKS, so the rest
+                // of a settled tick is owed on this one. Two things an early
+                // return left to "whatever offer comes next", which is the
+                // late offer the twin walk exists to refuse:
+                //
+                //   * the body still off its mark. The follower does not run
+                //     under the beat, so the glide sensor (`needs_frames`:
+                //     "moved this tick, a pixel still to go") read a cat the
+                //     station had slid out from under as at rest, and the
+                //     next wake took the whole ease in one clamped stride;
+                //   * the ♪/♥ a purring cat is owed AT ONCE. The pose change
+                //     zeroed `mote_mark`, and [`Self::tend_motes`] deals on
+                //     "this beat is not the marked one", not on a boundary —
+                //     a spawn no edge names, dealt by the arrived branch's
+                //     last line on the ladder's own pose swaps.
+                //
+                // Falling through runs both. A station more than [`ARRIVED`]
+                // away walks the cat home first, and the level rides that
+                // walk ([`Self::trick_settle_posed`]): it sits down where it
+                // belongs, in the seat it was asked for.
+                if self.trick_settle.is_none() {
                     return self.emit(sense, width);
                 }
             }
@@ -6735,8 +7241,8 @@ impl PetBrain {
             // every caret-travel intent (flight, hop, wall transit, pounce,
             // big jump) and after every one-shot hold, exactly like the
             // pounce latch. One stimulus per tick: fright before grief
-            // before joy before affection.
-            if self.consume_stimuli(cc, width) {
+            // before joy before affection before a typed kitty command.
+            if self.consume_stimuli(&sense, cc, width) {
                 return self.emit(sense, width);
             }
             // RAINBOW KITTY v2's OFFER (panel #10) — ranked below the pet's
@@ -6935,6 +7441,10 @@ impl PetBrain {
                 && !self.hiding
                 && self.pursuit_t.is_none()
                 && self.play_to.is_none()
+                // A cat being talked to is not dragged back to the door: a
+                // latched kitty command would flip it up and down every
+                // tick, and a commanded seat would last one frame.
+                && !self.trick_engaged()
             {
                 self.vigil = true;
                 self.hop_crouch = false;
@@ -7446,7 +7956,39 @@ impl PetBrain {
             self.settle_seed = self.settle_serial.wrapping_add(self.mote_serial);
         }
 
-        let next = if self.quiet >= SLEEP_AFTER && !self.waiting_up() {
+        // THE COMMANDED SEAT (a typed `sit` or `down`) is a LEVEL ON THE
+        // QUIET CLOCK, not a timer: it ends when `quiet` reaches
+        // [`Self::hold_end_q`], which is an instant the coarse offer can
+        // name — so the cat PARKS through the hold instead of burning ~240
+        // lane frames on a still pose, and there is no timer for the
+        // reduced, resident or no-caret arms to strand above zero.
+        if self.trick_settle.is_some()
+            && self.trick_settle != Some(Trick::Sleep)
+            && self.quiet >= self.hold_end_q
+        {
+            self.clear_trick_settle();
+        }
+        let next = if self.trick_settle == Some(Trick::Down) {
+            // DOWN: the loaf, held — no wash, no purr's pose — until the
+            // hold's end hands the dwell back to the deal below.
+            PetAction::Loaf
+        } else if self.trick_settle == Some(Trick::Sit) {
+            // SIT: the room's "sits tight" seat (below), for the length of
+            // the hold. Both commanded seats are asked for ABOVE the
+            // ladder's sleep, and that costs idle-to-zero nothing — the hold
+            // is [`TRICK_HOLD`] long and parked throughout. Asked for below
+            // it, a cat already quiet past [`SLEEP_AFTER`] (one waiting up
+            // with a job, one called off its vigil) wore the commanded seat
+            // for ONE FRAME before the ladder slept it: a pose flash under
+            // the frame-rate law's two-tick floor, and a request answered
+            // with nothing. A typed word never meets this — its own keys
+            // zeroed `quiet` a second ago.
+            PetAction::Sit
+        } else if self.quiet >= SLEEP_AFTER
+            // A cat TOLD to sleep sleeps, vigil or no vigil: waiting up is
+            // the cat's own idea, and it was overruled by name.
+            && (!self.waiting_up() || self.trick_settle == Some(Trick::Sleep))
+        {
             PetAction::Sleep
         } else if self.quiet >= SIT_AFTER && self.room_hold {
             // SITS TIGHT (panel #9(e)): a standing `hold on` keeps the seat
@@ -8725,7 +9267,11 @@ impl PetBrain {
     /// startled z + the stretch); every latch except the bell is kept
     /// across the wake, so the droop/cheer/purr follows the stretch —
     /// the bell IS the wake in its case, and is spent by it.
-    fn consume_stimuli(&mut self, caret_col: u16, width: f32) -> bool {
+    ///
+    /// `sense` is the typed kitty command's ([`Self::consume_trick`]: its
+    /// answered-word memory is dated on the injected clock); the four
+    /// stimuli above it do not read it.
+    fn consume_stimuli(&mut self, sense: &PetSense, caret_col: u16, width: f32) -> bool {
         // Fright first: the bell interrupts what the others would start.
         if self.pending_bell.take().is_some() {
             self.quiet = 0.0;
@@ -8782,9 +9328,7 @@ impl PetBrain {
                 return true; // latch kept
             }
             self.pending_cheer = None;
-            self.quiet = 0.0;
-            self.set_action(PetAction::Frolic);
-            self.spawn_cheer_motes(big, width);
+            self.cheer_frolic(big, width);
             return true;
         }
         if self.pending_pet > 0 {
@@ -8806,6 +9350,12 @@ impl PetBrain {
             // so a long-settled cat returns from the hold to its ladder.
             self.set_action(PetAction::Purr);
             self.spawn_pet_hearts(n, width);
+            return true;
+        }
+        // THE TYPED KITTY COMMAND — below the hand on the cat (a touch is
+        // more direct than a word) and above the flow, which is the one
+        // thing on this ladder the cat merely noticed.
+        if self.consume_trick(sense, width) {
             return true;
         }
         // THE HAND FOUND ITS FLOW — last in the ladder, because every other
@@ -8830,6 +9380,373 @@ impl PetBrain {
             return true;
         }
         false
+    }
+
+    /// The celebration itself — the frolic and its ♪/♥ shower — once the
+    /// notice has led it. ONE body for the two owners that play it: a long
+    /// green command ([`Self::consume_stimuli`], off `pending_cheer`) and a
+    /// typed `treat`, which performs it DIRECTLY. The treat cannot ride
+    /// `pending_cheer`: the console layer wipes that latch on every tick
+    /// the last key is younger than its input hold, and a cheer takes two
+    /// ticks (the notice, then this), so a typed treat latched there was
+    /// erased before it could frolic.
+    fn cheer_frolic(&mut self, big: bool, width: f32) {
+        self.quiet = 0.0;
+        self.set_action(PetAction::Frolic);
+        self.spawn_cheer_motes(big, width);
+    }
+
+    /// The settle gate of a kitty command: [`TRICK_SETTLE`] once the request
+    /// is final, [`TRICK_SETTLE_TENTATIVE`] while the line may still turn
+    /// into prose.
+    fn trick_settle_after(confirmed: bool) -> f32 {
+        if confirmed {
+            TRICK_SETTLE
+        } else {
+            TRICK_SETTLE_TENTATIVE
+        }
+    }
+
+    /// Retire a kitty-command latch nobody will perform: [`TRICK_TTL`] past
+    /// the user's last key, [`TRICK_CAP`] past the note — both on the
+    /// injected clock, like every wave-1 TTL — or at once under THE ROOM's
+    /// standing `hold on`, where the cat sits tight (no games, no tricks).
+    /// Shared by the live path's sweep and the reduced-motion arm, which
+    /// returns before it.
+    fn sweep_trick_latch(&mut self, now: Instant) {
+        let Some(p) = self.pending_trick else {
+            return;
+        };
+        let since = |at: Instant| now.saturating_duration_since(at).as_secs_f32();
+        if self.room_hold || since(p.stamped) > TRICK_TTL || since(p.noted) > TRICK_CAP {
+            self.pending_trick = None;
+        }
+    }
+
+    /// Stand the commanded seat down — the level and the quiet value that
+    /// ends it together, never one alone (the no-caret fast path's induction
+    /// rests on that).
+    fn clear_trick_settle(&mut self) {
+        self.trick_settle = None;
+        self.hold_end_q = 0.0;
+    }
+
+    /// Drop the verb an opening beat still owes, UNPLAYED — and with it the
+    /// memory that a tentative word was answered, because it was not: the
+    /// confirmation that follows must find a cat that still owes the trick.
+    /// A verb already performed has left `trick_go` empty, and its memory is
+    /// kept.
+    fn drop_trick_go(&mut self) {
+        if self.trick_go.take().is_some() {
+            self.trick_heard = None;
+        }
+    }
+
+    /// No cat free to act it: the whole kitty-command wave is dropped, not
+    /// parked — the latch, the beat, the playing flag, the commanded seat and
+    /// the answered-word memory (the wave-1 rule; shared by the no-caret arm
+    /// and the console resident's clear list).
+    fn drop_tricks(&mut self) {
+        self.pending_trick = None;
+        self.trick_go = None;
+        self.trick_heard = None;
+        self.trick_act = false;
+        self.clear_trick_settle();
+    }
+
+    /// A kitty command has the cat's attention or its body: one is latched,
+    /// its opening beat is up, its one-shot is playing, or its commanded
+    /// seat is held. The console layer's affection arm reads this — a
+    /// running command or a standing result must neither swallow the latch
+    /// nor reseat a cat in the middle of what it was asked to do — and so
+    /// does the vigil, which does not drag a cat back to the door while it
+    /// is being talked to.
+    ///
+    /// Public as host observability, beside [`Self::pending_trick`]: a latch
+    /// that went `None` was either HEARD (this stays true while the beat and
+    /// the verb play) or dropped (this is false at once), and the typed-word
+    /// seam's tests and the latch's conformance bind tell the two apart here
+    /// without reading poses. Reads nothing else and changes nothing; it is
+    /// NOT the cadence signal — a held seat is engaged and parked.
+    #[must_use]
+    pub fn trick_engaged(&self) -> bool {
+        self.pending_trick.is_some()
+            || self.trick_go.is_some()
+            || self.trick_act
+            || self.trick_settle.is_some()
+    }
+
+    /// The commanded seat's pose is still the cat's — or is owed back to it
+    /// by a re-anchor hop (`grieving`'s rule: a pose the hop owes back is a
+    /// pose the pet is still in), or is WAITING ON THE WALK HOME: the verb
+    /// is declared where the cat stands, and a station the beat let slide
+    /// more than [`ARRIVED`] away is walked to before the seat is taken. A
+    /// walk keeps the level because nothing else that walks a cat can reach
+    /// here with one: a caret move and a key clear it by name, a console
+    /// trip drops the whole wave, and every other trip opens on a crouch, a
+    /// perk or a gallop, which are not the seat's and end it. Vacuously true
+    /// with no seat commanded.
+    fn trick_settle_posed(&self) -> bool {
+        let Some(trick) = self.trick_settle else {
+            return true;
+        };
+        let pose = if trick == Trick::Sleep {
+            PetAction::Sleep
+        } else if trick == Trick::Down {
+            PetAction::Loaf
+        } else {
+            PetAction::Sit
+        };
+        self.action == pose
+            || self.action == PetAction::Walk
+            || matches!(self.resume, Some((held, _)) if held == pose)
+    }
+
+    /// A one-shot trick has finished playing: the cat is back in a settled
+    /// pose that is not a notice, with none of the holds a verb can ride
+    /// still live and no pose owed back by a hop. Every one of those is
+    /// finite by its own law, so the flag this clears cannot outlive them.
+    fn trick_act_over(&self) -> bool {
+        self.action.settled()
+            && self.action != PetAction::Perk
+            && self.wriggle_t <= 0.0
+            && self.pet_hold_t <= 0.0
+            && !self.groom_owed
+            && self.hide_to.is_none()
+            && self.resume.is_none()
+    }
+
+    /// Typed praise warms the ledger by [`TRICK_CONTENT`] — and at most once
+    /// per [`TRICK_CONTENT_COOL`] of the brain's own clock, so `good kitty`
+    /// on repeat cannot farm the joy that gates the purr, the games and the
+    /// screen-crossing show. Everything that is not praise moves nothing; a
+    /// scold moves nothing either (no ledger, no dated sulk — it is a word,
+    /// not a failed build).
+    fn praise(&mut self, trick: Trick) {
+        let praised = match trick {
+            Trick::Purr | Trick::Treat => true,
+            Trick::Sit
+            | Trick::Down
+            | Trick::Sleep
+            | Trick::Stretch
+            | Trick::Jump
+            | Trick::Play
+            | Trick::Roll
+            | Trick::Groom
+            | Trick::Speak
+            | Trick::Look
+            | Trick::Paw
+            | Trick::Hide
+            | Trick::Boo
+            | Trick::Scold => false,
+        };
+        if praised && (self.clock - self.trick_content_at) as f32 >= TRICK_CONTENT_COOL {
+            self.trick_content_at = self.clock;
+            self.content = (self.content + TRICK_CONTENT).min(1.0);
+        }
+    }
+
+    /// **THE TYPED KITTY COMMAND, CONSUMED** — from the arrived branch only,
+    /// ranked under the hand on the cat and above the flow, so every
+    /// caret-travel intent and every one-shot hold has already had its turn.
+    /// A trick is two steps, and this is the first:
+    ///
+    /// 1. **HEARD YOU.** Once the caret has been still for the latch's
+    ///    settle gate, the latch is consumed into the perk IN PLACE (no
+    ///    quiet reset — the room's idiom), and the verb is owed
+    ///    ([`Self::trick_go`]). Every trick opens with this same beat,
+    ///    which is what makes a commanded `sit` attributable at all: the
+    ///    ladder sits every cat 1.4 s after any typing, and an answer that
+    ///    cannot be told from the idle is a request that "reads as broken".
+    /// 2. **THE VERB**, on the tick that perk's hold lapses — the holds
+    ///    ladder's own arm in `tick`, through [`Self::perform_trick`].
+    ///
+    /// A SLEEPING CAT IS ADDRESSED, so it is woken first and keeps its
+    /// latch (the petted precedent) — except that `sleep` said to a sleeper
+    /// is already done, and `stretch` IS the wake and is spent by it (the
+    /// bell's precedent). Returns whether it acted.
+    fn consume_trick(&mut self, sense: &PetSense, width: f32) -> bool {
+        let Some(p) = self.pending_trick else {
+            return false;
+        };
+        if self.quiet < Self::trick_settle_after(p.confirmed) {
+            return false;
+        }
+        if self.action == PetAction::Sleep {
+            if p.trick == Trick::Sleep {
+                self.pending_trick = None;
+                return false;
+            }
+            if p.trick == Trick::Stretch {
+                self.pending_trick = None;
+            }
+            self.quiet = 0.0;
+            self.set_action(PetAction::Waking);
+            self.spawn_wake_pop(width);
+            return true;
+        }
+        self.pending_trick = None;
+        self.trick_go = Some(p.trick);
+        // Only a TENTATIVE answer can be followed by a confirmation of the
+        // same word; a confirmed one is the end of its phrase.
+        self.trick_heard = (!p.confirmed).then_some((p.trick, sense.now));
+        // No turn here: the notice is the ears, and each verb faces the way
+        // it needs to ([`Self::perform_trick`]).
+        self.perk_in_place();
+        true
+    }
+
+    /// **THE VERB** — what each [`Trick`] looks like, in existing machinery
+    /// only: no new action, no new pose, no new motion law. The match is
+    /// EXHAUSTIVE on purpose: a seventeenth trick must stop the build here.
+    ///
+    /// Three verbs are PLACES ON THE LADDER and are performed by moving the
+    /// quiet clock to the rung and declaring the level
+    /// ([`Self::trick_settle`]) — everything downstream of a settled pose
+    /// (the z cadence, the breath, deep sleep's byte stability, the coarse
+    /// offer, the retired fast path) is already a pure function of `quiet`,
+    /// and a `force` flag would have broken every one of them. The rest are
+    /// ONE-SHOTS riding a hold this file already owned, flagged
+    /// ([`Self::trick_act`]) only so the console layer lets them finish.
+    fn perform_trick(&mut self, trick: Trick, caret_col: u16, width: f32, dt: f32) {
+        let caret = f32::from(caret_col);
+        let toward_caret = caret < self.col + width * 0.5;
+        self.trick_act = true;
+        self.praise(trick);
+        // THE CHEST IS TURNED OFF THE CARET for the three verbs that float
+        // a ♪ or a ♥ from it. The station is one cell from the caret, the
+        // chest anchor follows the facing, and a ♪ born on the caret's side
+        // is born inside the caret's keep-off ring and drifts further in —
+        // where the console layer culls every mote, for the mote's whole
+        // life. Measured with an observed world: a typed `treat` frolicked
+        // under an empty sky whenever the cat faced the caret, which is how
+        // a typing run usually leaves it (it eases BACK to its station).
+        // The verbs that are a look turn the other way, and float nothing.
+        let away = !toward_caret;
+        match trick {
+            Trick::Sit => {
+                // THE ATTENTIVE SEAT: the sit's own rung, held against the
+                // melt for [`TRICK_HOLD`] and worn looking UP (`emit`) so it
+                // is visibly not the idle sit.
+                self.trick_act = false;
+                self.quiet = self.quiet.max(SIT_AFTER);
+                self.trick_settle = Some(Trick::Sit);
+                self.hold_end_q = self.quiet + TRICK_HOLD;
+                self.facing_left = toward_caret;
+                self.set_action(PetAction::Sit);
+            }
+            Trick::Down => {
+                self.trick_act = false;
+                self.quiet = self.quiet.max(self.loaf_after());
+                self.trick_settle = Some(Trick::Down);
+                self.hold_end_q = self.quiet + TRICK_HOLD;
+                self.set_action(PetAction::Loaf);
+            }
+            Trick::Sleep => {
+                // Asleep exactly as the ladder would have put it there at
+                // [`SLEEP_AFTER`]: the z's, the breath, the ten seconds of
+                // light sleep and the byte-stable deep sleep all follow, and
+                // it lasts exactly like natural sleep — until the next caret
+                // move or key, waking with the stretch.
+                self.trick_act = false;
+                self.quiet = self.quiet.max(SLEEP_AFTER);
+                self.trick_settle = Some(Trick::Sleep);
+                self.enter_settled(dt);
+            }
+            Trick::Stretch => self.set_action(PetAction::Waking),
+            Trick::Jump => {
+                // IN PLACE, through the play flight's own door: the coiled
+                // crouch, a lawful zero-span arc ([`Self::leave_ground`]
+                // tiers it a hop — [`FLIGHT_MIN`] long, [`ARC_BASE`] high),
+                // the landing, and the landing's short frolic.
+                self.play_to = Some((self.col, self.row));
+                self.play_land = Some(PlayLand::PointerFrolic);
+                self.hop_crouch = false;
+                self.big_gather = false;
+                self.set_action(PetAction::Crouch);
+            }
+            Trick::Play => {
+                self.play_frolic = true;
+                self.swipe = false;
+                self.play_hold = TRICK_PLAY_HOLD;
+                self.set_action(PetAction::Frolic);
+            }
+            Trick::Roll => {
+                self.wriggle_t = WRIGGLE_DUR;
+                self.set_action(PetAction::Loaf);
+            }
+            Trick::Purr => {
+                // The petting beat, verbatim — the purr hold and one heart —
+                // with the ledger moved by [`Self::praise`] above rather
+                // than by a hand's [`PET_CONTENT`].
+                self.facing_left = away;
+                self.pet_hold_t = PET_HOLD;
+                self.set_action(PetAction::Purr);
+                self.spawn_pet_hearts(1, width);
+            }
+            Trick::Groom => {
+                self.groom_owed = true;
+                self.set_action(PetAction::Groom);
+            }
+            Trick::Speak => {
+                self.facing_left = away;
+                self.mail_beat(width);
+            }
+            Trick::Look => {
+                // The opening beat IS the verb: the perk is simply held a
+                // second hold longer, eyes on the caret.
+                self.facing_left = toward_caret;
+                self.perk_in_place();
+            }
+            Trick::Paw => {
+                // The bored vignette's bat at the cursor: face it, swipe,
+                // puff the contact dust at the caret cell — claws in.
+                self.facing_left = toward_caret;
+                self.play_frolic = true;
+                self.swipe = true;
+                self.play_hold = BAT_HOLD;
+                self.set_action(PetAction::Frolic);
+                self.spawn_bat_dust(caret, self.row);
+            }
+            Trick::Hide => {
+                // Behind a word on this row when one is in reach (the
+                // vignette's own walk, dwell and stroll home) — otherwise
+                // the cat makes itself small where it stands.
+                let behind = self
+                    .ink_span(self.row)
+                    .filter(|(first, end)| end - first >= 2.0)
+                    .map(|(first, end)| (end - width * 0.7).max(first - width * 0.3))
+                    .filter(|dest| (dest - self.col).abs() <= HIDE_RANGE);
+                if let Some(dest) = behind {
+                    self.hide_to = Some(dest);
+                } else {
+                    self.hiding = true;
+                    self.hide_t = TRICK_DUCK;
+                    self.hop_crouch = false;
+                    self.big_gather = false;
+                    self.set_action(PetAction::Crouch);
+                }
+            }
+            Trick::Boo => {
+                self.facing_left = caret < self.col;
+                self.set_action(PetAction::Startle);
+            }
+            Trick::Scold => {
+                // The ear-flat beat — the droop's own frame for
+                // [`EAR_FLAT_HOLD`] with none of the grief. The seat rule is
+                // the sulk's, read off the ladder because the pose on glass
+                // is the notice: a cat quiet past [`SIT_AFTER`] was seated
+                // when it looked up, and keeps its seat.
+                self.droop_seated = self.quiet >= SIT_AFTER;
+                self.droop_brief = true;
+                self.speed = 0.0;
+                self.set_action(PetAction::Droop);
+            }
+            Trick::Treat => {
+                self.facing_left = away;
+                self.cheer_frolic(false, width);
+            }
+        }
     }
 
     /// Drop every wave-2 play envelope — the no-audience and reduced-motion
@@ -9031,25 +9948,7 @@ impl PetBrain {
             }
             RoomCue::Mail => {
                 self.facing_left = f32::from(caret_col) < mid;
-                self.perk_in_place();
-                // One ear (the pulse twitch's own beat, its parity dealt the
-                // same way) and one ♪ off the chest, in the ribbon's colour
-                // under the cat when there is one.
-                self.twitch_t = TWITCH_DUR;
-                self.twitch_up = self.mote_serial.is_multiple_of(2);
-                let seed = self.mote_serial;
-                self.mote_serial = self.mote_serial.wrapping_add(1);
-                let chest_x = if self.facing_left { 0.38 } else { 0.62 };
-                self.spawn_mote(Mote {
-                    kind: PetMoteKind::Note,
-                    born: self.clock,
-                    life: PURR_MOTE_LIFE,
-                    col: self.col + width * chest_x + 0.23,
-                    row: self.row - 0.27,
-                    dir: if self.facing_left { -1.0 } else { 1.0 },
-                    seed,
-                    rgb: self.mote_rgb,
-                });
+                self.mail_beat(width);
             }
             RoomCue::EarFlat => {
                 // The sulk's seat rule, verbatim: a seated cat keeps its
@@ -9064,6 +9963,31 @@ impl PetBrain {
             }
         }
         true
+    }
+
+    /// THE MAIL BEAT — the perk in place, one ear (the pulse twitch's own
+    /// beat, its parity dealt the same way) and one ♪ off the chest, in the
+    /// ribbon's colour under the cat when there is one. The caller faces the
+    /// cat first. Two owners: unread mail ([`RoomCue::Mail`]) and a typed
+    /// `speak` — the pet has no open-mouth frame but the yawn, and a note
+    /// off the chest is what its voice has always looked like.
+    fn mail_beat(&mut self, width: f32) {
+        self.perk_in_place();
+        self.twitch_t = TWITCH_DUR;
+        self.twitch_up = self.mote_serial.is_multiple_of(2);
+        let seed = self.mote_serial;
+        self.mote_serial = self.mote_serial.wrapping_add(1);
+        let chest_x = if self.facing_left { 0.38 } else { 0.62 };
+        self.spawn_mote(Mote {
+            kind: PetMoteKind::Note,
+            born: self.clock,
+            life: PURR_MOTE_LIFE,
+            col: self.col + width * chest_x + 0.23,
+            row: self.row - 0.27,
+            dir: if self.facing_left { -1.0 } else { 1.0 },
+            seed,
+            rgb: self.mote_rgb,
+        });
     }
 
     /// The perk taken IN PLACE — the v2 perk edge's idiom: not a quiet
@@ -9560,6 +10484,20 @@ impl PetBrain {
                 } else {
                     PetGlyphId::PetStretchHind
                 }
+            }
+            // THE COMMANDED SIT, above every other reading of the seat: the
+            // attentive look-UP frame for the whole hold, so a cat told to
+            // sit is visibly not a cat that merely sat down — the ladder
+            // sits every cat 1.4 s after any typing, in the most-worn awake
+            // frame in the roster, and an answer that cannot be told from
+            // the idle reads as no answer. One held frame: no dealt beat
+            // plays under it (the offer's Sit arm names none), and the fold
+            // is the seat's own, so [`Self::seat_scale`] stays exact.
+            PetAction::Sit if self.trick_settle == Some(Trick::Sit) && !sense.reduced_motion => {
+                let fold = (1.0 - (self.quiet - SIT_AFTER) / SIT_FOLD).clamp(0.0, 1.0);
+                scale_y -= 0.05 * fold;
+                scale_x += 0.03 * fold;
+                PetGlyphId::PetSitLookup
             }
             // NOT MY HAND (panel #9(a)): under a controller lease the stand
             // and the sit are WORN as the perk — ears up on the caret — a
@@ -10461,6 +11399,15 @@ impl PetBrain {
             // construction — one crouch, one flight, one flourish.
             || self.pending_vigil_pounce
             || self.vigil_cheer.is_some()
+            // THE TYPED KITTY COMMAND: the latch needs ticks to reach its
+            // settle gate or its TTL ([`TRICK_TTL`] from the user's last
+            // key, [`TRICK_CAP`] from the note — finite either way), and the
+            // verb its opening beat owes lives exactly as long as that
+            // [`PERK_HOLD`] perk. The COMMANDED SEAT is deliberately absent:
+            // a level on the quiet clock, whose end the coarse offer names —
+            // a cat told to sit PARKS.
+            || self.pending_trick.is_some()
+            || self.trick_go.is_some()
         {
             return true;
         }
@@ -10860,9 +11807,22 @@ impl PetBrain {
             }
             return soon.0;
         }
+        // THE COMMANDED SEAT'S END (a typed `sit` or `down`): the quiet at
+        // which `enter_settled` hands the seat back to the ladder — a pose
+        // swap (the look-up frame comes off, the loaf may melt into the
+        // purr or get up to wash), so an edge, and exact because the hold
+        // is a level on the very clock this offer is measured in. It is
+        // what lets the held seat PARK. While it stands the ladder's own
+        // sleep, melt and wash are withheld (`enter_settled` asks for the
+        // hold first), so none of them is offered; the tick that ends the
+        // hold re-reads them all.
+        let seat_held = self.trick_settle.is_some() && self.trick_settle != Some(Trick::Sleep);
+        if seat_held {
+            soon.at(self.hold_end_q - q);
+        }
         // AWAKE AND SETTLED: the ladder's sleep is always coming — unless
         // the cat is waiting up (panel #9(b)), when it is withheld.
-        if !self.waiting_up() {
+        if !self.waiting_up() && !seat_held {
             soon.at(SLEEP_AFTER - q);
         }
         // The tell: the swell stops (and the ♪/♥ with it) when the ledger,
@@ -10894,6 +11854,7 @@ impl PetBrain {
             self.action,
             PetAction::Sit | PetAction::Loaf | PetAction::Purr
         ) && !self.room_hold
+            && !seat_held
         {
             let since = q - SIT_AFTER;
             let groom_after = self.groom_after();
@@ -10932,14 +11893,16 @@ impl PetBrain {
             PetAction::Sit => {
                 let since = q - SIT_AFTER;
                 // A cat sitting tight (panel #9(e)) never melts; a cat
-                // wearing the perk (#9(a)) deals no seat beats.
-                if !self.room_hold {
+                // wearing the perk (#9(a)) deals no seat beats — and
+                // neither does a COMMANDED sit, which does not melt until
+                // its hold ends and wears one held frame throughout.
+                if !self.room_hold && !seat_held {
                     soon.at(self.loaf_after() - q);
                     if self.settle_seed.is_multiple_of(2) {
                         soon.at(self.loaf_after() - YAWN_DUR - q);
                     }
                 }
-                if !self.room_lease {
+                if !self.room_lease && !seat_held {
                     self.sit_beat_edges(&mut soon);
                 }
                 let fold_live = since < SIT_FOLD;
@@ -26569,8 +27532,8 @@ mod tests {
     /// The reach constants are DERIVED (the room round): the catch TTL is
     /// the sky m1's catchable life — its whole life less the finish a catch
     /// puts it on — read off the sky's own constants, so a retuned star
-    /// retunes the cat; the perk's late bound is one lane tick on a 60 Hz
-    /// panel; the cooldown is two swipes.
+    /// retunes the cat; the perk's late bound is one tick of the halved lane
+    /// on a 60 Hz panel; the cooldown is two swipes.
     #[test]
     fn the_catch_ttl_is_the_sky_m1_s_catchable_life() {
         use crate::rainbow_kitty::stardust::{CATCH_FINISH_MS, StarClass, StarLane};
@@ -26583,5 +27546,1567 @@ mod tests {
         );
         assert!((V2_PERK_LATE - 2.0 / 60.0).abs() < 1e-6);
         assert!((V2_CATCH_COOL - 2.0 * BAT_HOLD).abs() < 1e-6);
+    }
+
+    // ── the typed kitty commands (tricks) ───────────────────────────────
+    //
+    // Every test here asserts on `pending_trick()` and on POSES, never on
+    // `action == Sit` alone: the ladder sits every cat 1.4 s after any
+    // typing, so an assertion the idle could satisfy proves nothing.
+
+    /// One keystroke: the caret steps one cell right of `from` a frame after
+    /// `t`. Returns the instant of the move — `quiet` is zero there, so it is
+    /// the origin every settle gate below is measured from.
+    fn one_key(pet: &mut PetBrain, t: Instant, from: (u16, u16)) -> Instant {
+        let t = t + Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((from.0, from.1 + 1))));
+        t
+    }
+
+    /// Tick at 60 fps for `secs` with the caret parked, collecting every
+    /// frame — the trick tests read whole performances, not last frames.
+    fn watch(
+        pet: &mut PetBrain,
+        start: Instant,
+        caret: (u16, u16),
+        secs: f32,
+    ) -> (Instant, Vec<PetFrame>) {
+        let mut t = start;
+        let end = start + Duration::from_secs_f32(secs);
+        let mut frames = Vec::new();
+        while t < end {
+            t += Duration::from_millis(16);
+            frames.push(pet.tick(sense(t, Some(caret))));
+        }
+        (t, frames)
+    }
+
+    /// The wave-1 latch law, for the kitty command: it re-arms the lane from
+    /// deep sleep (the consume gate is only reached by ticks), is performed
+    /// on the ground, and releases the lane again — and it outlives a hold
+    /// and a flight, because work outranks a trick and a trick waits.
+    #[test]
+    fn a_trick_latch_arms_and_releases_the_lane_and_survives_a_hold_and_a_flight() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let (t, _) = type_run(&mut pet, start, 4, 10, 6, 0.05);
+        let (t, _) = idle(&mut pet, t, (4, 16), SLEEP_AFTER + BREATH_WINDOW + 2.0);
+        assert!(!pet.needs_frames(), "fixture: deeply asleep, lane released");
+        pet.note_trick(t, Trick::Jump, true);
+        assert_eq!(pet.pending_trick(), Some(Trick::Jump));
+        assert!(pet.needs_frames(), "a latched trick re-arms the lane");
+        let (t, frames) = watch(&mut pet, t, (4, 16), 6.0);
+        assert_eq!(pet.pending_trick(), None, "performed on the ground");
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Waking),
+            "a sleeping cat is addressed: it wakes first, and keeps the latch"
+        );
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Leap),
+            "…then it jumps"
+        );
+        let (_, f) = idle(&mut pet, t, (4, 16), SLEEP_AFTER + BREATH_WINDOW + 2.0);
+        assert_eq!(f.action, PetAction::Sleep);
+        assert!(
+            !pet.needs_frames(),
+            "every envelope the trick rode is finite: the lane releases again"
+        );
+
+        // A HOLD: a real retreat bottles the cat, and the trick noted into
+        // the fright is still performed once the startle and the walk home
+        // are over.
+        let mut pet = PetBrain::default();
+        let (t, _) = type_run(&mut pet, start, 2, 10, 8, 0.06);
+        let (mut t, _) = idle(&mut pet, t, (2, 20), 0.5);
+        t += Duration::from_millis(16);
+        let f = pet.tick(sense(t, Some((2, 15))));
+        assert_eq!(f.action, PetAction::Startle, "fixture: the hold is live");
+        pet.note_trick(t, Trick::Roll, true);
+        let (_, frames) = watch(&mut pet, t, (2, 15), 3.0);
+        assert!(
+            frames.iter().any(|f| f.pose == PetGlyphId::PetRoll1),
+            "the latch outlives the startle hold and the walk home"
+        );
+
+        // A FLIGHT: noted mid-jump, performed after the landing.
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        t += Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((4, 40))));
+        pet.note_trick(t, Trick::Roll, true);
+        let (_, frames) = watch(&mut pet, t, (4, 40), 3.5);
+        let landed = frames
+            .iter()
+            .position(|f| f.action == PetAction::Land)
+            .expect("fixture: the jump lands inside the window");
+        let rolled = frames
+            .iter()
+            .position(|f| f.pose == PetGlyphId::PetRoll1)
+            .expect("the latch outlives the flight");
+        assert!(rolled > landed, "and the verb waits for the ground");
+    }
+
+    /// The two settle gates, measured from the last key: a CONFIRMED trick
+    /// is heard at [`TRICK_SETTLE`] (past the typing rhythm's window and the
+    /// console layer's input hold), a TENTATIVE one at
+    /// [`TRICK_SETTLE_TENTATIVE`] — and never a frame sooner, because a verb
+    /// played inside a typing run is a tic.
+    #[test]
+    fn a_tentative_trick_settles_at_one_second_and_a_confirmed_one_at_seven_tenths() {
+        let heard_after = |confirmed: bool| -> f32 {
+            let start = Instant::now();
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            let key = one_key(&mut pet, t, (4, 12));
+            pet.note_trick(key, Trick::Play, confirmed);
+            let mut t = key;
+            for _ in 0..120 {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((4, 13))));
+                if pet.pending_trick().is_none() {
+                    assert_eq!(
+                        f.action,
+                        PetAction::Perk,
+                        "the latch is consumed INTO the heard-you beat"
+                    );
+                    return (t - key).as_secs_f32();
+                }
+                assert_ne!(
+                    f.action,
+                    PetAction::Frolic,
+                    "nothing plays while the latch still waits"
+                );
+            }
+            panic!("the trick was never heard (confirmed = {confirmed})");
+        };
+        let confirmed = heard_after(true);
+        let tentative = heard_after(false);
+        assert!(
+            (TRICK_SETTLE..TRICK_SETTLE + 0.04).contains(&confirmed),
+            "confirmed: heard {confirmed} s after the last key, want {TRICK_SETTLE}"
+        );
+        assert!(
+            (TRICK_SETTLE_TENTATIVE..TRICK_SETTLE_TENTATIVE + 0.04).contains(&tentative),
+            "tentative: heard {tentative} s after the last key, want {TRICK_SETTLE_TENTATIVE}"
+        );
+    }
+
+    /// A revoke takes back ONLY a tentative latch that has not been heard:
+    /// a confirmed request stands, and with nothing pending it is a no-op
+    /// (the listener reports revokes the brain never had a latch for).
+    #[test]
+    fn a_revoke_drops_only_a_still_pending_tentative_latch() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.revoke_trick();
+        assert_eq!(pet.pending_trick(), None, "a revoke of nothing is a no-op");
+
+        pet.note_trick(t, Trick::Roll, false);
+        pet.revoke_trick();
+        assert_eq!(pet.pending_trick(), None, "a tentative latch is taken back");
+        assert!(!pet.needs_frames(), "…and the lane goes with it");
+        let (t, frames) = watch(&mut pet, t, (4, 12), 2.0);
+        assert!(
+            frames.iter().all(|f| f.pose != PetGlyphId::PetRoll1),
+            "a revoked trick is never performed"
+        );
+
+        pet.note_trick(t, Trick::Roll, true);
+        pet.revoke_trick();
+        assert_eq!(
+            pet.pending_trick(),
+            Some(Trick::Roll),
+            "a confirmed request is not the listener's to take back"
+        );
+
+        // The upgrade is one-way: tentative → confirmed, never back, and the
+        // same trick noted again keeps the ONE slot.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Sit, false);
+        pet.note_trick(t, Trick::Sit, true);
+        pet.note_trick(t, Trick::Sit, false);
+        pet.revoke_trick();
+        assert_eq!(pet.pending_trick(), Some(Trick::Sit), "upgraded, and kept");
+        // …and the newest DIFFERENT trick wins the slot.
+        pet.note_trick(t, Trick::Jump, false);
+        assert_eq!(pet.pending_trick(), Some(Trick::Jump));
+    }
+
+    /// A revoked trick leaves NO TRACE on glass: a cat told to roll and then
+    /// un-told before it could is, frame for frame, the cat that was never
+    /// told anything. (The no-trick path itself is pinned by
+    /// `the_same_typing_still_produces_the_same_cat` and the offer goldens.)
+    #[test]
+    fn a_revoked_trick_leaves_the_frames_byte_identical() {
+        let run = |tell: bool| -> Vec<u64> {
+            let start = Instant::now();
+            let mut pet = PetBrain::default();
+            let mut t = awake(&mut pet, start, 4, 10);
+            let mut fps = Vec::new();
+            for (i, (row, col)) in [(4u16, 13u16), (4, 14), (4, 15), (5, 2), (5, 3)]
+                .into_iter()
+                .enumerate()
+            {
+                if tell && i == 1 {
+                    pet.note_trick(t, Trick::Roll, false);
+                }
+                if tell && i == 2 {
+                    pet.revoke_trick();
+                }
+                for _ in 0..30 {
+                    t += Duration::from_millis(16);
+                    fps.push(pet.tick(sense(t, Some((row, col)))).fp());
+                }
+            }
+            for _ in 0..400 {
+                t += Duration::from_millis(16);
+                fps.push(pet.tick(sense(t, Some((5, 3)))).fp());
+            }
+            fps
+        };
+        assert_eq!(run(false), run(true));
+    }
+
+    /// THE TTL IS MEASURED FROM THE USER'S LAST KEY, and only the user's keys
+    /// re-stamp it. A caret that keeps moving with nobody typing — a program
+    /// printing — never lets the settle gate open, and must not keep the
+    /// latch (and the lane) alive either: gone by [`TRICK_TTL`], unperformed.
+    /// The same stream WITH the user's typing behind it is re-stamped by
+    /// every key and holds to the absolute [`TRICK_CAP`].
+    #[test]
+    fn a_trick_expires_four_seconds_after_the_last_key_and_never_from_caret_moves() {
+        let drive = |typing: bool| -> (f32, bool) {
+            let start = Instant::now();
+            let mut pet = PetBrain::default();
+            let t0 = awake(&mut pet, start, 4, 10);
+            pet.note_trick(t0, Trick::Roll, true);
+            let mut t = t0;
+            let mut col = 12u16;
+            let mut gone = None;
+            let mut rolled = false;
+            // A move every 96 ms, back and forth over two cells, for 24 s.
+            for step in 0..1500u32 {
+                t += Duration::from_millis(16);
+                if step % 6 == 0 {
+                    col = if col == 12 { 13 } else { 12 };
+                    if typing {
+                        pet.note_console_input(t, PetInputKind::Text);
+                    }
+                }
+                let f = pet.tick(sense(t, Some((4, col))));
+                rolled |= f.pose == PetGlyphId::PetRoll1;
+                if gone.is_none() && pet.pending_trick().is_none() {
+                    gone = Some((t - t0).as_secs_f32());
+                }
+            }
+            (gone.expect("the latch is finite by construction"), rolled)
+        };
+        let (gone, rolled) = drive(false);
+        assert!(
+            (TRICK_TTL..TRICK_TTL + 0.1).contains(&gone),
+            "streamed caret moves re-stamp nothing: gone at +{gone} s, want {TRICK_TTL}"
+        );
+        assert!(!rolled, "and an expired trick is never performed");
+        let (gone, rolled) = drive(true);
+        assert!(
+            (TRICK_CAP..TRICK_CAP + 0.1).contains(&gone),
+            "the user's own keys re-stamp it, up to the cap: gone at +{gone} s, want {TRICK_CAP}"
+        );
+        assert!(!rolled, "the hand never stopped, so the gate never opened");
+    }
+
+    /// `sit` + Enter: the word fires at the Enter, the caret hops a row and
+    /// the prompt comes back — and the verb plays at the NEW prompt, after
+    /// the hop, never 100 ms into it. The latch is not dropped by the snap
+    /// an Enter from a long line produces (`clear_play_intents`).
+    #[test]
+    fn a_typed_word_and_enter_plays_at_the_new_prompt() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let (t, _) = type_run(&mut pet, start, 4, 2, 24, 0.07);
+        // Enter: the listener confirms at the submit; the caret lands on
+        // the next row's prompt, a whole snap to the left.
+        pet.note_trick(t, Trick::Sit, true);
+        let mut t = t + Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((5, 2))));
+        assert_eq!(
+            pet.pending_trick(),
+            Some(Trick::Sit),
+            "the snap home clears play intents, never an owed trick"
+        );
+        let mut flew = false;
+        let mut sat_on = None;
+        for _ in 0..240 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((5, 2))));
+            flew |= f.action.airborne();
+            if f.pose == PetGlyphId::PetSitLookup {
+                sat_on = Some((f.row, flew, pet.flight.is_none()));
+                break;
+            }
+            if f.action.airborne() {
+                assert_eq!(
+                    pet.pending_trick(),
+                    Some(Trick::Sit),
+                    "work outranks a trick: the latch waits out the hop"
+                );
+            }
+        }
+        let (row, flew, grounded) = sat_on.expect("the commanded sit plays");
+        assert!(flew && grounded, "after the row hop, on the ground");
+        assert!((row - 5.0).abs() < 0.01, "at the NEW prompt: row {row}");
+    }
+
+    /// A TRICK TYPED AT SPEED is performed WHERE THE CAT STANDS. A real
+    /// typing run opens the rhythm gate and leads the station out ahead of
+    /// the caret; the lead eases home while the "heard you" beat plays, so
+    /// the station is not still under a perking cat. The verb starts on the
+    /// tick the perk lapses — it does not wait to be re-arrived at a mark
+    /// that moved (the observed-world twin of this is
+    /// `a_trick_typed_through_a_repair_is_still_performed`, where it
+    /// measurably did not).
+    #[test]
+    fn a_trick_typed_at_speed_is_performed_where_the_cat_stands() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let (t, _) = type_run(&mut pet, t, 4, 12, 18, 0.07);
+        assert!(
+            pet.lead() > 0.5,
+            "fixture: the run opened the lead ({})",
+            pet.lead()
+        );
+        pet.note_trick(t, Trick::Roll, true);
+        let (_, frames) = watch(&mut pet, t, (4, 30), 4.0);
+        let heard = frames
+            .iter()
+            .position(|f| f.action == PetAction::Perk)
+            .expect("heard");
+        assert!(
+            frames[heard..]
+                .iter()
+                .any(|f| f.pose == PetGlyphId::PetRoll1),
+            "a request that is heard is answered"
+        );
+    }
+
+    /// NO AUDIENCE, NO THEATER — and no trick either: a hidden caret and a
+    /// standing `hold on` each DROP the latch (dropped, not parked: nothing
+    /// replays when the caret comes back or the hold lifts), and reduced
+    /// motion is bookkeeping only — with the ONE verb that is a still-pose
+    /// swap honoured there.
+    #[test]
+    fn a_hidden_caret_reduced_motion_and_a_hold_on_each_drop_a_trick() {
+        let start = Instant::now();
+
+        // Hidden caret.
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Roll, true);
+        t += Duration::from_millis(16);
+        let _ = pet.tick(sense(t, None));
+        assert_eq!(pet.pending_trick(), None, "no caret: dropped at once");
+        let (_, frames) = watch(&mut pet, t, (4, 12), 3.0);
+        assert!(
+            frames.iter().all(|f| f.pose != PetGlyphId::PetRoll1),
+            "and never replayed when the caret returns"
+        );
+        // …and a trick typed at a cat that is not on glass summons nothing.
+        let mut pet = PetBrain::default();
+        pet.note_trick(start, Trick::Jump, true);
+        let mut t = start;
+        for _ in 0..4 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, None));
+            assert_eq!(f.alpha, 0, "a typed word never summons");
+        }
+        assert_eq!(pet.pending_trick(), None);
+        assert!(
+            !pet.needs_frames(),
+            "and a hidden cat owes no frames for it"
+        );
+
+        // A standing `hold on`: the cat sits tight.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_room_inbox(t, RoomInbox::default());
+        pet.note_room_inbox(
+            t,
+            RoomInbox {
+                hold: true,
+                ..RoomInbox::default()
+            },
+        );
+        pet.note_trick(t, Trick::Roll, true);
+        let (_, frames) = watch(&mut pet, t, (4, 12), 3.0);
+        assert_eq!(pet.pending_trick(), None);
+        assert!(
+            frames.iter().all(|f| f.pose != PetGlyphId::PetRoll1),
+            "under a hold the cat sits tight: no games, no tricks"
+        );
+
+        // Reduced motion: every verb but one is bookkeeping.
+        let reduced = |t: Instant| {
+            let mut s = sense(t, Some((3, 10)));
+            s.reduced_motion = true;
+            s
+        };
+        let mut pet = PetBrain::default();
+        let mut t = start;
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(reduced(t));
+        }
+        // A key, so the cat is awake and `quiet` is young.
+        t += Duration::from_millis(16);
+        let mut s = reduced(t);
+        s.caret = Some((3, 11));
+        let _ = pet.tick(s);
+        let still = |t: Instant| {
+            let mut s = reduced(t);
+            s.caret = Some((3, 11));
+            s
+        };
+        pet.note_trick(t, Trick::Jump, true);
+        for _ in 0..90 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(still(t));
+            assert_eq!(
+                f.action,
+                PetAction::Sit,
+                "no choreography under reduced motion"
+            );
+            assert_eq!((f.scale_x, f.scale_y, f.lift), (1.0, 1.0, 0.0));
+            assert!(f.motes.iter().all(Option::is_none));
+        }
+        assert_eq!(pet.pending_trick(), None, "the latch clears as bookkeeping");
+        assert!(!pet.needs_frames());
+        // …but SLEEP is a still-pose swap, and is honoured once the hand
+        // has stopped: the very arm that pins the pose reads it off `quiet`.
+        pet.note_trick(t, Trick::Sleep, true);
+        t += Duration::from_millis(16);
+        let f = pet.tick(still(t));
+        assert_eq!(
+            f.action,
+            PetAction::Sleep,
+            "a commanded sleep is a pose swap"
+        );
+        assert_eq!(f.pose, PetGlyphId::PetSleep0);
+        assert_eq!(pet.pending_trick(), None);
+        assert!(pet.trick_settle.is_none() && !pet.needs_frames());
+    }
+
+    /// COMMANDED SLEEP IS NATURAL SLEEP, reached early: the z's, the breath,
+    /// the light-sleep window and the byte-stable deep sleep are all pure
+    /// functions of `quiet`, so a cat told to sleep rides the coarse offer
+    /// exactly like one that dozed off — proven against a 60 fps twin — and
+    /// ends offering nothing, its lane released.
+    #[test]
+    fn a_commanded_sleep_ends_byte_stable_and_rides_the_offer() {
+        let start = Instant::now();
+        let (mut pet, mut twin, t) = settled_pair(start, SIT_AFTER + 0.3);
+        pet.note_trick(t, Trick::Sleep, true);
+        twin.note_trick(t, Trick::Sleep, true);
+        let (_, end) = walk_offers(&mut pet, &mut twin, t, (4, 12), 60.0);
+        assert_eq!(pet.action, PetAction::Sleep);
+        assert!(
+            (end - t).as_secs_f32() < BREATH_WINDOW + 3.0,
+            "asleep within the beat, deep within the breath window: {:?}",
+            end - t
+        );
+        assert!(
+            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
+            "the walk ends in deep sleep, not on a timeout: quiet {}",
+            pet.quiet
+        );
+        assert!(pet.next_change_deadline(end).is_none() && !pet.needs_frames());
+        let a = pet.tick(sense(end + Duration::from_secs(5), Some((4, 12))));
+        let b = pet.tick(sense(end + Duration::from_secs(9), Some((4, 12))));
+        assert_eq!(a.fp(), b.fp(), "deep sleep is byte-stable");
+        assert_eq!(a.pose, PetGlyphId::PetSleep0);
+        // It lasts exactly like natural sleep: the next key stretches it
+        // awake, and the level stands down with it.
+        let t = end + Duration::from_secs(10);
+        let f = pet.tick(sense(t, Some((4, 13))));
+        assert_eq!(f.action, PetAction::Waking);
+        assert!(pet.trick_settle.is_none());
+    }
+
+    /// A COMMANDED SIT PARKS. The hold is a level on the quiet clock, so the
+    /// cat is off the frame train for the whole of it, the offer NAMES its
+    /// end (the walk fails with "a late offer" if it does not — the look-up
+    /// frame comes off at that instant), and the pose is the attentive
+    /// look-up seat, visibly not the idle sit.
+    #[test]
+    fn a_commanded_sit_parks_wears_the_look_up_seat_and_names_its_end() {
+        let start = Instant::now();
+        let (mut pet, _, t) = settled_pair(start, SIT_AFTER + 0.3);
+        pet.note_trick(t, Trick::Sit, true);
+        // Heard, then seated: the beat and the verb are the train's.
+        let (mut t, _) = idle(&mut pet, t, (4, 12), PERK_HOLD + 0.1);
+        assert_eq!(
+            pet.trick_settle,
+            Some(Trick::Sit),
+            "fixture: the seat is commanded"
+        );
+        let f = pet.tick(sense(t, Some((4, 12))));
+        assert_eq!(f.pose, PetGlyphId::PetSitLookup, "the attentive seat");
+        let q0 = pet.quiet;
+        let end_q = pet.hold_end_q;
+        assert!(
+            (end_q - q0 - TRICK_HOLD).abs() < 0.2,
+            "a {TRICK_HOLD} s hold"
+        );
+        // Park through the hold.
+        let mut parked = 0u32;
+        let mut ticks = 0u32;
+        let hold_end = t + Duration::from_secs_f32(end_q - q0);
+        while t < hold_end - Duration::from_millis(40) {
+            if pet.needs_frames() {
+                t += Duration::from_millis(16);
+            } else {
+                parked += 1;
+                t = pet
+                    .next_change_deadline(t)
+                    .expect("a held seat names its end")
+                    .min(hold_end - Duration::from_millis(40));
+            }
+            ticks += 1;
+            let f = pet.tick(sense(t, Some((4, 12))));
+            assert_eq!(f.pose, PetGlyphId::PetSitLookup, "held for the whole hold");
+        }
+        assert!(
+            parked >= 1 && ticks < 60,
+            "the hold is PARKED, not a 240-frame train: {ticks} wakes, {parked} offered"
+        );
+        let d = pet.next_change_deadline(t).expect("the end is named");
+        assert!(
+            d <= hold_end + Duration::from_millis(5),
+            "the hold's end is offered on time: +{:?} vs +{:?}",
+            d - t,
+            hold_end - t
+        );
+
+        // …and the twin walk proves the whole thing is the train's frames.
+        let (mut pet, mut twin, t) = settled_pair(start, SIT_AFTER + 0.3);
+        pet.note_trick(t, Trick::Sit, true);
+        twin.note_trick(t, Trick::Sit, true);
+        let (walk, _) = walk_offers(&mut pet, &mut twin, t, (4, 12), 6.0);
+        assert!(pet.trick_settle.is_none(), "the hold ended inside the walk");
+        assert!(walk.offers >= 2, "held on the offer: {walk:?}");
+    }
+
+    /// `down` is the same level on the loaf's rung: the melt, the thump and
+    /// the peek are the natural loaf's own offered edges, the wash the ladder
+    /// would have got up for is withheld until the hold ends, and that end
+    /// is named — the twin walk fails with "a late offer" if any of it is
+    /// not exactly the train's frames.
+    #[test]
+    fn a_commanded_loaf_rides_the_offer_to_its_named_end() {
+        let start = Instant::now();
+        let (mut pet, mut twin, t0) = settled_pair(start, SIT_AFTER + 0.3);
+        pet.note_trick(t0, Trick::Down, true);
+        twin.note_trick(t0, Trick::Down, true);
+        let (t, _) = idle(&mut pet, t0, (4, 12), PERK_HOLD + 0.1);
+        let (tt, _) = idle(&mut twin, t0, (4, 12), PERK_HOLD + 0.1);
+        assert_eq!(t, tt, "the twins share one clock");
+        assert_eq!(pet.trick_settle, Some(Trick::Down));
+        assert_eq!(pet.action, PetAction::Loaf, "down is the loaf, early");
+        assert!(
+            pet.quiet < LOAF_AFTER + 0.8 * 2.0 + 0.5,
+            "fast-forwarded to the loaf's own rung, no further: {}",
+            pet.quiet
+        );
+        let (walk, _) = walk_offers(&mut pet, &mut twin, t, (4, 12), 7.0);
+        assert!(pet.trick_settle.is_none(), "the hold ended inside the walk");
+        assert!(walk.offers >= 2, "held on the offer: {walk:?}");
+    }
+
+    /// REDUCED MOTION (or a load shed) ENGAGING MID-ROLL. The reduced arm
+    /// pins the pose to Sit and returns before every hold that could spend
+    /// the roll's timer, and the host still honours `needs_frames` under a
+    /// shed — so an unzeroed `wriggle_t` pinned the lane for the whole shed
+    /// and replayed the stale roll when it lifted.
+    #[test]
+    fn reduced_motion_mid_roll_releases_the_lane_and_replays_nothing() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Roll, true);
+        let (mut t, _) = idle(&mut pet, t, (4, 12), PERK_HOLD + 0.5);
+        assert!(pet.wriggle_t > 1.0 && pet.trick_act, "fixture: mid-roll");
+        t += Duration::from_millis(16);
+        let mut s = sense(t, Some((4, 12)));
+        s.reduced_motion = true;
+        let f = pet.tick(s);
+        assert_eq!(f.action, PetAction::Sit);
+        assert_eq!(pet.wriggle_t, 0.0);
+        assert!(!pet.trick_act && !pet.trick_engaged());
+        assert!(!pet.needs_frames(), "nothing of the roll holds the lane");
+        let (_, frames) = watch(&mut pet, t, (4, 12), 6.0);
+        assert!(
+            frames.iter().all(|f| !matches!(
+                f.pose,
+                PetGlyphId::PetRoll0 | PetGlyphId::PetRoll1 | PetGlyphId::PetRoll2
+            )),
+            "and the shed lifting replays nothing"
+        );
+    }
+
+    /// A commanded seat is a SETTLED pose — "the states a caret move
+    /// interrupts" — so the next key stands it down and the chase has the
+    /// cat back at once.
+    #[test]
+    fn a_caret_move_interrupts_a_commanded_seat() {
+        for trick in [Trick::Sit, Trick::Down] {
+            let start = Instant::now();
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            pet.note_trick(t, trick, true);
+            let (t, _) = idle(&mut pet, t, (4, 12), PERK_HOLD + 0.5);
+            assert_eq!(pet.trick_settle, Some(trick), "fixture: the seat is held");
+            let t = one_key(&mut pet, t, (4, 12));
+            assert!(pet.trick_settle.is_none() && pet.hold_end_q == 0.0);
+            let (_, f) = idle(&mut pet, t, (4, 13), 0.3);
+            assert_ne!(f.pose, PetGlyphId::PetSitLookup);
+            assert_ne!(
+                f.action,
+                PetAction::Loaf,
+                "the ladder starts over from the key"
+            );
+        }
+    }
+
+    /// THE ORPHANED ROLL. `roll` + Enter, then `git status` + Enter inside
+    /// the roll: the jump's Perk takes the Loaf away, and before the central
+    /// clear `wriggle_t` stranded above zero — `needs_frames` pinned until
+    /// the ladder happened to deal Loaf again, where the stale roll REPLAYED.
+    #[test]
+    fn a_roll_interrupted_by_an_enter_jump_releases_the_lane_and_never_replays() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Roll, true);
+        let (mut t, frames) = watch(&mut pet, t, (4, 12), PERK_HOLD + 0.6);
+        assert!(
+            frames.iter().any(|f| f.pose == PetGlyphId::PetRoll0),
+            "fixture: the roll is under way"
+        );
+        assert!(pet.wriggle_t > 1.0, "…with most of it still to play");
+        // The Enter: a row down and home.
+        t += Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((5, 2))));
+        let (t, frames) = watch(&mut pet, t, (5, 2), 1.2);
+        assert_eq!(
+            pet.wriggle_t, 0.0,
+            "the roll's pose was taken away: it is over"
+        );
+        assert!(
+            frames.iter().any(|f| f.action.airborne()),
+            "fixture: it hopped"
+        );
+        // Settle all the way down the ladder: the loaf is dealt again, and
+        // it is a loaf.
+        let (_, frames) = watch(&mut pet, t, (5, 2), 8.0);
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f.action, PetAction::Loaf | PetAction::Purr)),
+            "fixture: the long dwell is reached"
+        );
+        assert!(
+            frames.iter().all(|f| !matches!(
+                f.pose,
+                PetGlyphId::PetRoll0 | PetGlyphId::PetRoll1 | PetGlyphId::PetRoll2
+            )),
+            "a stale roll never replays"
+        );
+        assert!(!pet.needs_frames(), "and nothing of it pins the lane");
+    }
+
+    /// THE EXIT-127 FORGIVENESS. A line of nothing but pet talk, submitted at
+    /// a shell, fails fast with `command not found` — and the cat grieves
+    /// none of it: no ledger move, no sulk, NO DATED SULK (or the next `ls`
+    /// would be "the forgiven success", the big cheer, for ten minutes).
+    #[test]
+    fn a_pet_only_submit_forgives_the_fast_failure_that_follows() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 3, 2);
+        let (t, _) = type_run(&mut pet, t, 3, 4, 30, 0.05);
+        let (t, _) = idle(&mut pet, t, (3, 34), 0.3);
+        let c0 = pet.content();
+        assert!(c0 > 0.3, "fixture: warmth to lose ({c0})");
+        pet.note_trick_submit(t);
+        let done = t + Duration::from_millis(40);
+        pet.note_command_done(done, true, Some(12));
+        assert_eq!(pet.content(), c0, "the ledger does not move");
+        assert!(
+            !pet.pending_sulk && pet.sulk_at.is_none(),
+            "no sulk, and none dated"
+        );
+        assert!(!pet.grieving(), "and no failure hush either");
+        let (t, frames) = watch(&mut pet, done, (3, 34), 2.5);
+        assert!(
+            frames.iter().all(|f| f.action != PetAction::Droop),
+            "the cat does not droop at `command not found: sit`"
+        );
+        // The next fast green command is an ordinary nudge, not the big
+        // forgiven cheer.
+        pet.note_command_done(t, false, Some(30));
+        assert_eq!(
+            pet.pending_cheer, None,
+            "nothing was forgiven, so nothing is cheered"
+        );
+        // ONE-SHOT: the stamp was spent by that first completion.
+        assert!(pet.trick_submit_at.is_none());
+    }
+
+    /// …and it forgives NOTHING ELSE: a failure three seconds after the
+    /// submit is some other command's, a slow failure is a real program's,
+    /// and a success spends the stamp without buying a later failure off.
+    #[test]
+    fn an_unrelated_failure_still_sulks() {
+        let warm = || {
+            let start = Instant::now();
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 3, 2);
+            let (t, _) = type_run(&mut pet, t, 3, 4, 30, 0.05);
+            let (t, _) = idle(&mut pet, t, (3, 34), 0.3);
+            (pet, t)
+        };
+        // Three seconds later.
+        let (mut pet, t) = warm();
+        let c0 = pet.content();
+        pet.note_trick_submit(t);
+        pet.note_command_done(t + Duration::from_secs(3), true, Some(12));
+        assert!(pet.pending_sulk && pet.sulk_at.is_some());
+        assert!(pet.content() < c0);
+        // A slow failure inside the window.
+        let (mut pet, t) = warm();
+        pet.note_trick_submit(t);
+        pet.note_command_done(t + Duration::from_secs(1), true, Some(CHEER_MIN_MS));
+        assert!(
+            pet.pending_sulk,
+            "a program that really ran and failed is grieved"
+        );
+        // A success spends the stamp.
+        let (mut pet, t) = warm();
+        pet.note_trick_submit(t);
+        pet.note_command_done(t + Duration::from_millis(100), false, Some(12));
+        pet.note_command_done(t + Duration::from_millis(300), true, Some(12));
+        assert!(pet.pending_sulk, "one stamp forgives one completion");
+        // No timestamps at all still counts as fast.
+        let (mut pet, t) = warm();
+        pet.note_trick_submit(t);
+        pet.note_command_done(t + Duration::from_millis(100), true, None);
+        assert!(!pet.pending_sulk);
+    }
+
+    /// ONE PHRASE, ONE TRICK. `sit`, a long pause — the cat answers the
+    /// tentative fire — then Enter: the listener's confirmation finds the
+    /// trick already performed and replays nothing. A REVOKE in between
+    /// ends the phrase, so the same word asked again is a new request; and
+    /// a verb dropped unplayed (the hand typed over the heard-you beat) is
+    /// still owed when its confirmation arrives.
+    #[test]
+    fn a_confirmation_after_the_cat_answered_replays_nothing() {
+        let start = Instant::now();
+        let rolls = |frames: &[PetFrame]| {
+            frames
+                .windows(2)
+                .filter(|w| {
+                    w[0].pose != PetGlyphId::PetRoll0
+                        && w[1].pose == PetGlyphId::PetRoll0
+                        && w[0].action != PetAction::Loaf
+                })
+                .count()
+        };
+        let answered = |pet: &mut PetBrain| -> Instant {
+            let t = awake(pet, start, 4, 10);
+            pet.note_trick(t, Trick::Roll, false);
+            let (t, frames) = watch(pet, t, (4, 12), 4.5);
+            assert_eq!(rolls(&frames), 1, "fixture: the tentative roll played");
+            t
+        };
+        // The confirmation is absorbed.
+        let mut pet = PetBrain::default();
+        let t = answered(&mut pet);
+        pet.note_trick(t, Trick::Roll, true);
+        assert_eq!(pet.pending_trick(), None, "one phrase, one trick");
+        assert!(!pet.needs_frames() || pet.pending_trick().is_none());
+        let (_, frames) = watch(&mut pet, t, (4, 12), 4.0);
+        assert_eq!(rolls(&frames), 0, "and nothing replays");
+        // …once: the memory is spent by the confirmation it absorbed.
+        pet.note_trick(t, Trick::Roll, true);
+        assert_eq!(pet.pending_trick(), Some(Trick::Roll));
+
+        // A revoke ends the phrase: the same word again is a new request.
+        let mut pet = PetBrain::default();
+        let t = answered(&mut pet);
+        pet.revoke_trick();
+        pet.note_trick(t, Trick::Roll, true);
+        assert_eq!(pet.pending_trick(), Some(Trick::Roll));
+
+        // A different trick is never absorbed.
+        let mut pet = PetBrain::default();
+        let t = answered(&mut pet);
+        pet.note_trick(t, Trick::Jump, true);
+        assert_eq!(pet.pending_trick(), Some(Trick::Jump));
+
+        // HEARD, THEN TYPED OVER: the verb never played, so it is still
+        // owed — the confirmation latches, and the roll plays at the pause.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Roll, false);
+        let (t, _) = idle(&mut pet, t, (4, 12), 0.1);
+        assert!(
+            pet.trick_go == Some(Trick::Roll),
+            "fixture: heard, verb owed"
+        );
+        let t = one_key(&mut pet, t, (4, 12));
+        let (t, frames) = watch(&mut pet, t, (4, 13), 0.5);
+        assert!(
+            pet.trick_go.is_none(),
+            "the perk was taken away, and the verb with it"
+        );
+        assert_eq!(rolls(&frames), 0);
+        pet.note_trick(t, Trick::Roll, true);
+        assert_eq!(pet.pending_trick(), Some(Trick::Roll), "still owed");
+        let (_, frames) = watch(&mut pet, t, (4, 13), 3.0);
+        assert_eq!(rolls(&frames), 1);
+    }
+
+    /// Typed praise cannot farm the joy ledger: `purr` and `treat` warm it by
+    /// the fast success's nudge at most once per [`TRICK_CONTENT_COOL`], and
+    /// a scold moves nothing — no ledger, no sulk, no dated grief.
+    #[test]
+    fn typed_praise_is_rationed_and_a_scold_moves_nothing() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        let mut peak = 0.0f32;
+        for round in 0..6 {
+            let before = pet.content();
+            pet.note_trick(
+                t,
+                if round % 2 == 0 {
+                    Trick::Purr
+                } else {
+                    Trick::Treat
+                },
+                true,
+            );
+            let (t2, _) = idle(&mut pet, t, (4, 12), 2.6);
+            t = t2;
+            peak = peak.max(pet.content() - before);
+        }
+        assert!(peak <= TRICK_CONTENT + 1e-4, "one nudge at a time: {peak}");
+        assert!(
+            pet.content() < PURR_GATE,
+            "six praises in sixteen seconds buy at most one nudge: {}",
+            pet.content()
+        );
+        let c0 = pet.content();
+        pet.note_trick(t, Trick::Scold, true);
+        let (_, frames) = watch(&mut pet, t, (4, 12), 2.0);
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Droop),
+            "fixture: the ear-flat beat played"
+        );
+        assert!(
+            pet.content() <= c0,
+            "a scold takes nothing… ({c0} → {})",
+            pet.content()
+        );
+        assert!(
+            c0 - pet.content() < CONTENT_DECAY * 2.1,
+            "…beyond the two seconds of ordinary spend"
+        );
+        assert!(!pet.pending_sulk && pet.sulk_at.is_none() && !pet.grieving());
+    }
+
+    /// A SLEEPING CAT IS ADDRESSED: woken first (the startled z and the
+    /// stretch), latch kept — except that `sleep` said to a sleeper is
+    /// already done, and `stretch` IS the wake and is spent by it.
+    #[test]
+    fn a_sleeper_is_woken_for_a_trick_but_sleep_is_done_and_stretch_is_the_wake() {
+        let start = Instant::now();
+        let asleep = || {
+            let mut pet = PetBrain::default();
+            let (t, _) = type_run(&mut pet, start, 4, 10, 6, 0.05);
+            let (t, f) = idle(&mut pet, t, (4, 16), SLEEP_AFTER + 1.0);
+            assert_eq!(f.action, PetAction::Sleep, "fixture");
+            (pet, t)
+        };
+        let (mut pet, t) = asleep();
+        pet.note_trick(t, Trick::Sleep, true);
+        let (_, frames) = watch(&mut pet, t, (4, 16), 1.0);
+        assert!(
+            frames.iter().all(|f| f.action == PetAction::Sleep),
+            "`sleep` to a sleeper is a no-op: never woken to be told to sleep"
+        );
+        assert_eq!(pet.pending_trick(), None);
+
+        let (mut pet, t) = asleep();
+        pet.note_trick(t, Trick::Stretch, true);
+        let (_, frames) = watch(&mut pet, t, (4, 16), 3.0);
+        // The first watched frame is already the wake, so runs are counted
+        // from a sleeping frame in front of them.
+        let mut wakes = 0;
+        let mut prev = PetAction::Sleep;
+        for f in &frames {
+            wakes += u32::from(f.action == PetAction::Waking && prev != PetAction::Waking);
+            prev = f.action;
+        }
+        assert_eq!(wakes, 1, "`stretch` IS the wake: one stretch, not two");
+
+        let (mut pet, t) = asleep();
+        pet.note_trick(t, Trick::Paw, true);
+        let (_, frames) = watch(&mut pet, t, (4, 16), 3.0);
+        let woke = frames.iter().position(|f| f.action == PetAction::Waking);
+        let batted = frames.iter().position(|f| f.pose == PetGlyphId::PetBat);
+        assert!(
+            woke.is_some() && batted.is_some() && woke < batted,
+            "woken first, then the verb: {woke:?} / {batted:?}"
+        );
+    }
+
+    /// EVERY TRICK PERFORMS SOMETHING OBSERVABLE, opens with the shared
+    /// "heard you" perk, and lets the lane go when it is done. One loop over
+    /// [`Trick::ALL`], with an exhaustive match — a seventeenth trick has to
+    /// say here what it looks like.
+    #[test]
+    fn every_trick_is_heard_performs_something_observable_and_releases_the_lane() {
+        let start = Instant::now();
+        for trick in Trick::ALL {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            // A control that was told nothing, for the verbs whose
+            // performance is a pose the idle ladder also reaches.
+            let mut control = PetBrain::default();
+            let tc = awake(&mut control, start, 4, 10);
+            assert_eq!(t, tc);
+            pet.note_trick(t, trick, true);
+            let (end, frames) = watch(&mut pet, t, (4, 12), 5.0);
+            let (_, plain) = watch(&mut control, tc, (4, 12), 5.0);
+            let heard = frames
+                .iter()
+                .position(|f| f.action == PetAction::Perk)
+                .unwrap_or_else(|| panic!("{trick:?}: never heard"));
+            assert!(
+                plain.iter().all(|f| f.action != PetAction::Perk),
+                "fixture: an untold cat does not perk"
+            );
+            let after = &frames[heard..];
+            let saw = |pose: PetGlyphId| after.iter().any(|f| f.pose == pose);
+            let did = |action: PetAction| after.iter().any(|f| f.action == action);
+            let mote = |kind: PetMoteKind| {
+                after
+                    .iter()
+                    .any(|f| f.motes.iter().flatten().any(|m| m.kind == kind))
+            };
+            let early = |action: PetAction, frames: &[PetFrame]| {
+                frames[..120].iter().any(|f| f.action == action)
+            };
+            let seen = match trick {
+                Trick::Sit => saw(PetGlyphId::PetSitLookup),
+                Trick::Down => early(PetAction::Loaf, &frames) && !early(PetAction::Loaf, &plain),
+                Trick::Sleep => {
+                    early(PetAction::Sleep, &frames) && !early(PetAction::Sleep, &plain)
+                }
+                Trick::Stretch => saw(PetGlyphId::PetStretch) && saw(PetGlyphId::PetStretchHind),
+                Trick::Jump => did(PetAction::Leap) && after.iter().any(|f| f.lift > 0.3),
+                Trick::Play => saw(PetGlyphId::PetPlaybow) && saw(PetGlyphId::PetBat),
+                Trick::Roll => saw(PetGlyphId::PetRoll0) && saw(PetGlyphId::PetRoll1),
+                Trick::Purr => did(PetAction::Purr) && mote(PetMoteKind::Heart),
+                Trick::Groom => saw(PetGlyphId::PetGroom),
+                Trick::Speak => mote(PetMoteKind::Note),
+                Trick::Look => {
+                    let held = after
+                        .iter()
+                        .take_while(|f| f.action == PetAction::Perk)
+                        .count();
+                    held as f32 * 0.016 >= 2.0 * PERK_HOLD - 0.05
+                }
+                Trick::Paw => saw(PetGlyphId::PetBat) && mote(PetMoteKind::Dust),
+                Trick::Hide => after
+                    .iter()
+                    .any(|f| f.action == PetAction::Crouch && f.under_ink),
+                Trick::Boo => saw(PetGlyphId::PetStartle),
+                Trick::Scold => saw(PetGlyphId::PetDroop) || saw(PetGlyphId::PetDroopSit),
+                Trick::Treat => did(PetAction::Frolic) && mote(PetMoteKind::Note),
+            };
+            assert!(seen, "{trick:?} performed nothing observable");
+            assert_eq!(pet.pending_trick(), None, "{trick:?}: consumed");
+            // …and it all ends: the lane is released and the flag is down.
+            let (_, _) = idle(&mut pet, end, (4, 12), 3.0);
+            assert!(!pet.needs_frames(), "{trick:?} left the lane pinned");
+            assert!(
+                !pet.trick_act && pet.trick_go.is_none(),
+                "{trick:?} left a flag up"
+            );
+        }
+    }
+
+    /// `hide` with a word in reach walks behind it (the vignette's own
+    /// trip); an Enter jump mid-hide clears it, and the orphaned flag can
+    /// never outlive its crouch.
+    #[test]
+    fn a_commanded_hide_walks_behind_a_word_in_reach() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 40);
+        // A word on the cat's row, a few cells to its left.
+        let mut spans = vec![(0u16, 0u16); 30];
+        spans[4] = (30, 38);
+        pet.note_trick(t, Trick::Hide, true);
+        let mut hid_at = None;
+        for _ in 0..300 {
+            t += Duration::from_millis(16);
+            pet.sense_ink(0, &spans, None);
+            let f = pet.tick(sense(t, Some((4, 42))));
+            if f.under_ink && f.action == PetAction::Crouch {
+                hid_at = Some(f.col);
+                break;
+            }
+        }
+        let col = hid_at.expect("the cat hides");
+        assert!(
+            col < 38.0 && col + art_cols(10, 20) > 30.0,
+            "behind the word, not where it stood: col {col}"
+        );
+        // Work ends the hide at once.
+        t += Duration::from_millis(16);
+        pet.sense_ink(0, &spans, None);
+        let _ = pet.tick(sense(t, Some((5, 2))));
+        t += Duration::from_millis(16);
+        pet.sense_ink(0, &spans, None);
+        let f = pet.tick(sense(t, Some((5, 2))));
+        assert!(!f.under_ink && !pet.hiding, "the jump home clears the hide");
+    }
+
+    /// THE CAT AT THE DOOR ANSWERS. A vigil crouch is a held pose the
+    /// arrived ladder never runs under, so a trick typed during a long build
+    /// used to wait out its TTL unheard; and a commanded seat under an armed
+    /// vigil must last longer than the one tick the vigil's entry left it.
+    #[test]
+    fn a_cat_on_vigil_gets_up_to_answer_and_is_not_dragged_back_mid_seat() {
+        let t0 = Instant::now();
+        let mut pet = PetBrain::default();
+        let (mut t, _) = type_run(&mut pet, t0, 10, 20, 6, 0.12);
+        let end = t + Duration::from_secs_f32(VIGIL_AFTER + 1.0);
+        while t < end {
+            t += Duration::from_millis(50);
+            pet.note_executing(t, true);
+            let mut sn = sense(t, Some((10, 20)));
+            sn.output_burst = true;
+            let _ = pet.tick(sn);
+        }
+        for _ in 0..20 {
+            t += Duration::from_millis(100);
+            pet.note_executing(t, true);
+            let _ = pet.tick(sense(t, Some((10, 20))));
+        }
+        assert!(
+            pet.vigil && pet.action == PetAction::Crouch,
+            "fixture: at the door"
+        );
+        pet.note_trick(t, Trick::Sit, true);
+        let mut looked_up = 0u32;
+        for _ in 0..200 {
+            t += Duration::from_millis(16);
+            pet.note_executing(t, true);
+            let f = pet.tick(sense(t, Some((10, 20))));
+            looked_up += u32::from(f.pose == PetGlyphId::PetSitLookup);
+        }
+        assert!(
+            looked_up > 100,
+            "the commanded seat is held, not cut to a frame: {looked_up} frames"
+        );
+        // …and when the hold ends, the door has the cat back.
+        for _ in 0..120 {
+            t += Duration::from_millis(50);
+            pet.note_executing(t, true);
+            let _ = pet.tick(sense(t, Some((10, 20))));
+        }
+        assert!(
+            pet.vigil && pet.action == PetAction::Crouch,
+            "back at the door"
+        );
+        assert!(!pet.needs_frames());
+    }
+
+    /// THE CONFIRMATION THAT LANDS INSIDE THE BEAT, in the host's real
+    /// order. `roll`, a pause long enough for the cat to look up — and Enter
+    /// 100 ms into that look. The key handler notes the confirmation BEFORE
+    /// the tick that sees the key, so the brain is asked while the verb is
+    /// still owed: absorbed there, the Enter's own caret move then dropped
+    /// the owed verb and the request was heard and never answered. A verb
+    /// that has not played is not an answer — the confirmation latches, and
+    /// the roll plays at the new prompt, once.
+    #[test]
+    fn a_confirmation_inside_the_heard_you_beat_is_still_owed_and_plays_once() {
+        let start = Instant::now();
+        let rolls = |frames: &[PetFrame]| {
+            frames
+                .windows(2)
+                .filter(|w| {
+                    w[0].pose != PetGlyphId::PetRoll0
+                        && w[1].pose == PetGlyphId::PetRoll0
+                        && w[0].action != PetAction::Loaf
+                })
+                .count()
+        };
+        let heard = |pet: &mut PetBrain| -> Instant {
+            let t = awake(pet, start, 4, 10);
+            pet.note_trick(t, Trick::Roll, false);
+            let (t, _) = idle(pet, t, (4, 12), 0.1);
+            assert_eq!(pet.trick_go, Some(Trick::Roll), "fixture: heard, verb owed");
+            t
+        };
+        // Enter inside the beat: the note first, then the tick with the move.
+        let mut pet = PetBrain::default();
+        let t = heard(&mut pet);
+        pet.note_trick(t, Trick::Roll, true);
+        let t = t + Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((5, 2))));
+        assert!(pet.trick_go.is_none(), "the Enter took the beat's verb");
+        assert_eq!(
+            pet.pending_trick(),
+            Some(Trick::Roll),
+            "…and the confirmation still owes it"
+        );
+        let (_, frames) = watch(&mut pet, t, (5, 2), 4.5);
+        assert_eq!(rolls(&frames), 1, "played at the new prompt, once");
+
+        // The same confirmation with NOTHING taking the beat away (a host
+        // that feeds no key to the brain): the verb the beat owed plays, and
+        // the latch it satisfied goes with it — one phrase, one trick.
+        let mut pet = PetBrain::default();
+        let t = heard(&mut pet);
+        pet.note_trick(t, Trick::Roll, true);
+        let (_, frames) = watch(&mut pet, t, (4, 12), 7.0);
+        assert_eq!(rolls(&frames), 1, "never twice");
+        assert_eq!(pet.pending_trick(), None);
+        assert!(!pet.trick_engaged());
+    }
+
+    /// A REVOKE REACHES THE BEAT TOO. The line turned into prose while the
+    /// cat was still looking up at a tentative word: the verb has not begun,
+    /// so it is taken back with the latch it came from — the perk plays out
+    /// and nothing follows it. A verb already begun is never cut (a revoke
+    /// is not a fright).
+    #[test]
+    fn a_revoke_inside_the_heard_you_beat_takes_the_verb_back() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Roll, false);
+        let (t, _) = idle(&mut pet, t, (4, 12), 0.1);
+        assert_eq!(pet.trick_go, Some(Trick::Roll), "fixture: heard, verb owed");
+        pet.revoke_trick();
+        assert!(!pet.trick_engaged(), "nothing of it is left");
+        let (t, frames) = watch(&mut pet, t, (4, 12), 3.0);
+        assert!(
+            frames.iter().all(|f| !matches!(
+                f.pose,
+                PetGlyphId::PetRoll0 | PetGlyphId::PetRoll1 | PetGlyphId::PetRoll2
+            )),
+            "a tentative word taken back mid-look is never performed"
+        );
+        let (_, _) = idle(&mut pet, t, (4, 12), SLEEP_AFTER + BREATH_WINDOW);
+        assert!(!pet.needs_frames(), "and the lane is released");
+
+        // A CONFIRMED beat is the user's finished request: not the
+        // listener's to take back.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Roll, true);
+        let (t, _) = idle(&mut pet, t, (4, 12), 0.1);
+        pet.revoke_trick();
+        let (_, frames) = watch(&mut pet, t, (4, 12), 3.0);
+        assert!(frames.iter().any(|f| f.pose == PetGlyphId::PetRoll1));
+
+        // …and a roll already under way plays out.
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Roll, false);
+        let (t, _) = idle(&mut pet, t, (4, 12), PERK_HOLD + 0.4);
+        assert!(pet.wriggle_t > 1.0, "fixture: mid-roll");
+        pet.revoke_trick();
+        let (_, frames) = watch(&mut pet, t, (4, 12), 1.0);
+        assert!(
+            frames.iter().all(|f| f.action == PetAction::Loaf),
+            "a revoke is not a fright"
+        );
+    }
+
+    /// A HIDING PLACE THE CAT CANNOT STAND ON. The spot behind a word is
+    /// computed from the word alone, and a short one at the margin (`>>>`, a
+    /// two-glyph prompt) or one that runs to the right wall puts it past the
+    /// pane — where the body's clamp stops the walk short of "arrived"
+    /// forever: the trip never ended, and `hide_to` held the lane for good.
+    /// The spot is clamped to where a body can stand, so the hide happens
+    /// against the wall and then ends like any other.
+    #[test]
+    fn a_commanded_hide_behind_a_word_at_the_margin_still_ends() {
+        let start = Instant::now();
+        for (span, caret_col) in [((0u16, 3u16), 4u16), ((88, 100), 97)] {
+            let mut pet = PetBrain::default();
+            let mut t = awake(&mut pet, start, 4, caret_col - 2);
+            let mut spans = vec![(0u16, 0u16); 30];
+            spans[4] = span;
+            pet.note_trick(t, Trick::Hide, true);
+            let mut hid = false;
+            for _ in 0..900 {
+                t += Duration::from_millis(16);
+                pet.sense_ink(0, &spans, None);
+                let f = pet.tick(sense(t, Some((4, caret_col))));
+                hid |= f.under_ink && f.action == PetAction::Crouch;
+            }
+            assert!(hid, "{span:?}: the cat hides");
+            assert!(
+                pet.hide_to.is_none() && !pet.hiding,
+                "{span:?}: and the trip ends"
+            );
+            assert!(!pet.needs_frames(), "{span:?}: the lane is released");
+        }
+    }
+
+    /// A SURFACE SWITCH drops the whole wave — the latch, the beat, the
+    /// commanded seat and the answered-word memory are facts about the old
+    /// pane — and CARRIES the praise cooldown, which is the same pet's:
+    /// changing tabs must not reopen the ledger's till.
+    #[test]
+    fn a_surface_switch_drops_a_trick_and_carries_the_praise_cooldown() {
+        let start = Instant::now();
+        // The largest one-tick rise of the ledger while a `treat` plays: the
+        // praise lands whole on the tick of the verb, where travel and the
+        // purr's own spend move it by hundredths of that.
+        let treat_bump = |pet: &mut PetBrain, t: Instant, caret: (u16, u16)| -> f32 {
+            pet.note_trick(t, Trick::Treat, true);
+            let mut t = t;
+            let mut bump = 0.0f32;
+            for _ in 0..150 {
+                let before = pet.content();
+                t += Duration::from_millis(16);
+                let _ = pet.tick(sense(t, Some(caret)));
+                bump = bump.max(pet.content() - before);
+            }
+            bump
+        };
+        let mut control = PetBrain::default();
+        let t = awake(&mut control, start, 8, 20);
+        assert!(
+            treat_bump(&mut control, t, (8, 22)) > TRICK_CONTENT * 0.9,
+            "control: a first treat is seen landing on the ledger"
+        );
+
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Purr, true);
+        let (t, _) = idle(&mut pet, t, (4, 12), 2.0);
+        pet.note_trick(t, Trick::Sit, false);
+        let (t, _) = idle(&mut pet, t, (4, 12), PERK_HOLD + 0.2);
+        assert!(
+            pet.trick_settle == Some(Trick::Sit) && pet.trick_heard.is_some(),
+            "fixture: a seat is held, and a tentative word was answered"
+        );
+        pet.retire_coordinate_space();
+        assert!(!pet.trick_engaged() && pet.trick_heard.is_none());
+        assert_eq!(pet.hold_end_q, 0.0);
+        pet.note_trick(t, Trick::Jump, true);
+        pet.retire_coordinate_space();
+        assert_eq!(pet.pending_trick(), None, "the latch is the old pane's");
+        // The new pane: praise again at once, and the till stays shut.
+        let t = awake(&mut pet, t, 8, 20);
+        let bump = treat_bump(&mut pet, t, (8, 22));
+        assert!(
+            bump < TRICK_CONTENT * 0.5,
+            "the cooldown crossed the switch: a second nudge of {bump}"
+        );
+    }
+
+    /// THE RETIRED FAST PATH MAY NOT CARRY A TRICK. A brain that was never
+    /// on glass sits in the no-caret arm's constant-frame shortcut, which
+    /// runs only while every latch is empty — so a word typed at it must
+    /// meet the SLOW arm, which drops it. Without the gate's term the latch
+    /// rode the shortcut untouched and was performed by the next appearance:
+    /// a typed word summoning, a beat late.
+    #[test]
+    fn a_trick_noted_at_a_retired_cat_meets_the_slow_arm_and_is_dropped() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = start;
+        let mut a = pet.tick(sense(t, None));
+        // Past the breath window on the quiet clock — a few seconds a tick,
+        // because one tick's elapsed is capped.
+        while pet.quiet < SLEEP_AFTER + BREATH_WINDOW {
+            t += Duration::from_secs(4);
+            a = pet.tick(sense(t, None));
+        }
+        t += Duration::from_millis(16);
+        let b = pet.tick(sense(t, None));
+        assert_eq!(a.fp(), b.fp(), "fixture: retired, and byte-stable");
+        assert!(
+            pet.alpha == 0.0 && pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
+            "fixture: the shortcut's own state"
+        );
+        pet.note_trick(t, Trick::Roll, true);
+        t += Duration::from_millis(16);
+        let f = pet.tick(sense(t, None));
+        assert_eq!(f.alpha, 0, "a typed word never summons");
+        assert_eq!(pet.pending_trick(), None, "dropped by the slow arm");
+        assert!(!pet.trick_engaged() && !pet.needs_frames());
+        // …so the very next appearance owes nothing.
+        let (_, frames) = watch(&mut pet, t, (4, 12), 3.0);
+        assert!(
+            frames.iter().all(|f| !matches!(
+                f.pose,
+                PetGlyphId::PetRoll0 | PetGlyphId::PetRoll1 | PetGlyphId::PetRoll2
+            )),
+            "and nothing is performed when the caret arrives"
+        );
+    }
+
+    /// THE ORPHANED HIDE. A backspace under a ducked cat is a flinch — a
+    /// Perk — which takes the crouch away WITHOUT the travel clear a jump
+    /// runs. Before the central clear the flag outlived its pose: the body
+    /// stayed drawn under the glyphs, `needs_frames` stayed pinned, and the
+    /// next ordinary coil was taken for a hide.
+    #[test]
+    fn a_flinch_under_a_hiding_cat_ends_the_hide() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        // No ink map: the cat ducks where it stands.
+        pet.note_trick(t, Trick::Hide, true);
+        let (mut t, f) = idle(&mut pet, t, (4, 12), PERK_HOLD + 0.2);
+        assert!(
+            pet.hiding && f.under_ink && f.action == PetAction::Crouch,
+            "fixture: ducked"
+        );
+        t += Duration::from_millis(16);
+        let f = pet.tick(sense(t, Some((4, 11))));
+        assert_eq!(
+            f.action,
+            PetAction::Perk,
+            "fixture: the flinch took the crouch"
+        );
+        t += Duration::from_millis(16);
+        let f = pet.tick(sense(t, Some((4, 11))));
+        assert!(
+            !pet.hiding && !f.under_ink,
+            "the hide is over with its pose"
+        );
+        let (_, _) = idle(&mut pet, t, (4, 11), SLEEP_AFTER + BREATH_WINDOW + 1.0);
+        assert!(!pet.needs_frames(), "and nothing of it pins the lane");
+    }
+
+    /// A CAT TOLD TO SLEEP SLEEPS, VIGIL OR NO VIGIL. Waiting up with a
+    /// running job withholds the ladder's sleep — the cat's own idea, and one
+    /// it was overruled on by name: it leaves the door, answers, and is not
+    /// dragged back to the crouch while the nap lasts.
+    #[test]
+    fn a_cat_waiting_up_with_a_job_sleeps_when_told_to() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let (mut t, _) = type_run(&mut pet, start, 10, 20, 6, 0.12);
+        for _ in 0..60 {
+            t += Duration::from_millis(16);
+            pet.note_executing(t, true);
+            let mut s = sense(t, Some((10, 20)));
+            s.output_burst = true;
+            let _ = pet.tick(s);
+        }
+        pet.note_room_quiet(true);
+        let (_, slept, crouched, mut t) = drive_room(&mut pet, t, (10, 20), 40.0, true);
+        assert!(
+            !slept && crouched.is_some() && pet.waiting_up(),
+            "fixture: up with the job, at the door"
+        );
+        pet.note_trick(t, Trick::Sleep, true);
+        let mut asleep = 0u32;
+        for _ in 0..240 {
+            t += Duration::from_millis(16);
+            pet.note_executing(t, true);
+            let f = pet.tick(sense(t, Some((10, 20))));
+            asleep += u32::from(f.action == PetAction::Sleep);
+        }
+        assert!(asleep > 150, "told to sleep, it sleeps: {asleep} frames");
+        assert!(
+            pet.action == PetAction::Sleep && !pet.vigil && pet.waiting_up(),
+            "…and the door does not take a sleeping cat back"
+        );
+    }
+
+    /// THE SEAT STANDS DOWN WITH ITS POSE, whatever took it. A bell inside a
+    /// commanded sit is a flinch: no caret moved and no key landed, so
+    /// neither of the seat's two other clears ran — and a level left
+    /// standing re-seated the cat in the look-up frame the instant the
+    /// flinch was over, at a `quiet` the ladder would still have it STANDING
+    /// at, and held it there for the rest of a hold nobody was keeping.
+    #[test]
+    fn a_bell_inside_a_commanded_sit_ends_the_seat() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Sit, true);
+        let (t, f) = idle(&mut pet, t, (4, 12), PERK_HOLD + 0.5);
+        assert_eq!(f.pose, PetGlyphId::PetSitLookup, "fixture: seated");
+        pet.note_bell(t);
+        let (_, frames) = watch(&mut pet, t, (4, 12), 1.2);
+        assert!(
+            frames.iter().any(|f| f.action == PetAction::Perk),
+            "fixture: the bell's flinch played"
+        );
+        assert!(pet.trick_settle.is_none() && pet.hold_end_q == 0.0);
+        let flinched = frames
+            .iter()
+            .position(|f| f.action == PetAction::Perk)
+            .expect("checked above");
+        assert!(
+            frames[flinched..]
+                .iter()
+                .all(|f| f.pose != PetGlyphId::PetSitLookup),
+            "the ladder has the cat back, from the bell's own zero"
+        );
+    }
+
+    /// THE HELD SEAT OF A PURRING CAT RIDES THE OFFER TOO. A cat that typed
+    /// its way past the purr gate wears the tell on any seat — the swell on
+    /// the body and a ♪/♥ every two seconds — and the commanded seat keeps
+    /// both: the look-up frame takes the seat's own fold and the swell lands
+    /// on top of it exactly as on the idle sit, so the offer's pixel march
+    /// stays the train's. The twin walk fails with "a late offer" if the
+    /// held seat's arm and the offer's ever disagree.
+    ///
+    /// The second fixture is the one that did: a seat commanded PAST the
+    /// tell's first beat, after a fast run. The pose change zeroes the mote
+    /// mark, so a ♪/♥ is owed at once, and the run's lead is still easing
+    /// the station home under the beat — two changes no edge names, which a
+    /// verb that returned from its own tick left to whatever offer came
+    /// next ("the frame changed … before the offer", "the feet moved a
+    /// pixel … before the offer"). A seat verb finishes its tick like any
+    /// other settled one now.
+    ///
+    /// Both walks stop short of boredom's window: a vignette that opens ON
+    /// an offered edge starts a clocked hold a hair apart in the two brains
+    /// (their `quiet`s are different `f32` sums), which is the harness's
+    /// skew to bracket and no law of the seat's.
+    #[test]
+    fn a_purring_cat_s_commanded_seat_rides_the_offer() {
+        let start = Instant::now();
+        for trick in [Trick::Sit, Trick::Down] {
+            let (mut pet, mut twin, t) = contented_pair(start, SIT_AFTER + 0.3);
+            assert!(pet.purring(), "fixture: the tell is on");
+            pet.note_trick(t, trick, true);
+            twin.note_trick(t, trick, true);
+            let (walk, _) = walk_offers(&mut pet, &mut twin, t, (4, 72), 5.0);
+            assert!(
+                pet.trick_settle.is_none(),
+                "{trick:?}: the hold ended inside the walk"
+            );
+            assert!(walk.offers >= 2, "{trick:?}: held on the offer: {walk:?}");
+
+            let (mut pet, mut twin, t) = contented_pair(start, SIT_AFTER + 2.3);
+            assert!(
+                pet.purring() && pet.mote_mark >= 1,
+                "fixture: past the tell's first beat"
+            );
+            pet.note_trick(t, trick, true);
+            twin.note_trick(t, trick, true);
+            let (walk, _) = walk_offers(&mut pet, &mut twin, t, (4, 72), 2.5);
+            assert_eq!(pet.trick_settle, Some(trick), "{trick:?}: still held");
+            assert!(walk.offers >= 2, "{trick:?}: held on the offer: {walk:?}");
+        }
+    }
+
+    /// A SEAT IS TAKEN WHERE THE CAT BELONGS. The verb is declared where the
+    /// cat stands, but a seat is a level, not a hold: when the station has
+    /// slid more than [`ARRIVED`] out from under the heard-you beat (the
+    /// run's lead easing home, a console repair releasing its clocks late —
+    /// measured in the wild at 0.87 and 1.35 cells) the chase walks the cat
+    /// home first, and the level RIDES that walk. Dropped with the perk's
+    /// pose, the request was heard and then answered with the ladder's idle
+    /// sit a second later — the unattributable answer the look-up seat
+    /// exists to prevent.
+    #[test]
+    fn a_seat_commanded_off_its_mark_is_taken_after_the_walk_home() {
+        for trick in [Trick::Sit, Trick::Down] {
+            let start = Instant::now();
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, start, 4, 10);
+            pet.note_trick(t, trick, true);
+            let (t, _) = idle(&mut pet, t, (4, 12), 0.1);
+            assert_eq!(pet.trick_go, Some(trick), "fixture: heard, verb owed");
+            // The station slides out from under the beat (no caret move).
+            pet.col += ARRIVED + 0.6;
+            let (_, frames) = watch(&mut pet, t, (4, 12), 2.5);
+            let walked = frames
+                .iter()
+                .position(|f| f.action == PetAction::Walk)
+                .unwrap_or_else(|| panic!("{trick:?} fixture: the chase walks it home"));
+            assert_eq!(
+                pet.trick_settle,
+                Some(trick),
+                "{trick:?}: the level rode the walk"
+            );
+            let held = frames[walked..]
+                .iter()
+                .filter(|f| {
+                    if trick == Trick::Down {
+                        f.action == PetAction::Loaf
+                    } else {
+                        f.pose == PetGlyphId::PetSitLookup
+                    }
+                })
+                .count();
+            assert!(
+                held as f32 * 0.016 > 1.0,
+                "{trick:?}: and the seat is taken at home, and held: {held} frames"
+            );
+        }
+    }
+
+    /// A NOTICE TAKEN AWAY TAKES ITS VERB WITH IT. Ink arriving under a
+    /// perking cat re-anchors it with a hop — no caret move, no key — and
+    /// the owed verb is tied to the Perk it rides: it is dropped with the
+    /// pose (work outranks a trick) rather than left owed to a pose that is
+    /// gone, which is the state that would pin the lane.
+    #[test]
+    fn ink_arriving_under_the_heard_you_beat_drops_the_owed_verb() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        pet.note_trick(t, Trick::Roll, true);
+        t += Duration::from_millis(16);
+        let f = pet.tick(sense(t, Some((4, 12))));
+        assert!(
+            f.action == PetAction::Perk && pet.trick_go == Some(Trick::Roll),
+            "fixture: heard, verb owed"
+        );
+        // A line of output lands on the cat's own row, under its feet.
+        let mut spans = vec![(0u16, 0u16); 30];
+        spans[4] = (0, 40);
+        let mut hopped = false;
+        let mut rolled = false;
+        for _ in 0..400 {
+            t += Duration::from_millis(16);
+            pet.sense_ink(0, &spans, None);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            hopped |= f.action.airborne();
+            rolled |= matches!(
+                f.pose,
+                PetGlyphId::PetRoll0 | PetGlyphId::PetRoll1 | PetGlyphId::PetRoll2
+            );
+        }
+        assert!(hopped, "fixture: the ink re-anchored the cat");
+        assert!(pet.trick_go.is_none(), "the verb went with the perk");
+        assert!(!rolled, "and is not performed on the words it fled");
+        assert!(!pet.trick_engaged());
     }
 }

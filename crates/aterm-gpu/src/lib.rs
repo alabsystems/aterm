@@ -73,7 +73,8 @@ mod block_on;
 // Tier-1 exhaustive enumeration (tests/hdr_gate.rs) drives the SHIPPING policy.
 pub use format_plan::{
     HdrPlan, HdrReconfigurePlan, hdr_live_upgrade_wants_f16, hdr_present_plan,
-    hdr_reconfigure_plan, hdr_swapchain_wants_f16,
+    hdr_reconfigure_plan, hdr_screen_upgrade_wants_f16, hdr_swapchain_wants_f16,
+    hdr_swapchain_wants_f16_on_screen,
 };
 // THE ROW (macOS): the first-party Metal backend that will retire `wgpu` and
 // `softbuffer` on this cell. FOUNDATION ONLY so far — the ObjC FFI plus the six

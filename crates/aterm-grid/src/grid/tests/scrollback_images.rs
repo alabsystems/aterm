@@ -24,6 +24,7 @@ fn placement(rows: u16, cols: u16) -> Arc<ImageData> {
         rows,
         z_index: 0,
         band_lift_px: 0,
+        pixel_exact: false,
     })
 }
 

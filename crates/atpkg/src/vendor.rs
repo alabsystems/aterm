@@ -247,7 +247,30 @@ pub const MANAGER_TABLE: &[Manager] = &[
         install: &["pipx", "install", "{}"],
         elevated: false,
         id_chars: "._-",
-        local_file: &[".whl", ".zip", ".tar.gz", ".tgz"],
+        // EVERY ARCHIVE SUFFIX pip READS (audit 2026-09-17), not the four that were
+        // here. `pipx install` hands its argument to pip, which resolves a name OR
+        // loads a local path/URL, and pip reads far more than wheels and gzipped
+        // tarballs: its own tables are `.whl`/`.zip`, `.tar.gz`/`.tgz`/`.tar`,
+        // `.tar.bz2`/`.tbz`, and `.tar.xz`/`.txz`/`.tlz`/`.tar.lz`/`.tar.lzma`. A
+        // signed row spelling `evil.tar` or `evil.tar.bz2` passed this charset whole —
+        // first and last bytes alphanumeric, every byte in `._-` — so the admission
+        // read it as a package NAME while pip would have installed whatever file of
+        // that name the pass's working directory happened to hold. The list may only
+        // ever GROW: each entry is one more spelling refused.
+        local_file: &[
+            ".whl",
+            ".zip",
+            ".tar",
+            ".tar.gz",
+            ".tgz",
+            ".tar.bz2",
+            ".tbz",
+            ".tar.xz",
+            ".txz",
+            ".tar.lz",
+            ".tlz",
+            ".tar.lzma",
+        ],
         provides: "the package's console script under ~/.local/bin, by bare name",
     },
 ];
@@ -1866,6 +1889,19 @@ mod tests {
             ("pipx", "evil.tar.gz"),
             ("pipx", "evil.tgz"),
             ("pipx", "evil.zip"),
+            // Every other archive pip reads is a local file too (2026-09-17).
+            ("pipx", "evil.tar"),
+            ("pipx", "evil.tar.bz2"),
+            ("pipx", "evil.tbz"),
+            ("pipx", "evil.tar.xz"),
+            ("pipx", "evil.txz"),
+            ("pipx", "evil.tar.lz"),
+            ("pipx", "evil.tlz"),
+            ("pipx", "evil.tar.lzma"),
+            // Already refused before that widening, and pinned so it stays so: the
+            // suffix compare lowercases, so shouting does not smuggle one past.
+            ("pipx", "EVIL.TAR.GZ"),
+            ("pipx", "EVIL.TAR.BZ2"),
             ("pipx", "black."),
         ] {
             let m = manager(mgr).unwrap();

@@ -174,7 +174,7 @@ pub(crate) mod control_media;
 /// The aimed-spawn target (design S3) crosses the module seam: the control
 /// thread builds it in `control_media::cmd_spawn`, the event loop carries it
 /// in `Wake::SpawnSession`, so the root needs the name.
-pub(crate) use control_media::SpawnAim;
+pub(crate) use control_media::{IdentitySpec, SpawnAim, resolve_spawn_identity};
 // Re-export `image_payload`: `control_query::styled_image_json` reaches it through
 // `super::image_payload`, which now resolves to this sibling module's serializer.
 pub(crate) use control_media::image_payload;
@@ -741,9 +741,17 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
         // `spawn "connected=controller" of=<sid>` parses as a connected spawn while
         // a whitespace split sees a token beginning with `"`. Unparseable input
         // escalates too, so the fence is never weaker than the parser.
+        // `identity=` (session identities, 2026-09-17) sits behind the same
+        // fence: a scoped write edge must not open a session under another
+        // login — an identity is a directory of credentials, and naming one
+        // (or `-`, the opt-out that would land a worker's child under the
+        // human's) is an Owner's decision, like minting standing authority.
         "spawn"
-            if control_media::split_quoted_tokens(rest)
-                .is_none_or(|tokens| tokens.iter().any(|t| t.starts_with("connected="))) =>
+            if control_media::split_quoted_tokens(rest).is_none_or(|tokens| {
+                tokens
+                    .iter()
+                    .any(|t| t.starts_with("connected=") || t.starts_with("identity="))
+            }) =>
         {
             Some(Escalation::OwnerOnly)
         }
@@ -4407,6 +4415,10 @@ fn dispatch_before_session(
             // The exit ledger is a store read like `sessions` — the instance's
             // past stays answerable with no terminal at all.
             "exits" => Some(control_session::cmd_exits(store, rest)),
+            // The on-disk identity roster is a directory read plus a store read
+            // (the live count) — the instance's identities stay listable, and
+            // forgettable, with no terminal at all.
+            "identities" => Some(crate::agent_identity::cmd_identities(store, rest)),
             "dial-list" => Some(cmd_dial_list()),
             "dial-token" => Some(cmd_dial_token(rest)),
             // `appnotice <lane> <text>`: a row on the pull-down, from outside the
@@ -8490,6 +8502,8 @@ fn handle(
                 .unwrap_or_else(|| control_session::cmd_who(store, subscribers)),
             // `exits`: the roster journal's `Exited` rows — `sessions`' past.
             "exits" => control_session::cmd_exits(store, rest),
+            // `identities`: the on-disk identity roster and its `forget`.
+            "identities" => crate::agent_identity::cmd_identities(store, rest),
             // The op-level authority primitives and their connection-grain twins
             // (design §6) share the repaint poke: a successful act moves the §4
             // tab marks, which no funnel epoch would otherwise notice.
@@ -13161,6 +13175,7 @@ mod tests {
             rows: 1,
             z_index: 0,
             band_lift_px: 0,
+            pixel_exact: false,
         };
         let (fmt, b64) = image_payload(&small);
         assert_eq!(fmt, "png");
@@ -13173,6 +13188,7 @@ mod tests {
             rows: 24,
             z_index: 0,
             band_lift_px: 0,
+            pixel_exact: false,
         };
         let (fmt, b64) = image_payload(&big);
         assert_eq!(fmt, "truncated", "oversized image must be marked truncated");
@@ -14245,6 +14261,24 @@ mod tests {
     /// buys it with a DETERMINISTIC HANG: the sink drainer parks forever in
     /// `poll_writable` and `cross_session_paste_reports_a_dead_spill_peer_as_write_failed`
     /// wedged 3 runs out of 3, taking the whole `aterm-gui` suite with it.
+    ///
+    /// **AND THE ONE WRONG ANSWER IT COULD REACH IS OUT OF ITS REACH NOW
+    /// (2026-09-18).** The carrier keeps the window; the ASSERTION stops
+    /// resting on it. No test needs a pipe to be DEAD — it needs a peer that is
+    /// dead — and [`kill_peer_in_kernel`] gives it one whose death is a
+    /// property of a socket rather than of a descriptor count, so an inherited
+    /// duplicate cannot revive it. `cross_session_input_reports_a_dead_peer_as_write_failed`
+    /// (the test this note named as the wrong answer, measured three times) now
+    /// kills its peer that way, as
+    /// `background_binary_frame_reports_a_dead_peer_as_write_failed` already
+    /// did, and `a_stranger_holding_the_read_end_cannot_revive_a_kernel_killed_peer`
+    /// pins both halves: the false `Ok` a dropped reader alone can hand back,
+    /// and the `EPIPE` the swap earns with a stranger still holding the read
+    /// end. The sibling `cross_session_paste_reports_a_dead_spill_peer_as_write_failed`
+    /// keeps the residual exposure this note describes: it closes the peer
+    /// MID-WRITE by design, from a thread, so it has no moment before the write
+    /// at which to swap anything.
+    ///
     /// Darwin therefore keeps `pipe(2)` + `F_SETFD`, and keeps the narrowed but
     /// real window, because a rare wrong answer is the lesser defect against a
     /// suite that never finishes. This is the same trade
@@ -14345,6 +14379,7 @@ mod tests {
             term,
             master: wr, // the write end doubles as the "master" for this headless test
             ctx,
+            identity: None,
         };
         (handle, rx)
     }
@@ -14365,6 +14400,65 @@ mod tests {
         } else {
             Vec::new()
         }
+    }
+
+    /// KILL a session's peer in the KERNEL — so that no descriptor held
+    /// anywhere can revive it — and prove it dead before the caller asserts a
+    /// single verdict. The one spelling a "dead peer" test in this file should
+    /// use; `background_binary_frame_reports_a_dead_peer_as_write_failed`
+    /// carried it inline first.
+    ///
+    /// Closing this process's copy of a pipe's read end is NOT enough.
+    /// [`cloexec_pipe`] narrows Darwin's inherit window but cannot close it, so
+    /// a child that any concurrent test spawns can hold a duplicate of that
+    /// read end, and a live duplicate keeps the write SUCCEEDING: the
+    /// `Ok`-where-`WriteFailed`-is-required that note records three sightings
+    /// of, each in a full-suite run under load. A pipe's death is a property of
+    /// its DESCRIPTORS, and a stranger's duplicate is one of them. A socket's
+    /// `shutdown` is a property of the SOCKET, which every duplicate shares —
+    /// so this swaps a socket shut for writing over the sink's fd with `dup2`,
+    /// and the `EPIPE` that follows is one no stranger can take back.
+    /// `a_stranger_holding_the_read_end_cannot_revive_a_kernel_killed_peer`
+    /// pins both halves of that claim.
+    ///
+    /// The probe write is the receipt: this never returns while the fd it was
+    /// handed is still writable. (`dup2` also closes the description that fd
+    /// named, so the pipe's write end goes with it.)
+    #[cfg(unix)]
+    fn kill_peer_in_kernel(master: i32, subject: &str) {
+        let mut pair = [0i32; 2];
+        assert_eq!(
+            // SAFETY: `socketpair` fills the two-element array this frame owns.
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+            0,
+            "{subject}: socketpair(2)"
+        );
+        assert_eq!(
+            // SAFETY: `pair[0]` is a live socket this frame owns.
+            unsafe { libc::shutdown(pair[0], libc::SHUT_WR) },
+            0,
+            "{subject}: shutdown(SHUT_WR)"
+        );
+        assert_eq!(
+            // SAFETY: both are live descriptors; `dup2` closes what `master`
+            // named and makes it a second name for the dead socket.
+            unsafe { libc::dup2(pair[0], master) },
+            master,
+            "{subject}: dup2(2) the dead socket over the sink's fd"
+        );
+        // SAFETY: two live descriptors this frame owns, each closed once; the
+        // dead socket survives as `master`.
+        unsafe {
+            libc::close(pair[0]);
+            libc::close(pair[1]);
+        }
+        // SAFETY: a one-byte write from a static buffer to a live descriptor.
+        let probe = unsafe { libc::write(master, b"x".as_ptr().cast(), 1) };
+        assert_eq!(
+            (probe, std::io::Error::last_os_error().raw_os_error()),
+            (-1, Some(libc::EPIPE)),
+            "{subject}: the peer must be observably dead before any verdict"
+        );
     }
 
     /// One DEC 2026 frame of a synthetic alt-screen app (never a real capture):
@@ -15556,6 +15650,9 @@ mod tests {
                 "sessions",
                 // The exit ledger: `sessions`' past, Owner-gated with it.
                 "exits",
+                // The identity roster: the directories `sessions`' `identity=`
+                // names, Owner-gated with it.
+                "identities",
                 "whoami",
                 "grant",
                 "revoke",
@@ -15800,6 +15897,30 @@ mod tests {
         );
         assert_eq!(escalated_op("spawn", ""), None);
         assert_eq!(escalated_op("spawn", "cwd=/tmp"), None);
+        // SESSION IDENTITIES (2026-09-17): `identity=` — a name or the `-`
+        // opt-out — opens (or declines) a login, so it is fenced exactly like
+        // `connected=`, in either form, quoted or not, at any position.
+        assert_eq!(
+            escalated_op("spawn", "identity=worker"),
+            Some(OwnerOnly),
+            "a named identity is Owner-only"
+        );
+        assert_eq!(
+            escalated_op("spawn", "cwd=/tmp identity=-"),
+            Some(OwnerOnly)
+        );
+        assert_eq!(
+            escalated_op("spawn", "\"identity=worker\" cwd=/tmp"),
+            Some(OwnerOnly),
+            "a quoted identity= must not walk past the Owner fence"
+        );
+        assert_eq!(
+            escalated_op(
+                "spawn",
+                "connected=controlled place=tab of=s-abc identity=worker"
+            ),
+            Some(OwnerOnly)
+        );
 
         // The fence must classify with the PARSER's tokenizer, not a whitespace
         // split. Every spelling below is accepted by `parse_spawn_args` as a
@@ -17085,6 +17206,7 @@ mod tests {
             term,
             master,
             ctx,
+            identity: None,
         }
     }
 
@@ -19754,36 +19876,15 @@ mod tests {
         store.write().unwrap().register(background.clone());
         let active = active_for_handle(&front);
         // The background peer is gone, and must STAY gone. Closing our copy of
-        // the pipe's read end is not enough: `pipe_session`'s pipe is not
-        // CLOEXEC, so a child any concurrent test spawns in that window
-        // inherits the read end and keeps the peer alive — the write then
-        // lands and `OK 3 bytes` is a true answer, not the bug under test.
-        // Kill the peer in the kernel instead: swap the sink's fd for a socket
-        // shut for writing, whose EPIPE no descriptor held elsewhere revives.
+        // the pipe's read end is not enough: `pipe_session`'s pipe is CLOEXEC
+        // only after a window, so a child any concurrent test spawns inside it
+        // inherits the read end and keeps the peer alive — the write then lands
+        // and `OK 3 bytes` is a true answer, not the bug under test. Kill the
+        // peer in the kernel instead, and get the probe that proves it dead
+        // before any frame is sent: `kill_peer_in_kernel`, which this test
+        // carried inline until the dead-peer sibling needed the same thing.
         drop(background_rx);
-        let mut pair = [0i32; 2];
-        assert_eq!(
-            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
-            0,
-            "socketpair(2)"
-        );
-        assert_eq!(unsafe { libc::shutdown(pair[0], libc::SHUT_WR) }, 0);
-        assert_eq!(
-            unsafe { libc::dup2(pair[0], background.master) },
-            background.master,
-            "dup2(2) the dead socket over the sink's fd"
-        );
-        unsafe {
-            libc::close(pair[0]);
-            libc::close(pair[1]);
-        }
-        // Observably dead before any frame: a direct write is refused (EPIPE).
-        let probe = unsafe { libc::write(background.master, b"x".as_ptr().cast(), 1) };
-        assert_eq!(
-            (probe, std::io::Error::last_os_error().raw_os_error()),
-            (-1, Some(libc::EPIPE)),
-            "the background peer is dead before the frames are sent"
-        );
+        kill_peer_in_kernel(background.master, "the background session's peer");
 
         for (verb, frame) in [
             ("paste-bin", &b"@2 paste-bin 3\nabcafter\n"[..]),
@@ -19834,7 +19935,13 @@ mod tests {
     #[cfg(unix)]
     fn cross_session_input_reports_a_dead_peer_as_write_failed() {
         let (h, rx) = pipe_session(74);
+        // `drop` closes only THIS process's reader. A child that inherited a
+        // duplicate through cloexec_pipe's window keeps the peer alive, and
+        // every verdict below then reads a write that really landed — measured
+        // three times, always on the first assertion. Kill the peer where no
+        // descriptor can revive it (see `kill_peer_in_kernel`).
         drop(rx);
+        kill_peer_in_kernel(h.master, "a cross-session send into a dead peer");
         assert_eq!(
             cross_raw_input(&h.term, &h.ctx, send_bytes("ls")),
             InputOutcome::WriteFailed,
@@ -19855,6 +19962,51 @@ mod tests {
             ),
             control_input::KEY_USAGE
         );
+    }
+
+    /// THE PREMISE ITSELF, pinned, and why the dead-peer tests kill their peer
+    /// in the kernel instead of dropping a reader.
+    ///
+    /// A stranger holding a duplicate of the read end means the peer is NOT
+    /// dead: the write really does land, and a seam that reports what it
+    /// measured says `Ok` — honestly. That is the
+    /// `Ok`-where-`WriteFailed`-is-required [`cloexec_pipe`]'s note records
+    /// three sightings of, each in a full-suite run under load: a defect in the
+    /// TEST's premise, never in the seam. A pipe cannot tell whose descriptor a
+    /// duplicate is, so the inherited copy a `posix_spawn` racing that window
+    /// hands a child is modelled here by the duplicate that needs no child at
+    /// all — `dup(2)` in this process, whose timing this test owns.
+    ///
+    /// Both halves are asserted, with no sleep and no thread between them: the
+    /// false `Ok` while the stranger holds the read end, and the `WriteFailed`
+    /// that [`kill_peer_in_kernel`] earns WHILE THAT SAME STRANGER STILL HOLDS
+    /// IT. The second half is the claim the dead-peer tests rest on — a
+    /// `shutdown` no descriptor can take back.
+    #[test]
+    #[cfg(unix)]
+    fn a_stranger_holding_the_read_end_cannot_revive_a_kernel_killed_peer() {
+        use std::os::fd::AsRawFd;
+        let (h, rx) = pipe_session(75);
+        // SAFETY: `rx` is live across this call, and `dup` either returns a new
+        // descriptor for the same read end or -1.
+        let stranger = unsafe { libc::dup(rx.as_raw_fd()) };
+        assert!(stranger >= 0, "dup the read end: a stranger's duplicate");
+        drop(rx);
+        assert_eq!(
+            cross_raw_input(&h.term, &h.ctx, send_bytes("ls")),
+            InputOutcome::Ok,
+            "negative control: with a stranger on the read end the peer is NOT dead, \
+             the bytes really land, and OK is the honest answer — this is the reading \
+             a dropped reader alone can hand a dead-peer test"
+        );
+        kill_peer_in_kernel(h.master, "a pipe-backed session whose reader is duplicated");
+        assert_eq!(
+            cross_raw_input(&h.term, &h.ctx, send_bytes("ls")),
+            InputOutcome::WriteFailed,
+            "the kernel-killed peer is dead while the stranger STILL holds its duplicate"
+        );
+        // SAFETY: this test's own duplicate, closed exactly once.
+        assert_eq!(unsafe { libc::close(stranger) }, 0, "close the stranger");
     }
 
     /// A cross-session paste reply is a kernel-delivery receipt, not merely

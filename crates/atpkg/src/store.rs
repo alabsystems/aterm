@@ -107,6 +107,56 @@ impl Layout {
         created
     }
 
+    /// `agents/` ([`Self::agents_dir`]) ENSURED as a REAL directory — the rule the `aterm`
+    /// front door applies before it hands the directory to a TTY session
+    /// ([`crate::reroute::AGENTS_DIR_ENV`], 2026-09-18). What a launch needs synchronously
+    /// is only that the directory EXIST, so the twins atpkg lays into it later
+    /// ([`crate::activate::reconcile_agents`]) are found on the next invocation: one
+    /// `mkdir` through [`Self::ensure_dir`] — `0700` in a `$HOME` prefix, `0755` in a
+    /// system one — never a wait, and an existing directory is left as it is. A symlink or
+    /// a regular file at `agents/` is REFUSED and left alone (a pre-created link must never
+    /// capture the twins) — judged by `lstat` BEFORE the `mkdir`, so the refusal is this
+    /// function's one-path sentence and never the `update directory …` wording
+    /// `ensure_private_dir` would give the same fact. This is the window's mkdir/mode rule
+    /// (`aterm-gui::spawn::managed_agents_dir`, 2026-09-16) PLUS that refusal: the window
+    /// still hands a symlinked `agents/` after warning about it (`Path::is_dir` follows the
+    /// link); the front door hands nothing. One rule in two places until the window is
+    /// pointed here. `Ok` is the absolute directory, real and traversable; `Err` is the
+    /// sentence for the caller's one stderr line, always starting with the path — the
+    /// launch then omits the directory rather than putting a nonexistent entry first on
+    /// PATH.
+    pub fn ensure_agents_dir(&self) -> Result<PathBuf, String> {
+        let dir = self.agents_dir();
+        match std::fs::symlink_metadata(&dir) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(format!("{} is a symlink; refusing", dir.display()));
+            }
+            Ok(md) if !md.is_dir() => {
+                return Err(format!("{} exists and is not a directory", dir.display()));
+            }
+            _ => {}
+        }
+        // The bare io error names no path (`Permission denied (os error 13)`); the
+        // caller's stderr line must. `ensure_private_dir`'s own refusals already start
+        // with it — a link swapped in after the lstat above — and are not prefixed twice.
+        self.ensure_dir(&dir).map_err(|error| {
+            let text = error.to_string();
+            if text.starts_with(&dir.display().to_string()) {
+                text
+            } else {
+                format!("{}: {text}", dir.display())
+            }
+        })?;
+        match std::fs::symlink_metadata(&dir) {
+            Ok(md) if md.file_type().is_symlink() => {
+                Err(format!("{} is a symlink; refusing", dir.display()))
+            }
+            Ok(md) if md.is_dir() => Ok(dir),
+            Ok(_) => Err(format!("{} exists and is not a directory", dir.display())),
+            Err(error) => Err(format!("{}: {error}", dir.display())),
+        }
+    }
+
     /// `store/<program>/<build>/` — the versioned, immutable extracted tree.
     #[must_use]
     pub fn build_dir(&self, program: &str, build: u64) -> PathBuf {
@@ -323,9 +373,31 @@ impl Layout {
     /// program is an explicit act, and set-completion must never fight it by reinstalling on
     /// the next pass. The durable way to drop ONE program while staying adopted is
     /// `[packages].exclude`, which the default-set planner already honours.
+    ///
+    /// Existence-only, and silent on WHO adopted: that is a separate record,
+    /// [`Self::adopted_by_seed`].
     #[must_use]
     pub fn adopted(&self) -> PathBuf {
         self.prefix.join("adopted")
+    }
+
+    /// `adopted-by-seed` — WHO adopted: present only when `atpkg seed`, the first
+    /// launch's bootstrap, created the [`Self::adopted`] marker itself. Read the way that
+    /// marker is, as EXISTENCE and never a parsed value, and read for one sentence only:
+    /// an update pass that completes the set may say "installing aterm is the consent",
+    /// naming `[packages].seed_install = false` (which the seed pass reads BEFORE it
+    /// adopts) as the switch that would have stopped it, only where this record stands
+    /// beside the marker.
+    ///
+    /// The explicit `install --default-set` clears it: running that verb is its own
+    /// consent, and it never reads the key. A marker that verb writes (after `uninstall
+    /// --all`, or on a CLI-only box with no first launch) therefore has no record, and the
+    /// seed pass, which runs on every launch, never stamps a marker it did not just create.
+    /// Cleared with `adopted`. A marker with no record, including one written before this
+    /// record existed, claims no consent beyond the uninstall.
+    #[must_use]
+    pub fn adopted_by_seed(&self) -> PathBuf {
+        self.prefix.join("adopted-by-seed")
     }
 
     /// `provisional` — build numbers the batteries-included seed laid down that GC
@@ -648,6 +720,48 @@ fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
 /// Its spelling is a compatibility surface, not a detail — see [`ready_text_accepts`].
 const READY_PLATFORM_KEY: &str = "platform=";
 
+/// The key under which the readiness marker records WHAT THE BUILD CONTAINED when it was
+/// marked — the direct entries of its `bin/`, the files every shim and every exec root
+/// forward to. Its spelling is a compatibility surface for the same reason
+/// [`READY_PLATFORM_KEY`]'s is: a re-spelling silently demotes every marker this version
+/// wrote back to "no record", which is accepted (see [`ready_text_accepts`]) and therefore
+/// unchecked.
+///
+/// **WHY READINESS HAD TO BECOME A CLAIM ABOUT CONTENTS (2026-09-17).** The marker used to
+/// be a file someone remembered to write, and nothing ever asked whether the tree beside it
+/// still held anything. Measured on m3: `store/trust/8595/` with no `bin/` at all, 417 MB of
+/// orphaned `lib/`, and `8595.ready` beside it still saying `ok` — a corpse
+/// [`crate::ops::list_installed`] counted as an installed build, [`crate::gc`] refused to
+/// sweep (it sweeps only marker-LESS trees), and [`crate::flow::rollback`] would have
+/// selected as its rollback target, re-pointing every shim at a build with no compiler in it
+/// and disarming the machine. The cause of the corpse is fixed where corpses are made
+/// ([`discard_build`], [`crate::ops::uninstall`]: the marker now comes down BEFORE the tree
+/// goes, so an interrupt leaves a tree that reads as incomplete rather than a lie that reads
+/// as complete). This key is the other half: a marker that records what it vouched for can
+/// be REFUTED by the disk, so the class cannot go unnoticed however a tree loses its
+/// contents — an interrupted `rm -rf` a person typed, a volume that dropped a directory, a
+/// version of this manager older than the fix.
+///
+/// Two values, so "recorded nothing" and "recorded that there was nothing" stay apart:
+///
+/// * `contents=none` — the build had no `bin/` entries when it was marked. Nothing to check.
+/// * `contents=bin:<name>,<name>,…` — the sorted names of `bin/`'s direct entries. Each must
+///   still be there ([`contents_still_stand`]).
+///
+/// The key is OMITTED — leaving the marker exactly as lenient as every marker written before
+/// this version — when the inventory cannot be encoded: a `bin/` that cannot be read for a
+/// reason that is not `NotFound` (a bound on what this process may know is never written
+/// down as a fact about the build), or a name carrying a `,` or a newline. The writer says
+/// only what it can encode, and the reader checks only what was written.
+const READY_CONTENTS_KEY: &str = "contents=";
+
+/// [`READY_CONTENTS_KEY`]'s value for a build whose `bin/` held nothing (or is absent).
+/// A recorded emptiness, distinct from the absence of a record.
+const READY_CONTENTS_NONE: &str = "none";
+
+/// [`READY_CONTENTS_KEY`]'s prefix for a recorded `bin/` inventory: `bin:<name>,<name>,…`.
+const READY_CONTENTS_BIN: &str = "bin:";
+
 /// Line 1 of every readiness marker every version of atpkg has ever written — and now the
 /// WELL-FORMEDNESS gate a marker must pass before [`ready_text_accepts`] reads anything
 /// else out of it. Bytes that do not carry this line were not written by this writer, so
@@ -714,6 +828,103 @@ fn recorded_platform(text: &str) -> Option<&str> {
         .find(|p| !p.is_empty())
 }
 
+/// The `contents=` record a marker's text carries, or `None` when it carries none — which
+/// covers BOTH "written before this field existed" and a value this version does not
+/// recognise. An empty value is no record either, exactly as for the platform key.
+fn recorded_contents(text: &str) -> Option<&str> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix(READY_CONTENTS_KEY))
+        .map(str::trim)
+        .find(|v| !v.is_empty())
+}
+
+/// The inventory [`mark_build_ready`] is about to record for `build_dir`, or `None` when it
+/// cannot be encoded (see [`READY_CONTENTS_KEY`]).
+///
+/// The names are the direct entries of `bin/` — read with [`std::fs::read_dir`], which does
+/// not follow the entries themselves, so a `bin/clippy -> ../lib/…` link is recorded by its
+/// own name and checked by its own name. Sorted, so the record is a function of the tree and
+/// not of `readdir` order: two markers for the same tree are byte-identical, which is what
+/// lets a test compare them and a human diff them.
+fn bin_inventory(build_dir: &Path) -> Option<String> {
+    let bin = build_dir.join("bin");
+    let entries = match std::fs::read_dir(&bin) {
+        Ok(entries) => entries,
+        // A `bin/` that is not there is a FACT about the build, and one worth recording:
+        // a build marked with no bin entries is never later refuted for having none.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some(String::from(READY_CONTENTS_NONE));
+        }
+        // Anything else is a bound on what this process may know — EACCES on the directory,
+        // EIO, macOS privacy consent. Recording `none` there would write that bound down as
+        // a fact about the build and unprotect it forever; omitting the key leaves the
+        // marker exactly as lenient as it was before this field existed.
+        Err(_) => return None,
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        // One unreadable entry is the same bound as an unreadable directory: a partial
+        // inventory recorded as a whole one would refute a build that is intact.
+        let entry = entry.ok()?;
+        let name = entry.file_name().into_string().ok()?;
+        // A name this encoding cannot round-trip. Nothing atpkg stages produces one
+        // ([`ToolName`] admits neither), but `bin/` is a directory on the user's disk.
+        if name.contains(',') || name.contains('\n') || name.contains('\r') || name.is_empty() {
+            return None;
+        }
+        names.push(name);
+    }
+    if names.is_empty() {
+        return Some(String::from(READY_CONTENTS_NONE));
+    }
+    names.sort();
+    names.dedup();
+    // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
+    let mut out = String::from(READY_CONTENTS_BIN);
+    let mut first = true;
+    for name in &names {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(name);
+    }
+    Some(out)
+}
+
+/// Whether the tree at `build_dir` still holds what its marker's `contents=` record
+/// vouches for.
+///
+/// **Only a PROVEN absence refutes.** Each recorded name is `symlink_metadata`'d — not
+/// `exists()`, which would read an EACCES on a shared prefix, or macOS privacy consent, as
+/// "the tool is gone" and re-stage a multi-GB toolchain over a permissions answer. The
+/// three-answer rule [`presence`] exists for, applied to the one question that can
+/// un-install a build. `symlink_metadata`, not `metadata`: a `bin/` entry that is a symlink
+/// into the build's own `lib/` is present as itself even when what it names is not, and the
+/// dangling-link case is [`crate::doctor`]'s to report, not this predicate's to re-stage on.
+///
+/// An unrecognised value is not a refutation either: a marker written by a LATER atpkg that
+/// records something this version cannot parse must read as "no record", never as "refuted".
+fn contents_still_stand(build_dir: &Path, recorded: &str) -> bool {
+    if recorded == READY_CONTENTS_NONE {
+        return true;
+    }
+    let Some(list) = recorded.strip_prefix(READY_CONTENTS_BIN) else {
+        return true;
+    };
+    let bin = build_dir.join("bin");
+    !list
+        .split(',')
+        .filter(|n| !n.is_empty())
+        .any(|name| is_provably_absent(&bin.join(name)))
+}
+
+/// Whether `path` is PROVABLY not there, by its own link (never by its target).
+/// The `symlink_metadata` twin of [`Presence::is_absent`].
+fn is_provably_absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Whether a readiness marker with this text vouches for its build to a `running` slice.
 ///
 /// **BACKWARD COMPATIBILITY, decided here and only here: an absent platform record means
@@ -751,6 +962,16 @@ fn ready_text_accepts(text: &str, running: &str) -> bool {
     match recorded_platform(text) {
         None => true,
         Some(recorded) => recorded == running,
+    }
+}
+
+/// Whether a well-formed marker's CONTENTS record (if any) is still true of `build_dir`.
+/// Split out of [`ready_text_accepts`] because it is the one clause that reads the disk;
+/// the rest of that predicate is a function of the text alone and its tests say so.
+fn ready_contents_accept(text: &str, build_dir: &Path) -> bool {
+    match recorded_contents(text) {
+        None => true,
+        Some(recorded) => contents_still_stand(build_dir, recorded),
     }
 }
 
@@ -826,8 +1047,21 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
     let Some(marker) = ready_marker_path(build_dir) else {
         return false;
     };
+    // THE TREE ITSELF, before its marker is even opened. [`mark_build_ready`] has no
+    // existence precondition — it writes a temp file beside the build and renames it onto
+    // `<build>.ready` without ever looking at `<build>` — and `install::restore_outgoing`'s
+    // doc has named the consequence since it was written: a marker for a tree that is not
+    // there is "a durable lie one refactor away from being believed". This is the refactor,
+    // so the lie is refused at the door. Only a PROVEN absence refuses (the whole point of
+    // [`presence`]): an EACCES on a shared prefix must never un-install a build.
+    if is_provably_absent(build_dir) {
+        return false;
+    }
     match std::fs::read_to_string(&marker) {
-        Ok(text) => ready_text_accepts(&text, &running_platform()),
+        Ok(text) => {
+            ready_text_accepts(&text, &running_platform())
+                && ready_contents_accept(&text, build_dir)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => false,
         // Present and READ, but not text at all. Every marker this writer produces is
         // ASCII (`ok\n` plus an ASCII platform record), so bytes that are not UTF-8 were
@@ -843,6 +1077,32 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => true,
         Err(_) => false,
     }
+}
+
+/// Whether `build_dir` carries a WELL-FORMED completeness marker recording the OTHER
+/// slice of the universal binary: a build that slice finished installing — complete for
+/// it, and not for us.
+///
+/// [`build_is_complete`] answers `false` for such a build, and that is right for the
+/// callers it was written for: this slice must re-stage the tree rather than run it
+/// ([`running_platform`] has the Rosetta hazard in full). But `false` there means only
+/// "not complete FOR ME", and a caller that reads it as "no install ever finished here"
+/// is reasoning about a different question. [`crate::gc`]'s interrupted-install sweep did
+/// exactly that, and its verdict is a `remove_dir_all`.
+///
+/// So this is the distinction, and it is deliberately as strict as the acceptance rule:
+/// an `ok` first line ([`first_line_is_ok`] — a torn or empty marker is a crash artefact,
+/// never another slice's), a platform record present ([`recorded_platform`] — an absent
+/// one is the legacy `ok\n` this slice accepts anyway), and that record not ours.
+pub(crate) fn build_marks_another_slice(build_dir: &Path) -> bool {
+    let Some(marker) = ready_marker_path(build_dir) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    first_line_is_ok(&text)
+        && recorded_platform(&text).is_some_and(|p| p != running_platform().as_str())
 }
 
 /// Atomically AND DURABLY mark `build_dir` complete (temp + fsync + rename, so a crash
@@ -877,6 +1137,16 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     body.push_str(READY_PLATFORM_KEY);
     body.push_str(&running_platform());
     body.push('\n');
+    // AND WHAT THIS MARKER IS VOUCHING FOR ([`READY_CONTENTS_KEY`]): the `bin/` inventory
+    // as it stands right now, so a later reader can REFUTE the marker against the tree
+    // instead of believing it. Derived here, from the tree, rather than passed in by the
+    // stager: readiness is then a claim this function makes about what it can see, and no
+    // caller can assert a completeness it did not measure.
+    if let Some(contents) = bin_inventory(build_dir) {
+        body.push_str(READY_CONTENTS_KEY);
+        body.push_str(&contents);
+        body.push('\n');
+    }
     {
         use std::io::Write as _;
         // `0644` explicitly rather than `fs::write`'s umask-dependent `0666 & ~umask`:
@@ -905,6 +1175,50 @@ pub(crate) fn clear_build_ready(build_dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(&marker) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         other => other,
+    }
+}
+
+/// Take down the completeness marker of EVERY build under `prog_store`
+/// (`<prefix>/store/<program>`), durably, before a caller removes the tree.
+///
+/// The whole-program twin of the unmark that opens [`discard_build`], and it exists for the
+/// same reason: [`crate::ops::uninstall`]'s `remove_dir_all` of a program's whole store is
+/// the longest-running delete in this manager — for `trust`, several gigabytes across tens
+/// of thousands of files — and `readdir` order decides what it removes first. An interrupt
+/// inside that walk leaves whichever build dirs it had not reached, each still vouched for
+/// by a `<n>.ready` it also had not reached. On m3 that walk had taken `8595/bin` and left
+/// `8595/lib` and `8595.ready` (2026-09-17). Unmarking first means an interrupted uninstall
+/// leaves trees that read as INCOMPLETE — reclaimable debris that `gc`'s partial arm sweeps
+/// and that `list_installed`, `decide` and `rollback` all ignore — rather than installed
+/// builds that are not there.
+///
+/// Best-effort, and deliberately so: it is a narrowing of a window, not a precondition of
+/// the removal, and a marker that cannot be unlinked must not stop the uninstall the user
+/// asked for. One `sync_dir` at the end, not one per build: the ordering the flush
+/// establishes is "every marker gone before any tree goes", which is a claim about the
+/// directory, not about any one entry in it.
+pub(crate) fn unmark_program_builds(prog_store: &Path) {
+    let Ok(entries) = std::fs::read_dir(prog_store) else {
+        return;
+    };
+    let mut unmarked = false;
+    for entry in entries.flatten() {
+        // Numeric build dirs only, by the same test every other store scan uses: `current`
+        // is a symlink, and `<n>.ready` / `<n>.provenance` / `<n>.shim-env` are files.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.parse::<u64>().is_err() {
+            continue;
+        }
+        if clear_build_ready(&entry.path()).is_ok() {
+            unmarked = true;
+        }
+    }
+    if unmarked {
+        sync_dir(prog_store);
     }
 }
 
@@ -1289,6 +1603,26 @@ pub(crate) enum Scratch {
     Superseded,
 }
 
+/// A store build directory's name, parsed the way this manager WRITES one: a non-empty run
+/// of ASCII digits, with no leading zero unless the name is exactly `0` ([`crate::dec_u64`]
+/// renders nothing else). `u64::from_str` on its own is LOOSER than the producer — it
+/// accepts a leading `+`, and any number of leading zeros — so `+18` and `018` read back as
+/// build 18 though nothing here ever wrote them. That mattered because these names
+/// authorize deletion inside `store/<program>/`, a directory the user can also put things
+/// in: `+20.incoming-4242/` was swept as build 20's scratch, and `+18/` was swept as a
+/// partial build, by an unguarded `remove_dir_all`. It is the same line the shape test
+/// already held for `18.incoming-drafts/`, and the same canonical-parse rule
+/// [`crate::compat`]'s own store walk uses (`.filter(|n| n.to_string() == name)`).
+pub(crate) fn parse_build_name(name: &str) -> Option<u64> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if name.len() > 1 && name.starts_with('0') {
+        return None;
+    }
+    name.parse::<u64>().ok()
+}
+
 /// Recognise stage scratch by the PRODUCER's exact shape: `<build>.incoming-<pid>` or
 /// `<build>.superseded-<pid>`, where `<build>` is a real build number and `<pid>` a
 /// non-empty run of ASCII digits. Returns the build number and the shape.
@@ -1299,7 +1633,7 @@ pub(crate) enum Scratch {
 /// not a policy: `18.incoming-drafts/` is not ours to delete, whichever code path meets it.
 pub(crate) fn stage_scratch_of(name: &str) -> Option<(u64, Scratch)> {
     let (build, rest) = name.split_once('.')?;
-    let build = build.parse::<u64>().ok()?;
+    let build = parse_build_name(build)?;
     let (kind, pid) = match rest.strip_prefix("incoming-") {
         Some(pid) => (Scratch::Incoming, pid),
         None => (Scratch::Superseded, rest.strip_prefix("superseded-")?),
@@ -1319,7 +1653,7 @@ fn scratch_siblings(build_dir: &Path) -> Vec<(Scratch, PathBuf)> {
     ) else {
         return Vec::new();
     };
-    let Ok(build) = name.parse::<u64>() else {
+    let Some(build) = parse_build_name(name) else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(parent) else {
@@ -1381,12 +1715,21 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
 }
 
 /// Delete every stage-scratch sibling of `build_dir` left behind by an earlier run, after
-/// first recovering the swap window ([`recover_interrupted_swap`]) so a crash there does not
-/// get swept as debris.
+/// first stopping any lane helper that may still be writing into one
+/// ([`crate::stage_helper::stop_orphaned_lane_jobs`]) and recovering the swap window
+/// ([`recover_interrupted_swap`]) so a crash there does not get swept as debris.
 ///
-/// Safe to sweep unconditionally because every mutating verb holds the store-wide writer
-/// lock ([`crate::lock::try_lock_store`]): if scratch exists when we get here, its owner is
-/// gone. Without this sweep the scratch is INVISIBLE to reclamation — `list_installed`
+/// THE LOCK IS NOT, BY ITSELF, PROOF THAT NOTHING IS STILL WRITING. Every mutating verb
+/// holds the store-wide writer lock ([`crate::lock::try_lock_store`]), which is what makes
+/// another run's scratch ours to reclaim — but the untracked staging lane's extractor is a
+/// LAUNCHD job, launchd's child rather than the submitter's
+/// ([`crate::stage_helper::stage_untracked`]). A `kill -9` of the stager therefore drops
+/// the lock while its helper keeps extracting into `<build>.incoming-<the dead stager's
+/// pid>`, and the successor used to delete exactly that directory out from under it,
+/// stopping it only later, when its own lane prepared a job. So the orphaned jobs are
+/// stopped — and waited out — before a single entry is removed.
+///
+/// Without this sweep the scratch is INVISIBLE to reclamation — `list_installed`
 /// only counts numeric, marker-bearing dirs, and GC only reclaims what `list_installed`
 /// returns — so a killed install would strand its half-extracted tree on disk forever.
 ///
@@ -1394,9 +1737,35 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
 /// file and GC's pass filters to directories, so such an entry was reclaimed by NEITHER
 /// sweeper — it leaked forever, and while it sat there it blocked every swap of that build
 /// by a process holding the same pid.
+///
+/// A superseded sibling is NOT swept while `<build>` is absent and the recovery above
+/// declined to move it: that is the only copy of the build on disk, and deleting it is
+/// what [`recover_interrupted_swap`] refused to risk. See the comment on the guard.
 pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
-    recover_interrupted_swap(build_dir);
-    for (_, path) in scratch_siblings(build_dir) {
+    // STOP FIRST, DELETE SECOND: a launchd-parented lane helper outlives the stager that
+    // submitted it, and the store lock it dropped says nothing about the helper.
+    crate::stage_helper::stop_orphaned_lane_jobs();
+    let recovered = recover_interrupted_swap(build_dir);
+    // WHAT A REFUSED RECOVERY WAS PROTECTING IS NOT DEBRIS. [`recover_interrupted_swap`]
+    // answers `false` for three different states, and one of them is the very state it
+    // exists for: `<build>` absent with a superseded sibling it would not move — two
+    // siblings, so which is the outgoing tree cannot be told, or a rename that simply
+    // FAILED (EACCES, EXDEV, a busy handle). The loop below then `remove_dir_all`ed the
+    // tree the refusal had just declined to gamble with, which is exactly the
+    // "a survivable crash became a permanently deleted toolchain" outcome this pair of
+    // functions is written to prevent — the refusal bought nothing.
+    //
+    // So while NOTHING stands at `<build>`, a superseded sibling is the only copy of that
+    // build there is, and it is left alone. Narrow in both directions: with `<build>`
+    // present (recovery's other `false`) the sibling is genuine leftover and is still
+    // swept, `<build>.incoming-<pid>` half-extracts are nobody's only copy and are still
+    // swept, the next stage of this build sweeps the sibling the moment `<build>` is whole
+    // again, and `crate::gc`'s pass still reports and reclaims a genuinely ambiguous pair.
+    let parked_only_copy = !recovered && std::fs::symlink_metadata(build_dir).is_err();
+    for (kind, path) in scratch_siblings(build_dir) {
+        if parked_only_copy && kind == Scratch::Superseded {
+            continue;
+        }
         // `symlink_metadata`, not `is_dir()`: `remove_dir_all` refuses a SYMLINK to a
         // directory (it does not follow it — proven by the sweep tests), so dispatching on
         // the followed type would leave exactly that entry behind forever.
@@ -1540,12 +1909,41 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
 /// deletes only trees that NOTHING on disk points into, which is what earns it the right
 /// to name a build number it read out of a directory listing.
 pub(crate) fn discard_build(build_dir: &Path) {
-    // The build's EXEC ROOT (`<prefix>/compat/<program>/<n>`, `crate::compat`) goes
-    // FIRST: it is a copy-on-write clone of this build's files, so left behind it would
-    // keep every reclaimed block allocated and could still run the tools of a build the
-    // store no longer has. Derived from this path's own `store/<program>/<n>` chain only.
+    // THE MARKER COMES DOWN FIRST, AND DURABLY — before the exec root, before the tree.
+    //
+    // This used to be the LAST act, after `remove_dir_all`, and that ordering is how a
+    // corpse is made: `remove_dir_all` walks a multi-gigabyte toolchain for tens of
+    // seconds, and anything that ends the process inside that window — ^C, a SIGTERM at
+    // logout, the machine going down, an EACCES that aborts the walk partway — leaves a
+    // gutted tree with a marker beside it still saying `ok`. Measured on m3, 2026-09-17:
+    // `store/trust/8595/` with no `bin/` at all, 417 MB of orphaned `lib/`, and
+    // `8595.ready` intact. `list_installed` counted it as installed, `gc` would not sweep
+    // it (it sweeps only marker-LESS trees), and `flow::rollback` selects the highest
+    // retained build below current — that one — whose `bin/` no longer holds a single tool,
+    // so `rollback_member`'s "the prior build lacks this tool" arm would have REMOVED every
+    // shim on the machine.
+    //
+    // Unmarking first makes the whole window safe instead of merely narrower: from the
+    // instant the marker is gone the tree reads as incomplete to every reader
+    // ([`build_is_complete`]), which is the truth for the rest of this function and the
+    // truth for any interrupt inside it — and `gc`'s partial arm reclaims exactly such a
+    // tree on the next pass, under its claim guard. The `sync_dir` is what makes the
+    // ordering survive a power loss and not merely a kill: an unlink is metadata, and
+    // without a directory flush the marker's removal may reach the platter AFTER the
+    // tree's, which is the ordering this fix exists to forbid.
+    let _ = clear_build_ready(build_dir);
+    if let Some(parent) = build_dir.parent() {
+        sync_dir(parent);
+    }
+    // The build's EXEC ROOT (`<prefix>/compat/<program>/<n>`, `crate::compat`) next: it is
+    // a copy-on-write clone of this build's files, so left behind it would keep every
+    // reclaimed block allocated and could still run the tools of a build the store no
+    // longer has. Derived from this path's own `store/<program>/<n>` chain only.
     crate::compat::discard_root_of(build_dir);
     let _ = std::fs::remove_dir_all(build_dir);
+    // And the marker again, for the one case the unmark above could not settle: it is
+    // best-effort, so a failure there (a read-only parent that a later act made writable,
+    // an EIO) must not leave the sibling behind once the tree really is gone.
     if let Some(marker) = ready_marker_path(build_dir) {
         let _ = std::fs::remove_file(marker);
     }
@@ -2078,6 +2476,80 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o700)).unwrap();
         h
+    }
+
+    /// `Layout::ensure_agents_dir` — the front door's rule (2026-09-18; the window's
+    /// mkdir/mode rule plus a symlink refusal the window does not yet make):
+    /// a fresh prefix gets `agents/` created (private, `0700`, the `$HOME` shape) and
+    /// the absolute directory back; a second call is a no-op with the same answer; a
+    /// symlink at `agents/` — even one that resolves to a real directory — is REFUSED
+    /// and left alone; a regular file there is refused and left alone.
+    #[test]
+    fn ensure_agents_dir_creates_a_real_directory_once_and_refuses_a_link_or_a_file() {
+        let h = temp_home("ensure-agents");
+        let l = Layout {
+            prefix: h.join("pkg"),
+        };
+        assert!(!l.agents_dir().exists(), "a fresh prefix has no agents/");
+        let dir = l.ensure_agents_dir().expect("created");
+        assert_eq!(dir, l.agents_dir());
+        assert!(dir.is_absolute());
+        assert!(
+            std::fs::symlink_metadata(&dir).unwrap().is_dir(),
+            "a real directory"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "a $HOME prefix's directory is private"
+        );
+        assert_eq!(l.ensure_agents_dir().as_deref(), Ok(dir.as_path()));
+        // A regular file at agents/: refused, left alone.
+        let filed = Layout {
+            prefix: h.join("filed"),
+        };
+        std::fs::create_dir_all(&filed.prefix).unwrap();
+        std::fs::write(filed.agents_dir(), b"not a dir").unwrap();
+        let err = filed.ensure_agents_dir().expect_err("a file is refused");
+        assert_eq!(
+            err,
+            format!(
+                "{} exists and is not a directory",
+                filed.agents_dir().display()
+            ),
+            "one path, one sentence"
+        );
+        assert!(filed.agents_dir().is_file(), "left alone");
+        #[cfg(unix)]
+        {
+            // A symlink at agents/ — even one that points at a real directory: refused.
+            let linked = Layout {
+                prefix: h.join("linked"),
+            };
+            std::fs::create_dir_all(&linked.prefix).unwrap();
+            std::os::unix::fs::symlink(&dir, linked.agents_dir()).unwrap();
+            assert!(linked.agents_dir().is_dir(), "the link resolves");
+            let err = linked.ensure_agents_dir().expect_err("a link is refused");
+            assert_eq!(
+                err,
+                format!("{} is a symlink; refusing", linked.agents_dir().display()),
+                "one path, one sentence — never `ensure_private_dir`'s `update directory` wording twice over"
+            );
+            assert_eq!(
+                err.matches("linked").count(),
+                1,
+                "the path is named once: {err}"
+            );
+            assert!(
+                std::fs::symlink_metadata(linked.agents_dir())
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "left alone"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&h);
     }
 
     /// The tracked-install record: written beside the build, read back as its `why=`
@@ -2739,6 +3211,225 @@ mod tests {
             build_is_complete(&build),
             "re-staging natively must clear the mismatch, not leave the build unusable"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE m3 CORPSE, exactly as it was found (2026-09-17): `store/trust/8595/` with no
+    /// `bin/` at all, 417 MB of orphaned `lib/`, and `8595.ready` beside it still saying
+    /// `ok`. `ops::list_installed` counted it as an installed build, `gc` would not sweep it
+    /// (it sweeps only marker-LESS trees) and `flow::rollback` would have switched onto it,
+    /// removing every shim on the machine.
+    ///
+    /// A readiness marker is now a claim ABOUT CONTENTS: it records the `bin/` it was
+    /// written over, and the disk can refute it.
+    #[test]
+    fn a_marker_is_refuted_when_the_bin_it_vouched_for_is_gone() {
+        let home = temp_home("readygutted");
+        let build = home.join("store").join("trust").join("8595");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::create_dir_all(build.join("lib")).unwrap();
+        std::fs::write(build.join("bin").join("trustc"), b"#!/bin/true\n").unwrap();
+        std::fs::write(build.join("bin").join("targo"), b"#!/bin/true\n").unwrap();
+        std::fs::write(build.join("lib").join("libtrust.dylib"), b"payload").unwrap();
+        mark_build_ready(&build).unwrap();
+        assert!(build_is_complete(&build), "precondition: a whole build");
+
+        // The record is really there, and it really names the tools — otherwise the
+        // refutation below could be produced by a check that reads nothing.
+        let text = std::fs::read_to_string(ready_marker_path(&build).unwrap()).unwrap();
+        assert_eq!(
+            recorded_contents(&text),
+            Some("bin:targo,trustc"),
+            "sorted, comma-joined, so the record is a function of the tree: {text:?}"
+        );
+
+        // Now gut it the way an interrupted `remove_dir_all` does: `bin` goes, `lib` stays,
+        // the marker is untouched.
+        std::fs::remove_dir_all(build.join("bin")).unwrap();
+        assert!(
+            ready_marker_path(&build).unwrap().is_file(),
+            "the fixture must leave the marker in place, or it proves nothing"
+        );
+        assert!(
+            build.join("lib").join("libtrust.dylib").is_file(),
+            "and the orphaned payload, exactly as on m3"
+        );
+        assert!(
+            !build_is_complete(&build),
+            "a marker whose `bin/` is gone vouches for nothing"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The other half of the same corpse: ONE tool removed out of a `bin/` that is
+    /// otherwise intact. A predicate that only asked "is there a `bin/`?" would miss it.
+    #[test]
+    fn a_marker_is_refuted_when_one_recorded_tool_is_gone() {
+        let home = temp_home("readyonetool");
+        let build = home.join("store").join("trust").join("8595");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin").join("trustc"), b"x").unwrap();
+        std::fs::write(build.join("bin").join("targo"), b"x").unwrap();
+        mark_build_ready(&build).unwrap();
+        std::fs::remove_file(build.join("bin").join("trustc")).unwrap();
+        assert!(
+            !build_is_complete(&build),
+            "the marker named `trustc`; `trustc` is not there"
+        );
+    }
+
+    /// A `bin/` ENTRY that is a symlink is recorded and checked BY ITS OWN NAME: the link
+    /// standing is what the record claims, and a dangling link is doctor's to report, not
+    /// this predicate's to re-stage on. Otherwise every build whose `bin/clippy` points at a
+    /// tool it ships would re-download on a machine where that target moved.
+    #[cfg(unix)]
+    #[test]
+    fn a_bin_symlink_is_recorded_and_checked_by_its_own_name() {
+        let home = temp_home("readylink");
+        let build = home.join("store").join("trust").join("8595");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin").join("tippy"), b"x").unwrap();
+        std::os::unix::fs::symlink("tippy", build.join("bin").join("clippy")).unwrap();
+        mark_build_ready(&build).unwrap();
+        let text = std::fs::read_to_string(ready_marker_path(&build).unwrap()).unwrap();
+        assert_eq!(recorded_contents(&text), Some("bin:clippy,tippy"));
+        // The link's TARGET goes; the link itself stands. Still complete.
+        std::fs::remove_file(build.join("bin").join("tippy")).unwrap();
+        assert!(
+            !build_is_complete(&build),
+            "`tippy` was recorded in its own right and is gone"
+        );
+        std::fs::write(build.join("bin").join("tippy"), b"x").unwrap();
+        assert!(build_is_complete(&build));
+        // …and the link itself going IS a refutation.
+        std::fs::remove_file(build.join("bin").join("clippy")).unwrap();
+        assert!(!build_is_complete(&build));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A build with no `bin/` at all when it was marked records a RECORDED EMPTINESS, which
+    /// is not the same thing as no record: it is never refuted for having no `bin/`, and it
+    /// never silently inherits the legacy lenience either.
+    #[test]
+    fn a_build_with_no_bin_records_none_and_stays_complete() {
+        let home = temp_home("readynone");
+        let build = home.join("store").join("clt").join("3");
+        std::fs::create_dir_all(&build).unwrap();
+        mark_build_ready(&build).unwrap();
+        let text = std::fs::read_to_string(ready_marker_path(&build).unwrap()).unwrap();
+        assert_eq!(recorded_contents(&text), Some(READY_CONTENTS_NONE));
+        assert!(build_is_complete(&build));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A marker for a build dir that IS NOT THERE. `mark_build_ready` has no existence
+    /// precondition, so `install::restore_outgoing` can write one after a restore that
+    /// failed — a state that function's own doc called "a durable lie one refactor away
+    /// from being believed". The predicate refuses it at the door.
+    #[test]
+    fn a_marker_over_an_absent_build_dir_is_not_complete() {
+        let home = temp_home("readyghost");
+        let build = home.join("store").join("ay").join("18");
+        std::fs::create_dir_all(&build).unwrap();
+        mark_build_ready(&build).unwrap();
+        std::fs::remove_dir_all(&build).unwrap();
+        assert!(
+            ready_marker_path(&build).unwrap().is_file(),
+            "the fixture keeps the sibling marker, which is the whole point"
+        );
+        assert!(!build_is_complete(&build));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The contents rule, driven directly — the tests above all run on one machine with one
+    /// real `bin/`, so they would hold for an implementation that never compared anything.
+    #[test]
+    fn contents_still_stand_refutes_only_a_proven_absence() {
+        let home = temp_home("readycontents");
+        let build = home.join("b");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin").join("ay"), b"x").unwrap();
+        assert!(contents_still_stand(&build, READY_CONTENTS_NONE));
+        assert!(contents_still_stand(&build, "bin:ay"));
+        assert!(!contents_still_stand(&build, "bin:ay,ny"));
+        // A value a LATER atpkg might write is not a refutation: unknown is not refuted.
+        assert!(contents_still_stand(&build, "tree-root:deadbeef"));
+        // …and an unrecognised value does not accidentally match the `bin:` branch.
+        assert!(contents_still_stand(&build, "bin"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `discard_build` takes the MARKER DOWN FIRST. The corpse on m3 was made by the old
+    /// order — tree first, marker last — where anything ending the process inside a
+    /// multi-gigabyte `remove_dir_all` leaves a gutted tree still vouched for.
+    ///
+    /// The interrupt is simulated the only way a test can: the tree is made UNREMOVABLE
+    /// (its own permissions, so its writable parent can still lose the marker), which is one
+    /// of the real ways that walk aborts partway. Under the old order the marker would
+    /// survive untouched; under this one the build reads as incomplete the moment the
+    /// function returns, whatever happened to the tree.
+    #[cfg(unix)]
+    #[test]
+    fn discard_build_unmarks_before_it_removes_so_an_interrupted_discard_leaves_no_lie() {
+        let home = temp_home("discardorder");
+        let build = home.join("store").join("trust").join("8595");
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin").join("trustc"), b"x").unwrap();
+        mark_build_ready(&build).unwrap();
+        assert!(build_is_complete(&build), "precondition");
+        // No write permission on `bin/`: its entries cannot be unlinked, so `remove_dir_all`
+        // aborts inside the tree — the interrupt, in a form a test can arrange.
+        std::fs::set_permissions(build.join("bin"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        discard_build(&build);
+        let survived = build.join("bin").join("trustc").is_file();
+        std::fs::set_permissions(build.join("bin"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(
+            survived,
+            "the fixture must make the removal fail, or it proves nothing"
+        );
+        assert!(
+            !ready_marker_path(&build).unwrap().exists(),
+            "the marker comes down FIRST, so a failed removal cannot leave one behind"
+        );
+        assert!(
+            !build_is_complete(&build),
+            "and the surviving tree reads as incomplete — reclaimable debris, not an install"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The whole-program twin: `unmark_program_builds` takes down every build's marker and
+    /// touches nothing else, so `ops::uninstall` can run its `remove_dir_all` knowing an
+    /// interrupt inside it leaves incomplete trees rather than installed ones.
+    #[test]
+    fn unmark_program_builds_unmarks_every_build_and_only_builds() {
+        let home = temp_home("unmarkall");
+        let prog = home.join("store").join("trust");
+        for n in [8590u64, 8595] {
+            let b = prog.join(crate::dec_u64(n));
+            std::fs::create_dir_all(b.join("bin")).unwrap();
+            std::fs::write(b.join("bin").join("trustc"), b"x").unwrap();
+            mark_build_ready(&b).unwrap();
+        }
+        // A non-numeric sibling directory, and a sidecar that is not a readiness marker.
+        std::fs::create_dir_all(prog.join("8595.incoming-7")).unwrap();
+        std::fs::write(prog.join("8595.provenance"), b"src\n").unwrap();
+        unmark_program_builds(&prog);
+        for n in [8590u64, 8595] {
+            let b = prog.join(crate::dec_u64(n));
+            assert!(!build_is_complete(&b), "build {n} must read as incomplete");
+            assert!(
+                b.join("bin").join("trustc").is_file(),
+                "and nothing but the marker is touched"
+            );
+        }
+        assert!(
+            prog.join("8595.provenance").is_file(),
+            "other sidecars stay"
+        );
+        assert!(prog.join("8595.incoming-7").is_dir());
         let _ = std::fs::remove_dir_all(&home);
     }
 

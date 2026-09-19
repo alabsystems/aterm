@@ -1108,13 +1108,106 @@ fn validate_release_rustup_shim_dir(
     Err("release rustup shim validation requires Unix ownership and mode semantics".into())
 }
 
+/// The toolchain the release proof scripts query, and the argv they query it with.
+///
+/// `tools/artifact_source_fingerprint.py` and `tools/proof_snapshot.py` need a
+/// cargo-COMPATIBLE driver for `metadata` and `config get` — not rustup. Until
+/// 2026-09-18 this lane demanded `~/.cargo/bin` holding real `cargo` AND `rustup`
+/// files, so on a Mac provisioned the product's way (`aterm pkg install trust`: no
+/// rustup, no `cargo`/`rustc` on PATH, `~/.cargo/bin` present but EMPTY because it
+/// is only targo's registry home — measured) every `ship cut` died at "inspect
+/// release cargo shim …/.cargo/bin/cargo: No such file or directory" before its
+/// first proof step. The store's stage2 `targo` is the driver now; the rustup shim
+/// dir is the documented fallback for a machine with no store toolchain at all.
+#[derive(Debug, PartialEq, Eq)]
+struct ReleaseProofDriver {
+    /// Put FIRST on the scripts' PATH, so every bare-name lookup they make (`rustc`
+    /// for the build context's compiler identity, a suite's `cargo generate-lockfile`)
+    /// lands in the same toolchain: the stage2 dir ships the stock-named siblings
+    /// (`cargo` → targo, `rustc` a hard link of `trustc`).
+    tool_dir: PathBuf,
+    /// The `--cargo` argv handed to the scripts, one token per `--cargo`. Query
+    /// commands only, so never `--unverified`: targo refuses that flag outside a
+    /// compilation command ("`--unverified` is valid only for a Targo compilation
+    /// command", exit 101 — measured 2026-09-18, targo 1.99.0-dev 321aaeda7).
+    cargo: Vec<PathBuf>,
+    lane: ReleaseProofLane,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseProofLane {
+    /// `targo` from the Trust stage2 bin, in [`crate::gates::trust_stage2_bin`]'s
+    /// order: `$TRUST_STAGE2_BIN` → the atpkg store's `store/trust/current/bin` →
+    /// `$HOME/trust/build/host/stage2/bin`. Pinned once per process there, so the proof
+    /// steps and the build cannot land on two seals.
+    Store,
+    /// The rustup shim dir (`~/.cargo/bin`, else Homebrew's) — consulted only when
+    /// no store toolchain resolves, and audited as before (owned, real, closed).
+    Rustup,
+}
+
+fn release_proof_driver(home: &std::ffi::OsStr) -> Result<ReleaseProofDriver, String> {
+    let store = crate::gates::resolve_targo().map_err(|e| e.to_string());
+    resolve_release_proof_driver(store, || release_rustup_shim_dir(home))
+}
+
+/// Store first, rustup second, and a refusal that names the product's remedy first.
+/// Pure over the two probes so both lanes and the refusal are tests.
+fn resolve_release_proof_driver(
+    store_targo: Result<PathBuf, String>,
+    rustup_shim_dir: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<ReleaseProofDriver, String> {
+    let no_store = match store_targo {
+        Ok(targo) => {
+            let tool_dir = targo
+                .parent()
+                .ok_or_else(|| format!("store targo has no parent directory: {}", targo.display()))?
+                .to_path_buf();
+            return Ok(ReleaseProofDriver {
+                tool_dir,
+                cargo: vec![targo],
+                lane: ReleaseProofLane::Store,
+            });
+        }
+        Err(why) => why,
+    };
+    match rustup_shim_dir() {
+        Ok(shim) => Ok(ReleaseProofDriver {
+            cargo: vec![shim.join("cargo")],
+            tool_dir: shim,
+            lane: ReleaseProofLane::Rustup,
+        }),
+        Err(no_rustup) => Err(format!(
+            "no driver for the release proof scripts: {no_store}\n  \
+             fix: aterm pkg install trust   (then `aterm pkg which targo` names the \
+             store's targo, `aterm pkg doctor` the prefix)\n  \
+             or, the fallback for a machine without the store: a rustup shim dir holding \
+             real `cargo` and `rustup` — {no_rustup}"
+        )),
+    }
+}
+
 fn release_proof_python(repo_root: &Path, script: &Path) -> Result<Command, String> {
     let home = std::env::var_os("HOME").ok_or("release proof tooling requires HOME")?;
+    let driver = release_proof_driver(&home)?;
+    release_proof_python_with(repo_root, script, &home, &driver)
+}
+
+/// The proof-script command for a resolved driver: its tool dir first on a closed
+/// PATH, its argv handed down as `--cargo`, and rustup's home exported ONLY on the
+/// rustup lane — the store lane carries no rustup variable at all.
+fn release_proof_python_with(
+    repo_root: &Path,
+    script: &Path,
+    home: &std::ffi::OsStr,
+    driver: &ReleaseProofDriver,
+) -> Result<Command, String> {
+    // targo's registry home is `~/.cargo` too (measured 2026-09-18: `~/.cargo/registry`
+    // holds the locked crates on a Trust-only Mac, `~/.cargo/bin` is empty), so the
+    // same default serves both lanes.
     let cargo_home = std::env::var_os("CARGO_HOME")
-        .unwrap_or_else(|| Path::new(&home).join(".cargo").into_os_string());
-    let rustup_home = release_rustup_home(&home)?;
-    let shim_dir = release_rustup_shim_dir(&home)?;
-    let path = release_tool_path(&shim_dir)?;
+        .unwrap_or_else(|| Path::new(home).join(".cargo").into_os_string());
+    let path = release_tool_path(&driver.tool_dir)?;
     let mut command = Command::new("/usr/bin/python3");
     command
         .args([
@@ -1128,7 +1221,11 @@ fn release_proof_python(repo_root: &Path, script: &Path) -> Result<Command, Stri
                 .parent()
                 .ok_or("release proof script has no parent directory")?,
         )
-        .arg(script)
+        .arg(script);
+    for token in &driver.cargo {
+        command.arg("--cargo").arg(token);
+    }
+    command
         .env_clear()
         .env("HOME", home)
         .env("PATH", path)
@@ -1140,8 +1237,10 @@ fn release_proof_python(repo_root: &Path, script: &Path) -> Result<Command, Stri
         .env("PYTHONNOUSERSITE", "1")
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("CARGO_HOME", cargo_home)
-        .env("RUSTUP_HOME", rustup_home)
         .current_dir(repo_root);
+    if driver.lane == ReleaseProofLane::Rustup {
+        command.env("RUSTUP_HOME", release_rustup_home(home)?);
+    }
     Ok(command)
 }
 
@@ -2627,11 +2726,13 @@ mod tests {
 
     use super::{
         BuildOutput, LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, PrivateSliceDir,
-        RELEASE_SYSTEM_PATH, SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, cargo_build_args,
-        cleanup_release_target_residue_with, create_private_release_directory, current_release_uid,
-        fresh_lease_token, is_lower_hex, make_executable, parse_thin_macho_update_pin,
-        prepare_release_target_parent, publish_verified_binary, publish_verified_symbols,
-        release_build_command, release_tool_path, resolve_release_rustup_shim_dir,
+        RELEASE_SYSTEM_PATH, ReleaseProofDriver, ReleaseProofLane, SECTION_64_LEN,
+        SEGMENT_COMMAND_64_LEN, cargo_build_args, cleanup_release_target_residue_with,
+        create_private_release_directory, current_release_uid, fresh_lease_token, is_lower_hex,
+        make_executable, parse_thin_macho_update_pin, prepare_release_target_parent,
+        publish_verified_binary, publish_verified_symbols, release_build_command,
+        release_proof_driver, release_proof_python_with, release_tool_path,
+        resolve_release_proof_driver, resolve_release_rustup_shim_dir,
         validate_app_version_reports, validate_cli_app_version, validate_embedded_update_pin,
         validate_final_slice_records, validate_lipo_architectures, validate_named_cli_app_version,
         validate_slice_update_pin_reports, write_release_target_owner,
@@ -2730,6 +2831,175 @@ mod tests {
             resolve_release_rustup_shim_dir(&home, &fallback, current_release_uid().unwrap())
                 .unwrap_err();
         assert!(error.contains("not a real regular file"), "{error}");
+    }
+
+    fn create_test_store_targo(stage2: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(stage2).unwrap();
+        let targo = stage2.join("targo");
+        std::fs::write(&targo, "#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&targo).unwrap();
+        targo
+    }
+
+    /// The proof scripts' driver is the store's `targo`; the rustup shim dir is
+    /// consulted only when no store toolchain resolves; with neither, the refusal
+    /// names `aterm pkg install trust` before it names rustup. Measured 2026-09-18 on
+    /// a Mac provisioned by `aterm pkg install trust` (no rustup, no `cargo` on PATH,
+    /// `~/.cargo/bin` empty): the old resolver died at "inspect release cargo shim …
+    /// No such file or directory" before the cut's first proof step.
+    #[test]
+    fn the_proof_scripts_drive_the_stores_targo_and_fall_back_to_rustup_only_without_one() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let stage2 = scratch.0.join("store/trust/9192/bin");
+        let targo = create_test_store_targo(&stage2);
+        let home = scratch.0.join("home");
+        let shims = home.join(".cargo/bin");
+        create_test_rustup_shims(&shims);
+        let uid = current_release_uid().unwrap();
+        let rustup = || resolve_release_rustup_shim_dir(&home, &scratch.0.join("absent"), uid);
+
+        let driver = resolve_release_proof_driver(Ok(targo.clone()), || {
+            panic!("rustup consulted while a store toolchain resolves")
+        })
+        .unwrap();
+        assert_eq!(
+            driver,
+            ReleaseProofDriver {
+                tool_dir: stage2.clone(),
+                cargo: vec![targo.clone()],
+                lane: ReleaseProofLane::Store,
+            }
+        );
+
+        let driver =
+            resolve_release_proof_driver(Err("no Trust toolchain found".into()), rustup).unwrap();
+        let canonical = shims.canonicalize().unwrap();
+        assert_eq!(
+            driver,
+            ReleaseProofDriver {
+                tool_dir: canonical.clone(),
+                cargo: vec![canonical.join("cargo")],
+                lane: ReleaseProofLane::Rustup,
+            }
+        );
+
+        std::fs::remove_file(shims.join("cargo")).unwrap();
+        let error = resolve_release_proof_driver(Err("no Trust toolchain found".into()), rustup)
+            .unwrap_err();
+        assert!(error.contains("no Trust toolchain found"), "{error}");
+        let product = error
+            .find("aterm pkg install trust")
+            .expect("the refusal names the product's remedy");
+        let rustup_at = error
+            .find("rustup")
+            .expect("the refusal names the fallback");
+        assert!(
+            product < rustup_at,
+            "product remedy first, rustup second:\n{error}"
+        );
+    }
+
+    /// The proof command: the driver's dir first on a CLOSED path, the argv handed
+    /// down as `--cargo`, and no rustup variable on the store lane.
+    #[test]
+    fn the_proof_command_puts_the_driver_dir_first_on_path_and_hands_cargo_down() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let stage2 = scratch.0.join("store/trust/9192/bin");
+        let targo = create_test_store_targo(&stage2);
+        let home = scratch.0.join("home");
+        let shims = home.join(".cargo/bin");
+        create_test_rustup_shims(&shims);
+        let script = scratch.0.join("tools/proof_snapshot.py");
+        let argv = |cmd: &std::process::Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let envs = |cmd: &std::process::Command| -> std::collections::BTreeMap<String, String> {
+            cmd.get_envs()
+                .filter_map(|(k, v)| {
+                    v.map(|v| {
+                        (
+                            k.to_string_lossy().into_owned(),
+                            v.to_string_lossy().into_owned(),
+                        )
+                    })
+                })
+                .collect()
+        };
+
+        let store = ReleaseProofDriver {
+            tool_dir: stage2.clone(),
+            cargo: vec![targo.clone()],
+            lane: ReleaseProofLane::Store,
+        };
+        let cmd = release_proof_python_with(&scratch.0, &script, home.as_os_str(), &store).unwrap();
+        let args = argv(&cmd);
+        let cargo_at = args
+            .iter()
+            .position(|a| a == "--cargo")
+            .expect("--cargo handed down");
+        assert_eq!(args[cargo_at + 1], targo.to_string_lossy());
+        assert_eq!(
+            args[cargo_at - 1],
+            script.to_string_lossy(),
+            "the driver follows the script path"
+        );
+        let env = envs(&cmd);
+        assert_eq!(
+            env["PATH"],
+            format!("{}:{RELEASE_SYSTEM_PATH}", stage2.display()),
+            "the store's bin dir leads a closed PATH"
+        );
+        assert!(
+            !env.contains_key("RUSTUP_HOME"),
+            "the store lane exports no rustup variable: {env:?}"
+        );
+        assert_eq!(cmd.get_current_dir(), Some(scratch.0.as_path()));
+
+        let rustup = ReleaseProofDriver {
+            tool_dir: shims.clone(),
+            cargo: vec![shims.join("cargo")],
+            lane: ReleaseProofLane::Rustup,
+        };
+        let cmd =
+            release_proof_python_with(&scratch.0, &script, home.as_os_str(), &rustup).unwrap();
+        let args = argv(&cmd);
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "--cargo" && w[1] == shims.join("cargo").to_string_lossy() })
+        );
+        let env = envs(&cmd);
+        assert_eq!(
+            env["PATH"],
+            format!("{}:{RELEASE_SYSTEM_PATH}", shims.display())
+        );
+        assert!(
+            env.contains_key("RUSTUP_HOME"),
+            "the rustup lane keeps its home"
+        );
+    }
+
+    /// A DRY resolution on the machine running the tests: where the store toolchain
+    /// resolves (every checkout that can build this crate), the proof driver is its
+    /// `targo` and nothing about rustup is consulted; where it does not, the refusal
+    /// names the product's remedy. Measured 2026-09-18 on this Mac: the store's
+    /// `store/trust/9192/bin/targo`.
+    #[test]
+    fn on_this_machine_the_proof_driver_is_the_stores_targo() {
+        let home = std::env::var_os("HOME").expect("HOME");
+        match crate::gates::trust_stage2_bin() {
+            Ok(stage2) => {
+                let driver = release_proof_driver(&home).unwrap();
+                assert_eq!(driver.lane, ReleaseProofLane::Store);
+                assert_eq!(driver.tool_dir, stage2);
+                assert_eq!(driver.cargo, vec![stage2.join("targo")]);
+            }
+            Err(_) => match release_proof_driver(&home) {
+                Ok(driver) => assert_eq!(driver.lane, ReleaseProofLane::Rustup),
+                Err(error) => assert!(error.contains("aterm pkg install trust"), "{error}"),
+            },
+        }
     }
 
     /// The cut's compile child yields the CPU to the program a person is typing

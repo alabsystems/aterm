@@ -27,7 +27,7 @@
 //!   metadata, validated at parse ([`ShimEnv::admit`], [`crate::sig::Reject::ShimEnv`]).
 //! * **The shim itself** — the Unix `sh` wrapper carries one `export NAME='VALUE'` line
 //!   per entry ahead of its `exec`; the Windows `.cmd` wrapper one `@set "NAME=VALUE"`
-//!   line ahead of its `@"<target>" %*`. `resolve_shim` still reads the target off the
+//!   line ahead of its `@"<target>" %* & @exit /b`. `resolve_shim` still reads the target off the
 //!   exec line, so every sweep that keys on where a shim resolves — prune, undo,
 //!   rollback, uninstall, `which`, gc — is unchanged. The env is read BACK off the shim
 //!   ([`crate::platform::shim_env_of`]) by the surfaces that say so: `which` and

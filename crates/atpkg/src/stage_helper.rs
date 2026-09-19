@@ -688,6 +688,76 @@ pub fn arm_parent_watchdog() {
         });
 }
 
+/// Stop every lane job whose SUBMITTING process is gone, and WAIT for launchd to forget
+/// it. Removing every `systems.alab.atpkg.<stem>-<pid>-<seq>-<nonce>` label whose `<pid>`
+/// no longer exists: a parent that died before its `Drop` (a test killed under a timeout,
+/// a `kill -9`) left its job registered, and until 2026-09-13 launchd kept such labels —
+/// and re-spawned them — indefinitely.
+///
+/// WHY IT WAITS, and why anything that deletes from the store calls it FIRST. A helper is
+/// launchd's child, not the submitter's, so a killed stager releases the store lock while
+/// the job it submitted keeps extracting into `<build>.incoming-<the dead stager's pid>`
+/// ([`LANE_PARENT_ENV`]'s watchdog ends such a helper within a poll, and one running from
+/// a binary that predates the watchdog never ends at all). The successor took the lock and
+/// swept that scratch out from under the live helper, stopping it only later — when its
+/// own lane prepared a job (audit 2026-09-16). `launchctl remove` merely SIGNALS the
+/// wrapper, whose trap kills the helper, and the label disappears once both have exited:
+/// polled for up to [`TEARDOWN_BOUND`], exactly as [`Job::teardown`] waits out a job of
+/// this process's own.
+///
+/// A label whose pid is alive is left alone (another install in flight, or a pid reused by
+/// something else: not ours to judge), and so is every label that is not one of ours
+/// ([`owner_pid_of_label`] enforces the stem). Best effort: a `launchctl` that cannot list
+/// is simply no sweep.
+#[cfg(target_os = "macos")]
+pub(crate) fn stop_orphaned_lane_jobs() {
+    let Ok(out) = std::process::Command::new("/bin/launchctl")
+        .arg("list")
+        .output()
+    else {
+        return;
+    };
+    let me = std::process::id();
+    let mut stopped: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some(label) = line.split('\t').nth(2) else {
+            continue;
+        };
+        let Some(pid) = owner_pid_of_label(label) else {
+            continue;
+        };
+        if pid == me || pid_exists(pid) {
+            continue;
+        }
+        let _ = std::process::Command::new("/bin/launchctl")
+            .args(["remove", label])
+            .output();
+        stopped.push(label.to_string());
+    }
+    let started = Instant::now();
+    loop {
+        stopped.retain(|label| label_is_listed(label));
+        if stopped.is_empty() || started.elapsed() >= TEARDOWN_BOUND {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// See the macOS body: no launchd, so no lane job to outlive anyone.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn stop_orphaned_lane_jobs() {}
+
+/// Whether launchd still lists `label` — `launchctl list <label>` fails for a label it
+/// does not have, which is how a stopped job is known to be really gone.
+#[cfg(target_os = "macos")]
+fn label_is_listed(label: &str) -> bool {
+    std::process::Command::new("/bin/launchctl")
+        .args(["list", label])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// One submitted job: its scratch dir, label and files. Shared by the two hidden verbs —
 /// the staging lane here and the executable-laying lane ([`crate::lay`]) — so there is
 /// ONE launchd choreography (plan, wrapper, result and status files, grace, ceiling,
@@ -739,10 +809,10 @@ pub(crate) fn lanes_scratch() -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 impl Job {
     /// Create the job's `0700` scratch under `scratch`, named `<stem>-<pid>-<seq>-<nonce>`
-    /// (the label is `systems.alab.atpkg.` + that name). First sweeps the labels earlier
-    /// parents left behind ([`Self::sweep_orphans`]).
+    /// (the label is `systems.alab.atpkg.` + that name). First STOPS the jobs earlier
+    /// parents left behind ([`stop_orphaned_lane_jobs`]).
     pub(crate) fn prepare(scratch: &Path, stem: &str) -> Result<Self, String> {
-        Self::sweep_orphans();
+        stop_orphaned_lane_jobs();
         Self::sweep_dead_job_dirs(scratch);
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -771,36 +841,6 @@ impl Job {
             helper: PathBuf::new(),
             dir,
         })
-    }
-
-    /// Remove every `systems.alab.atpkg.<stem>-<pid>-<seq>-<nonce>` label whose `<pid>`
-    /// no longer exists: a parent that died before its `Drop` (a test killed under a
-    /// timeout) left its job registered, and until 2026-09-13 launchd kept such labels —
-    /// and re-spawned them — indefinitely. A label whose pid is alive is left alone
-    /// (another install in flight, or a pid reused by something else: not ours to judge).
-    /// Best effort: a `launchctl` that cannot list is simply no sweep.
-    fn sweep_orphans() {
-        let Ok(out) = std::process::Command::new("/bin/launchctl")
-            .arg("list")
-            .output()
-        else {
-            return;
-        };
-        let me = std::process::id();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let Some(label) = line.split('\t').nth(2) else {
-                continue;
-            };
-            let Some(pid) = owner_pid_of_label(label) else {
-                continue;
-            };
-            if pid == me || pid_exists(pid) {
-                continue;
-            }
-            let _ = std::process::Command::new("/bin/launchctl")
-                .args(["remove", label])
-                .output();
-        }
     }
 
     /// Remove every job directory under `scratch` — `<stem>-<pid>-<seq>-<nonce>`, the

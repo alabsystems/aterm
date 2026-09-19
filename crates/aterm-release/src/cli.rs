@@ -79,7 +79,8 @@ USAGE
                            master-signed roster pair from the channel release
                            into dist/, audits the WHOLE publishing stack — Trust
                            stage2 (real smoke-compile), the targo/tippy/ty
-                           drivers, the rustup front door, the stable x86_64
+                           drivers, the store's targo + trustc front door
+                           (rustup's link reported informationally), the stable x86_64
                            slice, Apple identity + live-tested notary
                            credential, the credentials profile, gh auth, channel
                            token — each gap with its exact remedy, and only on a

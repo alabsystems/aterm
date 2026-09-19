@@ -10,6 +10,26 @@
 //! box ` Run a dynamic workflow?` with `│`-led description rows. Anything else
 //! that says `Esc to cancel` is a prompt of kind [`PromptKind::Other`] — the
 //! supervisor hands it to the manager rather than guess.
+//!
+//! **A BOX IN THE TRANSCRIPT IS NOT A PROMPT** ([`live_cancel_row`]). A
+//! manager's screen shows its workers' boxes: a Monitor event or a tool's
+//! output that prints a worker's screen puts ` Esc to cancel · Tab to amend`
+//! in the MANAGER's transcript, and the whole-screen search this parser used
+//! to do read that manager as `prompt`. (Observed live on 0.86.0, 2026-09-15:
+//! a manager's own presence row read `phase=prompt`. That screen was not
+//! kept; its footer — `bypass permissions on · 1 monitor` over the artifact
+//! bar — reads busy or idle, never `prompt`, and an `Esc to cancel` row is
+//! the only thing that makes a prompt here.)
+//! Two things mark a copy, and each is a fact of Claude Code's layout rather
+//! than a guess about the words: the row hangs under the `⎿` gutter of an
+//! output block, or the worker's later words (a `⏺` row) or a finished
+//! turn's done row lie between it and the composer — the box a worker is
+//! blocked on sits in the live zone at the bottom, and nothing the
+//! transcript gains while it waits is drawn under it. A spinner row between
+//! the two decides nothing (where Claude Code draws one beside a live box is
+//! not measured), so a copy with only a spinner under it still reads as a
+//! box: the parser errs towards `prompt`, the answer that makes a supervisor
+//! look before it types.
 
 /// What the box is asking to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +84,7 @@ const CANCEL: &str = "Esc to cancel";
 
 /// Parse the approval box on `rows`, if one is showing.
 pub fn parse_prompt(rows: &[String]) -> Option<Prompt> {
-    let esc = rows.iter().rposition(|r| r.contains(CANCEL))?;
+    let esc = live_cancel_row(rows)?;
     let has_cancel = true;
     let header = header_above(rows, esc);
     let Some((h, kind)) = header else {
@@ -154,12 +174,69 @@ pub fn parse_prompt(rows: &[String]) -> Option<Prompt> {
 /// The inclusive row span of the box (`header..=Esc row`; for an unknown shape,
 /// the same window the description covers), for printing it verbatim.
 pub fn prompt_box_span(rows: &[String]) -> Option<(usize, usize)> {
-    let esc = rows.iter().rposition(|r| r.contains(CANCEL))?;
+    let esc = live_cancel_row(rows)?;
     let start = match header_above(rows, esc) {
         Some((h, _)) => h,
         None => esc.saturating_sub(30),
     };
     Some((start, esc))
+}
+
+/// The row that closes the box a worker is blocked on: the LAST `Esc to
+/// cancel` row on the screen, unless that row is a copy in the transcript
+/// (the module header's rule) — then `None`, because a live box would sit
+/// under every copy, and the last row is not one.
+///
+/// A copy is a row that hangs under the `⎿` gutter ([`under_gutter`]), or one
+/// with a `⏺` row or a done row between it and the composer's top rule
+/// ([`said_under`]). A row under the bottom rule is never a copy: whatever
+/// Claude Code draws there with `Esc to cancel` is a box of its own, and
+/// reading it as one is the conservative answer.
+fn live_cancel_row(rows: &[String]) -> Option<usize> {
+    let esc = rows.iter().rposition(|r| r.contains(CANCEL))?;
+    (!under_gutter(rows, esc) && !said_under(rows, esc)).then_some(esc)
+}
+
+/// Whether row `esc` belongs to an output block under the `⎿` gutter — a
+/// tool's output or a Monitor event, which Claude Code indents five columns
+/// or more under the row that opens it with `⎿`. A live box's own rows start
+/// at column one to three, so a row indented less than five is never under
+/// the gutter; one indented more is, when walking up over blank rows and rows
+/// indented five or more reaches a `⎿` row.
+fn under_gutter(rows: &[String], esc: usize) -> bool {
+    use crate::phase::leading_spaces;
+    if rows[esc].trim_start().starts_with('⎿') {
+        return true;
+    }
+    if leading_spaces(&rows[esc]) < 5 {
+        return false;
+    }
+    for row in rows[..esc].iter().rev() {
+        let t = row.trim_start();
+        if t.starts_with('⎿') {
+            return true;
+        }
+        if !t.is_empty() && leading_spaces(row) < 5 {
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether the transcript went on under row `esc`: between it and the
+/// composer's top rule there is a `⏺` row or a `⎿` output row (the worker
+/// said or did something after the box), or a DONE row (`✻ Worked for 3m 21s
+/// · done 8:50 PM` — the turn ended after it). A spinner row is neither: it
+/// is left out on purpose (module header). Without the composer frame, or
+/// with the row under the frame, `false`.
+fn said_under(rows: &[String], esc: usize) -> bool {
+    use crate::phase::{composer_top, is_done_row, is_glyph_row, is_transcript_row};
+    let Some(top) = composer_top(rows).filter(|&top| top > esc) else {
+        return false;
+    };
+    rows[esc + 1..top]
+        .iter()
+        .any(|r| is_transcript_row(r) || (is_glyph_row(r) && is_done_row(r)))
 }
 
 /// The nearest header row above `esc` (within the box's plausible height).

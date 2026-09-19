@@ -48,11 +48,13 @@ resumably, only the builds for your machine, visible end to end in the app.
 The script picks the newest app release, checks the download's SHA-256 against
 the release manifest, verifies the app's Developer ID signature and
 notarization, puts `aterm.app` in `/Applications` (or `~/Applications`), and
-links the `aterm` command and its man pages under `~/.local`. `--no-toolchain` keeps the packages
-off (`aterm pkg install --default-set` later), `--no-path` leaves your shell
-profile untouched, `--dry-run` prints the whole plan — elected release, asset,
-every destination, every edit — and writes nothing, and `--uninstall` reverses
-everything it installed.
+links the `aterm` command and its man pages under `~/.local`. `--no-toolchain`
+excludes the toolset, `--no-path` leaves your shell profile untouched,
+`--dry-run` prints the whole plan — elected release, asset, every destination,
+every edit — and writes nothing, and `--uninstall` reverses everything it
+installed. The toolset exclusion does not persist yet: `--no-toolchain` writes
+no config, so the app's first launch still installs the toolset unless
+`[packages].seed_install = false` is in `aterm.toml` first (`aterm help pkg`).
 
 aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
 and Intel), and for Linux x86_64 as a tarball on the same releases, from the
@@ -303,7 +305,7 @@ one:
 
 ```sh
 aterm ctl windows                              # one row per window: which sessions sit on its active tab
-aterm ctl ls                                   # every session of every live instance, with window= and detail= (what it runs)
+aterm ctl ls                                   # every session of every live instance, with window=, detail= (what it runs) and identity= (whose agent login)
 #   wfocus=1 marks aterm's most recently focused window (a minimize or the app deactivating does not clear it)
 sid=$(aterm ctl spawn window=1 | cut -d' ' -f2)   # a fresh tab in window 1, immediately addressable — not raised
 #   (an unknown id is refused by name; a --headless instance owns logical window 0, the one `ls` and `windows` show)
@@ -624,12 +626,25 @@ computed from source, never maintained in prose. Every gate is a local command �
 `tools/verify.sh --fast` is the merge contract and runs the L0 temporal-safety
 gate as one of its unconditional stages, the release cutter re-runs those six
 obligations itself before it claims a build number, the full ladder runs by
-hand, and there is no hosted CI. The pinned pre-push hook is ADVISORY: its whole
-body is one printf and `exit 0`. It was a blocking gate until 2026-08-24 and was
-demoted on its own stated rule — a hook slow enough to be bypassed teaches the
-bypass — once the pixel guard took it to twelve minutes. So the release cut is
-the only thing that mechanically enforces L0; before that, running the contract
-is a discipline, not a mechanism.
+hand, and there is no hosted CI. The pinned pre-push hook GATES the push, and
+does it without running anything: `tools/verify.sh` writes a receipt naming the
+commit it verified and whether that run discharged the whole merge contract, and
+the hook refuses a push of any commit that has no passing receipt
+(`ATERM_PUSH_NO_GATE=1` is the named, logged exception). Three pushes bring no
+ungated code and owe no receipt of their own: a tag; the release cutter's claim
+commit — origin's tip plus one `RELEASES.ledger` line and the rolled
+`CHANGELOG.md`, judged against the remote's current tip, refused the moment any
+other path moves; and a clean automatic merge of a receipted commit onto the
+remote's current tip, admitted only when its tree is byte-equal to git's own
+merge of those two parents — the gate takes over an hour and peers push every
+few minutes, so a receipt for the exact tip is a race the gate loses by
+construction, and what this trades away is only the integration of the two
+sides, which the next full run and the cutter's own gates judge. It was a blocking gate
+that RAN the ladder until 2026-08-24, and was demoted to advisory on its own
+stated rule — a hook slow enough to be bypassed teaches the bypass — once the
+pixel guard took it to twelve minutes; checking a result instead of producing
+one is microseconds, and it cannot lose a ref race either. So L0 is enforced at
+the push and again at the release cut.
 
 aterm makes no aggregate performance claim. The reproducible cross-engine
 measurements are engine-only and in-process — throughput via
@@ -656,6 +671,7 @@ aterm --window --write-config
 aterm --window --validate-config
 aterm --window --list-keybinds
 aterm list-themes
+aterm list-kitty-commands    # the words the cursor cat obeys when typed (aterm help kitty)
 ```
 
 Configuration is loaded from `$XDG_CONFIG_HOME/aterm/aterm.toml`, falling back to

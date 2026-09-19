@@ -79,6 +79,28 @@ pub struct ImageData {
     /// the first read their source `lift` px lower. With `0` both clauses are
     /// arithmetic no-ops, byte-identical to the pre-lift renderers.
     pub band_lift_px: u16,
+    /// PIXEL-EXACT placement: draw the source raster ONE SOURCE PIXEL TO ONE
+    /// DEVICE PIXEL, anchored at the footprint's TOP-LEFT, and leave the
+    /// remainder of the footprint fully transparent (a partial cell at the
+    /// right/bottom edge simply goes unpainted).
+    ///
+    /// `false` — the default, and what the iTerm2 OSC 1337 path and the host's
+    /// own chrome rasters want — means FIT: the renderer scales the raster,
+    /// aspect preserved, into the largest box that fits the footprint and
+    /// centres it there. That is right when the PROGRAM named the target in
+    /// CELLS (`File=width=40;height=8`, Kitty `c=`/`r=`): it asked for a
+    /// cell-sized picture, so filling the cells it asked for is the spec.
+    ///
+    /// `true` is for the protocols that name PIXELS. A sixel raster's footprint
+    /// is DERIVED from its pixel size by rounding UP to whole cells, so scaling
+    /// the raster back out to that rounded box is pure rounding noise: a 40x12
+    /// sixel in a 9x17 cell box would be magnified to 45x14 and a 4x6 sprite to
+    /// 9x14 (2.25x), with an interpolating resample that destroys exactly the
+    /// 1-px features such an image is drawn out of. xterm, foot, mlterm,
+    /// wezterm, contour and mintty all draw sixel 1:1, and every sixel-emitting
+    /// tool sizes its output to the reported cell geometry on that assumption.
+    /// Kitty graphics transmitted WITHOUT `c=`/`r=` are the same case.
+    pub pixel_exact: bool,
 }
 
 impl ImageData {

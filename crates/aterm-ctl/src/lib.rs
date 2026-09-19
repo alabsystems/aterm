@@ -35,9 +35,12 @@
 //! the `latest` symlink), else the per-user default `<dir>/aterm.sock` where
 //! `<dir>` is `$XDG_RUNTIME_DIR/aterm` (when set) or
 //! `~/Library/Application Support/aterm` (macOS). The default is a symlink
-//! the server atomically points at the newest instance's `aterm-<pid>.sock`,
-//! so the flagless flow reaches a live instance. This matches the server's
-//! resolution exactly, plus the in-session self-location step.
+//! the server atomically points at the newest instance's `aterm-<pid>.sock`;
+//! when nothing accepts on it (the newest instance exited or crashed and an
+//! older one lives on), the flagless flow falls back to the newest
+//! `<dir>/aterm-<pid>.sock` that does, so it reaches a live instance. This
+//! matches the server's resolution exactly, plus the in-session
+//! self-location step and the dead-symlink fallback.
 //!
 //! ## Authentication (transparent)
 //!
@@ -143,7 +146,8 @@
 //!   each with its own token.
 //! * `ls`              — every session of every live instance, one line each:
 //!   `<pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
-//!   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->[ *]` (the server's
+//!   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
+//!   identity=<name|->[ *]` (the server's
 //!   `sessions` line prefixed with the instance pid; `*` marks the calling
 //!   terminal's own session, from `$ATERM_PARENT_SESSION_ID`; the title is
 //!   pct-encoded and often mirrors the cwd via shell integration). The
@@ -277,8 +281,15 @@ SOCKET RESOLUTION:
     the symlink), else the per-user default <dir>/aterm.sock where <dir> is
     $XDG_RUNTIME_DIR/aterm (when set) or ~/Library/Application Support/aterm
     (macOS). The default is a symlink the server atomically points at the
-    newest instance's aterm-<pid>.sock, so the flagless flow reaches a live
-    instance.
+    newest instance's aterm-<pid>.sock; when nothing accepts on it (that
+    instance exited or crashed while an older one lives on) the flagless
+    flow falls back to the newest <dir>/aterm-<pid>.sock that does, so it
+    reaches a live instance. When nothing serves the socket but aterm IS
+    running, a FLAGLESS call's error names each live instance with the
+    --pid/--sock that reaches it; a socket PINNED by --sock, --pid or an
+    explicit $ATERM_CONTROL_SOCK is told only how many other instances are
+    live (`aterm ctl instances` lists them) — never handed a different
+    instance to drive.
 
     DISCOVERY (`ls`, `instances`, `windows`): the client enumerates <dir>/aterm-<pid>.sock
     (plus the <dir>/graph entries of explicit-$ATERM_CONTROL_SOCK instances)
@@ -368,7 +379,8 @@ const CLIENT_VERBS: &str = "\
 CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     ls            every session of every live instance, one per line:
                   <pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
-                  window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->[ *]
+                  window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
+                  identity=<name|->[ *]
                   (* = the calling terminal's own session; window= is the
                   hosting window — a headless instance reports its one logical
                   window 0; none = a session no window holds; - = the instance
@@ -377,7 +389,10 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   recently focused one (unchanged by a minimize or by the app
                   deactivating); detail= the sanitized running command, never
                   its arguments — e.g. claude, codex, targo%20test — so read it
-                  before typing into a peer).
+                  before typing into a peer; identity= the agent identity the
+                  session was spawned under (`spawn identity=<name>`: its
+                  agents' own login, kept apart from the human's), - for the
+                  human's own agent config — `identities` lists them).
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
@@ -822,9 +837,10 @@ fn front_door_completions_result(
 /// `$ATERM_CONTROL_SOCK` when explicit (and `None` outright when it disables the
 /// socket), otherwise the instance HOSTING the calling terminal when the caller
 /// is inside an aterm session, otherwise the `latest` pointer at the newest
-/// instance. Then a LIVENESS probe — a connect, not an existence check, because
-/// a crashed instance leaves its socket file behind and `attach` must not route
-/// a tab into a corpse.
+/// instance — or, when that pointer is dead, the newest instance that is
+/// listening ([`flagless_target`]). Then a LIVENESS probe — a connect, not an
+/// existence check, because a crashed instance leaves its socket file behind
+/// and `attach` must not route a tab into a corpse.
 #[must_use]
 pub fn front_door_instance() -> Option<String> {
     let path = resolve_path(
@@ -873,7 +889,11 @@ fn front_door_probe(path: &str) -> Option<String> {
 /// under any human's patience.
 pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
     const FORWARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-    let stream = connect_stream(path)?;
+    // PINNED: `path` is the one instance the probe just answered, and on a
+    // failure the launcher opens its own window instead of retargeting —
+    // `aterm new-tab` takes no `--pid`/`--sock`, so a per-instance flag list
+    // would be a remedy it cannot run.
+    let stream = connect_stream(path, TargetOrigin::Pinned)?;
     stream.set_read_timeout(Some(FORWARD_DEADLINE))?;
     stream.set_write_timeout(Some(FORWARD_DEADLINE))?;
     allow_foreground_handoff(path);
@@ -957,12 +977,6 @@ fn socket_dir() -> Option<PathBuf> {
     aterm_uds::control_socket_dir()
 }
 
-/// The default socket path: `<socket_dir>/aterm.sock`. `None` only when neither
-/// `XDG_RUNTIME_DIR` nor `HOME` is set.
-fn default_sock_path() -> Option<String> {
-    Some(socket_dir()?.join(SOCK_FILE).to_string_lossy().into_owned())
-}
-
 /// Environment variable naming the aterm session that HOSTS this process's
 /// terminal (injected into every session's shell). Its discovery graph entry
 /// locates the instance socket that hosts the calling terminal.
@@ -1023,7 +1037,10 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
 /// (its `0`/`off` forms and `$ATERM_NO_CONTROL_SOCK` are a refusal, not a
 /// path), then the instance hosting `self_sid` (its `<dir>/graph/<sid>` entry,
 /// probed for a listener — [`self_instance_sock`]), then the `latest` alias
-/// `<dir>/aterm.sock`. Nothing is cached: a self-update relaunches aterm under
+/// `<dir>/aterm.sock` — and, when that alias is dead, the newest instance
+/// socket in the same directory that accepts a connect ([`flagless_target`]),
+/// so a hook inside a session whose own instance has gone is pointed at a live
+/// window rather than at nothing. Nothing is cached: a self-update relaunches aterm under
 /// a new pid and a new socket name, and a caller that resolves on every run
 /// follows it.
 ///
@@ -1600,7 +1617,45 @@ fn run_mux_report(nesting: Option<&MuxNesting>) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Resolve the socket path from the flags and the environment values. Flags
+/// The socket path [`resolve_target`] resolves, without how it was chosen. Two
+/// callers: the front door's resolution ([`front_door_instance`]), which
+/// forwards to the one instance its probe answers and so dials it as pinned
+/// ([`front_door_send`]), and the public [`resolve_sock_for`], which is what
+/// aterm-link's hooks resolve through.
+fn resolve_path(
+    sock: Option<String>,
+    pid: Option<u32>,
+    env_sock: Option<String>,
+    env_no_sock: Option<String>,
+    self_sid: Option<String>,
+) -> io::Result<String> {
+    resolve_target(sock, pid, env_sock, env_no_sock, self_sid).map(|(path, _)| path)
+}
+
+/// How the socket a client dials was chosen — which decides what a connect
+/// failure on it may offer instead ([`running_elsewhere_hint`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetOrigin {
+    /// Nothing named a target: the flagless rule chose the socket (in-session
+    /// self-location, the `latest` alias, or [`flagless_target`]'s fallback).
+    /// The caller left the instance to aterm, so when that one is dead the
+    /// error may name each live instance with the flag that reaches it — the
+    /// same fleet a flagless `ls`/`instances` lists.
+    Flagless,
+    /// The caller PINNED the socket — `--sock`, `--pid`, an explicit
+    /// `$ATERM_CONTROL_SOCK` — or, for the front door, it is the instance the
+    /// probe just answered. A dead pin must never be answered with a DIFFERENT
+    /// instance to drive: an agent whose private socket dies mid-task would be
+    /// handed the human's window as a copy-paste `--pid`, and its next `send`
+    /// would land there. The precedent is discovery's scoping
+    /// ([`discovery_targets`]): a dead `--pid` reports that no live instance
+    /// has that pid and points at `instances`, naming no other.
+    Pinned,
+}
+
+/// Resolve the socket path from the flags and the environment values, and how
+/// it was chosen ([`TargetOrigin`]: every flag and an explicit
+/// `$ATERM_CONTROL_SOCK` pin it; the per-instance default is flagless). Flags
 /// win over the environment; `--pid` targets one instance's
 /// `<dir>/aterm-<pid>.sock` directly. The env interpretation (explicit path
 /// vs `0`/`off` disable keywords vs per-instance default) is the engine's
@@ -1609,13 +1664,13 @@ fn run_mux_report(nesting: Option<&MuxNesting>) -> io::Result<ExitCode> {
 /// aterm session (`self_sid` = `$ATERM_PARENT_SESSION_ID`) resolves to the
 /// instance hosting ITS OWN terminal via the discovery graph, not to whichever
 /// instance most recently claimed the `latest` symlink.
-fn resolve_path(
+fn resolve_target(
     sock: Option<String>,
     pid: Option<u32>,
     env_sock: Option<String>,
     env_no_sock: Option<String>,
     self_sid: Option<String>,
-) -> io::Result<String> {
+) -> io::Result<(String, TargetOrigin)> {
     let no_dir = || {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -1631,13 +1686,14 @@ fn resolve_path(
     }
     if let Some(pid) = pid {
         let dir = socket_dir().ok_or_else(no_dir)?;
-        return Ok(dir
+        let path = dir
             .join(control_socket::instance_sock_name(pid))
             .to_string_lossy()
-            .into_owned());
+            .into_owned();
+        return Ok((path, TargetOrigin::Pinned));
     }
     if let Some(s) = sock {
-        return Ok(s);
+        return Ok((s, TargetOrigin::Pinned));
     }
     match control_socket::socket_directive(env_sock.as_deref(), env_no_sock.as_deref()) {
         SocketDirective::Disabled => Err(io::Error::new(
@@ -1645,13 +1701,106 @@ fn resolve_path(
             "the control socket is disabled in this environment \
              ($ATERM_CONTROL_SOCK=0/off or $ATERM_NO_CONTROL_SOCK)",
         )),
-        SocketDirective::Explicit(p) => Ok(p),
+        SocketDirective::Explicit(p) => Ok((p, TargetOrigin::Pinned)),
         // Flagless: prefer the instance HOSTING this terminal (in-session
-        // self-location) over the newest-instance `latest` symlink.
-        SocketDirective::PerInstance => self_instance_sock(self_sid.as_deref())
-            .map(Ok)
-            .unwrap_or_else(|| default_sock_path().ok_or_else(no_dir)),
+        // self-location) over the newest-instance `latest` symlink — and when
+        // that symlink is DEAD, the newest instance that is actually listening.
+        SocketDirective::PerInstance => match self_instance_sock(self_sid.as_deref()) {
+            Some(own) => Ok((own, TargetOrigin::Flagless)),
+            None => {
+                let dir = socket_dir().ok_or_else(no_dir)?;
+                let latest = dir.join(SOCK_FILE).to_string_lossy().into_owned();
+                Ok((flagless_target(&dir, latest), TargetOrigin::Flagless))
+            }
+        },
     }
+}
+
+/// THE DEAD-`latest` FALLBACK: the flagless target when nothing pins one.
+///
+/// `latest` (`<dir>/aterm.sock`) is the newest instance's alias, and the server
+/// maintains it in the FORWARD direction only: a newer instance repoints it at
+/// itself, and nothing ever hands it back to a survivor. When the instance it
+/// names goes away, the alias is dead in one of two ways:
+///
+/// * a graceful exit — `cleanup_socket` removes the link outright, so
+///   `connect` on the alias reports `ENOENT`;
+/// * a crash — no cleanup runs and nothing unlinks the bound socket, so the
+///   dead instance's socket FILE stays, the alias still names an existing
+///   file, and `connect` through it is REFUSED (`ECONNREFUSED`).
+///   `sweep_stale_instances` deletes that corpse at the next default-dir spawn
+///   but never touches the alias, which stops naming the corpse only when that
+///   spawn publishes it to itself (between the sweep and the publish it
+///   dangles, and `connect` reports `ENOENT`).
+///
+/// Either way an OLDER window that is still alive is named by nothing a
+/// flagless client follows, and [`connect_error`] rendered both kinds as
+/// "aterm isn't running". Measured on this host (macOS 13.7.8, one live
+/// window, pid 99878): with the alias repointed at a name no file has — a
+/// dangling link, which `connect` reports as `ENOENT` just like a removed
+/// one — `aterm ctl version` failed with exactly that line (and `aterm
+/// new-tab`'s front-door probe resolves through this same rule), while `aterm
+/// ctl instances` — which scans the directory instead of following the link —
+/// listed the window.
+///
+/// The rule: the alias when something ACCEPTS on it (unchanged: the caller
+/// dials the alias and the kernel resolves it); else the newest per-instance
+/// socket in `dir` that accepts a connect ([`newest_live_instance_in`]); else
+/// the alias itself, so the error the caller then raises names the path it was
+/// given. Same-directory instances only: an explicit-`$ATERM_CONTROL_SOCK`
+/// instance never claims the alias and owns its path outright, and a private
+/// instance an agent booted must not silently receive a human's flagless
+/// `send` — it is still NAMED when the connect then fails
+/// ([`running_elsewhere_hint`]).
+///
+/// Dead means `NotFound` or `ConnectionRefused` — the two kinds that mean "no
+/// listener", the exit and crash states above — and nothing else: a seatbelt
+/// `EPERM` (finding F8) or a timeout is no evidence of a corpse, and a sweep
+/// would fail the same way, so the alias is returned untouched and the
+/// original error surfaces as before. The probe is the plain connect the two
+/// existing resolution-time probes use (`self_instance_sock`,
+/// `front_door_probe`), not discovery's single-worker deadline connector,
+/// whose busy-CAS fails a second in-process caller closed.
+fn flagless_target(dir: &Path, latest: String) -> String {
+    match CtlStream::connect(aterm_uds::latest::resolve(&latest)) {
+        Ok(_) => latest,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            newest_live_instance_in(dir).unwrap_or(latest)
+        }
+        Err(_) => latest,
+    }
+}
+
+/// The newest per-instance socket in `dir` something accepts on, as an
+/// absolute path — `None` when none does (or `dir` cannot be read).
+fn newest_live_instance_in(dir: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    newest(
+        instance_socks_in(dir, entries)
+            .into_iter()
+            .filter(|(_, sock)| CtlStream::connect(sock).is_ok())
+            .map(|(pid, sock)| {
+                let bound = std::fs::metadata(&sock).and_then(|m| m.modified()).ok();
+                (bound, pid, sock)
+            }),
+    )
+}
+
+/// The selection rule behind [`newest_live_instance_in`]: "newest" is the
+/// socket file's own mtime — the instant the server bound it — never the pid.
+/// Pids wrap (macOS at 99999, and this host's live window IS pid 99878 today),
+/// so the next instance to start can carry the LOWEST pid in the directory.
+/// Ties and an unreadable mtime (`None`, which orders below every `Some`) fall
+/// back to pid order, the order `enumerate_instances` already sorts by.
+fn newest(
+    live: impl IntoIterator<Item = (Option<std::time::SystemTime>, u32, String)>,
+) -> Option<String> {
+    live.into_iter().max().map(|(_, _, sock)| sock)
 }
 
 /// The per-socket deadline discovery dials with. Discovery dials EVERY socket
@@ -2126,15 +2275,7 @@ fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, Strin
         seen.insert(key)
     };
     // (1) Per-instance sockets directly in the default dir.
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(pid) = control_socket::instance_pid(&name) else {
-            continue; // non-instance name (latest symlink, sibling token, …)
-        };
-        if !name.ends_with(".sock") {
-            continue; // token files carry pids too; sockets only
-        }
-        let sock = dir.join(&name).to_string_lossy().into_owned();
+    for (pid, sock) in instance_socks_in(dir, entries) {
         if remember(&mut seen, &sock) {
             out.push((pid, sock));
         }
@@ -2161,6 +2302,25 @@ fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, Strin
     }
     out.sort_unstable();
     out
+}
+
+/// Step (1) of [`enumerate_instances`] on its own, because the dead-`latest`
+/// fallback ([`newest_live_instance_in`]) wants exactly this population and no
+/// more: the per-instance sockets living DIRECTLY in `dir` (`aterm-<pid>.sock`;
+/// the `latest` alias, the sibling tokens — which carry pids too — and every
+/// other name skipped), as `(pid, absolute path)` in readdir order. Existence
+/// only: the caller decides what "live" means (a `sessions` answer for
+/// discovery, an accepted connect for the fallback).
+fn instance_socks_in(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, String)> {
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let pid = control_socket::instance_pid(&name)?;
+            name.ends_with(".sock")
+                .then(|| (pid, dir.join(&name).to_string_lossy().into_owned()))
+        })
+        .collect()
 }
 
 /// `instances` / `ls` — the client-side cross-terminal discovery verbs.
@@ -3550,7 +3710,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let path = resolve_path(
+    let (path, origin) = resolve_target(
         sock,
         pid,
         env::var(SOCK_ENV).ok(),
@@ -3577,7 +3737,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         }
         let payload = read_stdin_payload()?;
         validate_operator_proposal_size(payload.len())?;
-        return feed_bin_exchange(&path, "operator-propose-bin", &payload, deadline);
+        return feed_bin_exchange(&path, origin, "operator-propose-bin", &payload, deadline);
     }
     if verb_tok == Some("feed-bin") {
         // The payload is stdin, not an inline argument; an inline token (e.g. a
@@ -3588,6 +3748,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         let payload = read_stdin_payload()?;
         return feed_bin_exchange(
             &path,
+            origin,
             &binary_frame_prefix(selector, "feed-bin"),
             &payload,
             deadline,
@@ -3609,6 +3770,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         };
         return feed_bin_exchange(
             &path,
+            origin,
             &binary_frame_prefix(selector, frame_verb),
             &payload,
             deadline,
@@ -3647,6 +3809,7 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
 
     let outcome = exchange(
         &path,
+        origin,
         &request,
         &verb,
         &frame_request,
@@ -3848,15 +4011,17 @@ fn reply_is_timeout(status_line: &str) -> bool {
 /// request framing splitting it (and without the argv newline guard rejecting
 /// it). Authenticates transparently like [`exchange`], runs under the same
 /// per-op `deadline`, and prints the server's `OK <n> bytes` reply (an `ERR`
-/// goes to stderr and exits FAILURE).
+/// goes to stderr and exits FAILURE). `origin` is how `path` was chosen, for
+/// the connect error ([`connect_error`]).
 fn feed_bin_exchange(
     path: &str,
+    origin: TargetOrigin,
     prefix: &str,
     payload: &[u8],
     deadline: Option<std::time::Duration>,
 ) -> io::Result<ExitCode> {
     let path = &aterm_uds::latest::resolve(path);
-    let stream = connect_stream(path)?;
+    let stream = connect_stream(path, origin)?;
     stream.set_read_timeout(deadline)?;
     stream.set_write_timeout(deadline)?;
     // `AUTH <token>\n` (transparent) + `<prefix> <len>\n`, then the raw body.
@@ -4117,12 +4282,44 @@ const EXCHANGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90
 
 /// The "connect <path>: <cause>" connection error, preserving the original
 /// [`io::ErrorKind`]. `NotFound` and `ConnectionRefused` on a control socket
-/// both mean ONE operator-visible thing — no aterm engine is serving that
-/// socket — so those two carry [`NOT_RUNNING_HINT`] on the line the user
-/// actually reads, instead of a bare `No such file or directory (os error 2)`.
-/// Every other kind keeps the raw cause alone: a permission error is NOT "not
-/// running", and claiming so would send the operator to the wrong fix.
-fn connect_error(path: &str, e: &io::Error) -> io::Error {
+/// both mean ONE operator-visible thing — no aterm engine is serving THAT
+/// socket — so those two carry a remedy on the line the user actually reads,
+/// instead of a bare `No such file or directory (os error 2)`: the not-running
+/// remedy when no instance is reachable at all ([`not_running_hint`]), and the
+/// fact that aterm IS running when some instance is
+/// ([`running_elsewhere_hint`]) — a `--pid` at a dead instance, or an explicit
+/// socket nobody serves, used to claim "aterm isn't running" beside a live
+/// window and send the operator off to launch a second one. How much that
+/// second remedy says is `origin`'s ([`TargetOrigin`]): a flagless call is
+/// shown each live instance with the flag that reaches it, a pinned one only
+/// how many there are — never a different instance to drive. Every other kind
+/// keeps the raw cause alone: a permission error is NOT "not running", and
+/// claiming so would send the operator to the wrong fix. The fleet look-up is
+/// the impure step, taken only on those two kinds; [`connect_error_naming`] is
+/// the pure rendering.
+fn connect_error(path: &str, e: &io::Error, origin: TargetOrigin) -> io::Error {
+    let (dir, live) = if matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ) {
+        (socket_dir(), live_instances_besides(path))
+    } else {
+        (None, Vec::new())
+    };
+    connect_error_naming(path, e, origin, dir.as_deref(), &live)
+}
+
+/// [`connect_error`]'s rendering, given how the target was chosen, the
+/// instances found alive elsewhere, and the default socket dir they were
+/// enumerated from (`None` when it is unresolvable — then the fleet is empty
+/// anyway, and every instance would render as `--sock`).
+fn connect_error_naming(
+    path: &str,
+    e: &io::Error,
+    origin: TargetOrigin,
+    dir: Option<&Path>,
+    live: &[(u32, String)],
+) -> io::Error {
     let mut msg = String::from("connect ");
     msg.push_str(path);
     msg.push_str(": ");
@@ -4131,9 +4328,141 @@ fn connect_error(path: &str, e: &io::Error) -> io::Error {
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
     ) {
-        msg.push_str(&not_running_hint());
+        if live.is_empty() {
+            msg.push_str(&not_running_hint());
+        } else {
+            msg.push_str(&running_elsewhere_hint(origin, dir, live));
+        }
     }
     io::Error::new(e.kind(), msg)
+}
+
+/// Every instance of [`live_instances`] (the default dir's own sockets AND the
+/// graph-registered explicit ones) that accepts a connect, minus the socket at
+/// `path` itself — the one that just failed. Sorted as `live_instances` sorts
+/// (by pid).
+///
+/// WIDER THAN WHAT `aterm ctl instances` PRINTS, and the remedy text says
+/// "lists" rather than promising a match: this set asks only for an accepted
+/// connect, while that verb prints the instances which also ANSWER `sessions`
+/// inside [`PROBE_DEADLINE`]. A wedged instance is therefore counted here and
+/// absent there — the state the commit that added this measured on an Intel
+/// Mac, where the one live window accepted a connect and timed out on
+/// `instances`. Counting it is the honest half: something IS serving, so the
+/// "aterm isn't running" line would be false.
+fn live_instances_besides(path: &str) -> Vec<(u32, String)> {
+    live_instances()
+        .into_iter()
+        .filter(|(_, sock)| !same_socket_path(sock, path))
+        .filter(|(_, sock)| CtlStream::connect(sock).is_ok())
+        .collect()
+}
+
+/// The remedy [`connect_error_naming`] appends when the socket dialed is dead
+/// but other instances answer. The launch remedy is deliberately absent either
+/// way — aterm IS running — and how much more it says is the target's
+/// [`TargetOrigin`]:
+///
+/// * `Pinned` ([`running_elsewhere_count`]): how many other instances are live
+///   and that `aterm ctl instances` lists them — no instance named, no flag
+///   handed out. The caller chose THIS socket, so the error must not choose
+///   another for it: rendering every live instance as a copy-paste
+///   `--pid`/`--sock` here handed an agent whose private socket died the
+///   human's real window, with the order to target it.
+/// * `Flagless` ([`running_elsewhere_flags`]): each live instance as the flag
+///   that reaches it. The caller left the instance to aterm; this is the choice
+///   the flagless rule could not make, over the fleet a flagless `ls` lists
+///   anyway.
+fn running_elsewhere_hint(
+    origin: TargetOrigin,
+    dir: Option<&Path>,
+    live: &[(u32, String)],
+) -> String {
+    match origin {
+        TargetOrigin::Pinned => running_elsewhere_count(live.len()),
+        TargetOrigin::Flagless => running_elsewhere_flags(dir, live),
+    }
+}
+
+/// [`running_elsewhere_hint`] for a pinned target: that aterm is running, how
+/// many OTHER instances are live, and where they are listed — the shape of
+/// discovery's own dead-`--pid` error ([`discovery_targets`]).
+fn running_elsewhere_count(others: usize) -> String {
+    let mut hint =
+        String::from(" — nothing is serving this control socket, but aterm IS running (");
+    hint.push_str(&others.to_string());
+    hint.push_str(if others == 1 {
+        " other instance; `aterm ctl instances` lists it)"
+    } else {
+        " other instances; `aterm ctl instances` lists them)"
+    });
+    hint
+}
+
+/// [`running_elsewhere_hint`] for a flagless target: each live instance as the
+/// flag that reaches it, so the line is the fix. `--pid <N> (<sock>)` when the
+/// socket IS the default dir's per-instance socket for `N`
+/// ([`reached_by_pid`]); `--sock <sock>` for every other — an
+/// explicit-`$ATERM_CONTROL_SOCK` instance, whose path only `--sock` dials —
+/// with ` (pid N)` appended when its graph entry carried the hosting pid, so
+/// the pid is still shown. The graph entry's pid is NOT the discriminator:
+/// `write_graph_entry` records the hosting pid in EVERY entry, so an explicit
+/// instance arrives here as `(nonzero pid, /explicit/path)` too, and keying on
+/// the legacy `0` placeholder printed `--pid <N>` for it — a remedy that dials
+/// `<dir>/aterm-<N>.sock`, which does not exist for that instance, fails with
+/// the same `NotFound`, and re-prints itself.
+fn running_elsewhere_flags(dir: Option<&Path>, live: &[(u32, String)]) -> String {
+    let mut hint =
+        String::from(" — nothing is serving this control socket, but aterm IS running: ");
+    for (i, (pid, sock)) in live.iter().enumerate() {
+        if i > 0 {
+            hint.push_str(", ");
+        }
+        if reached_by_pid(dir, *pid, sock) {
+            hint.push_str("--pid ");
+            hint.push_str(&pid.to_string());
+            hint.push_str(" (");
+            hint.push_str(sock);
+            hint.push(')');
+        } else {
+            hint.push_str("--sock ");
+            hint.push_str(sock);
+            if *pid != 0 {
+                hint.push_str(" (pid ");
+                hint.push_str(&pid.to_string());
+                hint.push(')');
+            }
+        }
+    }
+    hint.push_str("; target one with that flag (`aterm ctl instances` lists every live instance)");
+    hint
+}
+
+/// Whether `--pid <pid>` reaches `sock`: `resolve_path` dials exactly ONE path
+/// for `--pid` — `<default dir>/aterm-<pid>.sock` — so the remedy is only
+/// honest when `sock` names that file: its filename encodes `pid`
+/// ([`control_socket::instance_pid`]; a cheap reject for every explicit path,
+/// before any canonicalize) AND it is the same socket as the default dir's.
+/// "Same" is first a component-wise [`Path`] comparison, which folds the
+/// separator spelling — Windows' `dir.join` writes `\`, so a `/`-spelled path
+/// to the very same file is not a different socket — and then
+/// [`same_socket_path`], tolerant of a symlinked ancestor. A socket that
+/// merely LOOKS per-instance — `$ATERM_CONTROL_SOCK=/elsewhere/aterm-4242.sock`
+/// — fails the second test and is named by `--sock`. No default dir, no
+/// `--pid`: `--sock` always dials the path it is given.
+fn reached_by_pid(dir: Option<&Path>, pid: u32, sock: &str) -> bool {
+    let Some(dir) = dir else {
+        return false;
+    };
+    let named = Path::new(sock)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(control_socket::instance_pid);
+    if named != Some(pid) {
+        return false;
+    }
+    let own = dir.join(control_socket::instance_sock_name(pid));
+    Path::new(sock) == own.as_path() || same_socket_path(sock, &own.to_string_lossy())
 }
 
 /// How to start aterm ON THIS PLATFORM.
@@ -4218,11 +4547,12 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Resul
 }
 
 /// Connect to the control socket at `path`, wrapping a failure in
-/// [`connect_error`] so the surfaced message names the path tried.
-fn connect_stream(path: &str) -> io::Result<CtlStream> {
+/// [`connect_error`] so the surfaced message names the path tried — and, per
+/// `origin`, what the caller may do instead.
+fn connect_stream(path: &str, origin: TargetOrigin) -> io::Result<CtlStream> {
     match CtlStream::connect(path) {
         Ok(stream) => Ok(stream),
-        Err(e) => Err(connect_error(path, &e)),
+        Err(e) => Err(connect_error(path, &e, origin)),
     }
 }
 
@@ -4500,8 +4830,11 @@ fn receive_guarded_artifact_reply(
 /// `timeout_explicit` distinguishes a user-supplied `--timeout` from the default:
 /// it matters only for `subscribe`, whose default watches FOREVER but whose
 /// explicit `--timeout` is a max-watch wall-clock bound (see [`subscribe_watch`]).
+/// `origin` is how `path` was chosen, which decides what a connect failure on
+/// it may offer instead ([`connect_error`]).
 fn exchange(
     path: &str,
+    origin: TargetOrigin,
     request: &str,
     verb: &str,
     frame_request: &str,
@@ -4512,7 +4845,7 @@ fn exchange(
     // resolves it during connect) and a pointer FILE on Windows; resolve it
     // client-side so both platforms dial the live instance socket.
     let path = &aterm_uds::latest::resolve(path);
-    let stream = connect_stream(path)?;
+    let stream = connect_stream(path, origin)?;
 
     // Bound every socket operation, as `probe_lines` already does for
     // discovery: a wedged server (or one that stalls mid-reply) must surface
@@ -5064,6 +5397,7 @@ mod tests {
         let cli = std::thread::spawn(move || {
             let res = exchange(
                 &sockpath,
+                TargetOrigin::Pinned,
                 "dial myhost text\n",
                 "text",
                 "text",
@@ -5157,16 +5491,20 @@ mod tests {
     /// is preserved. The two "no engine serves this socket" kinds additionally
     /// carry the not-running remedy — a raw `No such file or directory (os
     /// error 2)` told the one user the installer leaves with only `aterm` on
-    /// PATH nothing about what to DO.
+    /// PATH nothing about what to DO. Pinned on the pure rendering with an
+    /// EMPTY fleet: `connect_error` itself looks the fleet up, and on a dev
+    /// machine with a live window that look-up is what changes the line.
     #[test]
     fn connect_error_matches_format_and_keeps_kind() {
         let path = "/tmp/aterm-test/aterm.sock";
         // A kind that does NOT mean "not running" keeps the bare cause: a
         // permission error must never claim aterm is down.
         let cause = io::Error::new(io::ErrorKind::PermissionDenied, "Permission denied");
-        let e = connect_error(path, &cause);
-        assert_eq!(e.to_string(), format!("connect {path}: {cause}"));
-        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        for origin in [TargetOrigin::Flagless, TargetOrigin::Pinned] {
+            let e = connect_error_naming(path, &cause, origin, None, &[]);
+            assert_eq!(e.to_string(), format!("connect {path}: {cause}"));
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        }
 
         // NotFound / ConnectionRefused say what the failure MEANS and what to
         // do, still framed on the path tried, still kind-preserving (the exit
@@ -5182,7 +5520,13 @@ mod tests {
             ),
         ] {
             let cause = io::Error::new(kind, oserr);
-            let e = connect_error(path, &cause);
+            let e = connect_error_naming(path, &cause, TargetOrigin::Flagless, None, &[]);
+            // With nothing live there is nothing to name and nothing to count:
+            // a pinned target reads exactly the same.
+            assert_eq!(
+                connect_error_naming(path, &cause, TargetOrigin::Pinned, None, &[]).to_string(),
+                e.to_string()
+            );
             let msg = e.to_string();
             assert!(
                 msg.starts_with(&format!("connect {path}: {oserr}")),
@@ -5203,6 +5547,149 @@ mod tests {
                 "the remedy is named, and is the one THIS platform can run: {msg}"
             );
             assert_eq!(e.kind(), kind);
+        }
+    }
+
+    /// A dead socket beside a LIVE instance must not claim "aterm isn't
+    /// running": that line sent the operator to launch a second window when
+    /// `--pid` named a corpse or `$ATERM_CONTROL_SOCK` a path nobody serves.
+    /// The launch remedy is gone in both forms, because it is false. What
+    /// replaces it depends on how the socket was chosen:
+    ///
+    /// * FLAGLESS — the flag that REACHES each live instance: `--pid` only for
+    ///   the default dir's own `aterm-<pid>.sock`, `--sock` for everything
+    ///   else.
+    /// * PINNED (`--sock`, `--pid`, an explicit `$ATERM_CONTROL_SOCK`) — only
+    ///   the count and `aterm ctl instances`: no instance, no flag, no "target
+    ///   one". Handing a pinned caller the fleet as flags gave an agent whose
+    ///   private socket died the human's window as a copy-paste `--pid`.
+    ///
+    /// Pure rendering; the fleet look-up itself is `live_instances_besides`.
+    ///
+    /// The fleet is what `enumerate_instances` really yields: `write_graph_entry`
+    /// puts the hosting pid in EVERY graph entry, so an explicit-socket
+    /// instance arrives as `(4242, /tmp/private/b.sock)` — a nonzero pid on a
+    /// path `--pid 4242` does NOT dial (`resolve_path` dials only
+    /// `<dir>/aterm-4242.sock`). The first fixture covered only the legacy `0`
+    /// placeholder, which is how a `--pid` remedy that fails with the same
+    /// `NotFound` and re-prints itself got through.
+    #[test]
+    fn connect_error_names_the_instances_that_are_alive() {
+        let dir = Path::new("/tmp/aterm-test");
+        let path = "/tmp/aterm-test/aterm-10274.sock";
+        // The dir's own socket exactly as `instance_socks_in` yields it:
+        // `dir.join(name)`, whose separator is the platform's (`\` on
+        // Windows), so every expectation below is built from the same join.
+        let own = dir
+            .join(control_socket::instance_sock_name(99878))
+            .to_string_lossy()
+            .into_owned();
+        let cause = io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 61)",
+        );
+        let live = vec![
+            // A legacy graph entry with no `pid` line: the `0` placeholder.
+            (0, "/tmp/private/a.sock".to_string()),
+            // An explicit socket whose graph entry carries the hosting pid.
+            (4242, "/tmp/private/b.sock".to_string()),
+            // A socket that LOOKS per-instance but lives outside the default
+            // dir: `--pid 7` would dial `/tmp/aterm-test/aterm-7.sock`, not it.
+            (7, "/tmp/elsewhere/aterm-7.sock".to_string()),
+            // The default dir's own per-instance socket: `--pid` reaches it.
+            (99878, own.clone()),
+        ];
+        let e = connect_error_naming(path, &cause, TargetOrigin::Flagless, Some(dir), &live);
+        let msg = e.to_string();
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            msg.starts_with(
+                "connect /tmp/aterm-test/aterm-10274.sock: Connection refused (os error 61)"
+            ),
+            "the raw cause stays first: {msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "aterm IS running: --sock /tmp/private/a.sock, \
+                 --sock /tmp/private/b.sock (pid 4242), \
+                 --sock /tmp/elsewhere/aterm-7.sock (pid 7), \
+                 --pid 99878 ({own})"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.ends_with(
+                "; target one with that flag (`aterm ctl instances` lists every live instance)"
+            ),
+            "the flagless form hands the choice back: {msg}"
+        );
+        // The same socket spelled differently is still the dir's own: a
+        // doubled separator here, `/` against the join's `\` on Windows.
+        // Neither spelling exists on disk, so only the component-wise
+        // comparison can say so — canonicalize fails on both.
+        assert!(reached_by_pid(
+            Some(dir),
+            99878,
+            "/tmp/aterm-test//aterm-99878.sock"
+        ));
+        assert!(reached_by_pid(
+            Some(dir),
+            99878,
+            "/tmp/aterm-test/aterm-99878.sock"
+        ));
+        assert!(!reached_by_pid(Some(dir), 7, "/tmp/elsewhere/aterm-7.sock"));
+        assert!(
+            !msg.contains("--pid 4242") && !msg.contains("--pid 7 "),
+            "`--pid` is a remedy only for the default dir's own socket: {msg}"
+        );
+        assert!(
+            !msg.contains("isn't running") && !msg.contains(LAUNCH_REMEDY),
+            "a live instance refutes both the claim and the launch remedy: {msg}"
+        );
+        // No resolvable default dir: `--pid` can dial nothing, so every
+        // instance — the per-instance-looking one included — is a `--sock`.
+        let msg =
+            connect_error_naming(path, &cause, TargetOrigin::Flagless, None, &live).to_string();
+        assert!(
+            msg.contains(&format!("--sock {own} (pid 99878)")) && !msg.contains("--pid"),
+            "{msg}"
+        );
+        // PINNED: the same dead socket and the same four live instances, but
+        // the caller named the socket, so the error names none of them and
+        // hands out no flag — the fact, the count, and where the list lives.
+        let pinned = connect_error_naming(path, &cause, TargetOrigin::Pinned, Some(dir), &live);
+        assert_eq!(pinned.kind(), io::ErrorKind::ConnectionRefused);
+        let msg = pinned.to_string();
+        assert_eq!(
+            msg,
+            "connect /tmp/aterm-test/aterm-10274.sock: Connection refused (os error 61) \
+             — nothing is serving this control socket, but aterm IS running \
+             (4 other instances; `aterm ctl instances` lists them)"
+        );
+        assert!(
+            !msg.contains("--pid") && !msg.contains("--sock") && !msg.contains("target one"),
+            "a pinned caller is handed no other instance to drive: {msg}"
+        );
+        assert!(
+            live.iter().all(|(_, sock)| !msg.contains(sock.as_str())),
+            "no live socket is named: {msg}"
+        );
+        // One other instance reads in the singular, and is not named either.
+        let one = connect_error_naming(path, &cause, TargetOrigin::Pinned, Some(dir), &live[3..]);
+        assert!(
+            one.to_string()
+                .ends_with("aterm IS running (1 other instance; `aterm ctl instances` lists it)"),
+            "{one}"
+        );
+        assert!(!one.to_string().contains("99878"), "{one}");
+        // A kind that does not mean "no listener" names nobody, live or not,
+        // whichever way the socket was chosen.
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "Permission denied");
+        for origin in [TargetOrigin::Flagless, TargetOrigin::Pinned] {
+            assert_eq!(
+                connect_error_naming(path, &denied, origin, Some(dir), &live).to_string(),
+                format!("connect {path}: {denied}")
+            );
         }
     }
 
@@ -5577,6 +6064,35 @@ mod tests {
         // ...but an explicit path value passes straight through.
         let path = resolve_path(None, None, Some("/tmp/x.sock".into()), None, None).unwrap();
         assert_eq!(path, "/tmp/x.sock");
+    }
+
+    /// The origin `connect_error` renders from is the resolving arm's own:
+    /// every flag and an explicit `$ATERM_CONTROL_SOCK` PIN the socket, so a
+    /// dead one is never answered with another instance to drive. (The
+    /// per-instance arm is `Flagless` by construction; exercising it here would
+    /// dial the developer's real `latest` alias.)
+    #[test]
+    fn resolve_target_pins_every_named_socket() {
+        let (path, origin) =
+            resolve_target(None, Some(42), None, None, None).expect("per-user dir");
+        let want = format!("{}aterm-42.sock", std::path::MAIN_SEPARATOR);
+        assert!(path.ends_with(&want), "got {path}");
+        assert_eq!(origin, TargetOrigin::Pinned);
+        assert_eq!(
+            resolve_target(
+                Some("/tmp/a.sock".into()),
+                None,
+                Some("/elsewhere.sock".into()),
+                None,
+                None,
+            )
+            .unwrap(),
+            ("/tmp/a.sock".to_string(), TargetOrigin::Pinned)
+        );
+        assert_eq!(
+            resolve_target(None, None, Some("/tmp/x.sock".into()), None, None).unwrap(),
+            ("/tmp/x.sock".to_string(), TargetOrigin::Pinned)
+        );
     }
 
     /// IN-SESSION SELF-LOCATION: with several instances running, a flagless call
@@ -6326,7 +6842,11 @@ mod tests {
         );
         assert!(windows.contains("could not say"), "{windows}");
         let ls = client_help_reply(&strings(&["help", "ls"])).unwrap();
-        assert!(ls.contains("detail=<pct|->[ *]"), "{ls}");
+        assert!(ls.contains("detail=<pct|->"), "{ls}");
+        // The identity column (session identities) is the LAST one, before the
+        // self mark, and its meaning is spelled beside the others.
+        assert!(ls.contains("identity=<name|->[ *]"), "{ls}");
+        assert!(ls.contains("`spawn identity=<name>`"), "{ls}");
         assert!(!ls.contains("instances     one line per"), "{ls}");
     }
 
@@ -7336,6 +7856,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// THE DEAD-`latest` FALLBACK over a synthetic socket dir, through both
+    /// ways an alias dies. A crashed newer instance leaves its socket FILE
+    /// behind, so the alias names a socket that REFUSES (`ConnectionRefused`);
+    /// a graceful exit removes the alias, and one whose corpse was swept before
+    /// the next publish dangles (`NotFound`, both). With the alias refused, a
+    /// live instance beside it, and a live NON-instance name (an explicit
+    /// socket) that must never be chosen, the flagless target is the live
+    /// instance. With the alias live it is the alias, untouched; with nothing
+    /// live it is the alias too, so the error the caller raises names the path
+    /// it was given. Measured shape on this host: a dangling alias beside a
+    /// live window left `aterm ctl version` claiming "aterm isn't running".
+    #[test]
+    fn flagless_target_falls_back_to_the_newest_live_instance_when_latest_is_dead() {
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-latest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("private dir");
+        let alias = dir.join(control_socket::LATEST_SOCK_FILE);
+        let alias_s = alias.to_str().expect("utf8").to_string();
+        let corpse = dir.join(control_socket::instance_sock_name(DEAD_PID));
+        let live = dir.join(control_socket::instance_sock_name(std::process::id()));
+        let live_s = live.to_str().expect("utf8").to_string();
+
+        // Nothing bound at all — the alias dangles, the swept-but-unpublished
+        // state: the alias comes back so the error names it.
+        aterm_uds::latest::publish(&alias, corpse.to_str().expect("utf8"));
+        #[cfg(unix)]
+        assert_eq!(
+            CtlStream::connect(&alias).map(drop).map_err(|e| e.kind()),
+            Err(io::ErrorKind::NotFound),
+            "a dangling alias is ENOENT"
+        );
+        assert_eq!(flagless_target(&dir, alias_s.clone()), alias_s);
+        assert_eq!(newest_live_instance_in(&dir), None);
+
+        // THE CRASH STATE: the corpse bound, then abandoned — nothing unlinks
+        // the file, exactly as after a crash — so the alias now names a socket
+        // that refuses. Beside it, a live instance, and a live explicit-name
+        // socket that must never be chosen.
+        drop(aterm_uds::CtlListener::bind(&corpse).expect("bind then abandon"));
+        #[cfg(unix)]
+        assert_eq!(
+            CtlStream::connect(&alias).map(drop).map_err(|e| e.kind()),
+            Err(io::ErrorKind::ConnectionRefused),
+            "a crashed instance's alias is ECONNREFUSED, not ENOENT"
+        );
+        let listener = aterm_uds::CtlListener::bind(&live).expect("bind the live instance");
+        let stranger =
+            aterm_uds::CtlListener::bind(dir.join("private.sock")).expect("bind the explicit one");
+        assert_eq!(
+            flagless_target(&dir, alias_s.clone()),
+            live_s,
+            "a dead alias resolves to the live instance beside it"
+        );
+        assert_eq!(
+            newest_live_instance_in(&dir).as_deref(),
+            Some(live_s.as_str())
+        );
+
+        // The alias repointed at the live instance: returned as-is, so the
+        // caller dials the alias exactly as before.
+        aterm_uds::latest::publish(&alias, &live_s);
+        assert_eq!(
+            flagless_target(&dir, alias_s.clone()),
+            alias_s,
+            "a live alias is dialed as the alias"
+        );
+
+        // The instance exits gracefully — `cleanup_socket` removes its socket
+        // and the alias with it. Only the stranger is left, and it is not an
+        // instance: back to the alias, and the error that names it.
+        drop(listener);
+        let _ = std::fs::remove_file(&live);
+        let _ = std::fs::remove_file(&alias);
+        #[cfg(unix)]
+        assert_eq!(
+            CtlStream::connect(&alias).map(drop).map_err(|e| e.kind()),
+            Err(io::ErrorKind::NotFound),
+            "a removed alias is ENOENT"
+        );
+        assert_eq!(flagless_target(&dir, alias_s.clone()), alias_s);
+        assert_eq!(newest_live_instance_in(&dir), None);
+        drop(stranger);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "Newest" is the bind instant, not the pid: pids wrap (macOS at 99999,
+    /// and this host's live window IS pid 99878), so the youngest instance can
+    /// carry the lowest pid in the directory. Ties and an unreadable mtime
+    /// fall back to pid order.
+    #[test]
+    fn newest_live_instance_is_by_bind_time_not_pid() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
+        let sock = |pid: u32| format!("/run/aterm-{pid}.sock");
+        // The wrapped pid 12 bound last: it wins over the higher pid 99878.
+        assert_eq!(
+            newest(vec![(t(100), 99878, sock(99878)), (t(200), 12, sock(12))]).as_deref(),
+            Some("/run/aterm-12.sock")
+        );
+        // Equal bind instants: pid order, as `enumerate_instances` sorts.
+        assert_eq!(
+            newest(vec![(t(100), 12, sock(12)), (t(100), 99878, sock(99878))]).as_deref(),
+            Some("/run/aterm-99878.sock")
+        );
+        // An unreadable mtime loses to any readable one.
+        assert_eq!(
+            newest(vec![(None, 99878, sock(99878)), (t(1), 12, sock(12))]).as_deref(),
+            Some("/run/aterm-12.sock")
+        );
+        assert_eq!(newest(Vec::new()), None);
+    }
+
     // -----------------------------------------------------------------------
     // THE MULTIPLEXER BOUNDARY
     //
@@ -8128,7 +8760,9 @@ mod tests {
     #[test]
     fn windows_rows_fold_sessions_per_window_and_keep_unknown_apart_from_none() {
         let lines: Vec<String> = [
-            "0 s-a - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude",
+            // A server with the identity column (session identities): one more
+            // key=value after detail=, read by key like the rest.
+            "0 s-a - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude identity=worker",
             "1 s-b s-a alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
             "2 s-c - alive sh meta=0 window=0 active=1 wfocus=0 detail=codex",
             "3 s-d - alive sh meta=0 window=none active=0 wfocus=0 detail=-",

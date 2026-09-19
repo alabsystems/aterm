@@ -670,10 +670,26 @@ impl App {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
                 } else {
+                    // The AUTOMATIC lane keeps its intent through a preflight block
+                    // and retries on its cooldown — so the row says the lane is
+                    // still acting, never "see Version menu" as if it had stopped
+                    // (2026-09-18; the Deferred arm above already follows this
+                    // rule). Only a lane that has genuinely stopped hands the
+                    // person the menu.
+                    let retry_scheduled = self
+                        .native_updater_service
+                        .snapshot()
+                        .staged
+                        .as_ref()
+                        .is_some_and(|stage| self.automatic_apply_retry_scheduled(stage.build));
                     self.note_update_outcome(
                         '\u{2191}',
                         "Update waiting",
-                        "see Version menu",
+                        if retry_scheduled {
+                            "it retries by itself"
+                        } else {
+                            "see Version menu"
+                        },
                         crate::status_bars::Tone::Info,
                     );
                 }
@@ -2014,9 +2030,10 @@ mod tests {
         );
         let detail = bar_detail(&app);
         assert!(
-            detail.contains("applies in place within ~2 min")
+            detail.contains("applies by itself at the next quiet moment")
                 && detail.contains("your shells keep running")
-                && !detail.to_lowercase().contains("restart"),
+                && !detail.to_lowercase().contains("restart")
+                && !detail.contains("min"),
             "{detail}"
         );
         app.auto_apply_manual_only = Some(latch(None));

@@ -16,9 +16,14 @@
 //! to clients, so the client's minimal crypto surface is unaffected.
 //!
 //! The unit signed is the exact asset bytes (no canonicalization — same discipline the
-//! verifier enforces), so a detached signature here is byte-for-byte what
-//! `atpkg::sig::verify_index` / `atpkg::sig::verify_pkg` check. A test signs a manifest and
-//! verifies it with the **actual client verifier**, pinning the contract.
+//! verifier enforces), so a detached signature here is byte-for-byte what the client
+//! verifier checks: `atpkg::sig::TrustedRoster::authorize_bytes` (and
+//! `atpkg::sig::TrustedIndex::verify_pkg`, the wrapper that calls it), which delegate to
+//! `aterm_update_core::roster` — the same verifier the app updater runs. There is
+//! exactly one; the single-root `verify_index`/`verify_index_with` pair this line
+//! used to name was retired with the package-specific root, as the note on
+//! `produces_signatures_the_client_verifier_accepts` below records. A test signs a
+//! manifest and verifies it with that **actual client verifier**, pinning the contract.
 //!
 //! # The paper master and the machine roster
 //!

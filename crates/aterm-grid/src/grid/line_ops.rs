@@ -245,7 +245,6 @@ impl Grid {
     /// REQUIRES: self.storage.scroll_region.top <= self.storage.scroll_region.bottom
     /// REQUIRES: self.storage.scroll_region.bottom < self.storage.visible_rows
     pub fn insert_lines(&mut self, count: usize) {
-        self.storage.clear_pending_wrap();
         if count == 0 {
             return;
         }
@@ -259,6 +258,14 @@ impl Grid {
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
+
+        // The deferred wrap dies with the insert, NOT with the request: xterm's
+        // `InsertLine` (util.c) returns on the margin test BEFORE it reaches
+        // `ResetWrap(screen)`, so an IL the cursor position rejects leaves the
+        // parked wrap armed. Resetting it above the guard cancelled a wrap that
+        // xterm keeps, and the next printable then landed on this row instead of
+        // the next one.
+        self.storage.clear_pending_wrap();
 
         // Per ECMA-48 §8.3.67: IL moves the active position to the line
         // home position (column 0, or left margin when DECLRMM is active).
@@ -346,7 +353,6 @@ impl Grid {
         }
         // Rectangular IL: shift cells within [left, right] down by `count` rows
         // within [cursor_row, scroll_region.bottom].
-        self.storage.clear_pending_wrap();
         if count == 0 {
             return;
         }
@@ -368,6 +374,10 @@ impl Grid {
         }
 
         self.storage.cursor.col = margins.left;
+        // Both margin tests are xterm's, and both come BEFORE its
+        // `ResetWrap(screen)` — a IL the cursor position rejects leaves the
+        // parked wrap armed (util.c `InsertLine`).
+        self.storage.clear_pending_wrap();
         self.reset_display_offset_with_damage();
 
         let top = usize::from(cursor_row);
@@ -477,7 +487,6 @@ impl Grid {
     /// REQUIRES: self.storage.scroll_region.top <= self.storage.scroll_region.bottom
     /// REQUIRES: self.storage.scroll_region.bottom < self.storage.visible_rows
     pub fn delete_lines(&mut self, count: usize) {
-        self.storage.clear_pending_wrap();
         if count == 0 {
             return;
         }
@@ -494,6 +503,11 @@ impl Grid {
         if cursor_row < region.top || cursor_row > region.bottom {
             return;
         }
+
+        // As in `insert_lines`: xterm's `DeleteLine` (util.c) returns on the
+        // margin test before `ResetWrap(screen)`, so a rejected DL keeps the
+        // parked wrap.
+        self.storage.clear_pending_wrap();
 
         // Per ECMA-48 §8.3.32: DL moves the active position to the line
         // home position (column 0, or left margin when DECLRMM is active).
@@ -579,7 +593,6 @@ impl Grid {
         }
         // Rectangular DL: shift cells within [left, right] up by `count` rows
         // within [cursor_row, scroll_region.bottom].
-        self.storage.clear_pending_wrap();
         if count == 0 {
             return;
         }
@@ -601,6 +614,10 @@ impl Grid {
         }
 
         self.storage.cursor.col = margins.left;
+        // Both margin tests are xterm's, and both come BEFORE its
+        // `ResetWrap(screen)` — a DL the cursor position rejects leaves the
+        // parked wrap armed (util.c `DeleteLine`).
+        self.storage.clear_pending_wrap();
         self.reset_display_offset_with_damage();
 
         let top = usize::from(cursor_row);

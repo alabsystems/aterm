@@ -41,6 +41,13 @@ fn main() {
         std::process::exit(0);
     }
 
+    // WHERE THIS RUN'S OWN OUTPUT GOES, before anything reads the tree. A log
+    // redirected into the checkout is an untracked file that GROWS for the
+    // length of the run, and an untracked file is part of the source identity
+    // by design — so without this the gate reads its own ladder as the tree
+    // moving and decides nothing. See `identity::claim_own_output`.
+    identity::claim_own_output();
+
     let env = EnvSnapshot::capture();
     let Some(root) = resolve_root(parsed.root.clone()) else {
         eprintln!(
@@ -73,6 +80,13 @@ fn main() {
             .ok()
     });
 
+    // What the claim above actually excluded, SAID rather than assumed: a run
+    // whose ladder is being written into the tree it verifies should read that
+    // on the ladder, not discover it in this source file.
+    let excluded = identity::untracked_split(&root, &env.path)
+        .map(|(_, own)| own)
+        .unwrap_or_default();
+
     // THE SNAPSHOT, before anything reads the tree — `--changed` included, so
     // its selection is of the same tree the stages build.
     let (snap, notes) = match choose_source(&parsed, &root, &env, &scratch) {
@@ -91,6 +105,13 @@ fn main() {
     // here rather than as a stage: every header below names the scope it picks.
     let (scope, prelude) = resolve_scope(&parsed, &run_root, &env);
 
+    // THE GATE KEEPS ITS OWN COPY OF THE LADDER, so nobody has to `| tee` one
+    // into the checkout (the failure above) to have a record afterwards. It
+    // lives in the gate's state directory, which no `TreeState` reads and
+    // `.gitignore` already covers, and `ATERM_VERIFY_LOG=<path>` moves it —
+    // empty turns it off.
+    let log = open_log(&env, &run_root);
+
     let mut ctx = Ctx::new(
         run_root,
         parsed.mode,
@@ -101,14 +122,22 @@ fn main() {
     )
     .with_prelude(prelude)
     .with_timings(timings)
-    .with_notes(notes);
+    .with_notes(
+        identity::own_output_note(&excluded)
+            .into_iter()
+            .chain(notes)
+            .collect::<Vec<_>>(),
+    );
     if let Some(s) = &snap {
         ctx = ctx.in_snapshot_of(s.caller.clone(), s.tree.clone(), s.notes.clone());
     }
 
     let started = Instant::now();
     let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut out = Tee {
+        out: std::io::BufWriter::new(stdout.lock()),
+        log: log.as_ref().map(|(_, f)| f),
+    };
     let code = match aterm_verify::run(&ctx, &mut out) {
         Ok(code) => code,
         Err(e) => {
@@ -125,6 +154,9 @@ fn main() {
 
     if std::io::stderr().is_terminal() {
         let secs = started.elapsed().as_secs_f64();
+        if let Some((path, _)) = &log {
+            let _ = writeln!(std::io::stderr(), "verify: log {}", path.display());
+        }
         let _ = writeln!(
             std::io::stderr(),
             "verify: finished in {secs:.1}s (exit {code})"
@@ -211,6 +243,94 @@ fn choose_source(
         trustc_commit: tools.identity(&path_env, scratch).commit,
     })?;
     Ok((Some(snap), Vec::new()))
+}
+
+/// stdout, and the gate's own copy of the ladder.
+///
+/// A log write NEVER decides anything: a full disk costs the record, not the
+/// run, exactly as `ATERM_VERIFY_TIMINGS` does. `write` reports what reached
+/// STDOUT, so a short write on the log cannot be mistaken for a short write on
+/// the ladder.
+struct Tee<'a, W: Write> {
+    out: W,
+    log: Option<&'a std::fs::File>,
+}
+
+impl<W: Write> Write for Tee<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.out.write(buf)?;
+        if let Some(f) = &mut self.log {
+            let _ = f.write_all(&buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(f) = &mut self.log {
+            let _ = f.flush();
+        }
+        self.out.flush()
+    }
+}
+
+/// How many of the gate's own logs are kept. A record worth writing is worth
+/// not filling a disk with: the newest few runs are what anyone reads.
+const LOGS_KEPT: usize = 20;
+
+/// Open this run's log — `ATERM_VERIFY_LOG` when set (empty turns it off),
+/// otherwise `<run root>/.aterm-verify/logs/verify-<pid>.log`.
+///
+/// Inside the gate's state directory ON PURPOSE: `identity::is_gate_state`
+/// keeps that path out of every `TreeState`, and `.gitignore` keeps it out of
+/// `git status`, so the gate writing a log cannot become the gate watching its
+/// own log move. A path that cannot be opened is said once on stderr and costs
+/// the record, never the run.
+fn open_log(env: &EnvSnapshot, run_root: &Path) -> Option<(PathBuf, std::fs::File)> {
+    let path = match &env.verify_log {
+        Some(p) if p.as_os_str().is_empty() => return None,
+        Some(p) => p.clone(),
+        None => {
+            let dir = run_root
+                .join(identity::GATE_STATE_DIR)
+                .join(aterm_verify::LOG_DIR);
+            prune_logs(&dir);
+            dir.join(format!("verify-{}.log", std::process::id()))
+        }
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::File::create(&path) {
+        Ok(f) => Some((path, f)),
+        Err(e) => {
+            eprintln!("verify: cannot write the run log {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Keep the newest [`LOGS_KEPT`] logs in `dir`. Best effort throughout: this is
+/// housekeeping for a side channel and may never fail a run.
+fn prune_logs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let t = e.metadata().ok()?.modified().ok()?;
+            Some((t, e.path()))
+        })
+        .collect();
+    if logs.len() < LOGS_KEPT {
+        return;
+    }
+    logs.sort_unstable();
+    let drop_n = logs.len() + 1 - LOGS_KEPT;
+    for (_, p) in logs.into_iter().take(drop_n) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// `--root`, then `ATERM_VERIFY_ROOT`, then a walk up from the cwd.

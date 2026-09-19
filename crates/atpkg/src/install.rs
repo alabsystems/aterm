@@ -216,7 +216,9 @@ pub fn verify_and_stage_with(
 
     // 2. Extract into a scratch SIBLING (tar-slip-safe, size-capped from the signed size).
     //    The live tree is untouched throughout. Any scratch left by a killed earlier run is
-    //    swept first — the store lock guarantees its owner is gone.
+    //    swept first — the store lock makes it ours to reclaim, and the sweep stops any
+    //    launchd-parented lane helper the dead stager left behind (its child only in
+    //    name: launchd is its parent) before deleting what it may still be writing into.
     crate::store::sweep_stage_scratch(build_dir);
     let incoming = crate::store::incoming_dir(build_dir).ok_or_else(|| {
         StageError::Io(std::io::Error::new(
@@ -2142,6 +2144,50 @@ mod tests {
         assert!(
             crate::store::build_is_complete(&build),
             "a sweep beside a live build must not disturb its marker"
+        );
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    // A RECOVERY THAT DID NOT HAPPEN MUST NOT FALL THROUGH INTO THE DELETE. Recovery is
+    // narrow on purpose: with `<build>` absent and TWO superseded siblings beside it there
+    // is no way to tell which tree is the outgoing one, so `recover_interrupted_swap`
+    // refuses to move either — and the sweep then `remove_dir_all`ed both, which is
+    // precisely the "a survivable crash became a deleted toolchain" outcome the refusal
+    // exists to prevent. (A recovery whose rename merely FAILED went the same way.) While
+    // nothing stands at `<build>`, a superseded sibling is the only copy of that build
+    // there is.
+    #[test]
+    fn a_refused_recovery_keeps_the_only_copy_it_could_not_choose() {
+        let b = bundle("crash-window-refused");
+        let (build, witness) = b.installed();
+        let parked = crate::store::superseded_dir(&build).unwrap();
+        crate::store::clear_build_ready(&build).unwrap();
+        std::fs::rename(&build, &parked).unwrap();
+        // A second parked tree, from another pid: recovery cannot tell which is the
+        // outgoing one, and refuses to move either.
+        let other = build.with_file_name(format!(
+            "{}.superseded-4242",
+            build.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::create_dir_all(&other).unwrap();
+        // An INCOMING half-extract is nobody's only copy, and is still swept.
+        let incoming = crate::store::incoming_dir(&build).unwrap();
+        std::fs::create_dir_all(&incoming).unwrap();
+        assert!(!build.exists(), "PRECONDITION: the swap window, ambiguous");
+
+        crate::store::sweep_stage_scratch(&build);
+
+        assert!(
+            parked.join(witness.file_name().unwrap()).exists(),
+            "the only copy of the user's tree went to the sweep the refusal called off"
+        );
+        assert!(
+            other.is_dir(),
+            "and so did the tree it could not be told apart from"
+        );
+        assert!(
+            !incoming.exists(),
+            "PRECONDITION: an unverified half-extract is still swept"
         );
         let _ = std::fs::remove_dir_all(&b.dir);
     }

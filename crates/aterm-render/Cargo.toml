@@ -84,6 +84,15 @@ libc = { workspace = true }
 skrifa = "0.46.2"
 
 [dev-dependencies]
+# TEST-ONLY sixel: re-declare the engine with its `sixel` feature so
+# `tests/inline_image.rs` can drive a REAL sixel DCS through `Terminal` and
+# measure the PIXELS the renderer composites for it (the pixel-exact placement
+# gate). The shipped build ignores dev-dependencies, so the production closure
+# stays byte-identical — no `aterm-sixel`, exactly as the [dependencies] entry
+# above declares it. Same bargain aterm-gpu strikes for its sixel parity gate.
+aterm-core = { path = "../aterm-core", default-features = false, features = [
+  "sixel",
+] }
 # ORACLE ONLY — never in the shipped graph. `src/raster.rs` is the first-party
 # scanline signed-area coverage rasterizer that retired this crate; it is kept
 # here purely so `tests/rasterizer_oracle.rs` can prove the two agree at f32

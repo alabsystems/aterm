@@ -46,10 +46,23 @@ use std::time::Duration;
 /// while still reducing amplification relative to the 1 MiB buffer cap.
 pub(crate) const DEFAULT_REFILL_BYTES_PER_SEC: u64 = 100 * 1024;
 
-/// Default burst capacity in bytes. 64 KiB absorbs legitimate startup
-/// bursts (DECRQSS batteries, multiple DA/DA2/XTVERSION queries, OSC
-/// palette probes) with room to spare.
-pub(crate) const DEFAULT_BURST_BYTES: u64 = 64 * 1024;
+/// Default burst capacity in bytes. Absorbs legitimate startup bursts
+/// (DECRQSS batteries, multiple DA/DA2/XTVERSION queries, OSC palette probes)
+/// with room to spare — and, unlike the 64 KiB it used to be, it can actually
+/// carry the largest response this terminal says it will send.
+///
+/// IT IS SIZED ON THE WIRE, NOT ON THE PAYLOAD. A clipboard query answers with
+/// base64, which expands 3 bytes to 4, so the
+/// [`MAX_OSC52_QUERY_RESPONSE_BYTES`] the handler admits becomes ~1.34x that on
+/// the wire — the handler's own doc says so ("a 64KB decoded payload becomes
+/// ~85KB on the wire"). At 64 KiB of capacity every clipboard between 49,145
+/// and 65,536 bytes was admitted by the handler and then dropped here without a
+/// byte being sent, because `try_consume` refuses anything larger than capacity
+/// outright. Silence, for content the terminal had already decided it was
+/// allowed to answer with.
+///
+/// [`MAX_OSC52_QUERY_RESPONSE_BYTES`]: super::MAX_OSC52_QUERY_RESPONSE_BYTES
+pub(crate) const DEFAULT_BURST_BYTES: u64 = 96 * 1024;
 
 /// Abstraction over [`Instant::now`] so tests can drive the clock forward
 /// deterministically without sleeping.
@@ -76,10 +89,12 @@ impl TimeSource for SystemTime {
 /// silently dropped. Tokens refill at `refill_bytes_per_sec` and the
 /// bucket is capped at `capacity_bytes`.
 ///
-/// Responses larger than `capacity_bytes` are always dropped — a single
-/// legitimate response never exceeds the [`MAX_OSC52_QUERY_RESPONSE_BYTES`]
-/// cap (64 KiB) by construction, so with the default burst capacity this
-/// is purely defensive.
+/// Responses larger than `capacity_bytes` are always dropped. That is purely
+/// defensive ONLY while the capacity can hold the largest legitimate response:
+/// the [`MAX_OSC52_QUERY_RESPONSE_BYTES`] cap is on the DECODED clipboard, and
+/// base64 makes the wire form ~1.34x larger, so the capacity is sized on the
+/// encoded size (see [`DEFAULT_BURST_BYTES`]). It used to be sized on the
+/// decoded one, which turned a 50 KiB clipboard into silence.
 ///
 /// [`MAX_OSC52_QUERY_RESPONSE_BYTES`]: super::MAX_OSC52_QUERY_RESPONSE_BYTES
 #[derive(Debug, Clone)]

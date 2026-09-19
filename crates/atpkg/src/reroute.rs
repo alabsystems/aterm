@@ -95,6 +95,18 @@ use crate::store::Layout;
 /// Exported by the spawn seams: the absolute reroute directory of THIS session,
 /// so the shell integration can re-assert it first after rc files ran.
 pub const REROUTE_DIR_ENV: &str = "ATERM_REROUTE_DIR";
+/// Exported by the FRONT DOOR (`crates/aterm/src/main.rs`) to a TTY session: the
+/// absolute managed `<prefix>/agents/` ([`Layout::agents_dir`]), ensured to exist, on
+/// EVERY lane — engaged reroute or not (2026-09-18, closing the R3 residual of
+/// 2026-09-16: the session derived the directory as `$ATERM_REROUTE_DIR`'s sibling,
+/// so `--no-reroute` / [`NO_REROUTE_ENV`] — the escape hatch for the UPSTREAM RUST
+/// NAMES — also dropped the managed `claude`/`codex` front-insert). Absent or EMPTY
+/// means none. Deliberately NOT `ATPKG_AGENTS`: that is the name the shell hook
+/// exports ([`crate::hooks`]) and the shell integration keys its hook-sourcing on it
+/// being unset, so a seam-exported `ATPKG_AGENTS` would stop a tab from ever sourcing
+/// the hook. The shell integration must never read THIS variable either — it is a
+/// launcher→session handoff, nothing more.
+pub const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 /// The one escape hatch (philosophy §4): engaged ⇒ every upstream tool is
 /// restored. Also what an escaped upstream child inherits, so its own spawns
 /// pass silently.
@@ -1404,6 +1416,17 @@ mod tests {
     /// Run `cmd`, killing it after `secs` — an exec loop must fail this test,
     /// not hang it.
     #[cfg(unix)]
+    /// The CPU time a pid has consumed, as `ps` spells it, or `None` when `ps`
+    /// cannot answer. Read ONLY to describe a timeout — never to decide one.
+    fn child_cpu_time(pid: u32) -> Option<String> {
+        let out = std::process::Command::new("/bin/ps")
+            .args(["-o", "time=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!t.is_empty()).then_some(t)
+    }
+
     fn output_within(mut cmd: std::process::Command, secs: u64) -> std::process::Output {
         use std::io::Read as _;
         let mut child = cmd
@@ -1435,8 +1458,31 @@ mod tests {
                 };
             }
             if std::time::Instant::now() > deadline {
+                // A BOUND ON OUR PATIENCE IS NOT A FACT ABOUT THE STUB.
+                //
+                // This used to panic with "an exec loop" — a diagnosis nothing
+                // here had measured. The bound is 5 s by default, and the two
+                // things that exhaust it are NOT alike: an exec loop replaces
+                // the image in the SAME pid over and over and burns CPU, while
+                // a stub the test has just written can sit at ~0% CPU for
+                // seconds while macOS `syspolicyd` assesses it under load (a
+                // recorded hazard on this machine). Calling the second one an
+                // exec loop sends the reader hunting a bug that is not there.
+                //
+                // So the pid is ASKED before it is killed. `ps -o time=` is the
+                // CPU the process has actually consumed; it is the one cheap
+                // measurement that separates spinning from blocked.
+                let burned = child_cpu_time(child.id());
                 let _ = child.kill();
-                panic!("stub did not exit within {secs}s — an exec loop");
+                let _ = child.wait();
+                panic!(
+                    "stub did not exit within {secs}s (cpu {}). Spinning CPU means an exec \
+                     loop — the defect this test is about. Near-zero CPU means it is \
+                     BLOCKED, not looping: on macOS the usual cause is Gatekeeper assessing \
+                     a script this test wrote moments ago, which says nothing about the \
+                     reroute. Re-run this test alone before believing the first reading.",
+                    burned.as_deref().unwrap_or("unknown")
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -1485,7 +1531,11 @@ mod tests {
             cmd.args(["build"])
                 .env("PATH", &path_env)
                 .env(NO_REROUTE_ENV, "1");
-            let out = output_within(cmd, 5);
+            // 60 s, not 5: the bound's only job is to tell "wedged" from
+            // "slow", and an exec loop never finishes, so a longer wait costs
+            // this test nothing when it is right and removes nearly all of the
+            // window in which a loaded machine can be accused of one.
+            let out = output_within(cmd, 60);
             assert_eq!(
                 out.status.code(),
                 Some(0),

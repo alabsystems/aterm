@@ -32,7 +32,12 @@ loc_method = "rs-physical-all-files-v1"
 graph_method = "cargo-tree-normal-no-dedupe-locked-offline-v1"
 # The measurement matrix: resolution needs no toolchain, so every cell is mandatory and
 # offline. A cell that cannot resolve is named and skipped, never passed.
-# EVERY CELL IS ROOTED AT SOMETHING ATERM SHIPS FOR THAT TARGET. The three native cells
+# ALL SIX SHIPPED TRIPLES ARE CELLS since 2026-09-18: `atpkg::manifest::TARGETS` names six
+# targets the index can serve, and three of them -- x86_64-apple-darwin, aarch64-unknown-linux-gnu
+# and aarch64-pc-windows-msvc -- had no cell here or in `xtask gate cells` at all, so nothing
+# ever measured or compiled them. crates/atpkg/tests/shipped_triples_have_a_compile_cell.rs is
+# the standing law that keeps the two lists in step.
+# EVERY CELL IS ROOTED AT SOMETHING ATERM SHIPS FOR THAT TARGET. The six native cells
 # are rooted at the `aterm` binary. The two wasm cells are NOT, and the correction is
 # recorded here because this file is the record: `aterm` is a [[bin]]
 # (crates/aterm/Cargo.toml) that nothing compiles for wasm32, and until 2026-08-30 the
@@ -52,6 +57,9 @@ cells = [
     { name = "win", triple = "x86_64-pc-windows-msvc", package = "aterm" },
     { name = "wasm-cpu", triple = "wasm32-unknown-unknown", package = "aterm-wasm" },
     { name = "wasm-gpu", triple = "wasm32-unknown-unknown", package = "aterm-gpu-web" },
+    { name = "mac-x64", triple = "x86_64-apple-darwin", package = "aterm" },
+    { name = "linux-arm", triple = "aarch64-unknown-linux-gnu", package = "aterm" },
+    { name = "win-arm", triple = "aarch64-pc-windows-msvc", package = "aterm" },
 ]
 
 # --- winit 0.30.13 ------------------------------------------------------------

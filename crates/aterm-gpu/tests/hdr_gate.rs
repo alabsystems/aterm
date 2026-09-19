@@ -19,7 +19,16 @@
 //!   we don't sample: every 2^3 Attach→Present chain AND every 2^3 raw plan
 //!   input (covering the live config-flip states where the surface format no
 //!   longer matches the config) is enumerated — a complete proof for the real
-//!   code, with non-vacuity controls.
+//!   code, with non-vacuity controls. On the shipped macOS Metal arm
+//!   (`cfg(not(wgpu_arm))`) `create_window_surface` reaches the Attach
+//!   function through [`aterm_gpu::hdr_swapchain_wants_f16_on_screen`], which
+//!   narrows it by the screen's EDR potential and never widens it — its result
+//!   implies `hdr_swapchain_wants_f16` for every input
+//!   (`metal_attach_pick_is_the_proven_gate_narrowed_by_the_screen`), so the
+//!   enumeration here bounds everything the Metal attach can pick; the live
+//!   screen re-pick (`GpuRenderer::upgrade_surface_for_screen`, gated
+//!   by [`aterm_gpu::hdr_screen_upgrade_wants_f16`]) sits inside that gate
+//!   again (`metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence`).
 //!
 //! ## On-GPU clamp laws (the float pipeline)
 //!
@@ -37,7 +46,8 @@
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{
     GpuRenderer, HdrReconfigurePlan, WindowGpu, hdr_live_upgrade_wants_f16, hdr_present_plan,
-    hdr_reconfigure_plan, hdr_swapchain_wants_f16,
+    hdr_reconfigure_plan, hdr_screen_upgrade_wants_f16, hdr_swapchain_wants_f16,
+    hdr_swapchain_wants_f16_on_screen,
 };
 use aterm_render::{GlowQuad, RenderInput, hdr, premul_rgb};
 use aterm_spec::derive::hdr_reconfigure_retag_model;
@@ -1194,5 +1204,195 @@ fn an_sdr_panel_is_byte_identical() {
         (factor(bar) - 1.0).abs() <= 1e-2,
         "a coloured mark must stay at reference emission (factor {})",
         factor(bar)
+    );
+}
+
+/// The macOS Metal arm's attach consults the SCREEN: the f16 pick is the
+/// proven gate narrowed by `NSScreen.maximumPotentialExtendedDynamicRange‑
+/// ColorComponentValue`, so a window on an SDR-only screen gets the 8-bit
+/// swapchain, which draws the SDR glow-boost crown there, instead of an f16
+/// one that draws no crown there at all (no headroom for the aurora, and
+/// `sdr_boost_pass` is off on f16) at ~2x the full-frame blit's GPU time and
+/// drawable memory (measured on a 2017 Intel MacBook Pro). The
+/// Tier-1 chain above stays complete because the screen gate IMPLIES the
+/// proven gate for every input; the source scan pins that the shipping attach
+/// really routes through it and resolves the screen off the SAME handle as
+/// the parent layer (before `target` is moved).
+#[test]
+fn metal_attach_pick_is_the_proven_gate_narrowed_by_the_screen() {
+    for (hdr_glow, supports_f16, _) in all_inputs() {
+        for potential in [None, Some(1.0), Some(2.0), Some(16.0), Some(f32::NAN)] {
+            let on_screen = hdr_swapchain_wants_f16_on_screen(hdr_glow, supports_f16, potential);
+            assert!(
+                !on_screen || hdr_swapchain_wants_f16(hdr_glow, supports_f16),
+                "({hdr_glow},{supports_f16},{potential:?}): the screen gate must only narrow"
+            );
+            let plan = hdr_present_plan(hdr_glow, on_screen, true);
+            assert_eq!(
+                plan.blit_linear_encode, on_screen,
+                "the encode follows the surface"
+            );
+        }
+    }
+    // The load-bearing narrowing, once: an SDR screen (potential 1.0) takes the
+    // 8-bit pick away from the fully opted-in, f16-capable corner.
+    assert!(hdr_swapchain_wants_f16(true, true));
+    assert!(!hdr_swapchain_wants_f16_on_screen(true, true, Some(1.0)));
+
+    let attach = include_str!("../src/renderer.rs")
+        .split_once("    pub fn create_window_surface<W: WindowTarget>(")
+        .expect("create_window_surface must remain present")
+        .1
+        .split_once("    fn create_window_surface_wgpu<W: WindowTarget>(")
+        .expect("the wgpu attach must follow the Metal attach")
+        .0;
+    let resolve = attach
+        .find("crate::metal::present::screen_edr_potential_of(&target)")
+        .expect("the Metal attach must resolve the screen's EDR potential off the target");
+    let pick = attach
+        .find("crate::format_plan::hdr_swapchain_wants_f16_on_screen(")
+        .expect("the Metal attach must pick the format through the screen gate");
+    assert!(
+        resolve < pick,
+        "the screen must be resolved before the pick (and before `target` is moved)"
+    );
+}
+
+/// The LIVE half of the screen gate: a window that attached 8-bit because its
+/// screen could not show EDR is re-picked from the frontend's monitor-change
+/// hook and its throttled headroom re-query
+/// (`GpuRenderer::upgrade_surface_for_screen`). Its decision,
+/// `hdr_screen_upgrade_wants_f16`, sits INSIDE the attach gate for every
+/// input — upgrade ⇒ on-screen pick ⇒ proven gate — so the Tier-1 enumeration
+/// above still bounds everything a live window can hold; and it rides only on
+/// a positive answer (an unresolved screen upgrades nothing, where the
+/// attach's `None` keeps the unconditional pick). The source scan pins that
+/// the renderer's upgrade routes through that function, resolves the screen
+/// with the SAME reader the attach uses, moves exactly the retained format
+/// the Metal present's reconcile reads, flips the LIVE layer through that
+/// reconcile (off the present's own `want` derivation) BEFORE the capture
+/// metadata is promoted — so the frontend's scRGB tag, replayed on `true`,
+/// never lands on a layer still holding 8-bit sRGB — reads the format the
+/// layer then holds rather than trusting `Ok` (a drawable acquisition in
+/// flight on the surface's worker defers the reconfigure), and reverts the
+/// retained format when the flip is refused or deferred. It also pins that
+/// the proven gate is checked BEFORE the screen is read: the throttled
+/// re-query calls the re-pick for every 8-bit GPU window, and one that can
+/// never upgrade must not cross into AppKit.
+#[test]
+fn metal_monitor_change_upgrade_is_the_attach_gate_on_positive_evidence() {
+    for (hdr_glow, supports_f16, _) in all_inputs() {
+        for swapchain_is_f16 in [false, true] {
+            for potential in [None, Some(1.0), Some(2.0), Some(16.0), Some(f32::NAN)] {
+                let upgrade = hdr_screen_upgrade_wants_f16(
+                    hdr_glow,
+                    supports_f16,
+                    swapchain_is_f16,
+                    potential,
+                );
+                assert!(
+                    !upgrade
+                        || hdr_swapchain_wants_f16_on_screen(hdr_glow, supports_f16, potential),
+                    "({hdr_glow},{supports_f16},{swapchain_is_f16},{potential:?}): \
+                     the upgrade must sit inside the attach gate"
+                );
+                assert!(
+                    !upgrade || hdr_swapchain_wants_f16(hdr_glow, supports_f16),
+                    "({hdr_glow},{supports_f16},{swapchain_is_f16},{potential:?}): \
+                     the upgrade must sit inside the proven gate"
+                );
+                assert!(
+                    !upgrade || potential.is_some(),
+                    "({hdr_glow},{supports_f16},{swapchain_is_f16}): an unresolved screen \
+                     is not evidence"
+                );
+                // After an upgrade the per-frame plan follows the NEW surface.
+                let now_f16 = swapchain_is_f16 || upgrade;
+                let plan = hdr_present_plan(hdr_glow, now_f16, true);
+                assert_eq!(
+                    plan.blit_linear_encode, now_f16,
+                    "the encode follows the surface"
+                );
+            }
+        }
+    }
+    // The load-bearing widening, once: an EDR screen (potential 2.0) lights an
+    // opted-in 8-bit window; the same window on no resolvable screen stays.
+    assert!(hdr_screen_upgrade_wants_f16(true, true, false, Some(2.0)));
+    assert!(!hdr_screen_upgrade_wants_f16(true, true, false, None));
+
+    let src = include_str!("../src/renderer.rs");
+    let body = src
+        .split_once("    pub fn upgrade_surface_for_screen<W: raw_window_handle::HasWindowHandle>(")
+        .expect("the live re-pick must remain present")
+        .1
+        .split_once("\n    }\n")
+        .expect("the live re-pick must close")
+        .0;
+    let resolve = body
+        .find("crate::metal::present::screen_edr_potential_of(target)")
+        .expect("the re-pick must resolve the screen with the attach's reader");
+    let gate = body
+        .find("crate::format_plan::hdr_screen_upgrade_wants_f16(")
+        .expect("the re-pick must decide through the pure upgrade gate");
+    assert!(
+        resolve < gate,
+        "the screen must be resolved before the decision"
+    );
+    let cheap = body
+        .find("hdr_swapchain_wants_f16(self.hdr_glow, surf.supports_f16)")
+        .expect("the re-pick must consult the proven gate before any AppKit read");
+    assert!(
+        cheap < resolve,
+        "the proven gate must short-circuit before the screen is read: the throttled \
+         re-query calls this for every 8-bit GPU window"
+    );
+    let moved = body
+        .find("surf.neutral.format = crate::device_layer::TexelFormat::Rgba16Float")
+        .expect("the re-pick must move the retained format the Metal present's reconcile reads");
+    let derived = body
+        .find("self.metal_present_want(win, surf)")
+        .expect("the re-pick must derive `want` through the present's own derivation");
+    let flip = body
+        .find("ms.reconcile(&device, &want)")
+        .expect("the re-pick must flip the LIVE layer through the present's reconcile");
+    let promote = body
+        .find("win.apply_hdr_surface_upgrade()")
+        .expect("the capture metadata must be promoted with the format");
+    assert!(
+        gate < moved && moved < derived && derived < flip && flip < promote,
+        "gate, then the retained format moves, then `want` derives off it, then the \
+         layer flips, and only then is the capture metadata promoted"
+    );
+    let revert = body
+        .find("surf.neutral.format = previous")
+        .expect("a refused flip must revert the retained format to what the layer holds");
+    assert!(
+        flip < revert && revert < promote,
+        "the revert sits between the flip and the promotion"
+    );
+    // `Ok` from reconcile is not a flip on its own: with a drawable
+    // acquisition in flight on the surface's worker, reconcile records the
+    // desire and leaves the layer alone. The format the layer holds decides,
+    // and a layer still holding 8-bit takes the revert.
+    let held = body
+        .find("ms.config().format == want.format")
+        .expect("the re-pick must read the format the layer holds, not trust `Ok`");
+    assert!(
+        flip < held && held < revert,
+        "the held-format check follows the reconcile and precedes the revert it feeds"
+    );
+    // The present derives its `want` through the same helper, so the flip the
+    // re-pick performs is the one the next present would otherwise perform.
+    let present = src
+        .split_once("    fn metal_present_input_with_crop(")
+        .expect("the armed present must remain present")
+        .1
+        .split_once("\n    }\n")
+        .expect("the armed present must close")
+        .0;
+    assert!(
+        present.contains("self.metal_present_want(win, surf)"),
+        "the armed present must derive its `want` through the shared helper"
     );
 }

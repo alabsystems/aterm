@@ -3487,6 +3487,13 @@ impl App {
             // through Done. This remains bounded work only on a damaged
             // capture, never a synthetic animation loop.
             let birth = capture_rescan_birth(now, ws.pending_deco_birth.take(), windowless);
+            // A CAPTURE IS A RENDERER, so it declares this snapshot's row
+            // origin for the kitty-command flash exactly as the glass paths
+            // do — immediately before the one rescan that spends it. A
+            // headless instance driven over the control socket rescans ONLY
+            // here, so without this line its flash would never learn that
+            // `sit⏎` scrolled.
+            ws.word_decos.set_scan_base_y(Some(ws.input_scratch.base_y));
             ws.word_decos.rescan_from_cells_with_geom_at_cursor(
                 &ws.input_scratch.cells,
                 &ws.input_scratch.line_sizes,
@@ -5704,6 +5711,10 @@ impl App {
                     image.cols.hash(hash);
                     image.rows.hash(hash);
                     image.z_index.hash(hash);
+                    // Placement POLICY, not just payload: the same raster in the
+                    // same footprint draws differently pixel-exact (sixel,
+                    // un-sized Kitty) than fitted (OSC 1337, Kitty `c=`/`r=`).
+                    image.pixel_exact.hash(hash);
                     image.bytes.hash(hash);
                 }
             }

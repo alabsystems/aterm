@@ -29,10 +29,22 @@
 //!
 //! Matches are positions used to paint a render-time overlay. They never alter
 //! terminal state, copied text, or recordings.
+//!
+//! # The kitty-command vocabulary is a SEPARATE table
+//!
+//! [`tricks`] holds the words a person types TO the cursor pet (`sit`, `nap`,
+//! `good kitty`). They are ordinary verbs that fill every build log, so they
+//! are deliberately NOT a [`Class`] here: the screen scanner never sees them.
+//! Only the typed-line listener asks, one token at a time
+//! ([`TrickLexicon::classify`]).
 
 mod fold;
+pub mod tricks;
 
-pub use fold::{fold, fold_into, has_foldable_marks, is_no_space_script, is_token_char};
+pub use fold::{
+    fold, fold_into, has_foldable_marks, is_code_adjacent_punct, is_no_space_script, is_token_char,
+};
+pub use tricks::{RowKind, Trick, TrickLexicon, TrickRole, TrickRow};
 
 use aterm_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;

@@ -457,6 +457,68 @@ fn key_token(word: &str) -> Option<KeyToken> {
     Some(KeyToken::Named(named))
 }
 
+/// The ASCII punctuation a US/UK layout composes with SHIFT, and which
+/// therefore never appears as a chord's key.
+///
+/// [`Chord::from_event`] matches on `key_without_modifiers()` — the UNSHIFTED
+/// layout key — deliberately, so a binding written as the base key still fires
+/// when the OS composed a different glyph. The config side accepts whatever
+/// single character the user typed. The two halves therefore normalise on ONE
+/// side only: `"ctrl+shift+?"` parses to `Char('?')`, a live press produces
+/// `Char('/')`, and the row is a permanent no-op that the loader accepted with
+/// no warning, `--validate-config` called green, and `--list-keybinds` printed
+/// like any other binding.
+///
+/// This is a CAUTION, not a verdict, and the wording says so: on a layout where
+/// one of these is a base key the binding works, and aterm cannot know the
+/// user's layout when it reads the config. What it can do is stop being silent.
+const SHIFT_COMPOSED_ASCII: &[char] = &[
+    '~', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '{', '}', '|', ':', '"', '<', '>',
+    '?',
+];
+
+/// The base-key spelling of a shift-composed glyph on a US layout, for the
+/// caution's "write it as" half — a warning that only says "this may not work"
+/// is barely better than silence.
+#[must_use]
+pub fn unshifted_us_spelling(c: char) -> Option<char> {
+    let pairs = [
+        ('~', '`'),
+        ('!', '1'),
+        ('@', '2'),
+        ('#', '3'),
+        ('$', '4'),
+        ('%', '5'),
+        ('^', '6'),
+        ('&', '7'),
+        ('*', '8'),
+        ('(', '9'),
+        (')', '0'),
+        ('_', '-'),
+        ('{', '['),
+        ('}', ']'),
+        ('|', '\\'),
+        (':', ';'),
+        ('"', '\''),
+        ('<', ','),
+        ('>', '.'),
+        ('?', '/'),
+    ];
+    pairs
+        .iter()
+        .find_map(|(shifted, base)| (*shifted == c).then_some(*base))
+}
+
+/// Whether `chord` names a key that a live press can never produce on a
+/// US/UK layout — see [`SHIFT_COMPOSED_ASCII`]. Returns the offending glyph.
+#[must_use]
+pub fn shift_composed_key(chord: &Chord) -> Option<char> {
+    match chord.key {
+        KeyToken::Char(c) if SHIFT_COMPOSED_ASCII.contains(&c) => Some(c),
+        _ => None,
+    }
+}
+
 impl Chord {
     /// Parse a chord STRING (the key side of a `[keybindings]` entry), e.g.
     /// `"cmd+shift+t"` or `"ctrl+a"`. Segments are split on `+`, lowercased, and

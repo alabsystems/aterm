@@ -7641,6 +7641,13 @@ mod inbox_hold {
             ),
             ("sessions", "the roster; a read in Owner clothing"),
             ("exits", "the exit ledger; a read in Owner clothing"),
+            (
+                "identities",
+                "lists the agent identities on disk, and `forget` removes one such \
+                 DIRECTORY — never a session: it is refused while any live session \
+                 carries the identity, so it puts no bytes on a PTY and retires \
+                 nothing a halt governs",
+            ),
             ("whoami", "reports this connection's own scope"),
             (
                 "grant",

@@ -58,7 +58,10 @@ pub fn human_bytes(n: u64) -> String {
 ///    exactly the dyadic rational `mant / 2^(k - exp)`.
 /// 3. `{:.1}` cuts the exact decimal expansion at one fractional digit, rounding
 ///    to nearest with ties to even on the kept tenths digit (`flt2dec` exact
-///    mode; verified against `format!` in `one_decimal_matches_format`).
+///    mode; verified against `format!` over a case table that includes both
+///    decimal ties and both sides of 2^53, in `human_bytes_matches_float_format`, this
+///    module's only oracle test. It never was `one_decimal_matches_format`,
+///    which this line named and which is defined nowhere in the tree.)
 ///
 /// All shifts are `wrapping_*` (total, no panic obligations); shift amounts are
 /// in-range on every reachable input, as argued inline.

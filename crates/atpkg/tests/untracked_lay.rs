@@ -296,14 +296,35 @@ fn a_clean_identical_pending_stub_is_left_alone_and_a_tagged_one_is_re_laid() {
         "the in-process rewrite carries the tag exactly when this process is tracked"
     );
     if tracked {
-        // Byte-identical NOW, and tagged: re-laid all the same.
-        write_pending_stub_kind(&layout, &tool, StubKind::Extra).expect("a tagged stub re-lays");
-        assert_ne!(
-            ino(&shim),
-            extra_ino,
-            "a tagged stub is re-laid even byte-identical, so the untracked lane can put a \
-             clean file there"
-        );
+        // Byte-identical NOW, and tagged: re-laid only when a lay from THIS process would
+        // come back clean (`08faa0245`). This binary is not `atpkg`/`aterm`, so it has no
+        // lane at all and its own writes land tagged — re-laying would clear nothing and
+        // repeat for ever, so the stub is LEFT ALONE. Measured rather than assumed, both
+        // because the rule reads this and because a future lane here must move the
+        // assertion, not go unnoticed: on a provenance-tracked Intel Mac (2026-09-17) this
+        // case asserted the pre-08faa0245 outcome and failed with the inode unchanged.
+        let clean_lay = atpkg::lay::lay_clears_provenance();
+        write_pending_stub_kind(&layout, &tool, StubKind::Extra)
+            .expect("a pass over a tagged identical stub still succeeds");
+        if clean_lay {
+            assert_ne!(
+                ino(&shim),
+                extra_ino,
+                "a tagged stub a lay of ours would clean is re-laid even byte-identical, so \
+                 the untracked lane can put a clean file there"
+            );
+        } else {
+            assert_eq!(
+                ino(&shim),
+                extra_ino,
+                "no lay of ours can clear this tag, so a re-lay would land tagged again: the \
+                 byte-identical stub is left alone"
+            );
+            assert!(
+                carries_provenance(&shim),
+                "left alone means the tag is still there — the state the lane exists to repair"
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(&d);
 }

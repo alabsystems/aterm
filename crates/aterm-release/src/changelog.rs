@@ -280,7 +280,13 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
 pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
     // Sizes are ballpark labels for a reader scanning the asset list, not
     // records (the `.sha256` sidecars are the records).
-    format!(
+    //
+    // THE BOUND IS TAKEN ON THE WHOLE DOCUMENT, not on `changelog_body` alone:
+    // the preamble is ~1.3 KB that the POST carries too, so bounding the body
+    // and then prefixing the preamble yields a document OVER the limit by the
+    // preamble's length — which is what the POST would then have to cut a
+    // second time. One bound, over exactly the bytes that get posted.
+    bound_release_body(&format!(
         "**aterm** is the terminal for AI. New here? What each file is:\n\
          \n\
          - `aterm-{version}.dmg` — the signed, notarized app as a drag-install DMG \
@@ -298,8 +304,245 @@ pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
          \n\
          ---\n\
          \n\
-         {changelog_body}\n"
-    )
+         {body}\n",
+        body = changelog_body,
+    ))
+}
+
+/// **GITHUB REFUSES A RELEASE BODY OVER THIS**, in characters, and says so only
+/// as an opaque `422` on the create POST.
+///
+/// Measured 2026-09-17, when the v0.87.0 cut failed at the draft step with
+/// `curl: (22) … error: 422` and nothing else to read. The tag was valid, the
+/// target commit was on the remote, and the identical request with a SHORT body
+/// succeeded — the only difference was the body, at 225,061 bytes. The rolled
+/// section is pasted verbatim, and it has been growing: 30 KB at v0.84.0,
+/// 52 KB at v0.85.0, 141 KB at v0.86.0, 225 KB here. v0.86.0's cut hit the same
+/// refusal and it was recorded as "transient GitHub convergence"; it was not
+/// transient, it was this, one release earlier.
+///
+/// COMPARED AGAINST [`github_length`], which counts UTF-16 code units — the
+/// safe reading of "characters" for an API that speaks JSON. It was compared
+/// against BYTES until the boundary panic below was found: bytes are merely
+/// conservative (UTF-8 never spends fewer bytes than characters, so nothing
+/// over-long could slip through) but they cut notes GitHub would have taken,
+/// and a byte budget cannot serve as a slice index at all. `publish.rs` reads
+/// this too: the bound is taken at the POST as well as at the write, and a 422
+/// is diagnosed against it.
+pub const GITHUB_RELEASE_BODY_LIMIT: usize = 125_000;
+
+/// What GitHub is counting when it says "maximum is 125000 characters".
+///
+/// NOT bytes: the first cut of this bound measured `str::len()`, which is
+/// merely conservative on a body of prose (every non-ASCII character costs
+/// more than it scores) but is wrong in the direction that matters — it cut
+/// notes GitHub would have taken. And a raw byte budget cannot be used as a
+/// slice index at all: `&body[..124_767]` PANICS when that byte is in the
+/// middle of an em dash, which this repo's changelog is full of.
+///
+/// UTF-16 code units are the safe reading of "characters" for an API that
+/// speaks JSON: it equals the scalar count for everything in the BMP and
+/// counts an astral scalar (an emoji) as the surrogate pair a UTF-16 counter
+/// sees. Where the two readings differ this one is the larger, so a body that
+/// passes here passes under either.
+fn github_length(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// The changelog body as GitHub will accept it: verbatim when it fits, and
+/// otherwise cut at the last SECTION BOUNDARY that does, with a pointer to the
+/// full text in the repository.
+///
+/// Cutting at a boundary rather than a character count is the point — a release
+/// body that ends mid-sentence reads as corruption, and a reader cannot tell a
+/// truncation from a bug. The tail names what was dropped and where to read it,
+/// so the body is honest about being partial.
+///
+/// IDEMPOTENT, and that is load-bearing: `publish.rs` bounds again at the POST,
+/// over a file this function already wrote. A body within the limit is returned
+/// verbatim, so the second application changes nothing — otherwise every
+/// resumed cut would saw another section off its own notes.
+#[must_use]
+pub fn bound_release_body(body: &str) -> String {
+    if github_length(body) <= GITHUB_RELEASE_BODY_LIMIT {
+        return body.to_string();
+    }
+    let tail = "\n\n---\n\n*These notes were longer than GitHub accepts in a release body \
+                (125,000 characters). The entries above are complete as far as they go; the \
+                rest of this release's changelog is in `CHANGELOG.md` in the source tree at \
+                this tag.*\n";
+    let budget_units = GITHUB_RELEASE_BODY_LIMIT.saturating_sub(github_length(tail));
+    // Walk to the byte index that spends the budget. `char_indices` only ever
+    // yields a boundary, so every index below is a legal slice point — the
+    // panic the byte budget could reach is unreachable by construction.
+    let mut budget = body.len();
+    let mut spent = 0usize;
+    for (at, ch) in body.char_indices() {
+        if spent + ch.len_utf16() > budget_units {
+            budget = at;
+            break;
+        }
+        spent += ch.len_utf16();
+    }
+    // The last section heading that still fits, so the body ends on a whole
+    // entry. `rfind` returns the index OF the newline, itself a boundary.
+    let head = &body[..budget];
+    let cut = head
+        .rfind("\n### ")
+        .or_else(|| head.rfind("\n## "))
+        .unwrap_or(budget);
+    format!("{}{tail}", &body[..cut])
+}
+
+#[cfg(test)]
+mod release_body_bound_tests {
+    use super::{GITHUB_RELEASE_BODY_LIMIT, bound_release_body, release_notes_document};
+
+    /// **A BODY THAT FITS IS VERBATIM**, to the byte — the bound must not touch
+    /// the ordinary release.
+    #[test]
+    fn a_body_within_the_limit_is_returned_unchanged() {
+        let body = "### Added\n\n- a thing\n\n### Fixed\n\n- another\n";
+        assert_eq!(bound_release_body(body), body);
+    }
+
+    /// **AND ONE THAT DOES NOT FIT ENDS ON A WHOLE ENTRY**, under the limit,
+    /// saying so.
+    ///
+    /// THE TWIN: return `body.to_string()` unconditionally and the length
+    /// assertion goes red — which is exactly what shipped until 2026-09-17, and
+    /// what made the v0.87.0 draft POST fail with an opaque `422` at 225,061
+    /// bytes (and v0.86.0's before it, at 141 KB, misrecorded as transient).
+    #[test]
+    fn an_oversized_body_is_cut_at_a_section_and_says_it_was() {
+        let entry = "### Section\n\n- an entry long enough to matter, repeated to overflow\n\n";
+        let body = entry.repeat(4000);
+        assert!(
+            body.len() > GITHUB_RELEASE_BODY_LIMIT,
+            "fixture must actually overflow: {} bytes",
+            body.len()
+        );
+        let bounded = bound_release_body(&body);
+        assert!(
+            bounded.len() <= GITHUB_RELEASE_BODY_LIMIT,
+            "bounded body is still {} bytes, over the {GITHUB_RELEASE_BODY_LIMIT} GitHub takes",
+            bounded.len()
+        );
+        assert!(
+            bounded.contains("longer than GitHub accepts"),
+            "a truncated body must say it is truncated, or it reads as corruption"
+        );
+        // It ends on a section boundary, not mid-sentence.
+        let kept = bounded
+            .split("\n\n---\n\n*These notes")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            kept.ends_with("\n\n") || kept.ends_with('\n'),
+            "the kept text must end on a whole entry"
+        );
+    }
+
+    /// **THE BUDGET INDEX LANDS INSIDE A CHARACTER AND NOTHING PANICS.**
+    ///
+    /// The first cut of this bound sliced `&body[..budget]` at a raw byte
+    /// count. `&str` indexing panics off a char boundary, so a release whose
+    /// notes happened to carry a multi-byte character across that one index
+    /// would have aborted the cut — in the POST path, after the claim.
+    ///
+    /// THE TWIN: restore the byte slice and this goes from green to a panic,
+    /// which is why the fixture pads with a single ASCII run and then lays em
+    /// dashes across the whole budget neighbourhood rather than trusting one
+    /// guessed offset.
+    #[test]
+    fn a_cut_that_falls_inside_a_character_does_not_panic() {
+        for pad in 0..8usize {
+            // Em dashes are 3 bytes and 1 UTF-16 unit, so the byte index the
+            // old code computed drifts off a boundary for most `pad` values.
+            let body = format!(
+                "### Section\n\n{}{}\n",
+                "a".repeat(pad),
+                "—x".repeat(GITHUB_RELEASE_BODY_LIMIT)
+            );
+            let bounded = bound_release_body(&body);
+            assert!(
+                super::github_length(&bounded) <= GITHUB_RELEASE_BODY_LIMIT,
+                "pad {pad}: bounded body is {} units",
+                super::github_length(&bounded)
+            );
+        }
+    }
+
+    /// **THE LIMIT IS COUNTED THE WAY GITHUB COUNTS IT.** A body of em dashes
+    /// is three times its character count in bytes; bounding on bytes would
+    /// throw away roughly two thirds of notes GitHub would have accepted.
+    #[test]
+    fn the_limit_counts_characters_not_bytes() {
+        let body = "—".repeat(GITHUB_RELEASE_BODY_LIMIT - 1);
+        assert!(
+            body.len() > GITHUB_RELEASE_BODY_LIMIT,
+            "fixture must overflow a BYTE budget: {} bytes",
+            body.len()
+        );
+        assert_eq!(
+            bound_release_body(&body),
+            body,
+            "a body inside the character limit must survive whole"
+        );
+    }
+
+    /// **BOUNDING TWICE CHANGES NOTHING.** The POST bounds what it reads from
+    /// disk, and that file was already bounded when this binary wrote it — so
+    /// the second application has to be a no-op or every resumed cut would
+    /// saw another section off its own notes.
+    #[test]
+    fn bounding_an_already_bounded_body_is_a_no_op() {
+        let body = "### Section\n\n- entry\n\n".repeat(20_000);
+        let once = bound_release_body(&body);
+        let twice = bound_release_body(&once);
+        assert_eq!(once, twice, "the bound must be idempotent");
+    }
+
+    /// The WHOLE document — preamble plus body — also lands under the limit,
+    /// because the preamble is what the POST carries too.
+    ///
+    /// EXACTLY the limit, with no slack: bounding `changelog_body` alone left
+    /// the assembled document over by the preamble's ~1.3 KB, and this
+    /// assertion used to have to allow `+ 2_000` to pass. That slack WAS the
+    /// defect — GitHub counts the document, not the section inside it.
+    #[test]
+    fn the_assembled_document_fits_what_github_accepts() {
+        let body = "### Section\n\n- entry\n\n".repeat(6000);
+        let doc = release_notes_document("0.87.0", &body);
+        assert!(
+            doc.len() <= GITHUB_RELEASE_BODY_LIMIT,
+            "assembled release notes are {} bytes, over the {GITHUB_RELEASE_BODY_LIMIT} \
+             GitHub takes",
+            doc.len()
+        );
+        assert!(
+            doc.starts_with("**aterm** is the terminal for AI."),
+            "the preamble must survive the bound"
+        );
+    }
+
+    /// **BOUNDING AN ALREADY-BOUNDED BODY IS A NO-OP**, byte for byte.
+    ///
+    /// This is what lets the guard sit at the POST as well as at the write
+    /// without the two fighting: the POST re-bounds whatever it reads off disk
+    /// — a file written by an older binary, a resumed cut, a hand-edited one —
+    /// and a file this binary wrote passes through untouched.
+    #[test]
+    fn bounding_an_already_bounded_body_changes_nothing() {
+        let overflowing = "### Section\n\n- an entry long enough to matter\n\n".repeat(5000);
+        assert!(overflowing.len() > GITHUB_RELEASE_BODY_LIMIT);
+        let once = bound_release_body(&overflowing);
+        let twice = bound_release_body(&once);
+        assert_eq!(once, twice, "the bound is not idempotent");
+        // And the same for the assembled document, which is what dist/notes-*.md holds.
+        let doc = release_notes_document("0.87.0", &overflowing);
+        assert_eq!(doc, bound_release_body(&doc));
+    }
 }
 
 /// Today's date in America/Los_Angeles as `YYYY-MM-DD` — exact parity with

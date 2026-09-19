@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# THIS CRATE IS NOT AT THE WORKSPACE EDITION, and `rustfmt` learns a file's
+# edition from the nearest `rustfmt.toml` — never from `Cargo.toml`. Without
+# this file every spelling of the formatter EXCEPT the gate's own sweep (which
+# reads the manifest: crates/xtask/src/gate.rs `crate_edition`) formats these
+# sources at the workspace's 2024: `trustfmt <path>` by hand, format-on-save,
+# rust-analyzer, and `targo-fmt -- <paths>`. That invents drift the gate does
+# not see and, for a file using `gen` as an identifier, does not parse at all —
+# so the file's real drift is never reported either.
+#
+# `xtask gate lint --fmt-only` compares the two resolutions for every tracked
+# file and fails if they disagree, so this file cannot silently go missing or
+# go stale against the manifest beside it.
+edition = "2021"

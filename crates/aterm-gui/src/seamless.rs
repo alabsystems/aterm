@@ -3247,6 +3247,9 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
                 // number to sort the two cases apart, by the rule above.
                 frozen_path: crate::session_store::predates_path_self_heal(manifest.outgoing_build)
                     || rec.frozen_path,
+                // IDENTITY (session identities, 2026-09-17): the label rides the
+                // record; the shell keeps the identity's env across the exec.
+                identity: rec.identity.clone(),
             })
         })
         .collect::<Option<Vec<_>>>();
@@ -3560,6 +3563,7 @@ mod tests {
                         icon: None,
                         role: None,
                         attention: None,
+                        identity: None,
                     })),
                     focused_path: Vec::new(),
                     zoomed: false,
@@ -4869,6 +4873,7 @@ mod tests {
                 attention: None,
                 control: None,
                 frozen_path: false,
+                identity: None,
             });
             live.push((local_id, master, 4000 + index as i32));
             if let Some(carry) = carry {
@@ -5731,6 +5736,7 @@ mod f4_adoption_proof_asymmetry {
                             icon: None,
                             role: None,
                             attention: None,
+                            identity: None,
                         },
                     ))),
                     second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
@@ -5744,6 +5750,7 @@ mod f4_adoption_proof_asymmetry {
                             icon: None,
                             role: None,
                             attention: None,
+                            identity: None,
                         },
                     ))),
                 },

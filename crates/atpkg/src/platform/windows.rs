@@ -4,8 +4,13 @@
 //! The Windows backend of [`crate::platform`]. Each function is the honest Windows
 //! analogue of the Unix primitive (see the module docs on [`crate::platform`]): a
 //! directory **junction** for the activation indirection, a `.cmd` batch wrapper for
-//! bin shims, per-user `%LOCALAPPDATA%`-ACL privacy (no POSIX mode/owner bits),
-//! `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` + `exit` for exec.
+//! bin shims (and, for the `agents/` twin, the same wrapper behind a `goto`-shaped
+//! landing prelude — [`super::cmd_landing_prelude`], 2026-09-17; every `.cmd` behind
+//! the resume-proof frame [`super::CMD_FRAME_HEAD`], 2026-09-18), per-user
+//! `%LOCALAPPDATA%`-ACL privacy (no POSIX mode/owner bits), `GetDiskFreeSpaceExW` for
+//! free space, `spawn().wait()` + `exit` for exec (behind a console control handler that
+//! leaves Ctrl-C to the child), and `SetConsoleCtrlHandler` for the landing wait's
+//! Ctrl-C ([`add_ctrl_handler`], the `signal(SIGINT, …)` twin; 2026-09-17).
 //!
 //! **This backend has NOT been exercised on a real Windows host.** It is written to be
 //! correct-by-construction; the pure `.cmd` formatting/parsing is unit-tested (on Unix) in
@@ -386,6 +391,13 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
 /// Atomically (best-effort) write `bytes` to `dest`: sibling temp + remove-dest + rename.
 /// Windows `rename` does not replace an existing file, so `dest` is removed first (a brief
 /// non-atomic window, documented — the state files this backs are per-user and serialized).
+///
+/// A `.cmd` shim this replaces may be EXECUTING (2026-09-17): `cmd.exe` runs a batch file
+/// by re-reading it at a remembered byte offset after every line, so what the shim text
+/// does about a re-lay mid-run is the shim's own business — every line that runs a
+/// program ends the batch on that line ([`super::CMD_FORWARD_TAIL`]), and every file
+/// starts with the frame ([`super::CMD_FRAME_HEAD`], 2026-09-18) that a file from
+/// before that tail resumes into harmlessly.
 fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp_name = String::from(".");
@@ -410,8 +422,8 @@ fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Install a bin shim at `shim` (a `.cmd`) forwarding to `target` (`…\<tool>.exe`),
 /// setting `env` first (design S7; an empty `env` is the plain shim — the form without
 /// an environment is [`super::install_shim_to`]).
-/// Fail-closed: refuse a target that could break out of the `@"<target>" %*` quoting
-/// (a `"`/`%`/CR/LF/NUL) rather than write an injectable batch wrapper — a managed
+/// Fail-closed: refuse a target that could break out of the `@"<target>" %* & @exit /b`
+/// quoting (a `"`/`%`/CR/LF/NUL) rather than write an injectable batch wrapper — a managed
 /// store path never contains these, so this only ever rejects a pathological path —
 /// and, the same way, an env entry that could break out of `@set "NAME=VALUE"`
 /// (already refused at manifest parse; this is the I/O site's own refusal).
@@ -468,28 +480,51 @@ pub fn shim_executable_to_env(
     ))
 }
 
-/// The `agents/` twin on Windows is the plain `.cmd` shim: no `sh` prelude exists for
-/// `cmd.exe`, so `prelude` is accepted for the one call site's sake and ignored — the
-/// landing wait ([`crate::landing`]) is a Unix twin's behaviour.
+/// The `agents/` twin on Windows (2026-09-17, residual R4 closed): the `.cmd` shim with
+/// `prelude` — the [`super::cmd_landing_prelude`] the caller rendered — ahead of its
+/// `@set` lines and forward line ([`super::cmd_shim_content_twin`]), so a `claude` typed
+/// while `<prefix>/landing/claude` stands hands over to the embedded co-located
+/// `atpkg __landing` and falls through to the store build when that `atpkg` is gone.
+/// The same two injection refusals as [`shim_executable_to_env`]; the prelude's own
+/// paths were guarded when it was rendered (an unsafe one renders EMPTY, the plain shim).
+/// RENDERED but not written. Unverified on a Windows host, like everything here.
 pub fn twin_executable_to_env(
     shim: &Path,
     target: &Path,
     env: &crate::shim_env::ShimEnv,
     prelude: &str,
 ) -> io::Result<crate::lay::Executable> {
-    let _ = prelude;
-    shim_executable_to_env(shim, target, env)
+    if !super::cmd_target_is_injection_safe(target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to shim an unsafe target path (quote/%/newline): {}",
+                target.display()
+            ),
+        ));
+    }
+    if !super::cmd_env_is_injection_safe(env) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to shim an unsafe shim_env entry (quote/%/newline)",
+        ));
+    }
+    Ok(crate::lay::Executable::new(
+        shim,
+        super::cmd_shim_content_twin(target, env, prelude),
+    ))
 }
 
-/// Lay the `.cmd` twin ([`twin_executable_to_env`]).
+/// Lay the `.cmd` twin ([`twin_executable_to_env`]): the same body, written through
+/// the same temp + remove + rename as every `.cmd` shim.
 pub fn install_twin_to_env(
     shim: &Path,
     target: &Path,
     env: &crate::shim_env::ShimEnv,
     prelude: &str,
 ) -> io::Result<()> {
-    let _ = prelude;
-    install_shim_to_env(shim, target, env)
+    let body = twin_executable_to_env(shim, target, env, prelude)?.body;
+    atomic_write(shim, &body)
 }
 
 /// Install a **failing tombstone shim** at `shim` (a `.cmd`) that prints `message` to
@@ -499,8 +534,9 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
 }
 
 /// Resolve the store/checkout target a `bin/<tool>.cmd` shim forwards to, or `None`.
-/// Parses the batch wrapper's `@"<target>" %*` line — the Windows inverse of `read_link`.
-/// A tombstone `.cmd` (no forward target) yields `None`.
+/// Parses the batch wrapper's `@"<target>" %* & @exit /b` line (or the `@"<target>" %*`
+/// line of a shim laid before 2026-09-17, until it is re-laid) — the Windows inverse of
+/// `read_link`. A tombstone `.cmd` (no forward target) yields `None`.
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
     super::read_cmd_shim_target(shim)
@@ -513,9 +549,88 @@ pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
     super::read_cmd_shim_env(shim)
 }
 
+/// A console control handler: `ctrl_type` is one of the `CTRL_*_EVENT` values; `TRUE`
+/// (non-zero) means "handled, call no further handler", `FALSE` passes the event on to
+/// the next handler and finally to the default one, which ends the process.
+pub type CtrlHandler = unsafe extern "system" fn(ctrl_type: u32) -> i32;
+
+/// `CTRL_C_EVENT`: the user pressed Ctrl-C in the console (or `GenerateConsoleCtrlEvent`).
+pub const CTRL_C_EVENT: u32 = 0;
+/// `CTRL_BREAK_EVENT`: Ctrl-Break, delivered to every process of the console's group.
+pub const CTRL_BREAK_EVENT: u32 = 1;
+
+// The console control seam, declared dependency-free like every Win32 call in this file
+// (std links `kernel32`). A `NULL` routine with `add = TRUE` sets the process's
+// ignore-Ctrl-C FLAG — which CHILDREN INHERIT, so a `claude` spawned under it would
+// never see its own Ctrl-C — which is why every caller here installs a REAL routine:
+// handler routines are per-process and are not inherited.
+unsafe extern "system" {
+    fn SetConsoleCtrlHandler(handler_routine: Option<CtrlHandler>, add: i32) -> i32;
+}
+
+/// Install `handler` at the front of this process's console control handler list — it is
+/// called (on its own thread) for every Ctrl-C / Ctrl-Break / close event until removed by
+/// [`remove_ctrl_handler`]. `false` when the call failed; the caller then has the default
+/// behaviour (the process ends on Ctrl-C), never a wrong claim. The Windows analogue of
+/// `signal(SIGINT, …)` — the seam `cli::cmd_landing` arms for the landing wait's duration
+/// (2026-09-17; unverified on a Windows host).
+pub fn add_ctrl_handler(handler: CtrlHandler) -> bool {
+    // SAFETY: `handler` is a plain `extern "system"` function that lives for the whole
+    // program; kernel32 keeps only its address. No memory of ours is handed over.
+    unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
+}
+
+/// Remove a handler [`add_ctrl_handler`] installed; `false` when it was not installed.
+pub fn remove_ctrl_handler(handler: CtrlHandler) -> bool {
+    // SAFETY: as in `add_ctrl_handler`; removing a routine that is not installed is a
+    // documented failure (`FALSE`), not undefined behaviour.
+    unsafe { SetConsoleCtrlHandler(Some(handler), 0) != 0 }
+}
+
+/// The wrapper's own Ctrl-C handler while a child owns the console: `TRUE` for Ctrl-C and
+/// Ctrl-Break — this process stays alive to collect the child's exit code, the child
+/// (which received the same event from the console) decides what the key means —
+/// `FALSE` for a console close, logoff or shutdown, which end every process of the
+/// console anyway and must not be swallowed.
+unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> i32 {
+    i32::from(matches!(ctrl_type, CTRL_C_EVENT | CTRL_BREAK_EVENT))
+}
+
 /// Run `command` to completion, then `exit` with its code (Windows has no `execve`, so
 /// this cannot replace the process image). Returns the error only if spawn/wait failed.
+/// Stdio is inherited (std's default), so the child owns the terminal exactly as an
+/// `exec`'d image would; the code is the child's REAL one (`exit /b <n>` from a `.cmd`
+/// included), `1` only when the child died with no code.
+///
+/// **Ctrl-C belongs to the child** (2026-09-17, review finding): the console delivers
+/// `CTRL_C_EVENT` to EVERY process attached to it, and a process with no handler ends on
+/// it. Before the spawn this wrapper installs [`swallow_ctrl_c`] — the shape rustup's
+/// proxies and cargo's runners use — so the first Ctrl-C typed inside an agent (which
+/// `claude` treats as "stop this turn", not "exit") no longer kills the wrapper, loses the
+/// exit code and orphans the agent; the child gets the event as before and answers it
+/// its own way. Installed for the rest of this process's life (it ends with the child's
+/// code). NOT the `NULL`-routine ignore flag, which children inherit.
+///
+/// A `.cmd` program (the `bin/<program>.cmd` shim `cli::cmd_landing` runs through here
+/// after the wait) is routed by std through its own `cmd.exe /d /c` lane with batch-safe
+/// quoting — std may refuse arguments it cannot quote safely, the same as for any `.cmd`
+/// shim today. That lane is std's; it shares only the `cmd.exe` binary with
+/// [`atomic_symlink`]'s explicit `cmd /C mklink`, and nothing in this crate has exercised
+/// it. While a batch file is the child, `cmd.exe` itself may ask `Terminate batch job
+/// (Y/N)?` after a Ctrl-C — its own prompt for every `.cmd` shim, in any shell, since
+/// before this lane. And on the landing path there are TWO batch levels, not one
+/// (review, 2026-09-17): the `agents\<program>.cmd` twin the user's shell is running,
+/// and the `bin\<program>.cmd` shim this function spawns through `cmd.exe /d /c` — each
+/// `cmd.exe` that received the Ctrl-C asks its own question once the agent exits, so a
+/// Ctrl-C typed inside the agent (which `claude` treats as "stop this turn" and keeps
+/// running through) can raise the prompt up to TWICE, in turn, when the agent finally
+/// ends — where the plain `bin\` shim asks once. Unverified on a Windows host, like
+/// everything here.
 pub fn exec_or_run(command: &mut Command) -> io::Error {
+    // Best effort: when the install fails the wrapper simply keeps the default
+    // disposition (it ends on Ctrl-C, as it did before 2026-09-17), and the child still
+    // runs — nothing here may stand between the user and the tool.
+    let _ = add_ctrl_handler(swallow_ctrl_c);
     match command.spawn() {
         Ok(mut child) => match child.wait() {
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),

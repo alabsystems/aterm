@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use crate::supervise::limit::tz_offset_s;
+use crate::supervise::run::Resume;
 use crate::supervise::{
     self, ClockAnchor, EXIT_TIMEOUT, LedgerFormat, LedgerHost, LedgerOpts, MailOpts, Mark,
     ReportOpts, Session, SuperviseOpts, TaskOpts, View, classify_command_with, exit_reason,
@@ -322,6 +324,9 @@ struct SubArgs {
     wait: bool,
     /// `task --no-nudge`: the mail alone (a worker with the wake hook).
     no_nudge: bool,
+    /// `watch --resume [RULES]`: `Some(None)` probes the worker after a
+    /// limit's reset, `Some(Some(file))` restates that file's rules too.
+    resume: Option<Option<PathBuf>>,
     /// Positional words (the command text for `classify`, the task's text
     /// for `task`).
     rest: Vec<String>,
@@ -519,6 +524,26 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                     ));
                 }
                 out.deadline_s = Some(int("--deadline", "a seconds integer", it.next())?);
+            }
+            // Only the unattended loop lives through a limit's reset.
+            "--resume" => {
+                if verb != "watch" {
+                    return Err(format!(
+                        "{verb}: --resume is watch's (the loop that stays through a usage \
+                         limit's reset and probes the worker after it)"
+                    ));
+                }
+                // An optional RULES file: the next word, unless it is a flag
+                // or the worker's @sid.
+                let file = it
+                    .clone()
+                    .next()
+                    .filter(|w| !w.starts_with('-') && !w.starts_with('@'))
+                    .map(|w| {
+                        it.next();
+                        PathBuf::from(w)
+                    });
+                out.resume = Some(file);
             }
             "--wait" | "--no-nudge" => {
                 if verb != "task" {
@@ -807,10 +832,14 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             no_positionals(verb, &sub)?;
             let sopts = supervise_opts(&sub);
             mail_needs_sid(verb, &sub)?;
+            let resume = resume_opts(&sub)?;
+            let manager = manager_sid(&sub);
             let reconnect = sub.reconnect_s;
             let mut lane = CtlClient::new(ctl.clone(), opts.socket.clone());
             let mut session = Session::new(&mut client, sub.sid);
             set_reconnect(&mut session, reconnect);
+            session.set_manager(manager);
+            session.set_resume(resume);
             // stdout itself, not its lock: the mail lane's thread prints
             // through the same sink.
             let code = session.watch_mail(
@@ -949,30 +978,6 @@ fn journal_sid(path: Option<&std::path::Path>) -> Option<String> {
     }
 }
 
-/// The local time's offset from UTC in seconds, from `date +%z` (the one
-/// place a zone is read; UTC when it cannot be run).
-fn tz_offset_s() -> i64 {
-    let out = std::process::Command::new("date").arg("+%z").output().ok();
-    let text = out
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    parse_zone(&text).unwrap_or(0)
-}
-
-/// `+hhmm` / `-hh:mm` as seconds.
-fn parse_zone(text: &str) -> Option<i64> {
-    let (sign, rest) = text.split_at(text.find(['+', '-']).filter(|&i| i == 0)? + 1);
-    let digits: String = rest.chars().filter(char::is_ascii_digit).collect();
-    if digits.len() != 4 {
-        return None;
-    }
-    let h: i64 = digits[..2].parse().ok()?;
-    let m: i64 = digits[2..].parse().ok()?;
-    let v = h * 3600 + m * 60;
-    Some(if sign == "-" { -v } else { v })
-}
-
 /// Where the aterm process hosting `sid` started the clock its `history`,
 /// `inbox` and `timeline` stamps count from: the BIRTH TIME of its control
 /// socket, which it binds as it starts (measured on 2026-09-14: within 0.12 s
@@ -1050,6 +1055,40 @@ fn supervise_opts(sub: &SubArgs) -> SuperviseOpts {
     }
 }
 
+/// `watch --resume [RULES]` as the loop takes it: a RULES file named must be
+/// readable NOW (a run that dies on it after two days of waiting is the
+/// wrong time to learn the path was mistyped), and not empty.
+fn resume_opts(sub: &SubArgs) -> Result<Option<Resume>, String> {
+    let Some(rules) = &sub.resume else {
+        return Ok(None);
+    };
+    if let Some(path) = rules {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("watch --resume: cannot read RULES {}: {e}", path.display()))?;
+        if text.trim().is_empty() {
+            return Err(format!(
+                "watch --resume: RULES {} is empty (the file the watcher restates after a limit)",
+                path.display()
+            ));
+        }
+    }
+    Ok(Some(Resume {
+        rules: rules.clone(),
+    }))
+}
+
+/// The manager's session for `watch`'s escalation mail: `--inbox @sid`, else
+/// `@$ATERM_PARENT_SESSION_ID` (the session this terminal is), else none —
+/// the loop then skips the mail and journals why.
+fn manager_sid(sub: &SubArgs) -> Option<String> {
+    sub.inbox.clone().or_else(|| {
+        std::env::var("ATERM_PARENT_SESSION_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("@{}", s.trim()))
+    })
+}
+
 /// `--mail` folds a report only when it is the watched worker's, so the
 /// worker must be named.
 fn mail_needs_sid(verb: &str, sub: &SubArgs) -> Result<(), String> {
@@ -1102,6 +1141,7 @@ fn report_opts(sub: &SubArgs) -> ReportOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervise::limit::parse_zone;
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1220,6 +1260,7 @@ mod tests {
                 allow_python: args(&["tools/*.py", "scripts/*report*.py"]),
                 notes: Some(PathBuf::from("/tmp/notes.txt")),
                 journal: None,
+                resume: None,
                 view: View::All,
                 format: None,
                 out: None,
@@ -1395,6 +1436,88 @@ mod tests {
         assert!(
             err.starts_with("phase: --report-window is watch's and supervise's"),
             "{err}"
+        );
+    }
+
+    /// `watch --resume [RULES]`: watch's alone; the file is the next word
+    /// unless that is a flag or the worker's @sid; the loop gets it only
+    /// when it can be read now, and never empty; the escalation mail's
+    /// address is `--inbox`, else this terminal's own session.
+    #[test]
+    fn resume_is_watchs_and_takes_an_optional_rules_file() {
+        let sub = parse_sub("watch", &args(&["@s-1", "--resume"])).expect("parses");
+        assert_eq!(sub.resume, Some(None));
+        assert_eq!(
+            resume_opts(&sub).expect("no file to read"),
+            Some(Resume { rules: None })
+        );
+        // The file after the flag; a flag or the sid after it is not one.
+        let sub = parse_sub("watch", &args(&["--resume", "rules.md", "@s-1"])).expect("parses");
+        assert_eq!(
+            (sub.resume, sub.sid.as_deref()),
+            (Some(Some(PathBuf::from("rules.md"))), Some("@s-1"))
+        );
+        let sub = parse_sub("watch", &args(&["--resume", "@s-1", "--report"])).expect("parses");
+        assert_eq!(
+            (sub.resume, sub.sid.as_deref(), sub.report),
+            (Some(None), Some("@s-1"), true)
+        );
+        let sub = parse_sub("watch", &args(&["--resume", "--mail", "@s-1"])).expect("parses");
+        assert_eq!((sub.resume, sub.mail), (Some(None), true));
+        let sub = parse_sub("watch", &args(&["@s-1"])).expect("parses");
+        assert_eq!(resume_opts(&sub), Ok(None), "off unless given");
+        assert_eq!(sub.resume, None);
+        for verb in [
+            "supervise",
+            "phase",
+            "await-turn",
+            "report",
+            "task",
+            "ledger",
+        ] {
+            let err = parse_sub(verb, &args(&["--resume"])).expect_err(verb);
+            assert!(
+                err.starts_with(&format!("{verb}: --resume is watch's")),
+                "{err}"
+            );
+        }
+        // The rules file is read at the launch: missing or empty is the error.
+        let dir = std::env::temp_dir().join(format!("aterm-drive-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let missing = dir.join("nope.md");
+        let sub = parse_sub("watch", &args(&["--resume", missing.to_str().unwrap()])).unwrap();
+        let err = resume_opts(&sub).expect_err("missing");
+        assert!(
+            err.starts_with("watch --resume: cannot read RULES"),
+            "{err}"
+        );
+        let empty = dir.join("empty.md");
+        std::fs::write(&empty, "  \n").expect("write");
+        let sub = parse_sub("watch", &args(&["--resume", empty.to_str().unwrap()])).unwrap();
+        let err = resume_opts(&sub).expect_err("empty");
+        assert!(err.contains("is empty"), "{err}");
+        let rules = dir.join("rules.md");
+        std::fs::write(&rules, "1. run nothing heavy\n").expect("write");
+        let sub = parse_sub("watch", &args(&["--resume", rules.to_str().unwrap()])).unwrap();
+        assert_eq!(
+            resume_opts(&sub).expect("readable"),
+            Some(Resume {
+                rules: Some(rules.clone())
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // The manager's address: --inbox first.
+        let sub = parse_sub("watch", &args(&["@s-1", "--inbox", "@s-9"])).unwrap();
+        assert_eq!(manager_sid(&sub).as_deref(), Some("@s-9"));
+        let sub = parse_sub("watch", &args(&["@s-1"])).unwrap();
+        let own = std::env::var("ATERM_PARENT_SESSION_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("@{}", s.trim()));
+        assert_eq!(
+            manager_sid(&sub),
+            own,
+            "this terminal's own session, if any"
         );
     }
 

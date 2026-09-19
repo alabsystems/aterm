@@ -22,7 +22,8 @@
 //! A thin platform driver (raw mode + passthrough loop: `poll(2)`/termios in
 //! `driver_unix`, console events in `driver_windows`) over the PROTECTED spawn
 //! seam. The shell is launched via the [`aterm_pty`] spawn seam — cap-gated,
-//! `setrlimit`-bounded, fail-closed fork/exec, and OS-sandbox-wrapped when the
+//! fail-closed fork/exec, resource-bounded in the confinement modes only
+//! (safety/containment; see `session_limits`), and OS-sandbox-wrapped when the
 //! containment mode demands it (P0) — exactly like `aterm-gui`, NOT raw
 //! `forkpty`/`execvp`. Daily-driver essentials are handled: window resize is
 //! forwarded (SIGWINCH / console resize event -> PTY, and the engine too when
@@ -32,10 +33,13 @@
 //!
 //! Containment mode is launcher-owned (`ATERM_CONTAINMENT_MODE`, ATERM_DESIGN §5):
 //! the default is `User` — no OS sandbox, so the daily-driver shell keeps full
-//! network/credential access and behaves as before, now confined by the cap gate +
-//! resource limits. `ATERM_CONTAINMENT_MODE=containment` opts into the macOS
-//! Seatbelt sandbox (deny network + credential/private-data reads); a malformed
-//! value fails CLOSED to Containment.
+//! network/credential access and behaves as before, confined by the cap gate and
+//! INHERITING the launching shell's `rlimit`s unchanged (the rule `aterm-gui`
+//! applies at its own spawn — see `session_limits`; on Windows, where the same
+//! `Limits` go onto the child's Job Object, that means no job caps); Safety /
+//! Containment keep the hardened caps. `ATERM_CONTAINMENT_MODE=containment` opts into
+//! the macOS Seatbelt sandbox (deny network + credential/private-data reads); a
+//! malformed value fails CLOSED to Containment.
 
 use aterm_core::terminal::Terminal;
 
@@ -91,8 +95,13 @@ const HELP_HEAD: &str = concat!(
     "behaves exactly like your shell. The output is NOT modelled: the host terminal\n",
     "draws the bytes and this process keeps no screen state (ATERM_SESSION_MODEL=1\n",
     "builds the in-process VT model anyway — see ENVIRONMENT). The shell runs through\n",
-    "the PROTECTED spawn seam: cap-gated, setrlimit-bounded, fail-closed, and\n",
-    "OS-sandbox-wrapped when the containment mode demands it.\n",
+    "the PROTECTED spawn seam: cap-gated, fail-closed, resource-bounded in the\n",
+    "confinement modes only (safety/containment; user — the default — and master\n",
+    "install no caps, so on macOS and Linux the shell inherits your shell's limits):\n",
+    "soft setrlimit caps on macOS and Linux (open files 8192; address space 16 GiB\n",
+    "on Linux; hard limits untouched), the child's Job Object on Windows (16 GiB,\n",
+    "512 active processes, UI restrictions). OS-sandbox-wrapped when the containment\n",
+    "mode demands it.\n",
     "\n",
     "A SESSION serves NO control socket — it is not itself introspectable from the\n",
     "outside. The live, introspectable model an AI can read and drive is the WINDOW\n",
@@ -137,6 +146,7 @@ const HELP_HEAD: &str = concat!(
     "    list-fonts                List available font families.\n",
     "    show-face <family>        Show metrics for a font family.\n",
     "    list-themes               List the built-in colour schemes.\n",
+    "    list-kitty-commands       List the words the cursor cat obeys, by language.\n",
     "\n",
 );
 
@@ -453,8 +463,9 @@ const HELP_TAIL: &str = concat!(
     "    aterm                              Start an interactive shell (mode: user).\n",
     "    aterm --sandbox                    Containment mode (macOS: deny network +\n",
     "                                       secret-dir read; Linux today: rlimit +\n",
-    "                                       capability gate only; Windows: capability\n",
-    "                                       gate only — prints a notice).\n",
+    "                                       capability gate only; Windows: Job Object\n",
+    "                                       caps + capability gate, no OS sandbox —\n",
+    "                                       prints a notice).\n",
     "    aterm --containment master         Full-trust developer mode.\n",
     "    ATERM_CONTAINMENT_MODE=safety aterm  Allowlisted-operations mode via env.\n",
 );
@@ -467,7 +478,11 @@ const HELP_TAIL: &str = concat!(
 /// enumerators `list-fonts` / `show-face` / `list-themes` (backed by aterm-render +
 /// aterm-types). `list-keybinds` is deliberately NOT here: keybindings are an
 /// aterm-gui concept; the transparent passthrough binary has no keymap, so it would
-/// belong in aterm-gui, not a false affordance here.
+/// belong in aterm-gui, not a false affordance here. `list-kitty-commands` IS here
+/// although the cursor cat lives in the window: what it prints is the VOCABULARY,
+/// pure data compiled into the one binary (aterm-lexicon's `tricks` table, the same
+/// one the window's typed-line listener compiles), so the listing is true with no
+/// window running — the `list-themes` case, not the `list-keybinds` one.
 ///
 /// This is the SINGLE source of truth: [`diag_report`] must handle every entry
 /// AND [`help_text`] must advertise every entry — both enforced by the
@@ -499,6 +514,10 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
         "list-themes",
         "List the built-in colour schemes and their descriptions.",
     ),
+    (
+        "list-kitty-commands",
+        "List the words the cursor cat obeys when typed (one row per trick and language).",
+    ),
 ];
 
 /// Build the `(report, exit_code)` for diagnostic subcommand `cmd` (with an
@@ -516,6 +535,7 @@ fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
         "list-fonts" => Some((list_fonts_report(), 0)),
         "show-face" => Some(show_face_report(arg)),
         "list-themes" => Some((list_themes_report(), 0)),
+        "list-kitty-commands" => Some((list_kitty_commands_report(), 0)),
         _ => None,
     }
 }
@@ -787,6 +807,26 @@ fn list_themes_report() -> String {
     let mut out = String::from("Built-in colour schemes:\n\n");
     for (name, desc) in aterm_types::scheme::builtin_themes() {
         out.push_str(&format!("{name:<18} {desc}\n"));
+    }
+    out
+}
+
+/// `aterm list-kitty-commands` — every word the cursor cat obeys when it is TYPED
+/// at the terminal, one row per (trick, language), then each language's names
+/// for the pet and its filler words. Data: [`aterm_lexicon::TrickLexicon::all_rows`]
+/// — the embedded vocabulary the window's typed-line listener compiles, every
+/// language, gated rows included (`gated=1` marks a row that loads only when
+/// `[sparkle_words] languages` lists its language).
+///
+/// NO BANNER, like `list-fonts`: every line is one [`aterm_lexicon::tricks::row_line`]
+/// — space-separated `key=value` fields — so `aterm list-kitty-commands | grep
+/// lang=es` is already the language filter and nothing has to skip a heading.
+/// The prose lives on `aterm help kitty`, which prints these same rows.
+pub(crate) fn list_kitty_commands_report() -> String {
+    let mut out = String::new();
+    for row in aterm_lexicon::TrickLexicon::all_rows() {
+        out.push_str(&aterm_lexicon::tricks::row_line(&row));
+        out.push('\n');
     }
     out
 }
@@ -1572,10 +1612,26 @@ fn is_absolute_existing_dir(dir: &str) -> bool {
     !dir.is_empty() && path.is_absolute() && path.is_dir()
 }
 
+/// [`is_absolute_existing_dir`] and not a symlink: the shape the front door's
+/// `$ATERM_AGENTS_DIR` handoff always has (it refuses a link at `agents/`), so a stray
+/// that is one is not the front door's and is not taken.
+fn is_absolute_real_dir(dir: &str) -> bool {
+    is_absolute_existing_dir(dir)
+        && std::fs::symlink_metadata(dir).is_ok_and(|md| !md.file_type().is_symlink())
+}
+
 /// `ATPKG_AGENTS`, atpkg's spelling restated (`atpkg::hooks` exports it from the shell
 /// hook; pinned by `reroute_env_names_match_atpkg`): the managed `<prefix>/agents/` as an
-/// enclosing shell that sourced the hook names it.
-const AGENTS_DIR_ENV: &str = "ATPKG_AGENTS";
+/// enclosing shell that sourced the hook names it. Read here, NEVER exported (the shell
+/// integration keys its hook-sourcing on it being unset).
+const HOOK_AGENTS_ENV: &str = "ATPKG_AGENTS";
+
+/// `atpkg::reroute::AGENTS_DIR_ENV` restated (pinned by `reroute_env_names_match_atpkg`):
+/// the managed `<prefix>/agents/` as THE FRONT DOOR hands it (2026-09-18) — resolved
+/// from the configured store, ensured to exist, absolute — on every lane, engaged
+/// reroute or not. Absent or empty means none. The one handle this lane prefers,
+/// [`managed_agents_dir`]; re-exported to the shell so a nested session reads the same.
+const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 
 /// THE MANAGED `agents/` DIRECTORY A TTY SESSION PUTS IN FRONT OF ITS SHELL'S PATH
 /// (2026-09-16). The window's spawn seam has front-inserted `<prefix>/agents/` — the
@@ -1605,32 +1661,49 @@ const AGENTS_DIR_ENV: &str = "ATPKG_AGENTS";
 /// `path_helper`'s list) and `. ~/.aterm/shell.d/00-atpkg.<shell>` moves it first.
 /// Pinned by `a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_moves_agents_first`.
 ///
-/// This crate does not link atpkg (Cargo.toml: "the router composes these crates,
-/// aterm-cli does not call atpkg"), so the store's layout is not asked here; the
-/// directory is DERIVED from the same contract the window resolves through
-/// `atpkg::store::Layout` — `reroute/` and `agents/` are siblings under the ONE manager
-/// prefix (`Layout::reroute_dir` = `<prefix>/reroute`, `Layout::agents_dir` =
-/// `<prefix>/agents`; pinned against the real layout by
-/// `the_agents_dir_is_the_reroute_dirs_sibling_in_atpkgs_layout`) — from the reroute
-/// directory the front door hands this process as `$ATERM_REROUTE_DIR` (which it sets
-/// only for an existing directory, so the prefix exists too; a relative value is refused
-/// before anything is derived or created, [`reroute_dir_from_env`]). With no reroute
-/// handle (`--no-reroute`, `ATERM_NO_REROUTE`, Windows), `enclosing_agents` —
-/// `$ATPKG_AGENTS` as an enclosing shell that sourced the atpkg hook exported it — is
-/// taken when it is an absolute existing directory; otherwise there is nothing to
-/// front-insert, as before.
+/// WHICH DIRECTORY, in order (the precedence is pinned by
+/// `managed_agents_dir_prefers_the_front_doors_handoff_then_the_sibling_then_the_hook`):
 ///
-/// RESIDUAL, DOCUMENTED (R3, 2026-09-16): the reroute escape hatch is for the UPSTREAM
-/// RUST NAMES (`aterm help reroute`), yet in this lane it also drops the managed
-/// `claude`/`codex` front-insert, because the agents dir is derived from the reroute
-/// handle and the front door hands nothing else. An `aterm --no-reroute` from
-/// Terminal.app (no `$ATPKG_AGENTS` in the environment) therefore leaves `agents/` to
-/// the rc hook alone — which is where a login shell puts it anyway (above). Closing it
-/// means the front door handing an agents-dir variable of its own that is not
-/// `ATPKG_AGENTS` (an inherited `ATPKG_AGENTS` would stop the window's shell
-/// integration from ever sourcing the hook) and this crate reading it; not done here.
+/// 1. `handed` — `$ATERM_AGENTS_DIR`, THE FRONT DOOR'S HANDOFF (2026-09-18, closing
+///    R3 below): the one binary that links atpkg (`crates/aterm/src/main.rs`) resolves
+///    the configured store, ensures `<prefix>/agents` through
+///    `Layout::ensure_agents_dir` — the window's mkdir/mode rule plus a symlink/file
+///    refusal the window's `spawn::managed_agents_dir` does not yet make — and
+///    establishes the absolute directory in this process's environment on EVERY lane,
+///    engaged reroute or not, removing an inherited stray when it hands nothing (no
+///    layout, a refused `mkdir`, a link or file at `agents/`: one stderr line there, and
+///    this lane sees no handoff). Taken when it is a
+///    non-empty ABSOLUTE path naming an existing REAL directory (not a symlink — the
+///    front door never hands one; a stray that is one must not capture the twins);
+///    nothing is created for it here, the front door already did.
+/// 2. the SIBLING DERIVATION — this crate does not link atpkg (Cargo.toml: "the router
+///    composes these crates, aterm-cli does not call atpkg"), so the store's layout is
+///    not asked here; the directory is DERIVED from the same contract the window
+///    resolves through `atpkg::store::Layout` — `reroute/` and `agents/` are siblings
+///    under the ONE manager prefix (`Layout::reroute_dir` = `<prefix>/reroute`,
+///    `Layout::agents_dir` = `<prefix>/agents`; pinned against the real layout by
+///    `the_agents_dir_is_the_reroute_dirs_sibling_in_atpkgs_layout`) — from the reroute
+///    directory the front door hands this process as `$ATERM_REROUTE_DIR` (which it
+///    sets only for an existing directory, so the prefix exists too; a relative value is
+///    refused before anything is derived or created, [`reroute_dir_from_env`]). Kept as
+///    the fallback for a launcher older than the handoff (a nested session spawned by
+///    a pre-2026-09-18 front door) — ENSURED here, below.
+/// 3. `enclosing_agents` — `$ATPKG_AGENTS` as an enclosing shell that sourced the atpkg
+///    hook exported it — when it is an absolute existing directory; otherwise there is
+///    nothing to front-insert.
 ///
-/// ENSURED TO EXIST, the way the window ensures it through `Layout::ensure_dir`, whose
+/// R3 (2026-09-16), CLOSED 2026-09-18: the reroute escape hatch is for the UPSTREAM
+/// RUST NAMES (`aterm help reroute`), yet in this lane it also dropped the managed
+/// `claude`/`codex` front-insert, because the agents dir was derived from the reroute
+/// handle and the front door handed nothing else — an `aterm --no-reroute` from
+/// Terminal.app (no `$ATPKG_AGENTS` in the environment) left `agents/` to the rc hook
+/// alone. Closed by rule 1: the front door hands `$ATERM_AGENTS_DIR` regardless of the
+/// reroute switch. The variable is deliberately not `ATPKG_AGENTS` (an inherited
+/// `ATPKG_AGENTS` would stop the window's shell integration from ever sourcing the
+/// hook), and the shell integration must never read it — that contract keys on
+/// `$ATPKG_AGENTS` alone and is left as it is.
+///
+/// ENSURED TO EXIST (rule 2), the way the window ensures it through `Layout::ensure_dir`, whose
 /// rule is restated from the PREFIX's own metadata ([`agents_dir_mode`]): one `mkdir`
 /// (`0700` in a prefix we own — the `$HOME` shape; `0755` in a root-owned system
 /// prefix — every user must traverse it, a `0700` there is exactly the failure
@@ -1645,7 +1718,14 @@ const AGENTS_DIR_ENV: &str = "ATPKG_AGENTS";
 /// `ATPKG_AGENTS` is exported here (the window exports none either): the shell
 /// integration sources the hook while that variable is unset, and a seam-exported value
 /// would stop it from ever doing so.
-fn managed_agents_dir(reroute_dir: Option<&str>, enclosing_agents: Option<&str>) -> Option<String> {
+fn managed_agents_dir(
+    handed: Option<&str>,
+    reroute_dir: Option<&str>,
+    enclosing_agents: Option<&str>,
+) -> Option<String> {
+    if let Some(dir) = handed.filter(|dir| is_absolute_real_dir(dir)) {
+        return Some(dir.to_owned());
+    }
     let derived = reroute_dir
         .map(std::path::Path::new)
         .filter(|reroute| reroute.is_absolute())
@@ -1853,6 +1933,45 @@ fn session_model_armed_from_env() -> bool {
     session_model_armed(raw.as_ref().map(|v| v.to_string_lossy()).as_deref())
 }
 
+/// The [`aterm_sandbox::Limits`] the SESSION hands the protected spawn seam,
+/// chosen by containment mode — the rule `aterm-gui` applies at ITS spawn
+/// (`spawn.rs`), the one [`aterm_sandbox::Limits::inherit`]'s doc states, and the
+/// one the seam's `limits` parameter comment states (`spawn_shell_with_pid_cell_px`
+/// in aterm-pty's unix seam): the daily-driver modes (`user`, the default, and
+/// `master`) request NOTHING, so the shell inherits the launching shell's
+/// `rlimit`s unchanged; the opt-in confinement modes (`safety`, `containment`)
+/// keep the hardened caps of [`aterm_sandbox::Limits::shell_default`].
+///
+/// The same set reaches the Windows ConPTY seam, which writes it onto the child's
+/// Job Object instead (there is no `setrlimit` lane there): `inherit()` installs
+/// no job caps, `shell_default()` installs 16 GiB of per-process memory, 512
+/// active processes and the Job Object UI restrictions. So this rule also means a
+/// `user`/`master` session's shell no longer gets the job caps the blanket
+/// `shell_default()` used to install — exactly as under the window.
+///
+/// Through 0.87.0 the session passed `shell_default()` in EVERY mode — carried
+/// over from the historical `spawn_shell` wrapper, never a decision. The unix
+/// actuator sets the soft limit to `min(cap, hard)` whatever the inherited soft
+/// value was (and keeps the hard ceiling), so a plain `aterm` typed into another
+/// terminal forced its shell's soft `RLIMIT_NOFILE` to 8192 in BOTH directions:
+/// a higher limit was lowered to it, and a lower one — macOS's launchd default is
+/// 256 (`launchctl limit maxfiles`) — was raised to it; off macOS the shell also
+/// got a soft 16 GiB `RLIMIT_AS`. Measured through the seam on an Intel Mac
+/// (macOS 13.7): a user-mode child read 8192 both from a parent at soft 1048576
+/// and from one at soft 256. Now a `user`/`master` session hands its shell the
+/// launching shell's soft limits, whichever side of the cap they are on. A
+/// terminal must not constrain the programs you run more than the shell that
+/// started it would; the confinement modes are where a cap is asked for.
+fn session_limits(mode: aterm_containment::ContainmentMode) -> aterm_sandbox::Limits {
+    use aterm_containment::ContainmentMode as Cm;
+    match mode {
+        Cm::Master | Cm::User => aterm_sandbox::Limits::inherit(),
+        // Safety / Containment — and, the enum being `#[non_exhaustive]`, any
+        // mode this build does not know: fail-safe to the hardened caps.
+        _ => aterm_sandbox::Limits::shell_default(),
+    }
+}
+
 /// The whole transparent SESSION as a callable: containment init, the single
 /// root-authority mint, the protected shell spawn, and the passthrough driver
 /// loop — never returns. The ONE `aterm` binary calls this after routing
@@ -1887,7 +2006,8 @@ pub fn session_main(quiet: bool) -> ! {
     //
     // Containment mode is launcher-owned. Default `User`: no OS sandbox, the shell
     // keeps full network/credential access (byte-for-byte daily behavior) and is
-    // confined only by the cap gate + setrlimit. `ATERM_CONTAINMENT_MODE=containment`
+    // confined only by the cap gate — its rlimits are the launching shell's own,
+    // unchanged (`session_limits`). `ATERM_CONTAINMENT_MODE=containment`
     // opts into the macOS Seatbelt sandbox; a MALFORMED value fails CLOSED to
     // Containment (never silently disables confinement).
     let mode = aterm_containment::init_mode_from_env(aterm_containment::ContainmentMode::User)
@@ -1928,14 +2048,17 @@ pub fn session_main(quiet: bool) -> ! {
                 | aterm_containment::ContainmentMode::Safety
         )
     {
-        // Platform-selected wording: on Windows the rlimit half is ALSO absent
-        // (aterm_sandbox::apply is a cap-gated no-op there), and the notice must
-        // never overstate the posture. The Unix string is byte-identical to the
-        // historical one.
+        // Platform-selected wording. Windows has no rlimits (`Limits::apply` is a
+        // cap-gated no-op there); its resource half is the child's Job Object,
+        // which the ConPTY seam fills from the same `Limits` while the child is
+        // still suspended (`limits.apply_to_job`, aterm-pty's windows seam) — and
+        // in these two modes `session_limits` hands it `shell_default()`'s caps.
+        // The notice must never overstate the posture, nor deny a cap that is
+        // installed. The Unix string is byte-identical to the historical one.
         if cfg!(windows) {
             eprintln!(
                 "aterm: containment mode {mode}: OS sandbox NOT actuated on this platform \
-                 (capability gate only; NO resource limits and NO network/filesystem \
+                 (Job Object caps + capability gate only; NO network/filesystem \
                  confinement). See aterm-containment::actuator."
             );
         } else {
@@ -1961,8 +2084,9 @@ pub fn session_main(quiet: bool) -> ! {
     // §"Reaching PATH"): the REROUTE dir first (move-to-front — a bare `cargo`/`rustc` in
     // the session is announced or signposted instead of running upstream Rust silently),
     // then the managed `agents/` (move-to-front too, 2026-09-16 — the managed
-    // `claude`/`codex` ahead of the native installer's and the casks', derived beside
-    // the reroute dir and ensured to exist, `managed_agents_dir`), then aterm's own
+    // `claude`/`codex` ahead of the native installer's and the casks'; handed by the
+    // front door as `$ATERM_AGENTS_DIR` since 2026-09-18, else derived beside the
+    // reroute dir and ensured to exist, `managed_agents_dir`), then aterm's own
     // binary directory so `aterm` (and thus every `aterm <verb>`) always resolves even
     // when aterm was launched by an absolute path from a dir not on $PATH (inert for a
     // lone binary or when already on PATH), then the inherited PATH verbatim. The
@@ -1983,10 +2107,16 @@ pub fn session_main(quiet: bool) -> ! {
     // (`__aterm_managed_path_live`). The reroute dir is still re-exported so a NESTED
     // window or session reads the same handle; nothing here exports `ATPKG_AGENTS`, so a
     // shell that does get the integration still sources the hook the moment it lands.
+    // The managed `agents/` arrives as `$ATERM_AGENTS_DIR` from the front door on EVERY
+    // lane since 2026-09-18 (`managed_agents_dir`, rule 1 — the R3 closure: the reroute
+    // escape no longer drops the managed `claude`/`codex`), and is re-exported the same
+    // way the reroute dir is — the directory this lane front-inserted, or blank when an
+    // inherited value was not taken, so "none" reads as "not set or empty" downstream.
     let reroute_dir = reroute_dir_from_env();
     let agents_dir = managed_agents_dir(
-        reroute_dir.as_deref(),
         std::env::var(AGENTS_DIR_ENV).ok().as_deref(),
+        reroute_dir.as_deref(),
+        std::env::var(HOOK_AGENTS_ENV).ok().as_deref(),
     );
     let mut env_add: Vec<(String, String)> = session_path_env(
         reroute_dir.as_deref(),
@@ -2004,19 +2134,27 @@ pub fn session_main(quiet: bool) -> ! {
         // integration's re-assert stays inert. "No export" has to mean "not set".
         env_add.push((REROUTE_DIR_ENV.to_string(), String::new()));
     }
+    if let Some(dir) = &agents_dir {
+        env_add.push((AGENTS_DIR_ENV.to_string(), dir.clone()));
+    } else if std::env::var_os(AGENTS_DIR_ENV).is_some() {
+        env_add.push((AGENTS_DIR_ENV.to_string(), String::new()));
+    }
     // Deliberately NOT setting `ATERM_CHILD` here: this lane has never carried it,
     // `net_listen`'s ROOT-ONLY nesting guard reads it, and the reroute gates on
     // nothing but its own two variables. Changing what a headless aterm launched
     // from an `aterm --session` shell counts as is a separate decision.
 
-    // PROTECTED spawn: cap-gated, setrlimit-bounded in the child before execve,
-    // fail-closed, and OS-sandbox-wrapped when `sandbox_wrap` is `Some`. Returns the
-    // PTY master + child pid. The seam itself fails closed if a demanded sandbox
-    // wrapper is missing (it refuses to spawn an unsandboxed shell). The explicit
-    // `shell_default` limits are byte-identical to what the historical
-    // `spawn_shell` wrapper passed; the pid is what both drivers reap for the exit
-    // code (the unix driver waits on exactly this pid, never `waitpid(-1)`: the
-    // session process can have other children).
+    // PROTECTED spawn: cap-gated, fail-closed, resource-bounded by the MODE's
+    // posture (`session_limits`: User/Master request nothing — the shell inherits
+    // the launching shell's rlimits, and on Windows its Job Object gets no caps;
+    // Safety/Containment apply the hardened caps — `setrlimit` in the child
+    // before execve on POSIX, the Job Object on Windows; the rule aterm-gui's
+    // spawn applies and the unix seam's `limits` parameter comment states), and
+    // OS-sandbox-wrapped when `sandbox_wrap` is `Some`. Returns the PTY master +
+    // child pid. The seam itself fails closed if a demanded sandbox wrapper is
+    // missing (it refuses to spawn an unsandboxed shell); the pid is what both
+    // drivers reap for the exit code (the unix driver waits on exactly this pid,
+    // never `waitpid(-1)`: the session process can have other children).
     let shell = aterm_pty::spawn_shell_with_pid(
         rows,
         cols,
@@ -2029,7 +2167,7 @@ pub fn session_main(quiet: bool) -> ! {
         None,     // exec_command — interactive $SHELL
         None,     // cwd — inherit
         sandbox_wrap.as_deref(),
-        aterm_sandbox::Limits::shell_default(),
+        session_limits(mode), // by mode — NOT a blanket `shell_default()`; see its doc
     )
     .unwrap_or_else(|e| {
         eprintln!("aterm: protected spawn failed ({e}); refusing to start an unconfined shell");
@@ -2072,13 +2210,13 @@ pub fn session_main(quiet: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTS_DIR_ENV, CliAction, DIAG_COMMANDS, DrClass, FdaState, Mark, NO_REROUTE_ENV,
-        PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, SESSION_MODEL_ENV, VERB_BLURB_COLUMN, Verb,
-        agents_dir_mode, decide_args, diag_report, doctor_checks, doctor_report,
-        explain_config_report, help_text, is_tool_candidate, list_fonts_report, list_themes_report,
-        managed_agents_dir, prepend_path, reroute_dir_from_values, session_model_armed,
-        session_path_env, show_face_report, validate_containment_value, verb_help_block,
-        version_text,
+        AGENTS_DIR_ENV, CliAction, DIAG_COMMANDS, DrClass, FdaState, HOOK_AGENTS_ENV, Mark,
+        NO_REROUTE_ENV, PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, SESSION_MODEL_ENV,
+        VERB_BLURB_COLUMN, Verb, agents_dir_mode, decide_args, diag_report, doctor_checks,
+        doctor_report, explain_config_report, help_text, is_tool_candidate, list_fonts_report,
+        list_themes_report, managed_agents_dir, prepend_path, reroute_dir_from_values,
+        session_limits, session_model_armed, session_path_env, show_face_report,
+        validate_containment_value, verb_help_block, version_text,
     };
 
     fn decide(args: &[&str]) -> CliAction {
@@ -2165,6 +2303,7 @@ mod tests {
             "doctor",
             "list-fonts",
             "list-themes",
+            "list-kitty-commands",
         ] {
             match decide(&[cmd, "--json"]) {
                 CliAction::Usage(msg) => {
@@ -2294,6 +2433,52 @@ mod tests {
         }
         // A non-registry name is NOT dispatchable.
         assert!(diag_report("definitely-not-a-command", None).is_none());
+    }
+
+    /// `aterm list-kitty-commands` prints the vocabulary the window's listener
+    /// compiles — so the listing is COMPLETE by construction, and this pins the
+    /// two things a script relies on: every trick has an English row, and every
+    /// line is one `key=value` row with no banner to skip.
+    #[test]
+    fn list_kitty_commands_prints_one_row_per_line_and_every_trick() {
+        let (report, code) =
+            diag_report("list-kitty-commands", None).expect("the subcommand is dispatchable");
+        assert_eq!(code, 0);
+        assert!(report.ends_with('\n'), "the report ends its last row");
+        for trick in aterm_lexicon::Trick::ALL {
+            let row = format!("command trick={} lang=en gated=0 ", trick.code());
+            assert!(
+                report.lines().any(|l| l.starts_with(&row)),
+                "no English row for trick {:?} in:\n{report}",
+                trick.code()
+            );
+        }
+        for line in report.lines() {
+            let kind = line.split(' ').next().unwrap_or_default();
+            assert!(
+                matches!(kind, "command" | "vocative" | "filler"),
+                "not a vocabulary row (a banner would break `| grep lang=`): {line:?}"
+            );
+            assert!(
+                line.split(' ').skip(1).all(|field| field.contains('=')),
+                "every field after the row kind is key=value: {line:?}"
+            );
+        }
+        // English is the priority language: its rows come first.
+        assert!(
+            report
+                .lines()
+                .next()
+                .is_some_and(|l| l.contains(" lang=en ")),
+            "the first row is English"
+        );
+        // `--help` DESCRIBES and never runs (the per-verb help law).
+        assert_eq!(
+            decide(&["list-kitty-commands", "--help"]),
+            CliAction::DiagHelp {
+                cmd: "list-kitty-commands".to_string()
+            }
+        );
     }
 
     #[test]
@@ -2660,7 +2845,8 @@ mod tests {
             !layout.agents_dir().is_dir(),
             "a fresh prefix has no agents/"
         );
-        let derived = managed_agents_dir(reroute.to_str(), None).expect("derived and created");
+        let derived =
+            managed_agents_dir(None, reroute.to_str(), None).expect("derived and created");
         assert_eq!(derived, layout.agents_dir().to_str().unwrap());
         assert!(layout.agents_dir().is_dir(), "ensured, like the window's");
         #[cfg(unix)]
@@ -2675,7 +2861,7 @@ mod tests {
         }
         // A second call is a no-op with the same answer.
         assert_eq!(
-            managed_agents_dir(reroute.to_str(), None).as_deref(),
+            managed_agents_dir(None, reroute.to_str(), None).as_deref(),
             Some(derived.as_str())
         );
         // And the sibling rule is the layout's: the reroute dir is `<prefix>/reroute`.
@@ -2684,14 +2870,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// The reroute variables and the agents variable this crate reads are atpkg's
+    /// The reroute variables and the two agents variables this crate reads are atpkg's
     /// spellings — restated in this crate because atpkg is a test-only dependency here,
-    /// and pinned so the copies cannot drift apart. `ATPKG_AGENTS` has no constant on
-    /// atpkg's side; it is the name the shell hook exports, so the pin is the hook body.
+    /// and pinned so the copies cannot drift apart. `ATERM_AGENTS_DIR` is
+    /// `atpkg::reroute::AGENTS_DIR_ENV`, the front door's handoff (2026-09-18).
+    /// `ATPKG_AGENTS` has no constant on atpkg's side; it is the name the shell hook
+    /// exports, so the pin is the hook body — and that hook must NOT mention the
+    /// handoff variable: it is a launcher→session handle, never the hook's or the shell
+    /// integration's to read.
     #[test]
     fn reroute_env_names_match_atpkg() {
         assert_eq!(REROUTE_DIR_ENV, atpkg::reroute::REROUTE_DIR_ENV);
         assert_eq!(NO_REROUTE_ENV, atpkg::reroute::NO_REROUTE_ENV);
+        assert_eq!(AGENTS_DIR_ENV, atpkg::reroute::AGENTS_DIR_ENV);
+        assert_ne!(AGENTS_DIR_ENV, HOOK_AGENTS_ENV);
         let hooks = atpkg::hooks::hook_files(
             std::path::Path::new("/p/bin"),
             std::path::Path::new("/p/agents"),
@@ -2702,9 +2894,145 @@ mod tests {
             .map(|(_, body)| body.as_str())
             .expect("the zsh hook");
         assert!(
-            zsh.contains(&format!("export {AGENTS_DIR_ENV}=")),
-            "the hook exports {AGENTS_DIR_ENV}: {zsh}"
+            zsh.contains(&format!("export {HOOK_AGENTS_ENV}=")),
+            "the hook exports {HOOK_AGENTS_ENV}: {zsh}"
         );
+        for (name, body) in &hooks {
+            assert!(
+                !body.contains(AGENTS_DIR_ENV),
+                "{name} must not read the front door's handoff: {body}"
+            );
+        }
+        // And neither must the SHELL INTEGRATION itself — every dialect this workspace
+        // ships and the copies the macOS app bundles: it keys its hook-sourcing on
+        // `$ATPKG_AGENTS` being unset, and a script that started reading the handoff
+        // would pass every test above while the contract silently changed. A file read,
+        // as `every_argv0_alias_is_bundled_and_routed` does, because those crates do not
+        // depend on this one.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/aterm-cli sits under crates/");
+        let workspace = root.parent().expect("crates/ sits under the workspace");
+        let mut scripts = Vec::new();
+        for dir in [
+            root.join("aterm-shell-integration/src/scripts"),
+            workspace.join("apps/aterm-mac/Sources/ATermMac/Resources/ShellIntegration"),
+        ] {
+            for entry in
+                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            {
+                let path = entry.expect("a directory entry").path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("aterm_shell_integration."))
+                {
+                    scripts.push(path);
+                }
+            }
+        }
+        assert!(
+            scripts.len() >= 7,
+            "four dialects plus the three bundled copies: {scripts:?}"
+        );
+        for script in scripts {
+            let body = std::fs::read_to_string(&script).expect("a shell integration script");
+            assert!(
+                body.contains(HOOK_AGENTS_ENV),
+                "{} keys on {HOOK_AGENTS_ENV}",
+                script.display()
+            );
+            assert!(
+                !body.contains(AGENTS_DIR_ENV),
+                "{} must not read the front door's handoff {AGENTS_DIR_ENV}",
+                script.display()
+            );
+        }
+    }
+
+    /// THE PRECEDENCE (2026-09-18, R3 closed): the front door's `$ATERM_AGENTS_DIR` —
+    /// absolute, existing, a real directory — is taken FIRST, with or without a reroute
+    /// handle and over an enclosing shell's `$ATPKG_AGENTS`, and nothing is created for
+    /// it (the front door ensured it); a relative, empty, absent, nonexistent or
+    /// symlinked value is not the front door's and falls through to the sibling
+    /// derivation (ensured here), and that to `$ATPKG_AGENTS`, and that to none — so
+    /// under `--no-reroute` (no reroute handle) the managed `claude`/`codex` still lead
+    /// from the handoff alone.
+    #[test]
+    fn managed_agents_dir_prefers_the_front_doors_handoff_then_the_sibling_then_the_hook() {
+        let scratch = scratch_dir("agents-precedence");
+        let handed = scratch.join("handed-agents");
+        std::fs::create_dir(&handed).unwrap();
+        let handed_str = handed.to_str().unwrap();
+        let prefix = scratch.join("pkg");
+        let reroute = prefix.join("reroute");
+        std::fs::create_dir_all(&reroute).unwrap();
+        let reroute_str = reroute.to_str().unwrap();
+        let hook = scratch.join("hook-agents");
+        std::fs::create_dir(&hook).unwrap();
+        let hook_str = hook.to_str().unwrap();
+        // 1. The handoff wins — the `--no-reroute` shape (no reroute handle) included —
+        //    and derives nothing.
+        assert_eq!(
+            managed_agents_dir(Some(handed_str), None, None).as_deref(),
+            Some(handed_str),
+            "the --no-reroute shape: the handoff alone fronts the managed agents"
+        );
+        assert_eq!(
+            managed_agents_dir(Some(handed_str), Some(reroute_str), Some(hook_str)).as_deref(),
+            Some(handed_str)
+        );
+        assert!(
+            !prefix.join("agents").exists(),
+            "a taken handoff derives and creates nothing beside the reroute dir"
+        );
+        // Shapes that are not the front door's fall through.
+        for stray in ["", "agents", "./handed-agents"] {
+            assert_eq!(
+                managed_agents_dir(Some(stray), None, Some(hook_str)).as_deref(),
+                Some(hook_str),
+                "{stray:?} is not an absolute handoff"
+            );
+        }
+        assert_eq!(
+            managed_agents_dir(scratch.join("absent").to_str(), None, Some(hook_str)).as_deref(),
+            Some(hook_str),
+            "must exist"
+        );
+        let filed = scratch.join("filed-agents");
+        std::fs::write(&filed, b"not a dir").unwrap();
+        assert_eq!(
+            managed_agents_dir(filed.to_str(), None, Some(hook_str)).as_deref(),
+            Some(hook_str),
+            "must be a directory"
+        );
+        #[cfg(unix)]
+        {
+            let linked = scratch.join("linked-agents");
+            std::os::unix::fs::symlink(&handed, &linked).unwrap();
+            assert!(linked.is_dir(), "the link resolves");
+            assert_eq!(
+                managed_agents_dir(linked.to_str(), None, Some(hook_str)).as_deref(),
+                Some(hook_str),
+                "a symlink is never the front door's handoff"
+            );
+        }
+        // 2. No handoff: the sibling derivation, ensured here, over the hook's value.
+        let derived = managed_agents_dir(None, Some(reroute_str), Some(hook_str)).expect("derived");
+        assert_eq!(derived, prefix.join("agents").to_str().unwrap());
+        assert!(prefix.join("agents").is_dir(), "ensured");
+        assert_eq!(
+            managed_agents_dir(Some(""), Some(reroute_str), Some(hook_str)).as_deref(),
+            Some(derived.as_str()),
+            "an EMPTY handoff means none — the sibling rule applies"
+        );
+        // 3. Neither: the enclosing shell's hook export; then nothing.
+        assert_eq!(
+            managed_agents_dir(None, None, Some(hook_str)).as_deref(),
+            Some(hook_str)
+        );
+        assert_eq!(managed_agents_dir(None, None, None), None);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// A fresh scratch directory for one test, named by pid and nanos.
@@ -2805,35 +3133,40 @@ mod tests {
             "precondition: the test cwd has no `agents` entry"
         );
         // Relative handle: nothing derived, nothing created.
-        assert_eq!(managed_agents_dir(Some("reroute"), None), None);
-        assert_eq!(managed_agents_dir(Some("./pkg/reroute"), None), None);
+        assert_eq!(managed_agents_dir(None, Some("reroute"), None), None);
+        assert_eq!(managed_agents_dir(None, Some("./pkg/reroute"), None), None);
         assert!(!cwd_agents.exists(), "no `agents` created in the cwd");
         // Fallback shapes.
         let enclosing = scratch.join("enclosing-agents");
         std::fs::create_dir(&enclosing).unwrap();
         let enclosing_str = enclosing.to_str().unwrap();
         assert_eq!(
-            managed_agents_dir(None, Some(enclosing_str)).as_deref(),
+            managed_agents_dir(None, None, Some(enclosing_str)).as_deref(),
             Some(enclosing_str)
         );
         assert_eq!(
-            managed_agents_dir(Some("reroute"), Some(enclosing_str)).as_deref(),
+            managed_agents_dir(None, Some("reroute"), Some(enclosing_str)).as_deref(),
             Some(enclosing_str),
             "a refused relative handle still leaves the fallback"
         );
-        assert_eq!(managed_agents_dir(None, Some("")), None);
-        assert_eq!(managed_agents_dir(None, Some("agents")), None, "relative");
+        assert_eq!(managed_agents_dir(None, None, Some("")), None);
         assert_eq!(
-            managed_agents_dir(None, scratch.join("absent").to_str()),
+            managed_agents_dir(None, None, Some("agents")),
+            None,
+            "relative"
+        );
+        assert_eq!(
+            managed_agents_dir(None, None, scratch.join("absent").to_str()),
             None,
             "must exist"
         );
-        assert_eq!(managed_agents_dir(None, None), None);
+        assert_eq!(managed_agents_dir(None, None, None), None);
         // Derived wins over the fallback.
         let prefix = scratch.join("pkg");
         let reroute = prefix.join("reroute");
         std::fs::create_dir_all(&reroute).unwrap();
-        let derived = managed_agents_dir(reroute.to_str(), Some(enclosing_str)).expect("derived");
+        let derived =
+            managed_agents_dir(None, reroute.to_str(), Some(enclosing_str)).expect("derived");
         assert_eq!(derived, prefix.join("agents").to_str().unwrap());
         // A regular file at agents/: refused (said on stderr), left alone; the enclosing
         // shell's directory — one that shell already had first on its PATH — is still the
@@ -2842,11 +3175,12 @@ mod tests {
         std::fs::create_dir_all(filed.join("reroute")).unwrap();
         std::fs::write(filed.join("agents"), b"not a dir").unwrap();
         assert_eq!(
-            managed_agents_dir(filed.join("reroute").to_str(), None),
+            managed_agents_dir(None, filed.join("reroute").to_str(), None),
             None
         );
         assert_eq!(
-            managed_agents_dir(filed.join("reroute").to_str(), Some(enclosing_str)).as_deref(),
+            managed_agents_dir(None, filed.join("reroute").to_str(), Some(enclosing_str))
+                .as_deref(),
             Some(enclosing_str)
         );
         assert!(filed.join("agents").is_file(), "left alone");
@@ -2858,11 +3192,12 @@ mod tests {
             std::os::unix::fs::symlink(&enclosing, linked.join("agents")).unwrap();
             assert!(linked.join("agents").is_dir(), "the link resolves");
             assert_eq!(
-                managed_agents_dir(linked.join("reroute").to_str(), None),
+                managed_agents_dir(None, linked.join("reroute").to_str(), None),
                 None
             );
             assert_eq!(
-                managed_agents_dir(linked.join("reroute").to_str(), Some(enclosing_str)).as_deref(),
+                managed_agents_dir(None, linked.join("reroute").to_str(), Some(enclosing_str))
+                    .as_deref(),
                 Some(enclosing_str)
             );
             assert!(
@@ -2893,12 +3228,12 @@ mod tests {
         let reroute = prefix.join("reroute");
         std::fs::create_dir_all(&reroute).unwrap();
         std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o500)).unwrap();
-        assert_eq!(managed_agents_dir(reroute.to_str(), None), None);
+        assert_eq!(managed_agents_dir(None, reroute.to_str(), None), None);
         assert!(!prefix.join("agents").exists());
         std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Writable again: created, private.
         assert_eq!(
-            managed_agents_dir(reroute.to_str(), None).as_deref(),
+            managed_agents_dir(None, reroute.to_str(), None).as_deref(),
             prefix.join("agents").to_str()
         );
         let mode = std::fs::metadata(prefix.join("agents"))
@@ -2941,7 +3276,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&zdotdir).unwrap();
         std::fs::create_dir_all(&reroute).unwrap();
-        let agents = managed_agents_dir(reroute.to_str(), None).expect("derived and created");
+        let agents = managed_agents_dir(None, reroute.to_str(), None).expect("derived and created");
         let reroute = reroute.to_str().unwrap().to_owned();
         let foreign = "/opt/homebrew/bin:/usr/bin:/bin";
         let (_, seam_path) = session_path_env(
@@ -3797,5 +4132,205 @@ mod tests {
             CliAction::Usage(m) => assert!(m.contains("unknown option --help"), "{m}"),
             other => panic!("expected Usage (post-`--` is an operand), got {other:?}"),
         }
+    }
+
+    /// THE RULE the session now shares with the window (`aterm-gui`'s spawn) and
+    /// with the seam's own `limits` contract: the daily-driver modes inherit, the
+    /// opt-in confinement modes cap. Pinned as a table so the posture per mode is
+    /// readable without a source dive, and so the regression — the session
+    /// passing `shell_default()` in EVERY mode, which forced a User-mode shell's
+    /// soft RLIMIT_NOFILE to 8192 whether the launching shell's was higher or
+    /// lower — cannot come back quietly. The numbers `aterm --help`, `aterm help
+    /// aterm`, the man page and the CHANGELOG quote are pinned to what the sandbox
+    /// crate installs, and `aterm --help` and `aterm help aterm` must quote them.
+    #[test]
+    fn the_session_inherits_rlimits_in_user_and_master_and_caps_in_safety_and_containment() {
+        use aterm_containment::ContainmentMode as Cm;
+        use aterm_sandbox::Limits;
+        for mode in [Cm::User, Cm::Master] {
+            assert_eq!(
+                session_limits(mode),
+                Limits::inherit(),
+                "{mode}: must inherit"
+            );
+        }
+        for mode in [Cm::Safety, Cm::Containment] {
+            assert_eq!(
+                session_limits(mode),
+                Limits::shell_default(),
+                "{mode}: must cap"
+            );
+        }
+        // Every number the help, man page and CHANGELOG quote, pinned to what the
+        // sandbox crate installs: open files 8192 (POSIX), 512 active processes +
+        // UI restrictions (Windows), 16 GiB of address space / job memory off macOS.
+        let hardened = Limits::shell_default();
+        assert_eq!(hardened.open_files, Some(8192));
+        assert_eq!(hardened.active_processes, Some(512));
+        assert!(hardened.restrict_ui);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                hardened.address_space, None,
+                "macOS accepts no finite RLIMIT_AS"
+            );
+        } else {
+            assert_eq!(hardened.address_space, Some(16 * 1024 * 1024 * 1024));
+        }
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&help_text());
+        let (page, code) = crate::manual::render(Some("aterm"), None);
+        assert_eq!(code, 0, "`aterm help aterm` must render");
+        let page = flat(&page);
+        for needle in [
+            "open files 8192",
+            "address space 16 GiB on Linux",
+            "hard limits untouched",
+            "16 GiB",
+            "512 active processes",
+            "UI restrictions",
+        ] {
+            assert!(
+                help.contains(needle),
+                "the help text must quote {needle:?}:\n{help}"
+            );
+        }
+        for needle in [
+            "open files at a soft 8192",
+            "address space at a soft 16 GiB on Linux",
+            "hard limits untouched",
+            "512 active processes",
+            "UI restrictions",
+        ] {
+            assert!(
+                page.contains(needle),
+                "`aterm help aterm` must quote {needle:?}:\n{page}"
+            );
+        }
+    }
+
+    /// This process's soft and hard `RLIMIT_NOFILE`, read back from the kernel.
+    #[cfg(unix)]
+    fn current_nofile() -> (libc::rlim_t, libc::rlim_t) {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid resource id and a valid out-param for the call.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        (lim.rlim_cur, lim.rlim_max)
+    }
+
+    /// Read a pty master until the child hangs up (EOF, or EIO on Linux once the
+    /// slave is closed), bounded by a deadline so a wedged probe fails the test
+    /// instead of hanging the suite.
+    #[cfg(unix)]
+    fn read_until_hangup(master: i32) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            let mut p = libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, 50 ms timeout.
+            if unsafe { libc::poll(&mut p, 1, 50) } > 0 {
+                // SAFETY: `read` fills at most `buf.len()` bytes of this owned buffer.
+                let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+                match usize::try_from(n) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(_) => {
+                        let errno = std::io::Error::last_os_error().raw_os_error();
+                        if errno != Some(libc::EAGAIN) && errno != Some(libc::EINTR) {
+                            break; // EIO: the slave side is gone
+                        }
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe shell did not hang up in time; got {:?}",
+                String::from_utf8_lossy(&out)
+            );
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// END-TO-END through the real seam, with the session's own choice: the
+    /// child of a User-mode session reads back the SAME soft `RLIMIT_NOFILE`
+    /// this process has, and the child of a Safety-mode session reads back the
+    /// hardened cap (clamped to the inherited hard ceiling, which the actuator
+    /// never lowers). Measured with `ulimit -n` in the spawned `/bin/sh` — the
+    /// number a program in the session sees, not a struct compared with itself.
+    /// The first assertion discriminates whenever this process's soft limit is
+    /// on either side of the cap: run from a zsh at soft 1048576 the pre-fix
+    /// session lowered its child to 8192, and run under `ulimit -Sn 256` (macOS's
+    /// launchd default) it raised its child to 8192. Where the parent's soft
+    /// limit equals the cap the assertion still holds, it is only not
+    /// discriminating.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_child_sees_the_posture_of_its_mode() {
+        use aterm_containment::ContainmentMode as Cm;
+
+        // SAFETY: a trusted test entry point, before any untrusted input flows.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "ulimit -n".into()];
+
+        let child_ulimit = |mode: Cm| -> String {
+            let shell = aterm_pty::spawn_shell_with_pid(
+                24,
+                80,
+                &spawn_cap,
+                &sandbox_cap,
+                &[],
+                None, // shell_override
+                None, // shell_args
+                None, // argv_override
+                Some(&exec),
+                None, // cwd
+                None, // sandbox_wrap
+                session_limits(mode),
+            )
+            .expect("the probe shell must spawn");
+            let out = read_until_hangup(shell.master);
+            // SAFETY: reaping our own child; the master is ours to close.
+            unsafe {
+                let mut status = 0;
+                libc::waitpid(shell.pid, &mut status, 0);
+                libc::close(shell.master);
+            }
+            out.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let render = |v: libc::rlim_t| {
+            if v == libc::RLIM_INFINITY {
+                "unlimited".to_string()
+            } else {
+                v.to_string()
+            }
+        };
+
+        let (soft, hard) = current_nofile();
+        assert_eq!(
+            child_ulimit(Cm::User),
+            render(soft),
+            "user mode: the child keeps the parent's soft limit"
+        );
+        let cap = aterm_sandbox::Limits::shell_default()
+            .open_files
+            .expect("the hardened set caps open files");
+        assert_eq!(
+            child_ulimit(Cm::Safety),
+            render(core::cmp::min(cap as libc::rlim_t, hard)),
+            "safety mode: the child gets the cap, clamped to the inherited hard ceiling"
+        );
     }
 }

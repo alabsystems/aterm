@@ -133,6 +133,16 @@ pub struct SessionRecord {
     /// wire it always saw.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub frozen_path: bool,
+    /// IDENTITY (additive, absent ⇒ `None`; session identities, 2026-09-17):
+    /// the agent identity this session was spawned under
+    /// (`spawn identity=<name>`). The adopted shell keeps that identity's env
+    /// across the update; this carries the LABEL so the successor's `sessions`
+    /// still says whose the tab is and `identities forget` still sees it live.
+    /// Not written when `None`, so an older reader sees the wire it always saw;
+    /// a downgrade to a build without the field keeps the env and drops the
+    /// label (the `frozen_path`-style degradation, accepted and documented).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 /// THE BUILD WHOSE SESSIONS ALWAYS HAVE THE MANAGED `agents/` ON PATH
@@ -407,6 +417,9 @@ impl SessionHandoff {
                         // A shell this process itself adopted frozen goes on
                         // frozen: the fact rides per record, not per manifest.
                         frozen_path: store.has_frozen_path(h.local_id),
+                        // The label the handle wears, from the spawn (or the
+                        // record it was adopted from).
+                        identity: h.identity.as_deref().map(str::to_owned),
                     }
                 })
                 .collect(),
@@ -526,6 +539,12 @@ pub struct SessionHandle {
     pub master: i32,
     /// The per-session fabric context (sink + edge table + identity).
     pub ctx: Arc<SessionCtx>,
+    /// IDENTITY (session identities, 2026-09-17): the agent identity the
+    /// session was spawned under, or `None` for the human's own agent config.
+    /// A handle FIELD, not a side table: every roster (`sessions`, `status`,
+    /// the handoff projection, `identities`' live count) reads handles, and
+    /// the label is immutable for the session's life.
+    pub identity: Option<Arc<str>>,
 }
 
 /// How many roster lifecycle records the store retains. Drop-oldest past this,
@@ -1289,6 +1308,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
         term,
         master: -1,
         ctx,
+        identity: None,
     }
 }
 
@@ -1403,6 +1423,55 @@ title = \"zsh\"
         assert_eq!(store.frozen_path_tabs(), 0);
         store.register(handle(9, None));
         assert_eq!(store.frozen_path_tabs(), 1);
+    }
+
+    /// THE IDENTITY CARRY (session identities, 2026-09-17): the handle's label
+    /// projects into its handoff record, `None` stays off the wire (an older
+    /// reader sees the wire it always saw), an old wire reads as `None`, and a
+    /// record round-trips through TOML.
+    #[test]
+    fn the_identity_carry_rides_per_record_and_absent_reads_none() {
+        let old_wire = "schema = 1
+
+[[sessions]]
+local_id = 3
+sid = \"s-old\"
+state = \"alive\"
+title = \"zsh\"
+";
+        let read = SessionHandoff::from_toml(old_wire).expect("this build reads an old manifest");
+        assert_eq!(read.sessions[0].identity, None, "absent reads None");
+
+        let mut store = SessionStore::default();
+        store.register(handle(0, None));
+        let mut worker = handle(1, None);
+        worker.identity = Some(Arc::from("worker"));
+        store.register(worker);
+        let manifest = SessionHandoff::from_store(&store);
+        assert_eq!(
+            manifest
+                .sessions
+                .iter()
+                .map(|r| r.identity.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, Some("worker")],
+            "the handle's label projects into its record"
+        );
+        let wire = manifest.to_toml().expect("serializes");
+        assert_eq!(wire.matches("identity = \"worker\"").count(), 1, "{wire}");
+        assert_eq!(
+            wire.matches("identity").count(),
+            1,
+            "None stays off the wire: {wire}"
+        );
+        assert!(manifest.roundtrips());
+        let back = SessionHandoff::from_toml(&wire).expect("round-trips");
+        assert_eq!(back.sessions[1].identity.as_deref(), Some("worker"));
+        assert_eq!(
+            store.by_local(1).and_then(|h| h.identity.as_deref()),
+            Some("worker"),
+            "and the registry answers the label by local id — what `@<sid> spawn` inherits"
+        );
     }
 
     #[test]

@@ -454,7 +454,15 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         ok,
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
-    assert!(log.contains("✓ indexmap live in all 5 cell(s)"), "{log}");
+    // The COUNT comes from the matrix, not from a number typed here: this line
+    // said `all 5 cell(s)` and went red the day the matrix grew to the six
+    // SHIPPED triples, which is a fact about `default_cells()` and not about the
+    // liveness obligation this fixture exists to prove.
+    let live_all = format!(
+        "✓ indexmap live in all {} cell(s)",
+        aterm_forge::resolve::default_cells().len()
+    );
+    assert!(log.contains(&live_all), "{log}");
 
     // Plant the violation: an intermediate dependency drags in a second
     // `indexmap` at another major, exactly as toml_edit 0.25 did for winnow.

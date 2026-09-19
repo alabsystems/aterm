@@ -4702,10 +4702,19 @@ pub struct GpuRenderer {
     /// CPU/GPU differential tests flip it OFF via [`GpuRenderer::set_bloom`] so the
     /// parity-critical base render stays byte-exact.
     enable_bloom: bool,
-    /// M3 phase B: config `hdr_glow` (DEFAULT OFF). Feeds the two proven gate
+    /// M3 phase B: config `hdr_glow` (the config default is ON; `set_hdr_glow`
+    /// forces it off on a Windows visual swapchain). Feeds the two proven gate
     /// seams — `format_plan::hdr_swapchain_wants_f16` at surface attach and
-    /// `format_plan::hdr_present_plan` at present. With this false everything
-    /// M3-phase-B is inert by the SdrInvariance proof (HdrPresentGate).
+    /// `format_plan::hdr_present_plan` at present. The shipped macOS Metal
+    /// attach (`cfg(not(wgpu_arm))`) reaches the first through
+    /// `format_plan::hdr_swapchain_wants_f16_on_screen`, which narrows it by
+    /// the screen's EDR potential and never widens it — its result implies
+    /// the spec-bound gate — and `upgrade_surface_for_screen` re-picks an
+    /// 8-bit window live (on a monitor change and on the frontend's throttled
+    /// headroom re-query) through the narrower still
+    /// `format_plan::hdr_screen_upgrade_wants_f16`. With this false
+    /// everything M3-phase-B is inert by the SdrInvariance proof
+    /// (HdrPresentGate).
     hdr_glow: bool,
     /// H1 (Windows Mica/Acrylic): config `background_material != none` — the
     /// frontend's live material knob, mirrored here so the renderer can carry
@@ -8778,13 +8787,21 @@ impl GpuRenderer {
         self.enable_shimmer && !input.fire_patch.is_empty() && !input.cursor_glow_add.is_empty()
     }
 
-    /// M3 phase B — config `hdr_glow` (DEFAULT OFF): opt the EDR aurora in. Set
-    /// BEFORE a window's surface is created to get the `Rgba16Float`
-    /// extended-linear swapchain (attach seam); the present seam re-checks it
-    /// each frame, so flipping it off live disables the >1.0 emission
-    /// immediately while an already-f16 swapchain keeps decoding correctly
-    /// (grid clamped at reference white). See `format_plan::hdr_present_plan`
-    /// for the proven gating.
+    /// M3 phase B — config `hdr_glow` (the config default is ON): opt the EDR
+    /// aurora in. The attach seam reads it when a window's surface is created
+    /// (the `Rgba16Float` extended-linear swapchain; the shipped macOS Metal
+    /// arm narrows that pick by the window's screen). It is not read at attach
+    /// only: on the Metal arm `upgrade_surface_for_screen` reads the LIVE value
+    /// at every monitor change and at the frontend's redraw-time headroom
+    /// re-query (throttled to 250 ms), so a window that attached 8-bit — with
+    /// this off, or on an SDR-only screen — takes f16 at the first such call
+    /// after this is on while its screen reports EDR potential above 1.0, with
+    /// no monitor change needed (on Windows the wgpu arm's
+    /// `reconcile_live_hdr_state_if_due` is the live reader). The present seam
+    /// re-checks it each frame, so flipping it off live disables the >1.0
+    /// emission immediately while an already-f16 swapchain keeps decoding
+    /// correctly (grid clamped at reference white). See
+    /// `format_plan::hdr_present_plan` for the proven gating.
     pub fn set_hdr_glow(&mut self, on: bool) {
         // H1 (Windows Mica/Acrylic): the EDR (f16 + scRGB) swapchain and the
         // DirectComposition visual swapchain are MUTUALLY EXCLUSIVE, decided at
@@ -10241,31 +10258,10 @@ impl GpuRenderer {
             };
             (translucent, premult, want)
         };
-        // THE FLIP's wgpu-free derivation — the same axes off the same knobs:
-        // translucency from the opacity knob (`present_alpha_mode`'s gate,
-        // PostMultiplied-shaped — macOS never offers PreMultiplied and has no
-        // DirectComposition visual), copy-out from the live taps, dims/format
-        // from the retained desires. `display_sync = false` is the shipped
-        // macOS pacing (wgpu had no Mailbox here and picked Immediate).
+        // THE FLIP's wgpu-free derivation — one helper, shared with the
+        // monitor-change re-pick so the two can never disagree on an axis.
         #[cfg(not(wgpu_arm))]
-        let (translucent, premult, want) = {
-            let translucent = self.cpu.background_opacity() < 1.0 && surf.post_mult;
-            let copy = surf.copyable
-                && Self::tap_wants_copy_src(win.video.is_some(), win.presented_snapshot.is_some());
-            (
-                translucent,
-                false,
-                crate::metal::swapchain::SwapchainConfig {
-                    format: surf.neutral.format.metal(),
-                    width: surf.neutral.width as usize,
-                    height: surf.neutral.height as usize,
-                    framebuffer_only: !copy,
-                    display_sync: false,
-                    maximum_drawables: 3,
-                    opaque: !translucent,
-                },
-            )
-        };
+        let (translucent, premult, want) = self.metal_present_want(win, surf);
         {
             let Some(cell) = self.metal_arm.as_mut() else {
                 metal_arm_note("armed present: the arm is not live");
@@ -11602,19 +11598,34 @@ impl GpuRenderer {
         };
         // THE FLIP's wgpu-free attach: the first-party swapchain IS the
         // surface. The format pick is the proven pure gate
-        // (`hdr_swapchain_wants_f16`; Metal always offers f16), the present
-        // pacing is the shipped macOS mode (`displaySyncEnabled = NO` — wgpu
-        // has no Mailbox on macOS and picked Immediate), and an attach
-        // failure is an ERROR: the frontend's `surface_attach_fallback` lands
-        // on the CPU renderer, the same floor device loss uses. There is no
-        // wgpu swapchain to fall back onto and this refuses to pretend
-        // otherwise.
+        // (`hdr_swapchain_wants_f16`; Metal always offers f16) narrowed by
+        // the screen's EDR potential (`hdr_swapchain_wants_f16_on_screen`: an
+        // SDR-only screen gets the 8-bit swapchain. An f16 one there would
+        // draw neither the >1.0 aurora (its headroom is 0) nor the SDR
+        // glow-boost crown (`sdr_boost_pass` is off on f16), at ~2x the
+        // full-frame blit's GPU time and drawable memory, measured on the
+        // Intel HD 630; the 8-bit one draws the SDR crown there. The frontend
+        // re-picks it through `upgrade_surface_for_screen`, on a monitor
+        // change and on its throttled headroom re-query, should the window's
+        // screen later report EDR potential), the present pacing is the
+        // shipped macOS mode (`displaySyncEnabled = NO` — wgpu has no Mailbox
+        // on macOS and picked Immediate), and an attach failure is an ERROR:
+        // the frontend's `surface_attach_fallback` lands on the CPU renderer,
+        // the same floor device loss uses. There is no wgpu swapchain to fall
+        // back onto and this refuses to pretend otherwise.
         #[cfg(not(wgpu_arm))]
         {
+            // Off the same handle as the parent layer, and before `target`
+            // moves: the EDR potential of the screen the window sits on.
+            let screen_edr_potential = crate::metal::present::screen_edr_potential_of(&target);
             let _ = (target, &metal_parent); // `target`'s layer was resolved above.
             let width = self.clamp_fb_dim(width.max(1));
             let height = self.clamp_fb_dim(height.max(1));
-            let format = if crate::format_plan::hdr_swapchain_wants_f16(self.hdr_glow, true) {
+            let format = if crate::format_plan::hdr_swapchain_wants_f16_on_screen(
+                self.hdr_glow,
+                true,
+                screen_edr_potential,
+            ) {
                 crate::device_layer::TexelFormat::Rgba16Float
             } else {
                 crate::device_layer::TexelFormat::Bgra8Unorm
@@ -11652,7 +11663,7 @@ impl GpuRenderer {
             crate::stderr_line!(
                 "aterm-gpu (metal arm): attached swapchain live state: \
                  display_sync={sync} framebuffer_only={fb_only} \
-                 max_drawables={max_dr} edr={edr}"
+                 max_drawables={max_dr} edr={edr} screen_edr_potential={screen_edr_potential:?}"
             );
             Ok(GpuSurface {
                 acquire_id: next_surface_acquire_id(),
@@ -12331,6 +12342,201 @@ impl GpuRenderer {
         }
     }
 
+    /// THE FLIP's per-present swapchain desire, derived wgpu-free — the same
+    /// axes off the same knobs as the wgpu arm's reconcile: translucency from
+    /// the opacity knob (`present_alpha_mode`'s gate, PostMultiplied-shaped —
+    /// macOS never offers PreMultiplied and has no DirectComposition visual),
+    /// copy-out from the live taps, dims/format from the retained desires.
+    /// `display_sync = false` is the shipped macOS pacing (wgpu had no Mailbox
+    /// here and picked Immediate). Returns `(translucent, premult, want)`.
+    ///
+    /// ONE derivation, two callers: the armed present reconciles the live
+    /// layer against `want` every frame, and the monitor-change re-pick
+    /// ([`Self::upgrade_surface_for_screen`]) reconciles against the SAME
+    /// `want` once, off the moved format — so the flip it performs is exactly
+    /// the one the next present would otherwise perform, and that present
+    /// then sees no drift.
+    #[cfg(not(wgpu_arm))]
+    fn metal_present_want(
+        &self,
+        win: &WindowGpu,
+        surf: &GpuSurface,
+    ) -> (bool, bool, crate::metal::swapchain::SwapchainConfig) {
+        let translucent = self.cpu.background_opacity() < 1.0 && surf.post_mult;
+        let copy = surf.copyable
+            && Self::tap_wants_copy_src(win.video.is_some(), win.presented_snapshot.is_some());
+        (
+            translucent,
+            false,
+            crate::metal::swapchain::SwapchainConfig {
+                format: surf.neutral.format.metal(),
+                width: surf.neutral.width as usize,
+                height: surf.neutral.height as usize,
+                framebuffer_only: !copy,
+                display_sync: false,
+                maximum_drawables: 3,
+                opaque: !translucent,
+            },
+        )
+    }
+
+    /// M3 phase B, the LIVE half of the attach's screen gate (the macOS Metal
+    /// arm): re-pick the swapchain format for the screen `target`'s window
+    /// NOW sits on. The attach narrows the f16 pick by the window's screen
+    /// (`create_window_surface` through `hdr_swapchain_wants_f16_on_screen`),
+    /// so a window born on an SDR-only screen (or with `hdr_glow` off) holds
+    /// an 8-bit swapchain. The frontend calls this from two places: its
+    /// monitor-change hook (`refresh_frame_interval`'s different-monitor
+    /// branch) and its redraw-time headroom re-query (`refresh_edr_headroom`,
+    /// throttled to 250 ms). The second covers a window whose screen gains EDR
+    /// potential with no monitor change: `hdr_glow` hot-reloaded on, or a
+    /// display-settings change (High Dynamic Range turned on for an external
+    /// monitor) should AppKit then report a higher potential for the window's
+    /// screen — Apple fixes the value per `NSScreen` object, not per monitor,
+    /// and the reader walks to the window's screen afresh on every call. When
+    /// the window's screen reports EDR potential above 1.0, this moves the
+    /// retained format to
+    /// `Rgba16Float` (`format_plan::hdr_screen_upgrade_wants_f16` — positive
+    /// evidence only, never wider than the attach gate), FLIPS THE LIVE LAYER
+    /// before returning, and only then promotes the window's capture
+    /// metadata (`WindowGpu::apply_hdr_surface_upgrade`).
+    ///
+    /// The flip is the armed present's own reconcile, run early: `want` comes
+    /// from `metal_present_want` — the one derivation the present
+    /// uses every frame — off the moved format, and
+    /// `MetalWindowSurface::reconcile` sees the format drift and reconfigures
+    /// the layer through `Swapchain::configure`, which names the pixel
+    /// format, `wantsExtendedDynamicRangeContent` and the extended-linear
+    /// colorspace in that order (the W1 storm test drives exactly this flip
+    /// on a live layer). Synchronous ON PURPOSE: the frontend replays the
+    /// attach's colour-space tag (`window_set_surface_colorspace`, scRGB)
+    /// the moment this returns `true`, and that tag lands on the first-party
+    /// `CAMetalLayer` — so it must find a layer that already holds f16 +
+    /// scRGB, where it is the same-value re-set it is at attach (there,
+    /// `Swapchain::attached` has configured the layer before the caller
+    /// tags it). Deferring the flip to the next present would leave an
+    /// 8-bit sRGB-encoded drawable under an scRGB tag until that present —
+    /// the state `Swapchain::configure`'s note forbids (the compositor
+    /// misreads every such frame). Every present-role pipeline is minted per
+    /// live format (`present_pso`) and the present plan is derived per frame
+    /// from the live format, so nothing downstream is frozen to the attach;
+    /// the next present's reconcile sees no drift. The macOS twin of the
+    /// Windows `reconcile_live_hdr_state_if_due`.
+    ///
+    /// A refused flip — the arm not live, no armed swapchain, `reconcile`'s
+    /// `Err`, or a layer that did not move in this call because a drawable
+    /// acquisition is in flight on the surface's worker (`reconcile` then
+    /// records the desire and answers `Ok` without touching the layer, so the
+    /// held format, not `Ok`, decides) — reverts the retained format to what
+    /// the layer still holds, promotes nothing and returns `false`, so the
+    /// frontend tags nothing (the throttled re-query tries again at its next
+    /// due call; `metal_arm_note` prints each distinct refusal once).
+    /// The revert is sound because a refused reconfigure never half-writes
+    /// the layer: `Swapchain::reconfigure` refuses before any write when the
+    /// loss latch is set, and `Swapchain::configure`'s failure points
+    /// (`validate`, the colorspace CREATE) both precede its first setter;
+    /// `MetalWindowSurface::reconcile` keeps its retained config on `Err`.
+    ///
+    /// ONE direction: an f16 window dragged onto an SDR screen keeps f16, and
+    /// there it draws neither the >1.0 aurora (the sanitized headroom is 0)
+    /// nor the SDR glow-boost crown (`format_plan::sdr_boost_pass` is off on
+    /// an f16 swapchain), while a window ATTACHED on that screen holds 8-bit
+    /// and draws the crown. The kept-f16 look is the pre-gate behaviour on
+    /// every SDR screen; a live downgrade would also have to walk the
+    /// frontend's colour-space and capture tags back, which this does not
+    /// take on. Returns whether the LAYER moved: `true` means the live layer
+    /// holds f16 + scRGB and the caller replays the attach's colour-space tag
+    /// and re-seeds the headroom. `false`, with no AppKit crossing, on an
+    /// already-f16 surface and whenever the proven gate refuses (`hdr_glow`
+    /// off, no f16 support): the throttled re-query calls this for every
+    /// 8-bit GPU window, so those return before the screen is read. `false`
+    /// on an unresolved or SDR screen, on a refused flip, off macOS, and on
+    /// the wgpu-oracle arm — whose attach keeps wgpu's screen-blind pick, so
+    /// it never holds an 8-bit swapchain the screen gate narrowed.
+    pub fn upgrade_surface_for_screen<W: raw_window_handle::HasWindowHandle>(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        target: &W,
+    ) -> bool {
+        #[cfg(not(wgpu_arm))]
+        {
+            // Cheap gates before the AppKit read. The frontend's throttled
+            // headroom re-query calls this for every 8-bit GPU window, so an
+            // f16 surface and a window the proven gate refuses (`hdr_glow`
+            // off, no f16 support), neither of which the upgrade gate below
+            // can admit, return here without touching AppKit.
+            if surf.is_hdr()
+                || !crate::format_plan::hdr_swapchain_wants_f16(self.hdr_glow, surf.supports_f16)
+            {
+                return false;
+            }
+            let screen_edr_potential = crate::metal::present::screen_edr_potential_of(target);
+            if !crate::format_plan::hdr_screen_upgrade_wants_f16(
+                self.hdr_glow,
+                surf.supports_f16,
+                surf.is_hdr(),
+                screen_edr_potential,
+            ) {
+                return false;
+            }
+            // The retained desire moves FIRST so `want` derives off it exactly
+            // as the next present would; the layer follows in the same call.
+            let previous = surf.neutral.format;
+            surf.neutral.format = crate::device_layer::TexelFormat::Rgba16Float;
+            let (_, _, want) = self.metal_present_want(win, surf);
+            let flipped = match (self.metal_arm.as_mut(), surf.metal.as_mut()) {
+                (Some(cell), Some(ms)) => {
+                    // The present's own preamble: settled presents feed the
+                    // loss latch before the reconfigure consults it.
+                    let live = cell.live_mut();
+                    live.drain_pending();
+                    let device = live.mint.device().clone_ref();
+                    // `Ok` is not a flip by itself: while a drawable
+                    // acquisition is in flight on the surface's worker,
+                    // `reconcile` records the desire and returns without
+                    // touching the layer (nextDrawable and the layer's
+                    // setters never overlap). The format the layer now holds
+                    // is the answer to "did it move".
+                    ms.reconcile(&device, &want).and_then(|_| {
+                        if ms.config().format == want.format {
+                            Ok(())
+                        } else {
+                            Err("a drawable acquisition is in flight, so the layer was not \
+                                 reconfigured in this call"
+                                .to_owned())
+                        }
+                    })
+                }
+                (None, _) => Err("the arm is not live".to_owned()),
+                (_, None) => Err("this window has no armed swapchain".to_owned()),
+            };
+            if let Err(e) = flipped {
+                // Nothing moved: the desire returns to the format the layer
+                // still holds, the capture metadata stays 8-bit, and the
+                // caller sees no upgrade — so no scRGB tag reaches an 8-bit
+                // layer.
+                surf.neutral.format = previous;
+                metal_arm_note(&format!(
+                    "screen re-pick: the f16 flip was refused ({e}); \
+                     the window keeps its 8-bit swapchain"
+                ));
+                return false;
+            }
+            win.apply_hdr_surface_upgrade();
+            crate::stderr_line!(
+                "aterm-gpu (metal arm): swapchain re-picked Rgba16Float for the window's screen \
+                 (screen_edr_potential={screen_edr_potential:?}); the live layer flipped"
+            );
+            true
+        }
+        #[cfg(wgpu_arm)]
+        {
+            let _ = (win, surf, target);
+            false
+        }
+    }
+
     /// Configure an EXISTING surface while preserving the invariant that f16
     /// means a compositor-confirmed scRGB swapchain.
     ///
@@ -12442,8 +12648,12 @@ impl GpuRenderer {
             return;
         }
 
-        // SDR→HDR is Windows-only: macOS takes f16 at initial attach whenever it
-        // is capable, while Linux/web have no explicit compositor HDR protocol.
+        // SDR→HDR through THIS seam is Windows-only (the wgpu arm's output-HDR
+        // probe); the shipped macOS Metal arm narrows its attach by the window's
+        // screen (`hdr_swapchain_wants_f16_on_screen`) and re-picks an 8-bit
+        // window through `upgrade_surface_for_screen` (on a monitor change and
+        // on the frontend's throttled headroom re-query);
+        // Linux/web have no explicit compositor HDR protocol.
         let output_hdr_enabled = Self::surface_output_hdr_enabled(&surf.surface);
         if !crate::format_plan::hdr_live_upgrade_wants_f16(
             self.hdr_glow,
@@ -20906,8 +21116,14 @@ fn decode_for_key(
     // image-cells) per frame, quadratic when a screenful of distinct images changes
     // every frame (round-9). The footprint (fp_w, fp_h) was computed from this image's
     // cols/rows at the call site, so it matches by construction.
-    let rgba = aterm_render::decode_image_to_footprint(&image.bytes, image.format, fp_w, fp_h)
-        .unwrap_or_default();
+    let rgba = aterm_render::decode_image_to_footprint(
+        &image.bytes,
+        image.format,
+        fp_w,
+        fp_h,
+        image.pixel_exact,
+    )
+    .unwrap_or_default();
     GpuDecodedImage {
         w: fp_w as u32,
         h: fp_h as u32,
@@ -24071,6 +24287,7 @@ mod tests {
             rows: 1,
             z_index: 0,
             band_lift_px: 0,
+            pixel_exact: false,
         })
     }
 

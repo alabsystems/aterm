@@ -2337,7 +2337,36 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
 /// The `spawn` verb's usage line — one string for every malformed form, naming
 /// the whole grammar (plain + aimed + connected) so a caller who got one token
 /// wrong sees the complete contract.
-const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<true|false>] [cwd=<path>] [split=<v|h>] [connected=controlled|controller place=window|tab of=<sid>]\n";
+const SPAWN_USAGE: &str = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [identity=<name>|-] [connected=controlled|controller place=window|tab of=<sid>]\n";
+
+/// `identity=<name>|-` as parsed on the control thread (session identities,
+/// 2026-09-17). Three states, because an AIMED spawn (`@<sid> spawn`, or the
+/// connected form's `of=`) INHERITS the aimed session's identity by default —
+/// a worker running `aterm ctl spawn` must not fall back to the human's login
+/// — and `-` is how it opts out. Resolved on the main thread, where the aimed
+/// handle is ([`resolve_spawn_identity`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentitySpec {
+    /// `identity=<name>`: spawn under this identity (folded to lowercase at
+    /// parse), creating it on first use — the ONLY create path.
+    Named(String),
+    /// `identity=-`: the human's own agent config, even under an aimed spawn.
+    Default,
+}
+
+/// The identity a spawn lands under, pure: an explicit name wins, `-` opts
+/// out, and nothing said means the aimed session's (`None` when the spawn
+/// was not aimed, or the aimed session has none).
+pub(crate) fn resolve_spawn_identity(
+    spec: Option<IdentitySpec>,
+    aimed: Option<&str>,
+) -> Option<String> {
+    match spec {
+        Some(IdentitySpec::Named(name)) => Some(name),
+        Some(IdentitySpec::Default) => None,
+        None => aimed.map(str::to_owned),
+    }
+}
 
 /// The `tab` verb's usage line, shared by the front-window form
 /// ([`super::control_input::cmd_tab`]) and the aimed `@<sid> tab` form
@@ -2355,17 +2384,23 @@ enum SpawnForm {
         /// window when one was given, else the front window
         /// ([`SpawnAim::from_request`]).
         window: Option<u64>,
-        /// `raise=<true|false>`: an EXPLICIT raise verdict. `None` defers to
-        /// [`raise_after_spawn`]'s default — raise only when nothing was aimed.
+        /// `raise=<t|f>` (`true|false` too, as `split=` takes `vertical`): an
+        /// EXPLICIT raise verdict. `None` defers to [`raise_after_spawn`]'s
+        /// default — raise only when nothing was aimed.
         raise: Option<bool>,
         cwd: Option<String>,
         split: Option<crate::pane::SplitDir>,
+        /// `identity=<name>|-` (session identities); `None` = not said.
+        identity: Option<IdentitySpec>,
     },
     Connected {
         kind: crate::connections::ConnectedSpawnKind,
         place: crate::connections::ConnectedSpawnPlace,
         origin: aterm_session::SessionId,
         cwd: Option<String>,
+        /// `identity=<name>|-`: allowed in the connected form too — a
+        /// controlled worker under its own login is the use case.
+        identity: Option<IdentitySpec>,
     },
 }
 
@@ -2390,19 +2425,32 @@ enum SpawnForm {
 fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
     let (mut cwd, mut split, mut kind, mut place, mut origin) = (None, None, None, None, None);
-    let (mut window, mut raise) = (None, None);
+    let (mut window, mut raise, mut identity) = (None, None, None);
     let Some(tokens) = split_quoted_tokens(rest) else {
         return Err(());
     };
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("cwd=") {
             cwd = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("identity=") {
+            // `-` is the absent mark (opt out of inheriting); anything else
+            // must be a name under the grammar, folded — a bad one is the
+            // usage line, never a spawn under a guessed identity.
+            identity = Some(if v == "-" {
+                IdentitySpec::Default
+            } else {
+                IdentitySpec::Named(crate::agent_identity::parse_name(v).map_err(|_| ())?)
+            });
         } else if let Some(v) = tok.strip_prefix("window=") {
             window = Some(v.parse::<u64>().map_err(|_| ())?);
         } else if let Some(v) = tok.strip_prefix("raise=") {
+            // The summary's `<t|f>` and the long spelling every existing caller
+            // uses — measured 2026-09-17 (review): the summary said `<t|f>`
+            // beside `split=<v|h>`, whose letters ARE accepted, and `raise=t`
+            // was `ERR usage`.
             raise = Some(match v {
-                "true" => true,
-                "false" => false,
+                "t" | "true" => true,
+                "f" | "false" => false,
                 _ => return Err(()),
             });
         } else if let Some(v) = tok.strip_prefix("split=") {
@@ -2438,6 +2486,7 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
             raise,
             cwd,
             split,
+            identity,
         }),
         (Some(kind), Some(place), Some(origin))
             if split.is_none() && window.is_none() && raise.is_none() =>
@@ -2447,6 +2496,7 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
                 place,
                 origin,
                 cwd,
+                identity,
             })
         }
         // A partial connected form (connected= without of=/place=, or a stray
@@ -2501,7 +2551,7 @@ pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -
     }
 }
 
-/// `spawn [window=<id>] [raise=<true|false>] [cwd=<path>] [split=<v|h>]` ->
+/// `spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>]` ->
 /// mint ONE new session and reply `OK <sid>` — birth as a socket primitive.
 /// The sid is live in the registry before the reply is sent, so `@<sid> …`
 /// works immediately: an orchestrator stands up a fleet with a loop of spawn
@@ -2553,6 +2603,7 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
             raise,
             cwd,
             split,
+            identity,
         }) => {
             let aim = SpawnAim::from_request(window, session);
             let raise = raise_after_spawn(aim.is_aimed(), raise);
@@ -2561,6 +2612,7 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
                 cwd,
                 split,
                 raise,
+                identity,
                 reply: tx,
             })
         }
@@ -2569,11 +2621,13 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
             place,
             origin,
             cwd,
+            identity,
         }) => call_main(proxy, |tx| Wake::SpawnConnectedSession {
             kind,
             place,
             origin,
             cwd,
+            identity,
             reply: tx,
         }),
         Err(()) => return SPAWN_USAGE.to_string(),
@@ -2673,9 +2727,25 @@ impl crate::App {
         cwd: Option<String>,
         split: Option<crate::pane::SplitDir>,
         raise: bool,
+        identity: Option<IdentitySpec>,
     ) -> Result<String, String> {
         let host = self.aimed_window(aim)?;
-        let sid = self.spawn_tab_session(host, cwd, split)?;
+        // IDENTITY (session identities, 2026-09-17): an aimed spawn inherits
+        // the aimed session's identity unless `identity=` says otherwise, so a
+        // worker's own `aterm ctl spawn` stays under its login instead of
+        // falling back to the human's. A named identity is created here, on
+        // the verb, and nowhere else — its failure is this spawn's reply
+        // (`ERR identity <name>: <why>`), never a shell without its env.
+        let aimed = match aim {
+            SpawnAim::Session(local) => self.identity_of_local(local),
+            SpawnAim::Front | SpawnAim::Window(_) => None,
+        };
+        let identity = resolve_spawn_identity(identity, aimed.as_deref());
+        if let Some(name) = &identity {
+            crate::agent_identity::ensure(name, true)
+                .map_err(|e| format!("identity {name}: {e}"))?;
+        }
+        let sid = self.spawn_tab_session(host, cwd, split, identity.as_deref())?;
         if raise
             && let Some(window) = host
                 .or(self.frontmost_window)
@@ -2685,6 +2755,15 @@ impl crate::App {
             self.apprt.window_bring_to_front(&window);
         }
         Ok(sid)
+    }
+
+    /// The identity label of the session with local id `local`, from the
+    /// registry handle — what an aimed spawn inherits. `None` for an unknown
+    /// id or a session under the human's own agent config.
+    pub(crate) fn identity_of_local(&self, local: u64) -> Option<String> {
+        let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+        g.by_local(local)
+            .and_then(|h| h.identity.as_deref().map(str::to_owned))
     }
 
     /// `@<sid> tab …` on the main thread: the aimed twin of the
@@ -2924,8 +3003,46 @@ mod fx_parse_tests {
 
 #[cfg(test)]
 mod spawn_parse_tests {
-    use super::{SpawnForm, parse_spawn_args, split_quoted_tokens};
+    use super::{
+        IdentitySpec, SpawnForm, parse_spawn_args, resolve_spawn_identity, split_quoted_tokens,
+    };
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
+
+    /// REVIEW (contract lens, 2026-09-17): the catalog's `spawn` summary says
+    /// `[raise=<t|f>]` beside `[split=<v|h>]`, whose letters ARE the accepted
+    /// values — and the parser refused `raise=t` (`ERR usage`). Every
+    /// spelling the summary, the usage line and the full entry name parses,
+    /// the long form every existing caller uses included; anything else is
+    /// still usage.
+    #[test]
+    fn the_summarys_raise_letters_parse_like_splits_do() {
+        let spawn = aterm_types::control_verbs::VERBS
+            .iter()
+            .find(|v| v.name == "spawn")
+            .expect("the spawn row");
+        assert!(spawn.summary.contains("[raise=<t|f>]"), "{}", spawn.summary);
+        assert!(spawn.summary.contains("[split=<v|h>]"), "{}", spawn.summary);
+        assert!(super::SPAWN_USAGE.contains("[raise=<t|f>]"));
+        let raise_of = |rest: &str| match parse_spawn_args(rest) {
+            Ok(SpawnForm::Plain { raise, .. }) => raise,
+            other => panic!("{rest:?}: {other:?}"),
+        };
+        for (rest, want) in [
+            ("raise=t", Some(true)),
+            ("raise=true", Some(true)),
+            ("raise=f", Some(false)),
+            ("raise=false", Some(false)),
+            ("split=v raise=t", Some(true)),
+            ("identity=worker raise=f", Some(false)),
+            ("", None),
+        ] {
+            assert_eq!(raise_of(rest), want, "{rest:?}");
+        }
+        assert!(parse_spawn_args("split=v").is_ok());
+        for bad in ["raise=", "raise=yes", "raise=T", "raise=1", "raise=tr"] {
+            assert!(parse_spawn_args(bad).is_err(), "{bad:?} is usage");
+        }
+    }
 
     /// The BACKWARD-COMPATIBILITY leg: every `spawn` request that worked before
     /// quoting existed must tokenize byte-identically, or a quiet regression
@@ -2992,7 +3109,8 @@ mod spawn_parse_tests {
                 window: None,
                 raise: None,
                 cwd: None,
-                split: None
+                split: None,
+                identity: None,
             })
         );
         assert_eq!(
@@ -3001,7 +3119,8 @@ mod spawn_parse_tests {
                 window: None,
                 raise: None,
                 cwd: Some("/tmp/x".to_string()),
-                split: None
+                split: None,
+                identity: None,
             })
         );
         assert_eq!(
@@ -3010,7 +3129,8 @@ mod spawn_parse_tests {
                 window: None,
                 raise: None,
                 cwd: Some("/tmp/x".to_string()),
-                split: Some(crate::pane::SplitDir::Vertical)
+                split: Some(crate::pane::SplitDir::Vertical),
+                identity: None,
             })
         );
         // The quoted `cwd=` reaches the plain form through the same tokenizer.
@@ -3020,11 +3140,13 @@ mod spawn_parse_tests {
                 window: None,
                 raise: None,
                 cwd: Some(r"C:\Program Files\Git".to_string()),
-                split: None
+                split: None,
+                identity: None,
             })
         );
         assert_eq!(parse_spawn_args("bogus"), Err(()));
         assert_eq!(parse_spawn_args("split=diagonal"), Err(()));
+        assert_eq!(parse_spawn_args("identity=a/b"), Err(()));
         // An unterminated quote is malformed for the verb, not "to end of line".
         assert_eq!(parse_spawn_args(r#"cwd="C:\Program Files"#), Err(()));
     }
@@ -3040,6 +3162,7 @@ mod spawn_parse_tests {
                 place: ConnectedSpawnPlace::Tab,
                 origin: aterm_session::SessionId::new("s-abc"),
                 cwd: Some("/w".to_string()),
+                identity: None,
             })
         );
         assert!(matches!(
@@ -3073,6 +3196,88 @@ mod spawn_parse_tests {
         );
     }
 
+    /// `identity=<name>|-` (session identities, 2026-09-17) parses in BOTH
+    /// forms: a name folds to lowercase at parse (`Worker` and `worker` are one
+    /// identity — one directory on a case-insensitive filesystem), `-` is the
+    /// absent mark that opts an aimed spawn out of inheriting, and anything
+    /// outside the grammar — a path, a shell word, `-x`, an empty value, a
+    /// 65-character name — is the usage line, never a spawn under a guess.
+    #[test]
+    fn identity_parses_folded_in_both_forms_and_the_absent_mark_opts_out() {
+        assert_eq!(
+            parse_spawn_args("identity=Worker"),
+            Ok(SpawnForm::Plain {
+                window: None,
+                raise: None,
+                cwd: None,
+                split: None,
+                identity: Some(IdentitySpec::Named("worker".to_string())),
+            })
+        );
+        assert_eq!(
+            parse_spawn_args("cwd=/w identity=- split=v window=2 raise=false"),
+            Ok(SpawnForm::Plain {
+                window: Some(2),
+                raise: Some(false),
+                cwd: Some("/w".to_string()),
+                split: Some(crate::pane::SplitDir::Vertical),
+                identity: Some(IdentitySpec::Default),
+            })
+        );
+        assert!(matches!(
+            parse_spawn_args("connected=controlled place=tab of=s-abc identity=WORKER-2"),
+            Ok(SpawnForm::Connected {
+                identity: Some(IdentitySpec::Named(name)),
+                ..
+            }) if name == "worker-2"
+        ));
+        assert!(matches!(
+            parse_spawn_args("connected=controller place=window of=s-abc"),
+            Ok(SpawnForm::Connected { identity: None, .. })
+        ));
+        for bad in [
+            "identity=",
+            "identity=-x",
+            "identity=a/b",
+            "identity=../up",
+            "identity=.hidden",
+            "identity=\"two words\"",
+            "identity=w\u{e9}",
+        ] {
+            assert_eq!(parse_spawn_args(bad), Err(()), "{bad}");
+        }
+        assert_eq!(
+            parse_spawn_args(&format!("identity={}", "a".repeat(65))),
+            Err(())
+        );
+        assert!(
+            parse_spawn_args(&format!("identity={}", "a".repeat(64))).is_ok(),
+            "64 is the limit"
+        );
+
+        // The resolution rule (pure): explicit wins, `-` opts out, silence
+        // inherits — and silence on an un-aimed spawn is none.
+        assert_eq!(
+            resolve_spawn_identity(
+                Some(IdentitySpec::Named("worker".into())),
+                Some("human-ish")
+            ),
+            Some("worker".to_string())
+        );
+        assert_eq!(
+            resolve_spawn_identity(Some(IdentitySpec::Default), Some("worker")),
+            None,
+            "identity=- opts out of inheriting"
+        );
+        assert_eq!(
+            resolve_spawn_identity(None, Some("worker")),
+            Some("worker".to_string()),
+            "@<sid> spawn inherits the aimed session's identity"
+        );
+        assert_eq!(resolve_spawn_identity(None, None), None);
+        assert!(super::SPAWN_USAGE.contains("[identity=<name>|-]"));
+    }
+
     /// The usage string the wire replies for every malformed form names the
     /// WHOLE grammar (a caller sees the complete contract) — the aimed knobs
     /// included, in the order the design spells them.
@@ -3082,9 +3287,7 @@ mod spawn_parse_tests {
         assert!(super::SPAWN_USAGE.contains("place=window|tab"));
         assert!(super::SPAWN_USAGE.contains("of=<sid>"));
         assert!(super::SPAWN_USAGE.contains("split=<v|h>"));
-        assert!(
-            super::SPAWN_USAGE.starts_with("ERR usage: spawn [window=<id>] [raise=<true|false>]")
-        );
+        assert!(super::SPAWN_USAGE.starts_with("ERR usage: spawn [window=<id>] [raise=<t|f>]"));
         assert!(super::SPAWN_USAGE.ends_with('\n'));
         // The aimed `tab` form replies the SAME usage sentence its front-window
         // twin does (control_input::cmd_tab), so the two never drift apart.
@@ -3104,7 +3307,8 @@ mod spawn_parse_tests {
                 window: Some(1),
                 raise: None,
                 cwd: None,
-                split: None
+                split: None,
+                identity: None,
             })
         );
         assert_eq!(
@@ -3113,7 +3317,8 @@ mod spawn_parse_tests {
                 window: None,
                 raise: Some(false),
                 cwd: None,
-                split: None
+                split: None,
+                identity: None,
             })
         );
         assert_eq!(
@@ -3122,7 +3327,8 @@ mod spawn_parse_tests {
                 window: Some(0),
                 raise: Some(true),
                 cwd: Some("/w".to_string()),
-                split: Some(crate::pane::SplitDir::Horizontal)
+                split: Some(crate::pane::SplitDir::Horizontal),
+                identity: None,
             })
         );
     }

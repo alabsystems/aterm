@@ -335,6 +335,9 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// `atpkg` argv0 alias) and by the thin standalone bin. Everything below is
 /// unchanged from the binary era.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
+    // Before any wait: the clock a waited launch pass compares the store's record
+    // against ([`pass_finished_while_we_waited`]).
+    let _ = PROCESS_START_UNIX.set(unix_now());
     // THE HIDDEN HELPER VERBS FIRST, ON THE RAW ARGV. Their one argument is a spec
     // PATH — a file under the store prefix — and a prefix under a non-UTF-8 name must
     // reach the helper byte for byte: the lossy conversion below turned such a path
@@ -672,6 +675,131 @@ struct WaitLock {
 /// argv of its own.
 static WAIT_LOCK: std::sync::OnceLock<WaitLock> = std::sync::OnceLock::new();
 
+/// Whether this process found the store lock CONTENDED at least once before it
+/// took it ([`mutator_store_lock`]'s poll): set on every contended poll of a
+/// `--wait-lock` wait, read by [`pass_finished_while_we_waited`].
+static WAITED_FOR_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// When this process started, unix seconds — captured at the top of
+/// [`main_entry`], before any wait.
+static PROCESS_START_UNIX: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// The unix second of this process's FIRST contended poll at the store lock: the
+/// instant it is known that someone else holds the store. A success stamp
+/// STRICTLY later than this second was written by a pass that ran while this
+/// process waited ([`pass_finished_while_we_waited`]); a same-second stamp cannot
+/// qualify, which fails safe (the verb runs) against one-second stamp
+/// granularity.
+static FIRST_CONTENDED_UNIX: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// THE HOLDER DID THIS PASS (2026-09-18). A launch UPDATE child (the `--wait-lock`
+/// lane; the launch seed always runs — its under-lock work is the new build's own
+/// stub/seam/exec-root reconcile, about a second) that queued behind another atpkg
+/// pass and then took the lock re-did that pass's whole work on the store the
+/// holder had just checked —
+/// a self-update's successor behind its own predecessor's launch pass, measured on
+/// the owner's Mac: 13 s queued, then ~14 s more under the lock for "up to date".
+/// Pure over the three facts: whether this process WAITED (a lock taken at the
+/// first try proves nothing about what ran before), the store's last SUCCESSFUL
+/// update-class pass (`status.toml` `last_success_at` — stamped only by a pass
+/// that resolved the index and ran to its end; never by a failed pass, a seed's
+/// own install or a typed `install <p>`, all of which move `updated_at`), and the
+/// second this process first found the lock held. A success stamped STRICTLY
+/// after that second was written by a pass that ran while this one waited — that
+/// pass is the one this launch owed, so the verb stands down; `Some(age)` says
+/// how long ago it ended. Anything less — no success, an older success, a holder
+/// that failed or installed one program — runs the verb: standing down is only
+/// ever "up to date" on proof.
+fn pass_finished_since_start(
+    waited: bool,
+    last_success_unix: Option<i64>,
+    first_contended_unix: i64,
+    now_unix: i64,
+) -> Option<u64> {
+    if !waited {
+        return None;
+    }
+    let stamp = last_success_unix?;
+    (stamp > first_contended_unix)
+        .then(|| u64::try_from(now_unix.saturating_sub(stamp)).unwrap_or(0))
+}
+
+/// [`pass_finished_since_start`] over this process's record: `Some(age)` when an
+/// update-class pass on `layout`'s store SUCCEEDED while this process waited for
+/// the lock. Never under the once-pass knob (`ATPKG_UPDATE_INTERVAL_SECS=0`, the
+/// test lane): its contract is one pass that RAN per launch, and a stood-down
+/// child would end it with no update having run.
+fn pass_finished_while_we_waited(layout: &crate::store::Layout) -> Option<u64> {
+    let waited = WAITED_FOR_LOCK.load(std::sync::atomic::Ordering::Relaxed);
+    if !waited || aterm_update_core::pkg_check::update_interval_secs() == 0 {
+        return None;
+    }
+    let first_contended = *FIRST_CONTENDED_UNIX.get_or_init(unix_now);
+    let text = std::fs::read_to_string(layout.status()).ok()?;
+    let last_success = aterm_update_core::pkg_check::last_success_at(&text)
+        .and_then(|stamp| aterm_update_core::pkg_check::rfc3339_to_unix(&stamp));
+    pass_finished_since_start(waited, last_success, first_contended, unix_now())
+}
+
+/// The line a stood-down launch pass prints — plain, no marker: to the window it
+/// is a quiet pass (exit 0), which raises nothing.
+fn stood_down_after_wait_line(verb: &str, ago: u64) -> String {
+    format!(
+        "atpkg: {verb}: up to date \u{2014} a pass on this store succeeded {ago} s ago, while \
+         this one waited for it; nothing to redo"
+    )
+}
+
+#[cfg(test)]
+mod stand_down_after_wait_tests {
+    use super::pass_finished_since_start;
+
+    /// A launch child that waited and finds a SUCCESS stamped strictly after the
+    /// second it first found the lock held stands down; one that did not wait,
+    /// whose record predates that second or lands in the same second, or whose
+    /// store carries no success, runs.
+    #[test]
+    fn only_a_waited_child_behind_a_pass_that_succeeded_since_it_queued_stands_down() {
+        let first = 1_700_000_000;
+        assert_eq!(
+            pass_finished_since_start(true, Some(first + 12), first, first + 20),
+            Some(8),
+            "the holder finished 8 s ago: stand down"
+        );
+        assert_eq!(
+            pass_finished_since_start(true, Some(first), first, first + 1),
+            None,
+            "a same-second stamp is not proof (one-second granularity): run"
+        );
+        assert_eq!(
+            pass_finished_since_start(true, Some(first - 1), first, first + 20),
+            None,
+            "a success older than this wait is the previous pass: run"
+        );
+        assert_eq!(
+            pass_finished_since_start(false, Some(first + 12), first, first + 20),
+            None,
+            "a lock taken at the first try waited for nobody: run"
+        );
+        assert_eq!(
+            pass_finished_since_start(true, None, first, first + 20),
+            None,
+            "no success on record (a failed holder, a seed's install): run"
+        );
+        assert_eq!(
+            pass_finished_since_start(true, Some(first + 30), first, first + 20),
+            Some(0),
+            "a stamp ahead of the clock reads as just now"
+        );
+    }
+}
+
 /// The environment variable a spawner sets beside `--wait-lock` to say WHO it is —
 /// its own pid — so the waiter's "my window is gone" is a comparison against a
 /// fact, not against a guess. The guess (`getppid` at the dispatch edge) races a
@@ -828,44 +956,42 @@ pub fn pending_passthrough(
     crate::vendor::system_binary_on_path(&layout.prefix, tool, path_var)
 }
 
-/// `atpkg __landing <program> -- [args…]` — the hidden verb an agent program's `agents/`
-/// twin execs while `<prefix>/landing/<program>` stands ([`crate::landing`]): wait for
-/// the newer build to land, saying so on STDERR, then `exec` the CURRENT `bin/<program>`
-/// shim — re-resolved after the wait, so the new build is what runs — with the
-/// arguments verbatim. Every ending runs the tool: a landed build, the expired bound
-/// ([`crate::landing::WAIT_SECS_ENV`]), a failed pass, a stale marker, or Ctrl-C
-/// (SIGINT stops the wait; it does not kill the command).
+/// `atpkg __landing <program> [<prefix>] -- [args…]` — the hidden verb an agent program's
+/// `agents/` twin execs while `<prefix>/landing/<program>` stands ([`crate::landing`]):
+/// wait for the newer build to land, saying so on STDERR, then `exec` the CURRENT
+/// `bin/<program>` shim — re-resolved after the wait, so the new build is what runs —
+/// with the arguments verbatim (on Windows, where nothing can `exec`, the `.cmd` shim runs
+/// as a child with inherited stdio and its real exit code is this process's; 2026-09-17).
+/// Every ending of the wait runs the tool: a landed build, the expired bound
+/// ([`crate::landing::WAIT_SECS_ENV`]), a failed pass, a stale marker, a prefix that is
+/// not landing at all, or Ctrl-C — SIGINT on Unix, a console control handler on Windows
+/// ([`landing_wait_in_process`]): either stops the wait; neither kills the command.
+/// ONE EXCEPTION, on Windows only: arming that handler is best-effort
+/// ([`crate::platform::add_ctrl_handler`] answers `false` when
+/// `SetConsoleCtrlHandler` fails), and when it could not be armed the console's default
+/// behaviour ends this process on Ctrl-C, so that one ending does NOT run the tool. The
+/// handler is unverified on a Windows host (2026-09-17), the failure path with it.
 fn cmd_landing(rest: &[String]) -> ExitCode {
-    let Some((program, rest)) = rest.split_first() else {
+    // The operands, parsed by the pure half ([`crate::landing::HandOver::parse`]): the
+    // program; the PREFIX operand the twin's prelude passes (absolute, laid from the
+    // layout that owns the twin) so the store is found with no `HOME` — `env -i`,
+    // launchd, a container entrypoint — where `layout()` would have printed "HOME is
+    // unset" and exited 1 with the tool never run (review, 2026-09-16), a twin from
+    // before the operand passing none; and the user's arguments with the ONE `--` the
+    // twin inserted stripped, so a user's own leading `--` survives.
+    let Some(hand_over) = crate::landing::HandOver::parse(rest) else {
         eprintln!(
             "usage: atpkg {} <program> [<prefix>] -- [args…]",
             crate::landing::HIDDEN_VERB
         );
         return ExitCode::from(2);
     };
-    // The PREFIX operand the twin's prelude passes (absolute, laid from the layout that
-    // owns the twin): the store is found from it alone, so a `claude` run with no `HOME`
-    // — `env -i`, launchd, a container entrypoint — still runs, where `layout()` would
-    // have printed "HOME is unset" and exited 1 with the tool never run (review,
-    // 2026-09-16). A twin laid before the operand existed passes none: `layout()` then.
-    let (prefix, rest) = match rest.split_first() {
-        Some((p, tail)) if p != "--" && std::path::Path::new(p).is_absolute() => {
-            (Some(std::path::PathBuf::from(p)), tail)
-        }
-        _ => (None, rest),
-    };
-    // The twin inserts ONE `--` of its own so a user's leading `--` survives; strip
-    // exactly that one.
-    let args = if rest.first().is_some_and(|a| a == "--") {
-        &rest[1..]
-    } else {
-        rest
-    };
+    let program = hand_over.program;
     let Some(tool) = crate::store::ToolName::new(program) else {
         eprintln!("atpkg: {program:?} is not a tool name");
         return ExitCode::from(2);
     };
-    let layout = match prefix {
+    let layout = match hand_over.prefix {
         Some(prefix) => crate::store::Layout { prefix },
         None => match layout() {
             Some(l) => l,
@@ -878,31 +1004,22 @@ fn cmd_landing(rest: &[String]) -> ExitCode {
     landing_wait_in_process(&layout, tool.as_str(), max_wait);
     // The CURRENT `bin/<program>` shim — never the `agents/` twin, whose prelude would
     // hand over here again. Re-resolved now: after a landing it is the new build's.
-    let shim = layout.shim(&tool);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        let err = std::process::Command::new(&shim).args(args).exec();
-        eprintln!("atpkg: could not run {}: {err}", shim.display());
-        ExitCode::from(126)
-    }
-    #[cfg(not(unix))]
-    {
-        // No `exec(2)`, and no `.cmd` twin carries the prelude that reaches here
-        // (`platform::windows::twin_executable_to_env`): a child, success or 1.
-        match std::process::Command::new(&shim).args(args).status() {
-            Ok(st) if st.success() => ExitCode::SUCCESS,
-            Ok(_) => ExitCode::from(1),
-            Err(err) => {
-                eprintln!("atpkg: could not run {}: {err}", shim.display());
-                ExitCode::from(126)
-            }
-        }
-    }
+    // `platform::exec_or_run` is the `exec(2)` on Unix; on Windows (where the shim is
+    // the `.cmd` wrapper and the `.cmd` twin has carried the prelude since 2026-09-17)
+    // it is a child with inherited stdio whose REAL exit code this process exits with
+    // — no `exec` exists there. Either way it returns only the error that stopped it.
+    let mut command = crate::landing::shim_command(&layout, &tool, hand_over.args);
+    let err = crate::platform::exec_or_run(&mut command);
+    eprintln!(
+        "atpkg: could not run {}: {err}",
+        command.get_program().to_string_lossy()
+    );
+    ExitCode::from(126)
 }
 
-/// Set by the SIGINT handler [`landing_wait_in_process`] installs for the wait's
-/// duration: the wait stops, the current build runs.
+/// Set by the handler [`landing_wait_in_process`] installs for the wait's duration —
+/// `landing_sigint` on Unix, [`landing_ctrl`] on Windows: the wait stops, the current
+/// build runs.
 static LANDING_INTERRUPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -912,14 +1029,41 @@ extern "C" fn landing_sigint(_signal: libc::c_int) {
     LANDING_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// The process half of the landing wait: the SIGINT handler for its duration, stderr as
-/// the seam (a terminal gets the waiting line refreshed in place with `\r`; a pipe gets
-/// one line per change), and a sleep sliced fine enough that Ctrl-C answers within
-/// 100 ms. The state machine itself is [`crate::landing::wait_for_landing`].
+/// The Windows twin of [`landing_sigint`]: the console control handler the wait installs
+/// ([`crate::platform::add_ctrl_handler`]). Ctrl-C and Ctrl-Break are the one store and
+/// `TRUE` (handled: the process lives, the wait's next slice sees the flag); a console
+/// close, logoff or shutdown is passed on (`FALSE`) to the default, which ends the
+/// process as it should. Without this the default handler ended `atpkg.exe` on the first
+/// Ctrl-C and the "— Ctrl-C runs <current> now" the waiting line promises was false on
+/// the platform the `.cmd` twin had just made it reachable on (review finding,
+/// 2026-09-17; no Windows box has run it).
+#[cfg(windows)]
+unsafe extern "system" fn landing_ctrl(ctrl_type: u32) -> i32 {
+    if matches!(
+        ctrl_type,
+        crate::platform::CTRL_C_EVENT | crate::platform::CTRL_BREAK_EVENT
+    ) {
+        LANDING_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        1
+    } else {
+        0
+    }
+}
+
+/// The process half of the landing wait: the Ctrl-C handler for its duration (`SIGINT`
+/// on Unix; a console control handler on Windows, [`landing_ctrl`]), stderr as the seam
+/// (a terminal gets the waiting line refreshed in place with `\r`; a pipe gets one line
+/// per change), and a sleep sliced fine enough that Ctrl-C answers within 100 ms. The
+/// state machine itself is [`crate::landing::wait_for_landing`].
 fn landing_wait_in_process(layout: &crate::store::Layout, program: &str, max_wait: u64) {
     use std::io::{IsTerminal as _, Write as _};
     let tty = std::io::stderr().is_terminal();
     LANDING_INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Best effort: when the install fails the wait still runs and every ending still
+    // runs the tool — only the promise that Ctrl-C ends the wait early is then the
+    // default disposition's (the process ends), which is what it was before 2026-09-17.
+    #[cfg(windows)]
+    let armed = crate::platform::add_ctrl_handler(landing_ctrl);
     #[cfg(unix)]
     let previous = {
         // SAFETY: `signal(2)` installs a handler that does one atomic store; the
@@ -976,6 +1120,14 @@ fn landing_wait_in_process(layout: &crate::store::Layout, program: &str, max_wai
         // SAFETY: restores the disposition captured above before the exec.
         unsafe {
             libc::signal(libc::SIGINT, previous);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // The hand-over (`platform::exec_or_run`) arms its own handler for the child's
+        // lifetime, so the wrapper never dies under the agent's Ctrl-C.
+        if armed {
+            let _ = crate::platform::remove_ctrl_handler(landing_ctrl);
         }
     }
 }
@@ -1787,7 +1939,14 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
                     bound.as_secs()
                 );
             },
-            || !parent_is_gone(),
+            || {
+                // Asked only on a CONTENDED poll: the lock was held by someone
+                // when this process wanted it ([`pass_finished_while_we_waited`]),
+                // and the first such second is the wait's start.
+                WAITED_FOR_LOCK.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = FIRST_CONTENDED_UNIX.set(unix_now());
+                !parent_is_gone()
+            },
         ),
         None => crate::lock::try_lock_store(&layout),
     };
@@ -1859,9 +2018,11 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
 /// window for the whole bound and then race the successor's own waiter for the freed
 /// lock. It is asked only on a CONTENDED poll, so that race is narrowed to one poll
 /// interval (≤ 500 ms: an orphan whose holder lets go inside it still takes the
-/// lock), not closed. An INSTALLING child is a different case — it dies at its next
-/// line of output (aterm-gui's final-exit path in its `main_entry`, 2026-09-10), and
-/// the store is crash-consistent under that (`crate::lock`).
+/// lock), not closed. An INSTALLING child is a different case — it KEEPS RUNNING:
+/// the orphan watch ([`crate::progress::watch_for_orphaning`], 2026-09-14) re-points
+/// its stdio at `orphan-pass.log` when its window goes, so it finishes its pass and
+/// holds the lock for the whole of it (it used to die at its next print, and the
+/// store is still crash-consistent under a death, `crate::lock`).
 pub(crate) fn parent_is_gone() -> bool {
     wait_lock().is_some_and(|w| is_orphaned(w.spawner, current_parent_id()))
 }
@@ -3253,6 +3414,87 @@ fn cmd_list(args: &[String]) -> ExitCode {
     run_list(layout(), human)
 }
 
+/// What `atpkg repair`'s shell-integration step prints: the hooks headline, then one line
+/// per rc file the pass EDITED, failed to edit, or will never edit. An rc that already
+/// carried the block gets no line, because nothing happened to it.
+///
+/// The per-rc lines exist because repair has more than one audience. The manual, doctor and
+/// the agent primer send users AND agents to `aterm pkg repair` for a stale rustup link or
+/// a missing reroute stub, and repair is also the one pass that re-lays an rc block the
+/// user deleted ([`crate::hooks::refresh_rewiring_rc`]). It used to print "shell
+/// integration rewritten (~/.aterm/shell.d + rc wiring)" whether it had re-laid an
+/// opted-out block, failed to write the rc (a `~/.zshrc` linked into a read-only store),
+/// skipped it at the consent fence, written no hook at all, or found no rc to wire. So a
+/// re-laid opt-out is named here with the way back out, and "rc wiring" is never claimed
+/// for four files at once.
+fn repair_hook_lines(pass: &crate::hooks::HookPass) -> Vec<String> {
+    use crate::hooks::{HookPass, RcOutcome};
+    let mut lines = match pass {
+        HookPass::Rewritten(_) => vec!["repair: ~/.aterm/shell.d hooks rewritten".to_string()],
+        HookPass::HooksNotWritten => {
+            return vec![
+                "repair: a ~/.aterm/shell.d hook could NOT be written, so no rc was wired — \
+                 atpkg's block may only name a hook that is on disk; the next pass retries \
+                 both"
+                    .to_string(),
+            ];
+        }
+        HookPass::NotHardened => {
+            return vec![
+                "repair: shell integration NOT rewritten — $HOME is unset, or ~/.aterm or \
+                 ~/.aterm/shell.d could not be made your own private (0700) directory (a \
+                 symlink, a foreign owner or a group/other-writable mode there is refused); \
+                 no rc was read or written"
+                    .to_string(),
+            ];
+        }
+    };
+    for (rc, outcome) in pass.rc() {
+        lines.push(match outcome {
+            RcOutcome::AlreadyWired => continue,
+            RcOutcome::Appended => format!(
+                "repair: appended atpkg's block to ~/{rc} (it sources ~/.aterm/shell.d; \
+                 delete the block to opt out)"
+            ),
+            RcOutcome::RelaidOverOptOut => format!(
+                "repair: re-laid atpkg's block in ~/{rc} — you had deleted it; delete it \
+                 again to opt out (install and update passes then leave it deleted)"
+            ),
+            RcOutcome::OptOutKept => {
+                format!("repair: ~/{rc} left alone — you deleted atpkg's block")
+            }
+            RcOutcome::ConsentFenced => format!(
+                "repair: ~/{rc} left alone — it resolves under a folder macOS guards with a \
+                 consent dialog (Documents, Desktop, Downloads, Pictures, Movies, Music, \
+                 iCloud Drive, a sync provider's folder, a mounted volume), which no atpkg \
+                 pass opens; source ~/.aterm/shell.d from it yourself, or use the export \
+                 line `aterm pkg doctor` prints"
+            ),
+            RcOutcome::Unreadable => format!(
+                "repair: ~/{rc} left alone — atpkg edits only a regular file it can read as \
+                 UTF-8 (a dangling link, a directory, a FIFO or device, or other bytes is \
+                 never touched)"
+            ),
+            RcOutcome::WriteFailed => format!(
+                "repair: ~/{rc} could NOT be rewritten (the file or its directory refused \
+                 the write); atpkg's block is not in it"
+            ),
+        });
+    }
+    #[cfg(unix)]
+    if pass.rc().is_empty() {
+        let names: Vec<String> = crate::hooks::RC_FILES
+            .iter()
+            .map(|(rc, _)| format!("~/{rc}"))
+            .collect();
+        lines.push(format!(
+            "repair: none of {} exists, so no rc was wired (atpkg never creates one)",
+            names.join(", ")
+        ));
+    }
+    lines
+}
+
 /// `atpkg repair` — put a half-installed store back into a state the rest of the CLI
 /// can describe honestly.
 ///
@@ -3282,9 +3524,11 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
     // with nothing installed still leaves repair better wired than it arrived. It REWIRES
     // an rc whose block the user deleted, which no unattended pass does (that deletion is
     // the opt-out the block documents, honoured through `hooks::RC_LEDGER`): repair is the
-    // pass the user asks for, and the line below promises it rewrote the rc wiring.
-    crate::hooks::refresh_rewiring_rc(&layout);
-    println!("repair: shell integration rewritten (~/.aterm/shell.d + rc wiring)");
+    // pass the user asks for. Say what happened, not what was attempted — one line per rc
+    // it edited, left alone or skipped (`repair_hook_lines`).
+    for line in repair_hook_lines(&crate::hooks::refresh_rewiring_rc(&layout)) {
+        println!("{line}");
+    }
     // The reroute stubs are the other store-less half: they embed this atpkg's path,
     // so a relocated or self-updated binary is exactly what repair re-lays for.
     lay_reroute_stubs(&layout);
@@ -5105,9 +5349,70 @@ fn default_set_adopts(
 }
 
 /// Forget adoption. Called by `uninstall`: removing a managed program is an explicit act,
-/// and set-completion must never undo it on the next unattended pass.
+/// and set-completion must never undo it on the next unattended pass. The record of WHO
+/// adopted goes with it ([`clear_seed_adoption`]), so that no record outlives the marker
+/// it describes and vouches for whatever adopts the machine next.
 fn clear_adoption(layout: &crate::store::Layout) {
     let path = layout.adopted();
+    if path.is_file() {
+        let _ = std::fs::remove_file(&path);
+    }
+    clear_seed_adoption(layout);
+}
+
+/// Whether THE SEED PASS adopted this machine ([`crate::store::Layout::adopted_by_seed`]):
+/// `cmd_seed` created the [`adopted`] marker itself, so installing aterm is the consent
+/// behind the set, and `[packages].seed_install = false`, which `cmd_seed` reads BEFORE it
+/// adopts, is the switch that would have stopped it. Both files must exist. A record
+/// without the marker vouches for nothing, and a marker without the record (the explicit
+/// verb adopted, or the marker predates the record) claims no more than the uninstall
+/// ([`set_completion_consent`]).
+fn adopted_by_seed(layout: &crate::store::Layout) -> bool {
+    adopted(layout) && layout.adopted_by_seed().is_file()
+}
+
+/// `cmd_seed`'s adoption: [`record_adoption`] plus the record of who adopted, written ONLY
+/// when this call creates the marker. The seed pass runs on every launch, and on an
+/// adopted machine it is a no-op. If it stamped a marker it found, a machine the explicit
+/// verb adopted (the Settings button after `uninstall --all`) would become the first
+/// launch's on its very next launch, and its update passes would again say "installing
+/// aterm is the consent", which is false there. Best-effort like the marker: a missing
+/// record claims less, never more.
+fn record_seed_adoption(layout: &crate::store::Layout) {
+    if adopted(layout) {
+        return;
+    }
+    record_adoption(layout);
+    if !adopted(layout) {
+        return;
+    }
+    let path = layout.adopted_by_seed();
+    match crate::platform::open_create_write(&path, 0o600) {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = writeln!(
+                f,
+                "# `atpkg seed`, the first launch's bootstrap, adopted this machine.\n\
+                 # Its EXISTENCE beside `adopted` is the whole fact: an update pass that\n\
+                 # completes the set says installing aterm is the consent, and names\n\
+                 # [packages].seed_install = false as the switch that would have stopped it.\n\
+                 # Removed with `adopted`, and by `install --default-set`, which is its own\n\
+                 # consent."
+            );
+        }
+        Err(e) => eprintln!(
+            "atpkg: could not record that the seed pass adopted the toolset at {}: {e} — \
+             update passes will name only `aterm pkg uninstall --all` as the way out",
+            path.display()
+        ),
+    }
+}
+
+/// Forget that the seed pass adopted. This is the explicit toolset verb's call: running it
+/// IS the consent, and it never reads `seed_install`. From then on neither "installing
+/// aterm is the consent" nor that key holds for the passes that keep the set complete.
+fn clear_seed_adoption(layout: &crate::store::Layout) {
+    let path = layout.adopted_by_seed();
     if path.is_file() {
         let _ = std::fs::remove_file(&path);
     }
@@ -6017,22 +6322,23 @@ pub const NET_FAILED_MARKER: &str = "net-failed: ";
 /// The dispatch edge's "queued behind a sibling" ANNOUNCEMENT (2026-09-10): printed
 /// ONCE, before any verb output, only when the caller opted into `--wait-lock`, the
 /// store lock is held, and the wait has outlasted [`crate::lock::WAIT_ANNOUNCE_GRACE`].
-/// It is neither a pass start nor a terminal answer — the GUI opens a non-terminal
-/// "waiting" row on it, which the sibling's progress file, this child's own markers,
-/// or this child's exit retires — any exit but 75: a wait that ran out leaves the row
-/// to the lane (its next child, queued behind the same holder, or the deferred
-/// notice), because the row belongs to the lane, not the child. Emitted by exactly
-/// one site ([`mutator_store_lock`]).
+/// It is neither a pass start nor a terminal answer — the GUI logs it (one INFO
+/// line, `Wake::PkgLockWaiting`) and paints NO row (2026-09-18; it used to open a
+/// "waiting" row that named another aterm, false after a self-update where the
+/// holder is the app's own predecessor's pass): a holder with a plan shows through
+/// the sibling's progress file, a no-op holder is nothing to show, and a wait that
+/// ran out (exit 75) is the lane's deferred notice. Emitted by exactly one site
+/// ([`mutator_store_lock`]).
 pub const LOCK_WAITING_MARKER: &str = "lock-waiting: ";
 /// The dispatch edge's "the wait is over" line (2026-09-14): printed ONCE, right
 /// after a wait that ANNOUNCED itself ([`LOCK_WAITING_MARKER`]) acquires the lock —
 /// never after a silent wait inside the grace, never after an uncontended try, and
 /// never by a typed verb. Neither a pass start nor a terminal answer, like the line
-/// it answers: the GUI retires its "waiting for another install" row on it, since
-/// nothing else says the holder has let go — the verb that follows may be QUIET (a
-/// seed's index read under the lock takes 6–18 s online, minutes offline) and the
-/// row kept saying another process held the lock until this child exited. Emitted
-/// by the same one site.
+/// it answers: the GUI logs it (`Wake::PkgLockAcquired`), so the interval the child
+/// spent queued is on record — there is no row to retire (2026-09-18). The verb
+/// that follows may be QUIET, or stand down at once when the holder succeeded at
+/// this store's pass meanwhile ([`pass_finished_while_we_waited`]). Emitted by the
+/// same one site.
 pub const LOCK_ACQUIRED_MARKER: &str = "lock-acquired: ";
 /// The SHADOW reconcile's answer ([`reconcile_shadowed`]): the managed programs a
 /// foreign copy out-ranks on this pass's `PATH`, comma-separated — the pass printed
@@ -7404,7 +7710,18 @@ fn do_install(
                 return result;
             }
             let outcome = if r.already_current {
-                format!("up to date ({program} build {})", r.build)
+                // THE SAME QUALIFICATION THE GROUP ARM MAKES, and it is RECORDED here
+                // rather than merely printed: this string is `status.toml`'s outcome, the
+                // detail line Settings ▸ Packages shows, and the sentence a person reads
+                // when they ask why nothing happened. "up to date" about a build the
+                // machine does not run is the answer to a question nobody asked.
+                match crate::seam::dissent_if_armed(layout, program) {
+                    Some(why) => format!(
+                        "up to date ({program} build {}) — but not what this machine runs: {why}",
+                        r.build
+                    ),
+                    None => format!("up to date ({program} build {})", r.build),
+                }
             } else {
                 format!("installed {program} build {}", r.build)
             };
@@ -7688,6 +8005,13 @@ fn cmd_install_with(
                 }
             } else if r.already_current {
                 println!("atpkg: {} already current (build {})", r.program, r.build);
+                // …CURRENT IN THE STORE. Whether it is what the machine COMPILES WITH is a
+                // second question, and until 2026-09-17 no install or update lane asked it:
+                // see [`crate::seam::dissent_line`] for the two weeks this sentence stood
+                // over a hand-placed toolchain 859 commits behind the pin.
+                if let Some(why) = crate::seam::dissent_if_armed(layout, &r.program) {
+                    println!("atpkg:   but not what this machine runs: {why}");
+                }
             } else {
                 println!(
                     "atpkg: installed {} build {} (shims: {})",
@@ -7731,6 +8055,26 @@ fn cmd_install_with(
                     crate::flow::DepResult::AlreadyPresent(_) => {}
                 }
             }
+            // THE SEAM AND THE EXEC ROOTS, on the single-program door too.
+            //
+            // `cmd_update_all_code`, `install_default_set_inner`, `cmd_seed` and
+            // `cmd_rollback` have all re-asserted the rustup seam and reconciled the exec
+            // roots at the end of their pass since those calls were written; the lane a
+            // PERSON types — `aterm pkg install <p>`, `aterm pkg update <p>`, which both
+            // end here — never did. That asymmetry is not a detail: the seam is how
+            // `cargo +trust` and every `rust-toolchain.toml` find the managed compiler, and
+            // the verb a user reaches for when they suspect their compiler is stale is
+            // `aterm pkg update trust`. On m3 that verb answered "up to date" for two weeks
+            // and did not once look at, or heal, the `~/.rustup/toolchains/trust` entry
+            // that was answering for it (2026-09-17).
+            //
+            // Both are best-effort and both print only what CHANGED or was refused, so an
+            // install on a healthy machine gains no output. A FOREIGN entry is refused
+            // rather than re-pointed — `reassert` never follows or replaces a link atpkg did
+            // not lay — and the refusal is both printed here and recorded, which is what
+            // turns it into a `doctor` fault instead of a line in a scrollback.
+            reassert_rustup_seam(layout);
+            let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
             ExitCode::SUCCESS
         }
         Err(crate::FlowError::Linked(p)) => {
@@ -7991,6 +8335,12 @@ fn cmd_update_all_code() -> u8 {
     let Some(layout) = layout() else {
         return 1;
     };
+    // THE HOLDER DID THIS PASS: a launch child that queued behind another pass and
+    // finds the record stamped since it started owes nothing (2026-09-18).
+    if let Some(ago) = pass_finished_while_we_waited(&layout) {
+        println!("{}", stood_down_after_wait_line("update", ago));
+        return 0;
+    }
     let cfg = crate::config::cached();
     // Reconcile `[packages.links]` first, so a config-declared dev-link is in place
     // BEFORE the apply decides what it manages (linked programs hard-skip, §13).
@@ -8150,12 +8500,21 @@ fn cmd_update_all_code() -> u8 {
         // contract exists to prevent, on the lane that is MORE surprising because
         // nothing local prompted it.
         let before_net = crate::active_builds(&layout);
+        // The consent the line states is the one that holds on THIS machine:
+        // installing aterm, with `seed_install = false` as the switch that
+        // would have stopped it, only where the seed pass itself adopted the
+        // set and neither key overrides that ([`set_completion_consent`]).
         let net = install_default_set(
             &layout,
             &*fetcher,
             &effective_anchor(&layout),
             cfg,
             ProvisionLane::Network,
+            set_completion_consent(
+                cfg.auto_install(),
+                cfg.seed_install(),
+                adopted_by_seed(&layout),
+            ),
             now_unix(),
             pass_index.as_ref(),
         );
@@ -8434,18 +8793,142 @@ impl ProvisionLane {
     }
 }
 
+/// WHO consented to a default-set pass — named by the caller beside its
+/// [`ProvisionLane`], because the wire lane's announcement states the consent
+/// and the switches that stop the pass, and those are not the same for every
+/// caller. [`NET_OFF_SWITCH`] is true of every pass (the decline `uninstall
+/// --all` records outranks adoption and `auto_install` alike in
+/// [`should_complete_set`]); the two clauses [`Consent::announced`] adds around
+/// it are true only of a pass completing a set the seed pass adopted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Consent {
+    /// Nobody asked: the pass runs because installing aterm adopted the
+    /// toolset — `cmd_seed` at the first launch, and `cmd_update_all`'s
+    /// unattended set-completion arm on a machine the seed pass itself adopted
+    /// ([`set_completion_consent`], told so by [`adopted_by_seed`]). Installing
+    /// aterm IS the consent here, and `[packages].seed_install = false`, which
+    /// `cmd_seed` reads BEFORE it records adoption, is the switch that would
+    /// have kept the pass from ever running — so this line names both.
+    InstallingAterm,
+    /// No consent claimed beyond the one every pass carries: the line names the
+    /// uninstall alone. This is the explicit verb's own pass — `aterm pkg
+    /// install --default-set` (what the Settings "Install ALab toolset" button
+    /// runs, on any platform — a CLI-only Linux box has no first launch at
+    /// all), whose running IS the consent, which clears the decline, the
+    /// removals and the seed pass's adoption record, and never reads
+    /// `seed_install`. It is also every `update` pass the seed pass's adoption
+    /// does not stand behind ([`set_completion_consent`]): the explicit verb
+    /// adopted the machine, or its marker predates the record of who adopted,
+    /// or `auto_install = true` completes the set whatever `seed_install` says,
+    /// or that key is already false. "Installing aterm is the consent" and the
+    /// `seed_install` switch are false of such a pass, or not known to be true,
+    /// so its line names neither.
+    Explicit,
+}
+
+impl Consent {
+    /// The clauses the wire lane's announcement wraps around [`NET_OFF_SWITCH`]:
+    /// the consent ahead of it and the switch that would have prevented the pass
+    /// after it — each only where it is true. Parenthesis-free, as that phrase
+    /// is, for the toolchain bar's sake (see [`NET_OFF_SWITCH`]).
+    fn announced(self) -> (&'static str, &'static str) {
+        match self {
+            Consent::InstallingAterm => (
+                "installing aterm is the consent for this; ",
+                ", or with `[packages].seed_install = false` in aterm.toml before the first \
+                 launch",
+            ),
+            Consent::Explicit => ("", ""),
+        }
+    }
+}
+
+/// The consent `cmd_update_all`'s set-completion pass states — pure, as
+/// [`should_complete_set`] is, so the choice is pinned by a test. "Installing
+/// aterm is the consent", with `seed_install = false` before the first launch as
+/// the switch, holds only where the SEED PASS adopted the machine
+/// (`adopted_by_seed`, from [`adopted_by_seed`]: `cmd_seed` created the adoption
+/// marker and recorded so) and neither key overrides that. `auto_install = true`
+/// completes the set whatever `seed_install` says, and a key set false after
+/// adoption can no longer stop the loop. The explicit verb clears the record, and
+/// a marker it writes never gets one: with the default keys, `uninstall --all`
+/// and then Settings "Install ALab toolset" (or `install --default-set` on a
+/// CLI-only box) adopts a machine whose later passes must not claim the first
+/// launch. Every such pass, and every pass on a marker that predates the record,
+/// whose adopter is unknown, gets [`Consent::Explicit`]. The decline is then the
+/// one switch its line names.
+fn set_completion_consent(
+    auto_install: bool,
+    seed_install: bool,
+    adopted_by_seed: bool,
+) -> Consent {
+    if adopted_by_seed && seed_install && !auto_install {
+        Consent::InstallingAterm
+    } else {
+        Consent::Explicit
+    }
+}
+
+/// The off switch EVERY wire-lane announcement names, whoever consented
+/// ([`Consent`]) — kept free of parentheses on purpose, as the clauses around it
+/// are: the GUI's toolchain bar reads the sizes out of the line's TRAILING `(…)`
+/// (crates/aterm-gui `toolchain_announced`), so the size parenthetical has to
+/// stay the last one on the line. The switches themselves reach only the log:
+/// the bar keeps that parenthetical and nothing else.
+///
+/// The switch is real on the lean app — every current release, on every CPU
+/// (tools/install.sh "container election"; `aterm help pkg`), so this lane is
+/// how the WHOLE set arrives on every current-release Mac; measured 2026-09-06
+/// on an Intel one: `uninstall --all` removes the set and writes the durable
+/// decline `should_complete_set` honours on every tick. The timing is stated
+/// because it is real on every lane: `uninstall`, `update` and `install` are all
+/// store mutators (`verb_mutates_store`), the dispatch edge holds the store-wide
+/// writer lock for the whole pass (`mutator_store_lock`), and a second process
+/// is refused with "another atpkg process holds the store lock … retry when it
+/// exits" — so the verb this line names cannot run until the pass it announces
+/// has ended, and a bare "opt out with" would send the reader into that refusal
+/// mid-download. `install.sh --no-toolchain` is NOT named: it persists nothing
+/// (docs/DESIGN-cli-toolchain-seed-2026-08-31.md, "Review corrections" 1), so
+/// the reader who relied on it is exactly who this line is for.
+const NET_OFF_SWITCH: &str = "opt out once this pass ends with `aterm pkg uninstall --all`, which \
+                              removes the set and records the decline";
+
 /// The wire lane's announcement, if `lane` owes one — pure, so the
 /// phantom-network defect stays pinned by a test rather than an lsof session:
 /// the sealed-payload lane returns `None` for EVERY set, and only a non-empty
 /// network pass speaks (the ordinary every-6-hours no-op tick stays silent).
-fn net_announcement(lane: ProvisionLane, will_install: &[String]) -> Option<String> {
+///
+/// Names the SIGNED sizes — what comes over the wire and what stays on disk
+/// ([`seed_install_bytes`], the same `[cost]` row the install is verified
+/// against, in ONE trailing parenthetical [`size_parenthetical`] renders through
+/// [`crate::cost::human_bytes`] exactly as the seed lane's line does) — and the
+/// off switch ([`NET_OFF_SWITCH`]), with the consent ahead of it and the
+/// `seed_install` switch after it only where `consent` makes them true
+/// ([`Consent::announced`]: a pass completing a set the seed pass adopted, not
+/// the explicit verb's).
+/// Until 2026-09-06 it carried none of it: the lean app — every current
+/// release, on every CPU — has no seal, so the whole set comes through THIS
+/// lane, and the first launch's only disclosure was "installing 10 program(s)
+/// over the network: ay, …" (aterm.log on an Intel Mac, where it was measured
+/// — not where it is true), while `aterm help pkg` promised that size is "the
+/// one thing disclosed up front". An unknown figure prints no figure — the
+/// [`seed_install_bytes`] contract.
+fn net_announcement(
+    lane: ProvisionLane,
+    consent: Consent,
+    will_install: &[String],
+    sizes: SignedSizes,
+) -> Option<String> {
     if lane == ProvisionLane::SealedPayload || will_install.is_empty() {
         return None;
     }
+    let (consent_clause, seed_clause) = consent.announced();
     Some(format!(
-        "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: {}",
+        "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: {} — \
+         {consent_clause}{NET_OFF_SWITCH}{seed_clause}{}",
         will_install.len(),
-        will_install.join(", ")
+        will_install.join(", "),
+        size_parenthetical(sizes)
     ))
 }
 
@@ -8466,6 +8949,7 @@ fn install_default_set(
     anchor: &crate::Anchor,
     cfg: &crate::config::PackagesConfig,
     lane: ProvisionLane,
+    consent: Consent,
     now: i64,
     index: Option<&crate::TrustedIndex>,
 ) -> DefaultSetOutcome {
@@ -8475,6 +8959,7 @@ fn install_default_set(
         anchor,
         cfg,
         lane,
+        consent,
         now,
         index,
         std::env::var_os("PATH").as_deref(),
@@ -8507,6 +8992,7 @@ fn install_default_set_with_path(
     anchor: &crate::Anchor,
     cfg: &crate::config::PackagesConfig,
     lane: ProvisionLane,
+    consent: Consent,
     now: i64,
     index: Option<&crate::TrustedIndex>,
     path_var: Option<&std::ffi::OsStr>,
@@ -8522,7 +9008,9 @@ fn install_default_set_with_path(
     // channel exactly as it gates the stdout announcement (`net_announcement`).
     let owned_pass = lane == ProvisionLane::Network
         && progress_path().is_some_and(|p| crate::progress::begin_pass(p, lane.pass_name()));
-    let out = install_default_set_inner(layout, fetcher, anchor, cfg, lane, now, index, path_var);
+    let out = install_default_set_inner(
+        layout, fetcher, anchor, cfg, lane, consent, now, index, path_var,
+    );
     if owned_pass {
         crate::progress::end_pass();
     }
@@ -8542,6 +9030,7 @@ fn install_default_set_inner(
     anchor: &crate::Anchor,
     cfg: &crate::config::PackagesConfig,
     lane: ProvisionLane,
+    consent: Consent,
     now: i64,
     index: Option<&crate::TrustedIndex>,
     path_var: Option<&std::ffi::OsStr>,
@@ -8913,7 +9402,23 @@ fn install_default_set_inner(
         );
     }
     will_install.sort();
-    let announcement = net_announcement(lane, &will_install);
+    // The signed sizes, derived ONLY when the wire lane is about to speak: the
+    // sealed lane already quoted its own in `cmd_seed`, and the silent no-op
+    // tick has no line to print them on. No extra fetch for a manifest the
+    // triple probe above already pulled through the same `verified_pkg` — the
+    // network fetcher memoises manifests per `(repo, program, build)` (`net.rs`
+    // `pkg_manifest`). A member the probe DEFERRED (its fetch failed, so
+    // `group_missing_triple` proved nothing and left it in `will_install`) is
+    // retried once here — the memo keeps successes only, so that is one more
+    // direct-URL attempt plus its enumeration fallback, a metered api.github.com
+    // call — and the first miss ends the sums (no figure at all), so at most one
+    // such retry precedes the announcement.
+    let sizes = if lane == ProvisionLane::Network && !will_install.is_empty() {
+        seed_install_bytes(fetcher, index, cfg, &will_install)
+    } else {
+        SignedSizes::UNKNOWN
+    };
+    let announcement = net_announcement(lane, consent, &will_install, sizes);
     let announced = announcement.is_some();
     if let Some(line) = &announcement {
         emit_marker_line(line);
@@ -9541,14 +10046,24 @@ fn cmd_install_default_set_code() -> u8 {
     clear_decline(&layout);
     let all_removed: Vec<String> = removed_programs(&layout).into_iter().collect();
     clear_removed(&layout, &all_removed);
+    // The seed pass's claim on the set goes too. From here on the owner's own
+    // act stands behind it, and this verb never reads `seed_install`, so no
+    // later update pass may say "installing aterm is the consent" or name that
+    // key ([`clear_seed_adoption`]; the marker this verb writes below gets no
+    // record either).
+    clear_seed_adoption(&layout);
     let fetcher = resolve_fetcher(&layout);
     let before = crate::active_builds(&layout);
+    // Running this verb IS the consent, and it never reads `seed_install`: its
+    // announcement names neither the first launch's consent nor that key, only
+    // the decline that stops every pass ([`Consent::Explicit`]).
     let failures_outcome = install_default_set(
         &layout,
         &*fetcher,
         &effective_anchor(&layout),
         cfg,
         ProvisionLane::Network,
+        Consent::Explicit,
         now_unix(),
         None,
     );
@@ -9775,7 +10290,10 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // only the adoption it recorded (see [`refuse_seed_for_disk`]), never one an
     // earlier launch or an explicit `install --default-set` made.
     let adopted_by_this_run = !adopted(&layout);
-    record_adoption(&layout);
+    // WHO adopted rides beside the marker, and only when THIS call creates it
+    // ([`record_seed_adoption`]): an update pass says "installing aterm is the
+    // consent" only on a machine the seed pass adopted.
+    record_seed_adoption(&layout);
     // PENDING STUBS AT ADOPTION (R6): the instant this machine wants the toolset,
     // every default-set name resolves on PATH — BEFORE any question of whether a
     // seal exists, before a single network byte moves. Running one prints the live
@@ -9871,8 +10389,10 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // Three derivations rendered three ways is how one install came to quote three
     // different figures for the same bytes (install.sh's "~4.2 GB" header, this
     // lane's "~4.7 GB", 4.08 GB measured). Unit convention: rendered ONLY via
-    // [`crate::cost::human_bytes`] — see [`seed_announcement`].
-    let signed_bytes = seed_install_bytes(&fetcher, &index, cfg, &wanted);
+    // [`crate::cost::human_bytes`] — see [`seed_announcement`]. The on-disk figure
+    // only: the sealed payload moves no network bytes, so there is no download to
+    // disclose.
+    let signed_bytes = seed_install_bytes(&fetcher, &index, cfg, &wanted).disk;
     if let Some(need) = signed_bytes {
         let have = crate::freespace::available_bytes(&layout.prefix);
         if refuse_seed_for_disk(&layout, need, have, adopted_by_this_run) {
@@ -9909,6 +10429,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         &anchor,
         cfg,
         ProvisionLane::SealedPayload,
+        Consent::InstallingAterm,
         now_unix(),
         None,
     )
@@ -10138,33 +10659,99 @@ fn refuse_seed_for_disk(
     true
 }
 
-/// The SIGNED installed size of `members` for this triple, summed from the pinned
-/// manifests' `[cost].disk_installed`.
+/// The SIGNED sizes of a set — [`seed_install_bytes`]' answer, and the input of
+/// [`size_parenthetical`]. The two figures are independent: a registry row that
+/// declares only `disk_installed` still discloses that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SignedSizes {
+    /// What the wire lane moves (`[cost].download_bytes`, summed); `None` when
+    /// unknown for any member.
+    download: Option<u64>,
+    /// What stays when the install is finished (`[cost].disk_installed`, summed);
+    /// `None` when unknown for any member.
+    disk: Option<u64>,
+}
+
+impl SignedSizes {
+    /// Neither figure known — the line prints no size at all.
+    const UNKNOWN: Self = Self {
+        download: None,
+        disk: None,
+    };
+}
+
+/// The SIGNED sizes of `members` for this triple, summed from the pinned manifests'
+/// `[cost]` row ([`crate::manifest::Cost`]): `download_bytes`, what the wire lane
+/// will move, and `disk_installed`, what stays when it is done — for BOTH
+/// announcing lanes: the sealed seed (`cmd_seed`, which quotes the on-disk figure
+/// only — its payload moves no network bytes) and the wire ([`net_announcement`],
+/// via `install_default_set`, both).
 ///
-/// The authoritative number, not a multiplier: the one disclosure a user gets before
+/// The authoritative numbers, not a multiplier: the one disclosure a user gets before
 /// committing multiple GB of disk should come from the same signed bytes everything
-/// else in this lane is verified against. `None` when any member's cost is unavailable
-/// or zero — a partial sum would understate the commitment, and no number at all is
-/// more honest than a confidently wrong one.
+/// else in this lane is verified against. A figure is `None` when any member's
+/// manifest is unavailable (the first miss ends both sums) or its entry for that
+/// figure is zero — a partial sum would understate the commitment, and no number at
+/// all is more honest than a confidently wrong one.
 fn seed_install_bytes(
     fetcher: &dyn crate::flow::Fetcher,
     index: &crate::TrustedIndex,
     cfg: &crate::config::PackagesConfig,
     members: &[String],
-) -> Option<u64> {
+) -> SignedSizes {
     let triple = current_triple();
-    let ch = index.channel_for(cfg.channel(), triple)?;
+    // [`crate::TrustedIndex::channel_for`], not a `channels` scan: the channel a HOST
+    // sees is the per-target view, so the figures announced are the ones this triple's
+    // pins will actually fetch.
+    let Some(ch) = index.channel_for(cfg.channel(), triple) else {
+        return SignedSizes::UNKNOWN;
+    };
     let ch = &ch;
-    let mut total: u64 = 0;
+    let (mut download, mut disk) = (Some(0u64), Some(0u64));
     for m in members {
-        let (_, _, pkg) = crate::flow::verified_pkg(fetcher, index, ch, m)?;
-        let art = pkg.artifact_for(triple)?;
-        if art.cost.disk_installed == 0 {
-            return None;
-        }
-        total = total.saturating_add(art.cost.disk_installed);
+        let Some((_, _, pkg)) = crate::flow::verified_pkg(fetcher, index, ch, m) else {
+            return SignedSizes::UNKNOWN;
+        };
+        let Some(art) = pkg.artifact_for(triple) else {
+            return SignedSizes::UNKNOWN;
+        };
+        download = sum_nonzero(download, art.cost.download_bytes);
+        disk = sum_nonzero(disk, art.cost.disk_installed);
     }
-    (total > 0).then_some(total)
+    SignedSizes {
+        download: download.filter(|t| *t > 0),
+        disk: disk.filter(|t| *t > 0),
+    }
+}
+
+/// One step of a None-on-zero sum: a zero (undeclared) entry poisons the total.
+fn sum_nonzero(total: Option<u64>, n: u64) -> Option<u64> {
+    total.filter(|_| n > 0).map(|t| t.saturating_add(n))
+}
+
+/// The trailing size parenthetical both announcing lanes end with — ONE renderer
+/// ([`crate::cost::human_bytes`]: binary units, one decimal) so the figures a user
+/// is told cannot drift across surfaces (see [`seed_announcement`]). The GUI's
+/// toolchain bar shows exactly this text, read out of the line's LAST `(…)` and
+/// clipped at 40 characters (crates/aterm-gui `toolchain_announced` →
+/// [`crate::progress::sanitize_for_tty`], which appends '…' past the cap), so every
+/// arm is built to fit: two GiB-tier figures up to `999.9 GiB` render in 39. (The
+/// one arithmetic overflow — both figures in the `1000.0–1024.0 MiB` band — is 41
+/// and clips "on disk" to "on dis…" with both numbers intact; a set whose
+/// download packs several-fold never lands there.) An unknown figure is not
+/// printed; neither known prints nothing — no number beats a wrong one.
+fn size_parenthetical(sizes: SignedSizes) -> String {
+    use crate::cost::human_bytes;
+    match (sizes.download, sizes.disk) {
+        (Some(d), Some(k)) => format!(
+            " (~{} download, ~{} on disk)",
+            human_bytes(d),
+            human_bytes(k)
+        ),
+        (None, Some(k)) => format!(" (~{} on disk when finished)", human_bytes(k)),
+        (Some(d), None) => format!(" (~{} download)", human_bytes(d)),
+        (None, None) => String::new(),
+    }
 }
 
 /// The seed lane's announcement line (`seed-starting:` — the marker that opens the
@@ -10185,15 +10772,17 @@ fn seed_install_bytes(
 ///   remaining out-of-crate quote and must carry the same GiB figure.
 ///
 /// `None` size prints no size at all: no number is more honest than a
-/// confidently wrong one (the [`seed_install_bytes`] contract).
+/// confidently wrong one (the [`seed_install_bytes`] contract). On-disk only —
+/// the sealed payload moves no network bytes, so unlike the wire lane's line
+/// there is no download figure to disclose.
 fn seed_announcement(count: usize, signed_bytes: Option<u64>) -> String {
-    let size = match signed_bytes {
-        Some(b) => format!(" (~{} on disk when finished)", crate::cost::human_bytes(b)),
-        None => String::new(),
-    };
     format!(
         "atpkg: {SEED_STARTING_MARKER}installing {count} ALab program(s) from the bundled \
-         registry{size}"
+         registry{}",
+        size_parenthetical(SignedSizes {
+            download: None,
+            disk: signed_bytes,
+        })
     )
 }
 
@@ -10995,6 +11584,14 @@ fn cmd_update_one(program: &String) -> ExitCode {
         });
         print_gc_sweeps("update", &gc);
         print_gc_abstentions("update", &gc);
+        // THE SEAM AND THE EXEC ROOTS — the same two acts `cmd_update_all_code` performs
+        // after its gc, and for the same reason. This is the branch `aterm pkg update trust`
+        // takes (trust is in the `rustc` coherence group), so it is literally the lane that
+        // printed `atpkg: rustc up to date` on m3 for two weeks without ever inspecting the
+        // `~/.rustup/toolchains/trust` entry that decided what the machine compiled with.
+        // Order matches the pass: gc, then the roots, then the shell hook.
+        reassert_rustup_seam(&layout);
+        let _ = reconcile_exec_roots(&layout, crate::seam::Depth::Shallow);
         crate::hooks::refresh(&layout);
         return if failures == 0 {
             ExitCode::SUCCESS
@@ -11076,6 +11673,21 @@ fn report_channel_apply(
         match outcome {
             crate::TxnOutcome::UpToDate => {
                 println!("atpkg: {label} up to date");
+                // …OF WHAT THIS MACHINE ACTUALLY RUNS, or the line above is a verdict about
+                // a build nobody uses. `atpkg: rustc up to date` is exactly what this arm
+                // printed for two weeks on m3 while every compile went through a
+                // hand-placed `~/.rustup/toolchains/trust` 859 commits behind the pin; both
+                // halves were true of the store and neither was true of the machine.
+                // `doctor` had reported that seam twice, which is the wrong verb to have to
+                // guess you should run. Said per GROUP, beside the verdict it qualifies —
+                // and recorded below, so Settings ▸ Packages carries it too.
+                for prog in &group.members {
+                    if let Some(why) = crate::seam::dissent_if_armed(layout, prog) {
+                        println!(
+                            "atpkg: {label} up to date — but not what this machine runs: {why}"
+                        );
+                    }
+                }
                 // THE GATE LIFTS ITS OWN ROW. A member the `Blocked` arm below recorded
                 // `blocked by <dep>: …` whose dependency has since come back — and whose
                 // pin has not moved — is UpToDate: nothing flips, so no other arm would
@@ -11890,6 +12502,10 @@ mod tests {
     /// cannot acquire a foreign binary later. A pass that wants to exercise
     /// shadowing calls `super::install_default_set_with_path` and says which
     /// `PATH` it means.
+    ///
+    /// The consent is the first launch's: it shapes only the wire lane's
+    /// announcement, whose words `net_announcement`'s own tests pin — no pass
+    /// test through this shim reads them.
     fn install_default_set(
         layout: &crate::store::Layout,
         fetcher: &dyn crate::flow::Fetcher,
@@ -11904,6 +12520,7 @@ mod tests {
             anchor,
             cfg,
             lane,
+            super::Consent::InstallingAterm,
             now,
             None,
             Some(std::ffi::OsStr::new("")),
@@ -12915,6 +13532,125 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// `atpkg repair` names each rc it edited. It used to print one "shell integration
+    /// rewritten (~/.aterm/shell.d + rc wiring)" line whether it had re-laid a block the
+    /// user deleted, failed to write the rc, or found no rc at all. doctor, the manual and
+    /// the agent primer send people to repair for a stale rustup link or a missing reroute
+    /// stub, so re-laying their opt-out went unannounced. Pinned over REAL passes on a
+    /// synthetic home: an opted-out `~/.zshrc` is kept by an unattended pass, re-laid by
+    /// repair and NAMED with the way back out; an rc already wired gets no line; an rc
+    /// linked into a read-only directory (as a non-root user), no rc at all, and a refused
+    /// `~/.aterm` each say what happened. No line claims "rc wiring" wholesale.
+    #[test]
+    fn repair_names_the_rc_it_relaid_over_an_opt_out() {
+        use crate::hooks::{HookPass, RcOutcome, RcWiring};
+        let layout = temp_layout("repair-rc");
+        let home =
+            std::env::temp_dir().join(format!("atpkg-main-repair-rc-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let zshrc = home.join(".zshrc");
+        let mine = "export FOO=1\n";
+        std::fs::write(&zshrc, mine).unwrap();
+        let rewritten = "repair: ~/.aterm/shell.d hooks rewritten".to_string();
+
+        // atpkg wires ~/.zshrc once (which records it in the ledger), and the user
+        // deletes the block afterwards — the opt-out, exactly as the block words it.
+        let first = crate::hooks::pass_at(&layout, &home, RcWiring::HonorOptOut);
+        assert_eq!(first.rc(), [(".zshrc", RcOutcome::Appended)]);
+        std::fs::write(&zshrc, mine).unwrap();
+
+        let unattended = crate::hooks::pass_at(&layout, &home, RcWiring::HonorOptOut);
+        assert_eq!(unattended.rc(), [(".zshrc", RcOutcome::OptOutKept)]);
+        assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), mine);
+
+        let repaired = crate::hooks::pass_at(&layout, &home, RcWiring::Rewire);
+        assert_eq!(repaired.rc(), [(".zshrc", RcOutcome::RelaidOverOptOut)]);
+        assert!(
+            std::fs::read_to_string(&zshrc)
+                .unwrap()
+                .contains(crate::hooks::RC_BEGIN)
+        );
+        let lines = super::repair_hook_lines(&repaired);
+        assert_eq!(lines.first(), Some(&rewritten), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("re-laid atpkg's block in ~/.zshrc")
+                    && l.contains("you had deleted it")
+                    && l.contains("delete it again to opt out")),
+            "the re-laid opt-out is named, with the way back out: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("rc wiring")),
+            "no wholesale claim: {lines:?}"
+        );
+
+        // A second repair finds the block in place: nothing happened to the rc, no line.
+        let again = crate::hooks::pass_at(&layout, &home, RcWiring::Rewire);
+        assert_eq!(again.rc(), [(".zshrc", RcOutcome::AlreadyWired)]);
+        assert_eq!(super::repair_hook_lines(&again), vec![rewritten.clone()]);
+
+        // An rc linked into a read-only directory (a home-manager store's shape): the
+        // write is refused, the target is untouched, and repair says so.
+        // Non-root only: root can write a 0555 directory, so the refusal never happens.
+        if crate::platform::our_uid() != 0 {
+            let store = home.join("ro-store");
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(store.join("zshrc"), mine).unwrap();
+            std::fs::remove_file(&zshrc).unwrap();
+            std::os::unix::fs::symlink(store.join("zshrc"), &zshrc).unwrap();
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let ro = crate::hooks::pass_at(&layout, &home, RcWiring::Rewire);
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(ro.rc(), [(".zshrc", RcOutcome::WriteFailed)]);
+            assert_eq!(std::fs::read_to_string(store.join("zshrc")).unwrap(), mine);
+            let lines = super::repair_hook_lines(&ro);
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("~/.zshrc could NOT be rewritten")),
+                "{lines:?}"
+            );
+        }
+
+        // No rc at all: said, not implied — and the roster is named, not summarised.
+        std::fs::remove_file(&zshrc).unwrap();
+        let none = crate::hooks::pass_at(&layout, &home, RcWiring::Rewire);
+        assert!(none.rc().is_empty());
+        assert_eq!(
+            super::repair_hook_lines(&none),
+            vec![
+                rewritten,
+                "repair: none of ~/.zshrc, ~/.bashrc, ~/.bash_profile, \
+                 ~/.config/fish/config.fish exists, so no rc was wired (atpkg never \
+                 creates one)"
+                    .to_string()
+            ]
+        );
+
+        // ~/.aterm refused (a symlink): nothing touched, and the one line says so.
+        let refused = home.join("refused-home");
+        std::fs::create_dir_all(refused.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(refused.join("elsewhere"), refused.join(".aterm")).unwrap();
+        std::fs::write(refused.join(".zshrc"), mine).unwrap();
+        let pass = crate::hooks::pass_at(&layout, &refused, RcWiring::Rewire);
+        assert_eq!(pass, HookPass::NotHardened);
+        let lines = super::repair_hook_lines(&pass);
+        assert!(
+            lines.len() == 1 && lines[0].contains("no rc was read or written"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(refused.join(".zshrc")).unwrap(),
+            mine
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
     fn temp_layout(label: &str) -> crate::store::Layout {
         let p = std::env::temp_dir().join(format!("atpkg-main-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
@@ -13846,7 +14582,7 @@ mod tests {
             format!(
                 "claude → {} — {expect_absent}\n{}",
                 exe.display(),
-                foreign_copies_line_with(FOREIGN_ON_THIS_SHELL, &[exe.clone()])
+                foreign_copies_line_with(FOREIGN_ON_THIS_SHELL, std::slice::from_ref(&exe))
             )
         );
         assert!(
@@ -15075,6 +15811,41 @@ mod tests {
             "reconcile_exec_roots(layout, crate::seam::Depth::Deep)",
             "repair: done",
         );
+        // THE LANES A PERSON TYPES (2026-09-17). Every whole-set pass above has re-asserted
+        // the rustup seam and reconciled the exec roots since those calls were written;
+        // `aterm pkg install <p>` and `aterm pkg update <p>` — which end in
+        // `cmd_install_with`, or in `cmd_update_one`'s coherence-group branch — never did.
+        // That is the asymmetry that let `aterm pkg update trust` answer "up to date" for
+        // two weeks on m3 without once looking at the `~/.rustup/toolchains/trust` entry
+        // that decided what the machine actually compiled with. The seam comes first in
+        // both, matching every other lane: a root laid over a seam that was just re-pointed
+        // is the order `cmd_seed` and `cmd_rollback` already use.
+        for lane in ["cmd_install_with", "cmd_update_one"] {
+            let b = body(lane);
+            let seam = b
+                .find("reassert_rustup_seam(")
+                .unwrap_or_else(|| panic!("{lane} must re-assert the rustup seam"));
+            let roots = b
+                .find("reconcile_exec_roots(")
+                .unwrap_or_else(|| panic!("{lane} must reconcile the exec roots"));
+            assert!(
+                seam < roots,
+                "{lane}: the seam is re-asserted before the roots"
+            );
+        }
+        // …and the verdict those lanes print is qualified by what the machine RUNS, not
+        // only by what the store holds ([`crate::seam::dissent_line`]).
+        for (lane, count) in [
+            ("cmd_install_with", 1usize),
+            ("do_install", 1),
+            ("report_channel_apply", 1),
+        ] {
+            assert_eq!(
+                body(lane).matches("dissent_if_armed(").count(),
+                count,
+                "{lane} must qualify its up-to-date verdict with what this machine runs"
+            );
+        }
         assert!(body("run_repair").contains("repair_store(&layout)"));
         assert_eq!(
             body("cmd_uninstall_all")
@@ -16462,8 +17233,10 @@ mod tests {
         let flag = seed_body
             .find("let adopted_by_this_run = !adopted(&layout);")
             .expect("cmd_seed captures whether this run adopts");
+        // The seed lane's adoption is [`record_seed_adoption`] — `record_adoption`
+        // plus the record of WHO adopted — so the name searched for is that one.
         let adopt = seed_body
-            .find("record_adoption(&layout);")
+            .find("record_seed_adoption(&layout);")
             .expect("cmd_seed adopts");
         assert!(
             flag < adopt,
@@ -16712,19 +17485,37 @@ mod tests {
     fn a_seed_from_the_sealed_payload_never_prints_the_net_starting_marker() {
         let two = vec!["ay".to_string(), "trust".to_string()];
         // The network lane still announces before acting…
-        let line = net_announcement(ProvisionLane::Network, &two)
-            .expect("a non-empty network pass announces before acting");
+        let line = net_announcement(
+            ProvisionLane::Network,
+            Consent::InstallingAterm,
+            &two,
+            SignedSizes::UNKNOWN,
+        )
+        .expect("a non-empty network pass announces before acting");
         assert!(
             line.starts_with(&format!("atpkg: {NET_STARTING_MARKER}")),
             "the GUI strips exactly this prefix: {line}"
         );
         assert!(line.contains("ay, trust"), "{line}");
-        // …stays silent on the ordinary no-op tick…
-        assert!(net_announcement(ProvisionLane::Network, &[]).is_none());
-        // …and the sealed-payload lane NEVER claims the wire, whatever the set:
-        // its announcement is `cmd_seed`'s own `seed-starting:` line.
-        assert!(net_announcement(ProvisionLane::SealedPayload, &two).is_none());
-        assert!(net_announcement(ProvisionLane::SealedPayload, &[]).is_none());
+        // …stays silent on the ordinary no-op tick, whoever consented…
+        let known = SignedSizes {
+            download: Some(1 << 28),
+            disk: Some(1 << 30),
+        };
+        for consent in [Consent::InstallingAterm, Consent::Explicit] {
+            assert!(net_announcement(ProvisionLane::Network, consent, &[], known).is_none());
+            // …and the sealed-payload lane NEVER claims the wire, whatever the
+            // set, the sizes or the consent: its announcement is `cmd_seed`'s own
+            // `seed-starting:` line.
+            for sizes in [SignedSizes::UNKNOWN, known] {
+                assert!(
+                    net_announcement(ProvisionLane::SealedPayload, consent, &two, sizes).is_none()
+                );
+                assert!(
+                    net_announcement(ProvisionLane::SealedPayload, consent, &[], sizes).is_none()
+                );
+            }
+        }
         // The local lane's announcement carries the LOCAL marker, and never the
         // wire's — the GUI opens the same card off either, so the marker is the
         // only place the transport claim lives.
@@ -17053,6 +17844,392 @@ mod tests {
             !production.contains("{:.1} GB") && !production.contains("{:.0} GB"),
             "no decimal-GB format fragment may return"
         );
+    }
+
+    /// THE WIRE LANE SAYS WHAT IT IS ABOUT TO DO, AND HOW TO STOP IT. The lean app
+    /// — every current release, on every CPU — has no seal, so the WHOLE set
+    /// arrives through this lane on every current-release Mac — and until
+    /// 2026-09-06 its one line read "installing 10 program(s) over the network:
+    /// ay, clean, …" (aterm.log on an Intel Mac, where it was measured): no size,
+    /// no way out, while `aterm help pkg` called size "the one thing disclosed up
+    /// front". The way out it names is timed honestly: `uninstall --all` is a
+    /// store mutator like `update`, and the dispatch edge holds the store lock for
+    /// the whole pass, so that verb can only run once the pass ends — the line
+    /// must say so, or it sends the reader into "another atpkg process holds the
+    /// store lock" mid-download.
+    #[test]
+    fn the_network_lane_names_the_size_and_the_off_switches() {
+        // The set a first launch names today, derived from the compiled lists the
+        // client installs from — the ALab roster plus the agent programs, which
+        // 88c0e224e made default-set members installed unasked — sorted as
+        // `install_default_set_inner` sorts `will_install`. The 2026-09-06 line
+        // named ten; this one names twelve, and the log-cap check below runs
+        // against the longer line.
+        let mut set: Vec<String> = crate::stub::DEFAULT_SET_STUB_NAMES
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .chain(crate::stub::AGENT_PROGRAMS.iter().map(|n| (*n).to_string()))
+            .collect();
+        set.sort();
+        set.dedup();
+        // 3_650_000_000 B = 3.399… GiB and 1_100_000_000 B = 1.024… GiB, so the
+        // ONE renderer's rounding is exercised on both figures — the finding named
+        // the undisclosed cost as "~0.9 GB over the network, 3.4 GB on disk"
+        // (docs/GOLDEN-INSTALL-PATH.md: "~1.1 GB down"), and the same signed
+        // `[cost]` row carries both.
+        let both = SignedSizes {
+            download: Some(1_100_000_000),
+            disk: Some(3_650_000_000),
+        };
+        let line = net_announcement(ProvisionLane::Network, Consent::InstallingAterm, &set, both)
+            .expect("a non-empty network pass announces before acting");
+        // The GUI strips exactly this prefix…
+        assert!(
+            line.starts_with(&format!(
+                "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: ay, \
+                 claude, ",
+                set.len()
+            )),
+            "{line}"
+        );
+        // …each size is cost::human_bytes of its signed sum, stated once…
+        assert_eq!(
+            line.matches("3.4 GiB").count(),
+            1,
+            "one on-disk figure, once: {line}"
+        );
+        assert_eq!(
+            line.matches("1.0 GiB").count(),
+            1,
+            "one download figure, once: {line}"
+        );
+        // …both off switches are named, spelled as typed…
+        assert!(line.contains("`aterm pkg uninstall --all`"), "{line}");
+        assert!(line.contains("`[packages].seed_install = false`"), "{line}");
+        assert!(line.contains("before the first launch"), "{line}");
+        // …the uninstall verb is timed honestly — it is refused while the pass
+        // holds the store lock (`verb_mutates_store` covers `update` and
+        // `uninstall` alike; `mutator_store_lock` at the dispatch edge), so the
+        // line says "once this pass ends" BEFORE naming it and says what it does…
+        let ends = line.find("once this pass ends").expect("the timing");
+        let verb = line.find("`aterm pkg uninstall --all`").expect("the verb");
+        assert!(
+            ends < verb,
+            "the timing must qualify the verb, not trail it: {line}"
+        );
+        assert!(line.contains("records the decline"), "{line}");
+        assert!(
+            !line.contains("opt out with `aterm pkg uninstall"),
+            "untimed: {line}"
+        );
+        // …the whole line owns exactly two '(' — "program(s)" and the size — so a
+        // parenthesis can arrive from neither the switch phrase nor the format…
+        assert_eq!(line.matches('(').count(), 2, "{line}");
+        // …and the sizes are the line's TRAILING parenthetical, which is where the
+        // toolchain bar reads them (crates/aterm-gui `toolchain_announced` takes
+        // the text after the LAST '(' when it closes with ')'), so the off-switch
+        // phrase must never bring a parenthesis of its own.
+        let (_, tail) = line.rsplit_once('(').expect("a parenthetical");
+        assert_eq!(tail, "~1.0 GiB download, ~3.4 GiB on disk)", "{line}");
+        let (consent_clause, seed_clause) = Consent::InstallingAterm.announced();
+        for phrase in [NET_OFF_SWITCH, consent_clause, seed_clause] {
+            assert!(
+                !phrase.contains(['(', ')']),
+                "the bar would read the wrong parenthetical: {phrase}"
+            );
+        }
+        // …shown WHOLE: the bar passes the text inside the parentheses through
+        // `sanitize_for_tty(s, 40)`, which appends '…' past 40 characters — and
+        // the figures this line exists to disclose may not be what gets clipped.
+        let inside = tail.strip_suffix(')').expect("closed");
+        assert!(
+            inside.chars().count() <= 40,
+            "{inside:?} would be clipped on the toolchain bar"
+        );
+        assert_eq!(crate::progress::sanitize_for_tty(inside, 40), inside);
+        // …and the whole line fits the LOG. The GUI logs it as `atpkg install
+        // pass starting: {detail}` — one `Wake::PkgSeedStarted` serves the seed
+        // lane AND this one, so its line names the EVENT rather than a lane
+        // (crates/aterm-gui; `detail` is the text after "atpkg: net-starting: ",
+        // trimmed) — and its file sink caps one
+        // record BODY at aterm_log::MAX_RECORD_BYTES = 512, eliding the tail with
+        // '…' (`aterm_log::sanitize_record`). The sizes are the LAST thing on the
+        // line — they cannot move ahead of the switches, because the bar reads
+        // the LAST '(' (above) — so they are the first casualty of any growth
+        // (about a dozen more member names; opted-in extras join `will_install`
+        // too), and the one figure this line exists to disclose would be what
+        // vanished. atpkg does not depend on aterm-log, so the cap is pinned
+        // here by hand: change both or neither.
+        const MAX_RECORD_BYTES: usize = 512; // = aterm_log::MAX_RECORD_BYTES
+        let detail = line
+            .strip_prefix(&format!("atpkg: {NET_STARTING_MARKER}"))
+            .expect("the GUI strips exactly this prefix");
+        let logged = "atpkg install pass starting: ".len() + detail.len();
+        assert!(
+            logged <= MAX_RECORD_BYTES,
+            "the log sink would elide the sizes: {logged} bytes as logged, cap \
+             {MAX_RECORD_BYTES}: {line}"
+        );
+        // THE EXPLICIT VERB IS ITS OWN CONSENT. `aterm pkg install --default-set`
+        // — what the Settings "Install ALab toolset" button runs, on any
+        // platform — clears the decline and the removals and never reads
+        // `seed_install`, so "installing aterm is the consent" and the
+        // `seed_install` switch are both false on its pass. Its line is the same
+        // line with exactly those two clauses gone: the sizes, the timed
+        // uninstall switch (true on every lane) and the two '(' all stay.
+        let explicit = net_announcement(ProvisionLane::Network, Consent::Explicit, &set, both)
+            .expect("a non-empty network pass announces before acting");
+        assert!(
+            !explicit.contains("installing aterm is the consent"),
+            "{explicit}"
+        );
+        assert!(!explicit.contains("seed_install"), "{explicit}");
+        assert!(!explicit.contains("before the first launch"), "{explicit}");
+        assert_eq!(
+            explicit,
+            line.replacen(consent_clause, "", 1)
+                .replacen(seed_clause, "", 1),
+            "the explicit line differs by exactly the two clauses"
+        );
+        assert!(
+            explicit.ends_with(&format!(
+                " — {NET_OFF_SWITCH} (~1.0 GiB download, ~3.4 GiB on disk)"
+            )),
+            "{explicit}"
+        );
+        assert_eq!(explicit.matches('(').count(), 2, "{explicit}");
+        // One figure known prints that figure alone: a registry row without
+        // `download_bytes` keeps the seed lane's on-disk phrase; one without
+        // `disk_installed` names just the download — in its own tier
+        // (970_000_000 B is under 1 GiB, so the renderer says "925.1 MiB"; the
+        // two figures need not share a unit, and neither is ever rounded up
+        // into the next one to match the other).
+        let disk_only = net_announcement(
+            ProvisionLane::Network,
+            Consent::InstallingAterm,
+            &set,
+            SignedSizes {
+                download: None,
+                disk: Some(3_650_000_000),
+            },
+        )
+        .expect("announces");
+        assert!(
+            disk_only.ends_with(" (~3.4 GiB on disk when finished)"),
+            "{disk_only}"
+        );
+        assert_eq!(disk_only.matches("GiB").count(), 1, "{disk_only}");
+        let download_only = net_announcement(
+            ProvisionLane::Network,
+            Consent::InstallingAterm,
+            &set,
+            SignedSizes {
+                download: Some(970_000_000),
+                disk: None,
+            },
+        )
+        .expect("announces");
+        assert!(
+            download_only.ends_with(" (~925.1 MiB download)"),
+            "{download_only}"
+        );
+        assert_eq!(download_only.matches("MiB").count(), 1, "{download_only}");
+        assert!(!download_only.contains("GiB"), "{download_only}");
+        // No signed sum ⇒ no size at all (no number beats a wrong one), the
+        // switches still named, and the last '(' is then "program(s)", whose
+        // tail does not close — the bar shows "starting…" rather than a guess.
+        let bare = net_announcement(
+            ProvisionLane::Network,
+            Consent::InstallingAterm,
+            &set,
+            SignedSizes::UNKNOWN,
+        )
+        .expect("a non-empty network pass announces before acting");
+        assert!(!bare.contains("GiB") && !bare.contains("GB"), "{bare}");
+        assert!(bare.contains(NET_OFF_SWITCH), "{bare}");
+        let (_, tail) = bare.rsplit_once('(').expect("program(s)");
+        assert!(!tail.ends_with(')'), "{bare}");
+    }
+
+    /// WHO ADOPTED DECIDES WHAT THE LINE MAY CLAIM. "Installing aterm is the
+    /// consent", with `seed_install = false` before the first launch as the
+    /// switch, is true only of the update pass on a machine the SEED PASS
+    /// adopted (`adopted_by_seed`), with neither key overriding it:
+    /// `auto_install = true` completes the set whatever `seed_install` says
+    /// (`should_complete_set`), and a key set false after adoption can no longer
+    /// stop the loop. A machine the explicit verb adopted carries no record,
+    /// because that verb is its own consent and never reads the key. With the
+    /// default keys that is `uninstall --all` followed by Settings "Install ALab
+    /// toolset", or `install --default-set` on a CLI-only box. The callers' half
+    /// is source-shaped in the house style, because the verbs read the GLOBAL
+    /// layout and config; the record's own life cycle is
+    /// `who_adopted_is_recorded_only_when_the_seed_pass_creates_adoption`.
+    #[test]
+    fn only_a_pass_the_first_launch_adopted_says_installing_aterm_is_the_consent() {
+        // The one case that may state the first launch's consent…
+        assert_eq!(
+            set_completion_consent(false, true, true),
+            Consent::InstallingAterm
+        );
+        // …and the seven that may not. The first is the default config on a
+        // machine the explicit verb adopted, or on one adopted before the record.
+        for (auto_install, seed_install, by_seed) in [
+            (false, true, false),
+            (true, true, true),
+            (true, true, false),
+            (false, false, true),
+            (false, false, false),
+            (true, false, true),
+            (true, false, false),
+        ] {
+            assert_eq!(
+                set_completion_consent(auto_install, seed_install, by_seed),
+                Consent::Explicit,
+                "auto_install={auto_install} seed_install={seed_install} \
+                 adopted_by_seed={by_seed}"
+            );
+        }
+
+        // Up to the verb's OWN closing brace, not the next top-level `fn`: the
+        // items between `cmd_update_all` and the next function include
+        // `Consent` itself, whose arms would satisfy any search. Each verb is a
+        // thin `answer_announcement` wrapper over a `_code` worker that holds
+        // its body, so the scans read the worker.
+        fn body_of(src: &'static str, signature: &str) -> &'static str {
+            let start = src.find(signature).expect("the verb");
+            let end = src[start..]
+                .find("\n}\n")
+                .map(|i| start + i)
+                .expect("the verb's closing brace");
+            &src[start..end]
+        }
+        let src = include_str!("cli.rs");
+        let verb = body_of(src, "fn cmd_install_default_set_code(");
+        assert!(
+            verb.contains("Consent::Explicit"),
+            "the explicit verb is its own consent"
+        );
+        assert!(
+            !verb.contains("Consent::InstallingAterm"),
+            "the explicit verb must never claim the first launch's consent"
+        );
+        let update = body_of(src, "fn cmd_update_all_code(");
+        // Whitespace-free, so the formatter's line breaks cannot hide the call.
+        let squeezed: String = update.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains(
+                "set_completion_consent(cfg.auto_install(),cfg.seed_install(),adopted_by_seed(&layout)"
+            ),
+            "the update pass asks which consent holds on this machine, including who adopted it"
+        );
+        assert!(
+            !update.contains("Consent::InstallingAterm") && !update.contains("Consent::Explicit"),
+            "the update pass must not hard-code a consent"
+        );
+        // Who adopted is written by the seed verb alone and cleared by the explicit one.
+        assert!(
+            verb.contains("clear_seed_adoption(&layout)") && !verb.contains("record_seed_adoption"),
+            "the explicit verb takes the seed pass's claim over and never writes it"
+        );
+        let seed = body_of(src, "fn cmd_seed(");
+        assert!(
+            seed.contains("record_seed_adoption(&layout)")
+                && !seed.contains("record_adoption(&layout)"),
+            "the seed pass adopts through the door that records who adopted"
+        );
+    }
+
+    /// WHO ADOPTED, ACROSS THE VERBS THAT CHANGE IT: the record behind
+    /// `set_completion_consent`'s third input. The seed pass writes it only when
+    /// it CREATES adoption, because it runs on every launch, and stamping a marker
+    /// it found would hand a machine the explicit verb adopted back to the first
+    /// launch's consent on its very next launch. The explicit verb clears it,
+    /// uninstall clears it with the marker, a record without the marker vouches
+    /// for nothing, and a marker with no record (the explicit verb's, or one
+    /// written before the record existed) claims no more than the uninstall.
+    #[test]
+    fn who_adopted_is_recorded_only_when_the_seed_pass_creates_adoption() {
+        let layout = temp_layout("who-adopted");
+        // What `cmd_update_all` asks, with the default keys.
+        let consent = |layout: &crate::store::Layout| {
+            set_completion_consent(false, true, adopted_by_seed(layout))
+        };
+
+        // The first launch adopts, and says so.
+        record_seed_adoption(&layout);
+        assert!(adopted(&layout) && adopted_by_seed(&layout));
+        assert_eq!(consent(&layout), Consent::InstallingAterm);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(layout.adopted_by_seed())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the record is 0600 like the marker");
+        }
+        // Every later launch re-runs the seed pass: a no-op.
+        let first = std::fs::read(layout.adopted_by_seed()).unwrap();
+        record_seed_adoption(&layout);
+        assert_eq!(std::fs::read(layout.adopted_by_seed()).unwrap(), first);
+
+        // Default keys, `uninstall --all`, then Settings "Install ALab toolset":
+        // uninstall forgets both files, the explicit verb clears the record and
+        // adopts, and the next launch's seed pass finds a marker and records nothing.
+        clear_adoption(&layout);
+        assert!(!adopted(&layout) && !layout.adopted_by_seed().exists());
+        clear_seed_adoption(&layout);
+        record_adoption(&layout);
+        record_seed_adoption(&layout);
+        assert!(adopted(&layout) && !adopted_by_seed(&layout));
+        assert_eq!(
+            consent(&layout),
+            Consent::Explicit,
+            "the explicit verb adopted this machine; its passes must not claim the first launch"
+        );
+
+        // The explicit verb on a machine the seed pass adopted takes the claim over.
+        clear_adoption(&layout);
+        record_seed_adoption(&layout);
+        assert_eq!(consent(&layout), Consent::InstallingAterm);
+        clear_seed_adoption(&layout);
+        assert!(adopted(&layout), "clearing the record is not un-adopting");
+        assert_eq!(consent(&layout), Consent::Explicit);
+        // Clearing what is already clear is not an error.
+        clear_seed_adoption(&layout);
+
+        // A record without the marker vouches for nothing…
+        clear_adoption(&layout);
+        std::fs::write(layout.adopted_by_seed(), b"stray").unwrap();
+        assert!(!adopted_by_seed(&layout));
+        // …and a marker that predates the record claims no more than the uninstall.
+        clear_seed_adoption(&layout);
+        record_adoption(&layout);
+        assert_eq!(consent(&layout), Consent::Explicit);
+
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The None-on-zero sum behind both figures: one undeclared (zero) entry
+    /// poisons its total, the other figure is unaffected, and an already-poisoned
+    /// total stays `None` whatever follows.
+    #[test]
+    fn a_signed_sum_is_poisoned_by_one_undeclared_entry() {
+        assert_eq!(sum_nonzero(Some(0), 5), Some(5));
+        assert_eq!(sum_nonzero(Some(5), 7), Some(12));
+        assert_eq!(sum_nonzero(Some(5), 0), None);
+        assert_eq!(sum_nonzero(None, 7), None);
+        assert_eq!(sum_nonzero(Some(u64::MAX), 1), Some(u64::MAX));
+        // The renderer prints only what is known.
+        let known = SignedSizes {
+            download: Some(1 << 30),
+            disk: Some(1 << 30),
+        };
+        assert_eq!(
+            size_parenthetical(known),
+            " (~1.0 GiB download, ~1.0 GiB on disk)"
+        );
+        assert_eq!(size_parenthetical(SignedSizes::UNKNOWN), "");
     }
 
     /// THE CONSENT POLICY, as a table. Every consent regression this branch shipped
@@ -17649,6 +18826,7 @@ mod tests {
             &test_anchor(),
             &cfg,
             ProvisionLane::Network,
+            super::Consent::InstallingAterm,
             0,
             Some(&index),
             Some(std::ffi::OsStr::new("")),
@@ -17695,6 +18873,7 @@ mod tests {
             &test_anchor(),
             &cfg,
             ProvisionLane::Network,
+            super::Consent::InstallingAterm,
             lapsed,
             Some(&index),
             Some(std::ffi::OsStr::new("")),

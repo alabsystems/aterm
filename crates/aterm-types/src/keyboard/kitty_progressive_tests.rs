@@ -251,10 +251,15 @@ fn report_associated_text_omits_payload_for_super_modified() {
 
 #[test]
 fn report_associated_text_omits_payload_for_named_key() {
-    // Named keys (Enter, Tab, etc.) never carry associated text.
+    // Enter and Tab type CONTROL CODES (`\r`, `\t`), and the spec's one
+    // exclusion drops those — not "named keys carry no text", which would
+    // also silence the spacebar (see
+    // `encode_tests::kitty_associated_text_carries_the_spacebars_space`).
     let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::REPORT_ASSOCIATED_TEXT;
     let result = encode_key(&Key::Named(NamedKey::Enter), Modifiers::empty(), mode);
     assert_eq!(result, b"\x1b[13u");
+    let result = encode_key(&Key::Named(NamedKey::Tab), Modifiers::empty(), mode);
+    assert_eq!(result, b"\x1b[9u");
 }
 
 #[test]

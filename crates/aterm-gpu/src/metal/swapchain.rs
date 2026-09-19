@@ -548,7 +548,7 @@ impl Swapchain {
         // SAFETY: every send below is a documented property setter on the live
         // layer, with the prototype written out per selector: object, usize
         // (NSUInteger), `ObjcBool` (BOOL — `signed char` on x86_64, see its
-        // docs), CGSize by value (HFA in v0/v1), and CGColorSpaceRef. The EDR
+        // docs), CGSize by value (HFA in v0/v1), and CGColorSpaceRef. The
         // colorspace is created at +1 and released after `setColorspace:` —
         // the property retains it (CAMetalLayer.h:122).
         unsafe {
@@ -556,6 +556,28 @@ impl Swapchain {
             let set_usize: unsafe extern "C" fn(Id, Sel, usize) = msg();
             let set_bool: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
             let set_size: unsafe extern "C" fn(Id, Sel, CgSize) = msg();
+
+            // The EDR arm, derived from the format exactly as wgpu-hal derives
+            // it (surface.rs:93-96) — plus the colorspace wgpu never names.
+            // Both are decided off `config` alone, so the colorspace object
+            // is CREATED here, ahead of the first layer write: with
+            // `validate` above, that makes every failure point of this
+            // function precede its first setter, and a refused configure
+            // leaves the layer exactly as it was (`reconcile` then keeps its
+            // retained config too — the property `upgrade_surface_for_screen`
+            // rests its revert on). The SET stays last, below: on a fresh
+            // layer `setPixelFormat:` installs sRGB implicitly, so an explicit
+            // space written before it would be overwritten.
+            let wants_edr = config.format == PixelFormat::Rgba16Float;
+            let space_name = if wants_edr {
+                kCGColorSpaceExtendedLinearSRGB
+            } else {
+                kCGColorSpaceSRGB
+            };
+            let space = CGColorSpaceCreateWithName(space_name);
+            if space.is_null() {
+                return Err("CGColorSpaceCreateWithName failed".to_owned());
+            }
 
             set_obj(layer.id(), sel(c"setDevice:"), device.id());
             set_usize(layer.id(), sel(c"setPixelFormat:"), config.format as usize);
@@ -597,9 +619,7 @@ impl Swapchain {
                 true.into(),
             );
 
-            // The EDR arm, derived from the format exactly as wgpu-hal derives
-            // it (surface.rs:93-96) — plus the colorspace wgpu never names.
-            let wants_edr = config.format == PixelFormat::Rgba16Float;
+            // The EDR arm (`wants_edr`, decided above with the colorspace).
             set_bool(
                 layer.id(),
                 sel(c"setWantsExtendedDynamicRangeContent:"),
@@ -621,15 +641,6 @@ impl Swapchain {
             // the setter's fresh-layer side effect. On a fresh layer this
             // writes the value the implicit install already produced, which
             // is why S1's readback was green both before and after.
-            let space_name = if wants_edr {
-                kCGColorSpaceExtendedLinearSRGB
-            } else {
-                kCGColorSpaceSRGB
-            };
-            let space = CGColorSpaceCreateWithName(space_name);
-            if space.is_null() {
-                return Err("CGColorSpaceCreateWithName failed".to_owned());
-            }
             let set_space: unsafe extern "C" fn(Id, Sel, *mut c_void) = msg();
             set_space(layer.id(), sel(c"setColorspace:"), space);
             CGColorSpaceRelease(space);

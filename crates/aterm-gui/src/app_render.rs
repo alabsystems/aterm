@@ -2086,8 +2086,8 @@ mod cursor_fx_generation_fence_tests {
             !ws.cursor_fx_active(fixture.await_at, false),
             "negative control: a cold first key owns no resident cadence"
         );
-        let interval = crate::effect_present_interval(ws.frame_interval);
-        let grace = interval * crate::DECO_ANIM_LEVEL_FRAMES;
+        let interval = ws.effect_present_interval();
+        let grace = ws.deco_anim_hold();
         let stale_frame_started = fixture
             .await_at
             .checked_sub(grace)
@@ -5444,6 +5444,19 @@ struct SuccessfulPresentWindowOutcome {
     offscreen: bool,
 }
 
+// TEST-ONLY: the swapchain-acquire wait `App::last_acquire_wait_ns` reports,
+// injected. A headless window has no swapchain, so no present of it can wait
+// for a drawable, and the pool-park latch's feed at the success boundary
+// (`App::finalize_successful_present`) would otherwise be reachable in a test
+// only with a wait of 0. Thread-local, like the compose seams: `cargo test`
+// runs each test function on its own thread. (Plain comments, not doc
+// comments: `unused_doc_comments` is an error under the lint gate.)
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ACQUIRE_WAIT_NS_FOR_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SuccessfulPresentRoute {
     Terminal,
@@ -5747,10 +5760,10 @@ mod trail_present_pacing_tests {
             "a resting decoration holds the lane open for nothing: the loop parks"
         );
 
-        // One animating frame. The hold is `DECO_ANIM_LEVEL_FRAMES` panel
-        // refreshes, long enough to cover arm -> fire -> next redraw.
-        let grace =
-            crate::effect_present_interval(ws.frame_interval) * crate::DECO_ANIM_LEVEL_FRAMES;
+        // One animating frame. The hold is `DECO_ANIM_LEVEL_FRAMES` periods of
+        // the window's LONGEST lane (`deco_anim_hold`), long enough to cover
+        // arm -> fire -> next redraw even if a park stretches the lane meanwhile.
+        let grace = ws.deco_anim_hold();
         ws.note_deco_animating(t0);
         assert!(ws.deco_anim_frame_active(t0));
         assert!(
@@ -5848,7 +5861,7 @@ mod trail_present_pacing_tests {
         // NOW THE BLOCKER. Five event-loop turns before the slot is due, none of
         // them a redraw of this window and none of them `ResumeTimeReached`, so
         // nothing refreshes the latch and nothing consumes the tick.
-        let interval = crate::effect_present_interval(ws.frame_interval);
+        let interval = ws.effect_present_interval();
         for step in 1..=5_u32 {
             let woke = t0 + interval / 8 * step;
             assert!(
@@ -5866,7 +5879,7 @@ mod trail_present_pacing_tests {
 
         // And it is BOUNDED, not a train: the walk ends, no redraw refreshes the
         // latch, and the lane parks back to pure `Wait` within the grace.
-        let grace = interval * crate::DECO_ANIM_LEVEL_FRAMES;
+        let grace = ws.deco_anim_hold();
         assert_eq!(
             ws.plan_terminal_effect_lane(t0 + grace, false, true),
             None,
@@ -6024,7 +6037,7 @@ mod trail_present_pacing_tests {
             .get_mut(&WindowId(0))
             .expect("the headless fixture owns window 0");
         let t0 = Instant::now();
-        let interval = crate::effect_present_interval(ws.frame_interval);
+        let interval = ws.effect_present_interval();
 
         // Stand in for the reduced-motion cat's one-shot erase, armed by the
         // else-if on an earlier park and still pending when a decoration moves.
@@ -6247,6 +6260,79 @@ mod trail_present_pacing_tests {
             !state.capture_present_invert && state.capture_present_overlay.is_none(),
             "a later mixed/native frame explicitly clears stale terminal chrome"
         );
+    }
+
+    /// THE POOL-PARK LATCH HEARS BOTH ROUTES THAT DRAW CURSOR EFFECTS. A mixed
+    /// native + terminal tab whose focused leaf is a terminal runs the same
+    /// effect lane as a terminal tab (`front_terminal()` is that leaf) and
+    /// presents through the same drawable pool, so a heterogeneous present
+    /// that waited [`crate::EFFECT_LANE_ACQUIRE_PARK_NS`] for a drawable must
+    /// leave the window's lane at the halving exactly as a terminal present
+    /// does — on an Intel Mac's 60 Hz panel-rate arm that is the only thing
+    /// that stops a mixed tab presenting the lane at panel rate while the pool
+    /// parks it. Driven through the success boundary both routes share, with
+    /// the renderer's measured wait injected (a headless window has no
+    /// swapchain to wait on); a wait one nanosecond short of the threshold is
+    /// the negative control on each route. Holds on every host: off the Intel
+    /// arm the lane is the halving before and after, and the latch still sets.
+    #[test]
+    fn both_effect_drawing_routes_feed_the_pool_park_latch() {
+        struct ClearInjectedWait;
+        impl Drop for ClearInjectedWait {
+            fn drop(&mut self) {
+                super::ACQUIRE_WAIT_NS_FOR_TEST.with(|wait| wait.set(None));
+            }
+        }
+        let _clear = ClearInjectedWait;
+        let hz60 = Duration::from_nanos(1_000_000_000_000 / 60_000);
+        let halved =
+            crate::effect_present_interval_with(Some(hz60), crate::EFFECT_PRESENT_PANEL_PERIODS);
+        let routes = [
+            (
+                SuccessfulPresentRoute::Terminal,
+                crate::VisibleContentRoute::Terminal { composed: false },
+            ),
+            (
+                SuccessfulPresentRoute::Heterogeneous,
+                crate::VisibleContentRoute::Heterogeneous,
+            ),
+        ];
+        for (route, visible_route) in routes {
+            for (wait_ns, parks) in [
+                (crate::EFFECT_LANE_ACQUIRE_PARK_NS - 1, false),
+                (crate::EFFECT_LANE_ACQUIRE_PARK_NS, true),
+            ] {
+                let mut app = App::headless_for_test();
+                let id = WindowId(0);
+                app.windows
+                    .get_mut(&id)
+                    .expect("the headless fixture owns window 0")
+                    .frame_interval = Some(hz60);
+                let before = app.windows[&id].effect_present_interval();
+                let plan = app.active_visible_leaf_plan(id).expect("visible plan");
+                super::ACQUIRE_WAIT_NS_FOR_TEST.with(|wait| wait.set(Some(wait_ns)));
+                app.finalize_successful_present(
+                    id,
+                    crate::metrics::StartupPresentTiming::collapsed(Instant::now()),
+                    0,
+                    None,
+                    route,
+                    visible_route,
+                    HostVisualState::default(),
+                    &plan,
+                );
+                let state = &app.windows[&id];
+                assert_eq!(
+                    state.effect_lane_parked, parks,
+                    "{route:?}: a present whose acquire waited {wait_ns} ns"
+                );
+                assert_eq!(
+                    state.effect_present_interval(),
+                    if parks { halved } else { before },
+                    "{route:?}: a parked present leaves the lane at the halving on every host"
+                );
+            }
+        }
     }
 
     #[test]
@@ -25238,6 +25324,10 @@ impl App {
     /// Wall time this window's most recent present spent BLOCKED acquiring a
     /// swapchain drawable. 0 on the CPU backend (no swapchain to wait on).
     fn last_acquire_wait_ns(&self, id: WindowId) -> u64 {
+        #[cfg(test)]
+        if let Some(ns) = ACQUIRE_WAIT_NS_FOR_TEST.with(std::cell::Cell::get) {
+            return ns;
+        }
         match self.windows.get(&id).and_then(|ws| ws.present.as_ref()) {
             Some(PresentTarget::Gpu { window_gpu, .. }) => window_gpu.last_acquire_wait_ns(),
             _ => 0,
@@ -28789,6 +28879,10 @@ impl App {
         presented_plan: &crate::tab_model::VisibleLeafPlan,
     ) {
         let frame_started = startup_timing.frame_started();
+        // THIS present's swapchain-acquire wait, read before anything below can
+        // replace the present target (device-loss recovery runs last). The
+        // effect lane's pool-park latch hears it in the route arms.
+        let acquire_wait_ns = self.last_acquire_wait_ns(id);
         self.reveal_successfully_presented_window(id);
         let app_frame_interval = self.frame_interval;
         let presented_at = Instant::now();
@@ -28805,12 +28899,27 @@ impl App {
             // successful-present serial.
             state.capture_present_invert = visuals.invert;
             state.capture_present_overlay = visuals.overlay;
+            // THE EFFECT LANE'S POOL-PARK LATCH (`WindowState::note_acquire_wait`)
+            // is fed on BOTH routes that draw cursor effects, here at the success
+            // boundary they share rather than on one route's own arm. A mixed
+            // native + terminal tab (the heterogeneous route) runs the same effect
+            // lane as a terminal tab — its focused terminal leaf is
+            // `front_terminal()` — and presents through the same drawable pool,
+            // so on an Intel Mac's panel-rate arm it must demote on the same
+            // evidence; fed on the terminal arm alone it never could. The native
+            // route draws no cursor effect (`cursor_fx_active` needs a terminal
+            // front), so it has nothing to demote. `metrics::note_acquire_wait`
+            // stays on the terminal route, where it was: the published acquire
+            // histogram keeps the population it had, so a read of it before and
+            // after this latch compares like with like.
             match route {
                 SuccessfulPresentRoute::Terminal => {
+                    state.note_acquire_wait(acquire_wait_ns);
                     state.heterogeneous_output_streak_staged.clear();
                     state.heterogeneous_output_streak_presented.clear();
                 }
                 SuccessfulPresentRoute::Heterogeneous => {
+                    state.note_acquire_wait(acquire_wait_ns);
                     std::mem::swap(
                         &mut state.heterogeneous_output_streak_staged,
                         &mut state.heterogeneous_output_streak_presented,
@@ -30998,6 +31107,15 @@ impl App {
                     // when a rescan was due (`deco_rescan`, same `epoch` — no torn
                     // read); scan those cells here on host state, no lock held.
                     if deco_rescan {
+                        // THE ROW ORIGIN OF THIS SNAPSHOT, declared for the
+                        // kitty-command flash immediately before the rescan
+                        // that spends it: `sit⏎` on the bottom row scrolls
+                        // before its echo is scanned, and the snapshot's
+                        // `base_y` is the exact delta that finds the word on
+                        // the row it moved to rather than on the shell's
+                        // `command not found: sit`. Same snapshot as the cells
+                        // (LOCK A, same `epoch`), so the pair cannot be torn.
+                        ws.word_decos.set_scan_base_y(Some(ws.input_scratch.base_y));
                         ws.word_decos.rescan_from_cells_with_geom_at_cursor(
                             &ws.input_scratch.cells,
                             &ws.input_scratch.line_sizes,
@@ -34979,6 +35097,11 @@ impl App {
             // first visible frame can animate. Scanning first leaves the latch
             // armed and silently spends that subsequent real output.
             if rescan {
+                // This pane snapshot's row origin, for the kitty-command
+                // flash — declared under the pane just bound, immediately
+                // before the one rescan that spends it (the unsplit path's
+                // twin; see there for why).
+                ws.word_decos.set_scan_base_y(Some(snapshot.base_y));
                 ws.word_decos.rescan_from_cells_with_geom_at_cursor(
                     &snapshot.cells,
                     &snapshot.line_sizes,
@@ -40334,16 +40457,113 @@ pub(crate) fn reflow_thread_ceiling(jobs: usize) -> usize {
 
 /// The BOUND on concurrent off-thread scrollback rewraps, process-wide.
 ///
-/// `min(available_parallelism, REFLOW_WORKER_MAX)`, floored at 1 and resolved
-/// once. WHY A CEILING AT ALL: the jobs are CPU-bound decompress + rewrap, so
-/// more workers than cores buys nothing and costs context switches; and each
-/// in-flight job holds its session's ENTIRE detached off-screen history
-/// resident, so the ceiling is also the bound on how many sessions' histories
-/// can be resident-but-detached at once.
+/// `min(physical cores, available_parallelism, REFLOW_WORKER_MAX)`, floored at
+/// 1 and resolved once — [`reflow_worker_ceiling_for`] is the rule. WHY A
+/// CEILING AT ALL: the jobs are CPU-bound decompress + rewrap, so more workers
+/// than cores buys nothing and costs context switches; and each in-flight job
+/// holds its session's ENTIRE detached off-screen history resident, so the
+/// ceiling is also the bound on how many sessions' histories can be
+/// resident-but-detached at once.
 ///
-/// WHY EIGHT, AND NOT THE FOUR THIS STARTED AT — the number was MEASURED, on
-/// `workspace_scaling`'s 30-tab x 4-pane settle, against the two spans a
-/// concurrency bound trades between: the MAIN-THREAD settle
+/// CORES MEANS PHYSICAL CORES, NOT `available_parallelism`. That call answers
+/// with the LOGICAL CPU count — `sysconf(_SC_NPROCESSORS_ONLN)`, which on
+/// Darwin is `HW_AVAILCPU`, i.e. `hw.activecpu` — and on a hyper-threaded
+/// Intel Mac that is TWICE the number of execution units the jobs actually run
+/// on. On the 2017 15" MacBook Pro (i7-7920HQ, 4 cores / 8 threads, macOS
+/// 13.7.8): `available_parallelism()` = 8 = `hw.activecpu` = `hw.logicalcpu`,
+/// `hw.physicalcpu` = 4 — so the earlier rule, `min(available_parallelism,
+/// 8)`, resolved to EIGHT CPU-bound workers on that machine's FOUR cores.
+/// Apple silicon has no SMT (`hw.physicalcpu == hw.logicalcpu`: 8 on an M1,
+/// 12 on an M2 Pro, the cap holds it at 8), so the arm64 build is unchanged
+/// by the physical bound and the arm64 table further down still stands.
+///
+/// WHAT EIGHT WORKERS ON FOUR CORES COST, AND WHAT FOUR GIVE UP — MEASURED,
+/// because the two spans a bound trades between pull opposite ways here. The
+/// model first, since the obvious one is wrong. A QoS class sets only a
+/// thread's BASE priority, and only as far as the process's standing lets
+/// it. Read with `ps -M` on that MacBook Pro: a pool worker — a plain
+/// `std::thread::spawn`, so `QOS_CLASS_DEFAULT` (`qos.rs` ranks reflow below
+/// the UI thread by design; the worker as spawned today sits lower still) —
+/// runs at 31; the frontmost app's main thread sat at 42, and Finder's, on
+/// screen behind another app, at 46; and a process launched from a shell ran
+/// EVERY thread at 31, the one that had set `USER_INTERACTIVE` included,
+/// though `pthread_get_qos_class_np` still read that class back. The
+/// scheduler (`kern.sched` = `dualq`, timeshare) then decays each thread's
+/// running priority by the CPU it has used lately, and decays it harder the
+/// more threads are runnable per CPU. So a thread that COMPUTES while the
+/// workers pile up sinks into their band — or, with no headroom above it,
+/// starts there — and once in it, it IS queued behind them, a quantum at a
+/// time. With its class capped at 31 (a shell launch), the tail follows the
+/// thread's own CPU use: with the probe's compute quantum switched off
+/// (`PROBE_UI_COMPUTE=0`) its main thread held priority 27-29 through a
+/// 120-worker drain while two sampled workers sat at 0-20, and its p99 wake
+/// came back 3.7 ms late instead of 235 ms (an unoptimized build on a loaded
+/// machine: the ratio is the result, not the absolute tail). That is CPU use
+/// driving the tail while the class is capped; it does not make the class
+/// irrelevant, since a GUI app's UI thread can start above 31 (the 42 and 46
+/// above). Eight workers are the mild form of the same thing: they leave no
+/// idle logical CPU, so a wake that does not outrank the running workers at
+/// that instant waits for one of their quanta to end. Four leave four logical
+/// CPUs idle, and a wake lands on one with nothing to wait for. What four give
+/// up is the other half of SMT: a sibling is not a second core, so the second
+/// four workers do not deliver a second four cores' worth of rewrap either —
+/// they deliver the SMT share, and that share is exactly what a ceiling of four
+/// gives up on the history-back span.
+///
+/// The measurement, on that MacBook Pro (quiet machine: load average 2 on 8
+/// logical CPUs; `-O3`), with a probe that MODELS the settle, not with
+/// `workspace_scaling` — the x86_64 rows of the arm64 table are still
+/// unmeasured, and a release build of that bench on this host is the follow-up.
+/// The probe is `benches/reflow_smt_probe.rs` (`cargo bench -p aterm-gui
+/// --features bench-support --bench reflow_smt_probe -- 2 4 6 8 120`): N pooled
+/// workers drain a queue of 120 jobs (a 30-tab x 4-pane settle), each job eight
+/// rounds of LZ4-decompressing a 250 KB history block into a reused buffer and
+/// rewrapping it (6.5 ms on an idle core); meanwhile the main thread alternates
+/// a 0.55 ms compute quantum (the settle's own work) with a 1 ms timer sleep
+/// (an input or vsync wake) and records how late each wake came back. Launched
+/// from a shell, that main thread ran at the workers' own base priority
+/// (above), so the wake column is the tail of a latency-sensitive thread with
+/// NO headroom over the workers — the position of any app thread without it.
+/// Not being frontmost is not that position (Finder kept 46, above). When the
+/// app is throttled (App Nap), every thread reads 4, the workers included —
+/// the live app's 38 all did — and a napped app is not being dragged. A GUI
+/// app's UI thread's headroom can only shorten that tail; by how much on this
+/// host is unmeasured. Medians of 5 rounds; the ranges are the spread over six
+/// such tables (the 2-worker row is one) — the runs whose idle calibration
+/// came within ~10% of 6.5 ms at a load average under ~3, which left out three
+/// (one calibrating at 8.0 ms, two taken while a build pushed the load past 7):
+///
+/// | workers   | drain, 120 jobs | job, as its worker sees it | wake overshoot p99 / max    |
+/// |-----------|-----------------|----------------------------|-----------------------------|
+/// | 2         | 388 ms          | 6.4 ms                     | 0.32 / 0.41 ms              |
+/// | 4         | 212-220 ms      | 6.9-7.2 ms                 | 0.31-1.5 / 0.42-2.7 ms      |
+/// | 6         | 203-208 ms      | 9.9-10.2 ms                | 0.37-1.2 / 0.47-2.2 ms      |
+/// | 8         | 197-209 ms      | 12.8-13.6 ms               | 4.0-5.9 / 5.3-7.9 ms        |
+/// | unbounded | 194-199 ms      | 102-108 ms                 | 140-166 / 140-166 ms        |
+///
+/// The main thread's own compute quantum barely moves — p99 0.65-0.92 ms at
+/// four, 0.75-1.18 ms at eight, against 0.51-0.69 ms idle — the cost of eight
+/// is the WAKE: a thread with no headroom that asked for a core 1 ms later gets
+/// it 4-6 ms late at p99 and up to 8 ms late, versus well under a millisecond
+/// at four (and 140-166 ms unbounded). The history-back side is the mirror
+/// image: eight drains 5-8% faster than four — a hyper-thread's worth of rewrap
+/// and no more, per-job time nearly doubling (6.9 -> 13 ms) as the siblings
+/// share a core — and unbounded 9-10% faster than four, because with jobs this
+/// size the 120 thread spawns cost less than the SMT share they buy. So on this
+/// host the arm64 table's bar — the smallest ceiling that beats unbounded on
+/// BOTH spans — is cleared by no ceiling at all on the drain span, and the
+/// choice is which ceiling wins the span the user is holding the mouse through
+/// and pays the least on the other. Eight fails the first for any thread
+/// without headroom (it keeps the wake tail of a saturated machine); four wins
+/// it and pays the SMT share, 5-8%, on history-back. Six is in the table so the
+/// trade is visible — most of the drain for a fraction of the tail — but the
+/// rule is physical cores rather than a fraction of the siblings because it is
+/// a fact of the machine, not a constant fitted to one probe on one CPU, and
+/// each worker past the cores is also one more session's history held resident.
+///
+/// WHY EIGHT, AND NOT THE FOUR THIS STARTED AT, ON APPLE SILICON — the cap
+/// was MEASURED there, on `workspace_scaling`'s 30-tab x 4-pane settle,
+/// against the two spans a concurrency bound trades between: the MAIN-THREAD settle
 /// (`resize_settle`, what a live drag actually blocks on) and the
 /// user-facing whole (`settle_to_quiesce`, drag until every pane has its
 /// history back). Unbounded is the baseline:
@@ -40364,17 +40584,155 @@ pub(crate) fn reflow_thread_ceiling(jobs: usize) -> usize {
 /// span the user is holding the mouse through — and regresses the 8x4
 /// main-thread settle outright — so it is not free either.
 pub(crate) fn reflow_worker_ceiling() -> usize {
-    /// See [`reflow_worker_ceiling`].
-    const REFLOW_WORKER_MAX: usize = 8;
     static CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CEILING.get_or_init(|| {
-        // `clamp`, not `min().max()`: the linter rejects the manual form, and
-        // the panic it warns about cannot arise here — `REFLOW_WORKER_MAX` is a
-        // constant well above the floor.
-        std::thread::available_parallelism()
-            .map_or(REFLOW_WORKER_MAX, std::num::NonZeroUsize::get)
-            .clamp(1, REFLOW_WORKER_MAX)
+        reflow_worker_ceiling_for(
+            physical_cpu_count(),
+            std::thread::available_parallelism()
+                .ok()
+                .map(std::num::NonZeroUsize::get),
+        )
     })
+}
+
+/// See [`reflow_worker_ceiling`].
+const REFLOW_WORKER_MAX: usize = 8;
+
+/// THE SIZING RULE behind [`reflow_worker_ceiling`], pure so the topologies
+/// that matter are pinned by a unit test instead of by whichever machine runs
+/// the suite. `physical` is the physical-core count when the host can report
+/// one ([`physical_cpu_count`]); `logical` is `available_parallelism`.
+///
+/// * both known: `min(physical, logical)` — the smaller wins, so a host that
+///   reports fewer online logical CPUs than cores (processors taken offline, a
+///   `cpus=` boot-arg) still bounds;
+/// * physical unknown (a non-macOS host, or a sysctl that failed): `logical`,
+///   which is EXACTLY the earlier rule — an unknown topology is NOT treated as
+///   hyper-threaded, because halving a host with no SMT is the 42%
+///   history-back regression the arm64 table above measured for a ceiling of
+///   four;
+/// * nothing known: the cap, as before.
+///
+/// Clamped to `1..=REFLOW_WORKER_MAX`. `clamp`, not `min().max()`: the linter
+/// rejects the manual form, and the panic it warns about cannot arise here —
+/// `REFLOW_WORKER_MAX` is a constant well above the floor.
+fn reflow_worker_ceiling_for(physical: Option<usize>, logical: Option<usize>) -> usize {
+    let logical = logical.unwrap_or(REFLOW_WORKER_MAX);
+    physical
+        .filter(|&cores| cores > 0)
+        .map_or(logical, |cores| cores.min(logical))
+        .clamp(1, REFLOW_WORKER_MAX)
+}
+
+/// The host's PHYSICAL core count, when it can say: `hw.physicalcpu` on macOS
+/// (the cores online now; `hw.physicalcpu_max` would count offlined ones too),
+/// `None` everywhere else — `available_parallelism` alone sizes the pool
+/// there, as it always has. A sysctl that fails, answers with the wrong width,
+/// or reports a non-positive count is `None` as well: an unknown topology must
+/// never become a one-worker pool.
+#[cfg(target_os = "macos")]
+fn physical_cpu_count() -> Option<usize> {
+    let mut cores: libc::c_int = 0;
+    let mut len: libc::size_t = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is a NUL-terminated literal that outlives the call;
+    // `cores` and `len` are live locals the kernel writes through only for the
+    // call's duration, and `len` is initialised to the buffer's real size so
+    // the copy is bounded; the new-value pair is null/0, so this reads the
+    // sysctl and never sets it. No pointer escapes.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.physicalcpu".as_ptr(),
+            (&mut cores as *mut libc::c_int).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != std::mem::size_of::<libc::c_int>() {
+        return None;
+    }
+    usize::try_from(cores).ok().filter(|&cores| cores > 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn physical_cpu_count() -> Option<usize> {
+    None
+}
+
+#[cfg(test)]
+mod reflow_ceiling_tests {
+    use super::{REFLOW_WORKER_MAX, reflow_worker_ceiling_for};
+
+    /// The topologies the rule has to get right, one row per machine aterm
+    /// ships to. The first row IS the finding: a hyper-threaded 4-core Intel
+    /// Mac reports `available_parallelism() == 8`, and the earlier
+    /// `min(available_parallelism, 8)` put eight CPU-bound workers on four
+    /// cores.
+    #[test]
+    fn the_ceiling_is_bounded_by_physical_cores_not_hyperthreads() {
+        // 2017 15" MacBook Pro, i7-7920HQ: hw.physicalcpu 4, hw.logicalcpu 8.
+        assert_eq!(reflow_worker_ceiling_for(Some(4), Some(8)), 4);
+        // A 2-core / 4-thread MacBook Air.
+        assert_eq!(reflow_worker_ceiling_for(Some(2), Some(4)), 2);
+        // Apple silicon has no SMT — physical == logical — so arm64 is
+        // unchanged by the physical bound: an M1 is 8, an M2 Pro is capped
+        // from 12 to 8 exactly as before.
+        assert_eq!(reflow_worker_ceiling_for(Some(8), Some(8)), 8);
+        assert_eq!(
+            reflow_worker_ceiling_for(Some(12), Some(12)),
+            REFLOW_WORKER_MAX
+        );
+        // Fewer online logical CPUs than cores (processors taken offline, a
+        // `cpus=` boot-arg) still bounds.
+        assert_eq!(reflow_worker_ceiling_for(Some(8), Some(2)), 2);
+    }
+
+    /// No physical count (a non-macOS host, or a failed sysctl) means the
+    /// EARLIER rule, verbatim: `logical` alone, never halved on a guess.
+    #[test]
+    fn an_unknown_topology_keeps_the_earlier_rule() {
+        assert_eq!(reflow_worker_ceiling_for(None, Some(8)), 8);
+        assert_eq!(reflow_worker_ceiling_for(None, Some(6)), 6);
+        assert_eq!(reflow_worker_ceiling_for(None, Some(16)), REFLOW_WORKER_MAX);
+        // Nothing known at all: the cap, as before.
+        assert_eq!(reflow_worker_ceiling_for(None, None), REFLOW_WORKER_MAX);
+        // A bogus zero from the physical side is "unknown", not "no cores".
+        assert_eq!(reflow_worker_ceiling_for(Some(0), Some(8)), 8);
+    }
+
+    /// The sysctl read itself, on the machine running the suite: macOS always
+    /// answers `hw.physicalcpu` with a positive count (`physical_cpu_count`
+    /// maps anything else to `None`, which the `expect` rejects), the live
+    /// ceiling is the rule applied to the live pair and never exceeds the
+    /// physical count —
+    /// and the pair is printed (`--nocapture`), so a run on a new machine
+    /// records the topology it sized the pool from. `physical <= logical` is
+    /// NOT asserted: it holds on every ordinary Mac, but a host with processors
+    /// taken offline can report fewer online logical CPUs than cores, and the
+    /// rule's `min` is what handles that.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_live_ceiling_never_exceeds_this_machines_physical_cores() {
+        use super::{physical_cpu_count, reflow_worker_ceiling};
+        let physical = physical_cpu_count().expect("macOS reports hw.physicalcpu");
+        let logical =
+            std::thread::available_parallelism().map_or(usize::MAX, std::num::NonZeroUsize::get);
+        eprintln!(
+            "live topology: hw.physicalcpu {physical}, available_parallelism {logical}, \
+             reflow worker ceiling {}",
+            reflow_worker_ceiling()
+        );
+        assert_eq!(
+            reflow_worker_ceiling(),
+            reflow_worker_ceiling_for(Some(physical), Some(logical)),
+            "the live ceiling is not the rule applied to the live topology"
+        );
+        assert!(
+            reflow_worker_ceiling() <= physical.min(REFLOW_WORKER_MAX),
+            "ceiling {} exceeds min(physical {physical}, cap {REFLOW_WORKER_MAX})",
+            reflow_worker_ceiling()
+        );
+    }
 }
 
 /// ONE hand-off from the resize path to the bounded reflow pool.

@@ -2380,6 +2380,9 @@ impl App {
         window: Option<WindowId>,
         cwd: Option<String>,
         split: Option<crate::pane::SplitDir>,
+        // The agent identity the newborn spawns under (session identities;
+        // already resolved and created by the verb), `None` for the human's own.
+        identity: Option<&str>,
     ) -> Result<String, String> {
         let Some(host) = window.or(self.frontmost_window) else {
             return Err("no window to host the session".to_string());
@@ -2395,8 +2398,8 @@ impl App {
             // registry-diff's generic shrug. Nothing was spawned, so returning
             // here skips a diff that could only report the same emptiness with
             // less information.
-            Some(dir) => self.split_focused_pane_in_window(host, dir, cwd)?,
-            None => self.open_tab_in_cwd(host, cwd.as_deref()),
+            Some(dir) => self.split_focused_pane_in_window(host, dir, cwd, identity)?,
+            None => self.open_tab_in_cwd_observing(host, cwd.as_deref(), None, identity),
         }
         let after = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
@@ -2516,6 +2519,12 @@ impl App {
     /// (the wire `OK <sid>` body). The newborn is found by REGISTRY DIFF (the
     /// [`Self::spawn_tab_session`] idiom) so a concurrently exiting session
     /// can never be misattributed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the connected spawn's birth facts — kind, place, origin, cwd, the \
+                  reporting surface and the agent identity — are each a per-spawn datum; \
+                  a wrapper struct would relocate the list, not simplify it"
+    )]
     pub(crate) fn spawn_connected_session(
         &mut self,
         el: &ActiveEventLoop,
@@ -2524,9 +2533,22 @@ impl App {
         origin: &aterm_session::SessionId,
         cwd: Option<String>,
         surface: &str,
+        identity: Option<crate::control::IdentitySpec>,
     ) -> Result<String, String> {
         use crate::connections::{ConnectedSpawnKind as Kind, ConnectedSpawnPlace as Place};
         let (origin_local, host) = self.connected_spawn_precheck(place, origin)?;
+        // IDENTITY (session identities, 2026-09-17): the ORIGIN is the aimed
+        // session of a connected spawn (the selector is discarded), so the
+        // newborn inherits its identity unless `identity=` says otherwise —
+        // the same rule as `@<sid> spawn`, the same only-create-here path.
+        let identity = crate::control::resolve_spawn_identity(
+            identity,
+            self.identity_of_local(origin_local).as_deref(),
+        );
+        if let Some(name) = &identity {
+            crate::agent_identity::ensure(name, true)
+                .map_err(|e| format!("identity {name}: {e}"))?;
+        }
         // Default the newborn's cwd to the ORIGIN's (design §6): the `of=`
         // target need not be the front pane the plain-spawn default would read.
         let cwd = cwd.or_else(|| self.session_cwd_by_local(origin_local));
@@ -2545,6 +2567,7 @@ impl App {
                         None,
                         lineage_parent,
                         observe.as_ref(),
+                        identity.as_deref(),
                     )
                     .is_none()
                 {
@@ -2554,7 +2577,12 @@ impl App {
             Place::Tab => {
                 // Precheck resolved the hosting window for every Tab place.
                 let host = host.expect("tab precheck resolves a host window");
-                self.open_tab_in_cwd_observing(host, cwd.as_deref(), observe.as_ref());
+                self.open_tab_in_cwd_observing(
+                    host,
+                    cwd.as_deref(),
+                    observe.as_ref(),
+                    identity.as_deref(),
+                );
             }
         }
         let newborn = {
@@ -2726,7 +2754,7 @@ impl App {
                 }
                 // A TAB, never a split: the operator row stands up its own
                 // terminal, not a division of whatever pane happens to be focused.
-                match self.spawn_tab_session(None, None, None) {
+                match self.spawn_tab_session(None, None, None, None) {
                     Ok(sid) => {
                         // Stamp identity via user meta BEFORE the agent renames
                         // itself, then type the launch line through the sink —
@@ -3037,7 +3065,7 @@ impl App {
     /// `None` keeps the default: inherit the focused pane's cwd so a Cmd-T tab opens
     /// where the user is.
     pub(crate) fn open_tab_in_cwd(&mut self, owner: WindowId, cwd_override: Option<&str>) {
-        self.open_tab_in_cwd_observing(owner, cwd_override, None);
+        self.open_tab_in_cwd_observing(owner, cwd_override, None, None);
     }
 
     /// [`open_tab_in_cwd`] with the per-spawn CONTROLLER observation hint
@@ -3049,6 +3077,9 @@ impl App {
         owner: WindowId,
         cwd_override: Option<&str>,
         observe: Option<&aterm_session::SessionId>,
+        // The agent identity the newborn spawns under (session identities;
+        // resolved and created by the verb), `None` for every chord/menu tab.
+        identity: Option<&str>,
     ) {
         if !self.windows.contains_key(&owner) {
             return;
@@ -3082,6 +3113,7 @@ impl App {
             &proxy,
             cwd.as_deref(),
             observe,
+            identity,
             None, // fresh shell (not a seamless-update adoption)
         ) {
             Ok(session) => {
@@ -6908,6 +6940,7 @@ mod mixed_tab_tests {
                     icon: None,
                     role: None,
                     attention: None,
+                    identity: None,
                 },
             )),
             focused_path: Vec::new(),

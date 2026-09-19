@@ -139,14 +139,26 @@ fn palette_limit() -> RateLimit {
 }
 
 fn response_limit() -> RateLimit {
-    // Mirrors the pre-#7995 `ResponseRateLimiter` defaults (commit
-    // 2134b5559): 64 KiB burst, 100 KiB/s refill. Tokens represent *bytes*
-    // written via `send_response`. No per-sequence cap — a single
-    // legitimate response never exceeds `capacity_bytes` by construction
-    // because `MAX_OSC52_QUERY_RESPONSE_BYTES = 64 KiB` in the handler.
+    // Mirrors the `ResponseRateLimiter` defaults: 100 KiB/s refill, and a burst
+    // sized on the WIRE form of the largest legitimate response. Tokens are
+    // *bytes* written via `send_response`.
+    //
+    // The old comment here read "a single legitimate response never exceeds
+    // `capacity_bytes` by construction because `MAX_OSC52_QUERY_RESPONSE_BYTES
+    // = 64 KiB` in the handler", and it was false in a way that cost real
+    // answers: that cap is on the DECODED clipboard, and the response is
+    // base64, which expands 3 bytes to 4. So a clipboard of 49,145..65,536
+    // bytes passed the handler's cap, produced a >64 KiB wire response, and was
+    // dropped here without a byte being sent — `try_consume` refuses anything
+    // larger than capacity outright, however full the bucket is. The capacity
+    // now holds base64(64 KiB) plus framing.
+    //
+    // `aterm-core`'s `osc52_query_answers_every_clipboard_it_admits` pins the
+    // relationship from the other side of this crate boundary, so the two
+    // numbers cannot drift apart again in silence.
     RateLimit {
         id: "response".to_owned(),
-        capacity_bytes: 64 * 1024,
+        capacity_bytes: 96 * 1024,
         refill_per_second: 100 * 1024,
         per_sequence_max: 0,
     }

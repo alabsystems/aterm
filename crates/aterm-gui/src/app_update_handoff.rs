@@ -9,13 +9,18 @@
 //! A verbatim inherent-impl split of `App`.
 //!
 //! The successor this module spawns races the parent's in-flight `atpkg` pass
-//! exactly as a second window does: the parent's child dies at its next line of
-//! output once the parent has exited, and the successor's own launch lanes
-//! `--wait-lock` behind it and pick the work up (`crate::spawn_pkg_update_check`,
-//! `atpkg::lock`, 2026-09-10). A REJECTED candidate is the one shape that is not
-//! covered: its sweep SIGKILLs the candidate's process group, atpkg child included
-//! (the store is crash-consistent), and the parked parent's loop picks the
-//! remainder up at its next tick or bump.
+//! exactly as a second window does: the parent's child KEEPS RUNNING once the
+//! parent has exited (atpkg's orphan watch re-points its stdio at
+//! `orphan-pass.log`, 2026-09-14 — it used to die at its next print), so it holds
+//! the store lock for the whole of its pass, and the successor's own launch lanes
+//! `--wait-lock` behind it. The successor owes no pass of its own while the
+//! store's last pass is fresh (`crate::spawn_pkg_update_check`'s due gate,
+//! 2026-09-18), stands down after a waited acquisition when the holder finished a
+//! pass (`atpkg::cli`), and paints NO row for the wait (`Wake::PkgLockWaiting` is
+//! a log line). A REJECTED candidate is the one shape that is not covered: its
+//! sweep SIGKILLs the candidate's process group, atpkg child included (the store
+//! is crash-consistent), and the parked parent's loop picks the remainder up at
+//! its next tick or bump.
 
 use winit::event_loop::ActiveEventLoop;
 
@@ -112,15 +117,68 @@ struct HandoffWorkerJob {
     /// killed before it ever reached `check_boot_health` cannot give back a launch
     /// some earlier, genuinely crashed candidate observed.
     trial_launches_before: u32,
+    /// Whether an aterm window WITH AN OS SURFACE had keyboard focus when the
+    /// attempt was built (`App::any_os_window_focused`; the bare per-window flag
+    /// is seeded true and not trusted alone) — the one input to whether
+    /// LaunchServices ACTIVATES the successor (`app_launch_successor::begin_launch`,
+    /// 2026-09-18): the automatic lane prefers moments when no aterm window is
+    /// focused, and activating there popped aterm over the app the user was
+    /// typing in.
+    #[cfg(target_os = "macos")]
+    activate_successor: bool,
     /// The `.app` ROOT to hand LaunchServices on the out-of-band lane. `None`
     /// whenever this process is not running from a bundle, which is one of the
     /// reasons that lane is refused.
     #[cfg(target_os = "macos")]
     bundle: Option<std::path::PathBuf>,
+    /// This attempt must take the out-of-band lane or not happen at all — a provenance
+    /// repair, whose whole purpose is a successor launchd mints from a clean image
+    /// ([`SameImageHandoff::requires_out_of_band`]). `run_out_of_band_handoff` can still
+    /// decide at RUNTIME that it must fork (five sites: no bundle, a rendezvous that
+    /// will not bind, a non-UTF-8 path, an environment needing a removal, a
+    /// LaunchServices refusal), and this is what turns that one rejoining arm into an
+    /// abort. Derived from the authority at the single construction site, so the two
+    /// spellings of one fact cannot disagree across the thread boundary.
+    #[cfg(target_os = "macos")]
+    require_out_of_band: bool,
     cleanup: HandoffWorkerCleanup,
     cancel: std::sync::mpsc::Receiver<()>,
     arbiter: crate::HandoffAttemptArbiter,
     _owned_masters: Vec<std::os::fd::OwnedFd>,
+}
+
+/// WHY an attempt may run with no staged artifact to authenticate.
+///
+/// Both variants mean the same thing to every gate downstream — "this attempt re-runs the
+/// image we are already executing, and swaps nothing" — which is why they share one
+/// parameter rather than two booleans that could disagree. The type is a zero-field
+/// discriminant ON PURPOSE: it carries no build, no commit, no digest and no path, so
+/// `target_build` and `target_commit` fall through to this build's own by construction
+/// and there is no field an authority could point at another image.
+///
+/// `ProvenanceRepair` is additionally EARNED, not merely typed: `apply_staged_update_now`
+/// accepts it only when the App's own measured verdict is consumable
+/// ([`crate::provenance_repair::RepairPosture::take_eligible`]). A caller that passes it
+/// without one falls through to the unchanged "no exact verified update authority"
+/// refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SameImageHandoff {
+    /// `ATERM_DEBUG_SEAMLESS_REEXEC=1` — the QA seam that exercises the full handoff and
+    /// adopt path without a release. Byte-identical in behaviour to before this type.
+    DebugSeam,
+    /// A provenance self-repair: this process is tracked, the bundle is clean, and the
+    /// only way to stop being tracked is to be re-minted by launchd from that bundle
+    /// ([`crate::provenance_repair`]). Unlike the seam, this one REFUSES rather than
+    /// falling back to the fork lane, because a forked successor inherits the tag and
+    /// the whole replacement would buy nothing.
+    ProvenanceRepair,
+}
+
+impl SameImageHandoff {
+    /// Whether this attempt must take the out-of-band lane or not run at all.
+    pub(crate) fn requires_out_of_band(self) -> bool {
+        matches!(self, Self::ProvenanceRepair)
+    }
 }
 
 /// How this attempt hands its descriptors to the successor.
@@ -219,7 +277,7 @@ fn out_of_band_lane_refusal(facts: HandoffLaneFacts) -> Option<&'static str> {
 /// launch failure a whole deadline later instead of an immediate fallback.
 #[cfg(target_os = "macos")]
 #[must_use]
-fn app_bundle_root(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(crate) fn app_bundle_root(exe: &std::path::Path) -> Option<std::path::PathBuf> {
     let bundle = exe.parent()?.parent()?.parent()?;
     (bundle
         .extension()
@@ -2148,6 +2206,24 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
                     expected: returned_expected,
                     channels,
                 }) => {
+                    // A REPAIR ABORTS RATHER THAN REJOINING THE FORK LANE. This is
+                    // post-park, so it must roll back rather than return: the failure
+                    // below raises `PreparationFailed` under the `NoCandidate` warrant —
+                    // no descriptor has left this process, the rendezvous is dropped
+                    // (closing the listener and unlinking the node), and the readers
+                    // resume with windows, PTYs and screens intact. One arm covers all
+                    // five runtime fallbacks, so a sixth added later cannot leak past it.
+                    #[cfg(target_os = "macos")]
+                    if returned_job.require_out_of_band {
+                        send_handoff_preparation_failure(
+                            &returned_job,
+                            &proxy,
+                            Some(artifacts.nonce.clone()),
+                            "a provenance repair needs the out-of-band lane, and it became \
+                             unavailable while preparing",
+                        );
+                        return;
+                    }
                     job = returned_job;
                     expected = returned_expected;
                     path = artifacts.manifest_path;
@@ -2569,33 +2645,42 @@ fn run_out_of_band_handoff(
     // is exactly the trade the fork lane already makes today, and it beats not
     // updating at all on a machine LaunchServices refuses. The rendezvous is
     // dropped on the way out, which closes the listener and unlinks the node.
-    let in_flight =
-        match crate::app_launch_successor::begin_launch(&bundle, &arguments, &environment) {
-            Ok(in_flight) => in_flight,
-            Err(error) => {
-                aterm_log::warn!(
-                    "update apply: LaunchServices refused the successor ({error}); forking instead"
-                );
-                return Some(ForkInstead {
-                    job,
-                    artifacts: OutgoingArtifacts {
-                        manifest_path,
-                        layout_path,
-                        nonce,
-                    },
-                    expected,
-                    channels: HandoffChannels {
-                        proof_rd,
-                        proof_wr,
-                        commit_rd,
-                        commit_wr,
-                    },
-                });
-            }
-        };
+    let in_flight = match crate::app_launch_successor::begin_launch(
+        &bundle,
+        &arguments,
+        &environment,
+        job.activate_successor,
+    ) {
+        Ok(in_flight) => in_flight,
+        Err(error) => {
+            aterm_log::warn!(
+                "update apply: LaunchServices refused the successor ({error}); forking instead"
+            );
+            return Some(ForkInstead {
+                job,
+                artifacts: OutgoingArtifacts {
+                    manifest_path,
+                    layout_path,
+                    nonce,
+                },
+                expected,
+                channels: HandoffChannels {
+                    proof_rd,
+                    proof_wr,
+                    commit_rd,
+                    commit_wr,
+                },
+            });
+        }
+    };
     aterm_log::info!(
         "update apply: asked LaunchServices for the successor as its own launchd application \
-         job; awaiting its rendezvous dial"
+         job ({}); awaiting its rendezvous dial",
+        if job.activate_successor {
+            "activating: an aterm window had focus"
+        } else {
+            "not activating: no aterm window had focus"
+        }
     );
     // No expected pid at the gate: the claim secret is what admits a dialer, and
     // the kernel-attested peer pid is the identity everything below rests on.
@@ -3292,6 +3377,7 @@ impl App {
         safety_token: crate::app_native::NativeUpdateSafetyToken,
         mode: crate::native_updater_service::ApplyMode,
         apply_attempt: Option<crate::native_updater_service::ApplyAttemptTicket>,
+        same_image: Option<SameImageHandoff>,
     ) -> Result<(), crate::UpdateHandoffStartError> {
         if self.pending_update_handoff.is_some() {
             return Err(crate::UpdateHandoffStartError::failed(
@@ -3302,8 +3388,28 @@ impl App {
         // QA SEAM: `ATERM_DEBUG_SEAMLESS_REEXEC=1` re-execs the SAME binary (no staged
         // build, no bundle swap) but exercises the FULL seamless handoff + adopt path, so
         // the shell-survives-an-update contract is testable end-to-end without a release.
-        let debug_seamless = crate::app_update_screen::debug_seamless_reexec_armed();
-        if !debug_seamless && apply_attempt.is_none() {
+        // The QA seam is derived here exactly as before; a caller may also present one
+        // of the other same-image authorities, and a provenance repair must additionally
+        // be EARNED — the App's own measured verdict, consumed on the way through, so a
+        // caller cannot conjure the variant and a refusal downstream is never retried.
+        let same_image = match same_image {
+            // THE CALLER'S AUTHORITY IS DECIDED FIRST, and a repair is never rewritten
+            // into the seam. It used to be: with `ATERM_DEBUG_SEAMLESS_REEXEC` armed the
+            // seam branch won unconditionally, which silently dropped
+            // `requires_out_of_band` (so a repair could be FORKED, inheriting the tag it
+            // exists to shed) and skipped `take_eligible` (so the one-shot verdict was
+            // never consumed and the trigger retried on every event-loop tick).
+            Some(SameImageHandoff::ProvenanceRepair) => self
+                .provenance_repair
+                .take_eligible()
+                .then_some(SameImageHandoff::ProvenanceRepair),
+            // The seam supplies its own authority only where the caller offered none.
+            Some(SameImageHandoff::DebugSeam) | None => {
+                crate::app_update_screen::debug_seamless_reexec_armed()
+                    .then_some(SameImageHandoff::DebugSeam)
+            }
+        };
+        if same_image.is_none() && apply_attempt.is_none() {
             let message = "no exact verified update authority was supplied".to_string();
             aterm_log::info!("update apply: {message}");
             return Err(crate::UpdateHandoffStartError::failed(message));
@@ -3341,7 +3447,7 @@ impl App {
                 safety_token,
                 mode,
                 apply_attempt,
-                debug_seamless,
+                same_image,
             );
             if started.is_err() {
                 self.retire_update_installing();
@@ -3355,7 +3461,7 @@ impl App {
         {
             let live_ptys = self.pool.iter().count();
             let facts = crate::native_update_admission::AdmissionFacts {
-                staged_verified: debug_seamless || apply_attempt.is_some(),
+                staged_verified: same_image.is_some() || apply_attempt.is_some(),
                 seamless_capable: false,
                 native_state_certified: safety_token.is_certified(),
                 live_ptys,
@@ -3470,7 +3576,7 @@ impl App {
         safety_token: crate::app_native::NativeUpdateSafetyToken,
         mode: crate::native_updater_service::ApplyMode,
         apply_attempt: Option<crate::native_updater_service::ApplyAttemptTicket>,
-        debug_seamless: bool,
+        same_image: Option<SameImageHandoff>,
     ) -> Result<(), crate::UpdateHandoffStartError> {
         use std::os::unix::process::CommandExt as _;
 
@@ -3547,7 +3653,7 @@ impl App {
         }
         let overlap_available = handoff_unavailable.is_none();
         let facts = crate::native_update_admission::AdmissionFacts {
-            staged_verified: debug_seamless || apply_attempt.is_some(),
+            staged_verified: same_image.is_some() || apply_attempt.is_some(),
             seamless_capable: overlap_available && !live.is_empty(),
             native_state_certified: safety_token.is_certified(),
             live_ptys: live.len(),
@@ -3566,6 +3672,21 @@ impl App {
             crate::native_update_admission::AdmissionDecision::Apply(
                 crate::native_update_admission::ApplyLane::Cold,
             ) => {
+                // A REPAIR HAS NOTHING TO GAIN HERE. The cold lane `exec`s this image in
+                // place, and the provenance tag survives `exec` into a clean image
+                // (`atpkg::provenance`), so the successor would be tracked exactly as we
+                // are — a full process replacement that changes the one thing it exists
+                // to change: nothing. Unreachable in practice (a repair is gated on at
+                // least one live PTY, and this arm is an exact zero-PTY state), but
+                // written rather than argued: `classify` runs far from the lane decision
+                // below, and an unreachable refusal costs a branch while an unwritten one
+                // costs the user their session for no benefit.
+                if same_image.is_some_and(SameImageHandoff::requires_out_of_band) {
+                    return Err(crate::UpdateHandoffStartError::refused(
+                        "a provenance repair has no session to hand over; the cold lane \
+                         would exec this image in place and stay tracked",
+                    ));
+                }
                 // Direct exec is authorized only for an exact zero-PTY state.
                 debug_assert!(live.is_empty());
                 let mut command = std::process::Command::new(exe);
@@ -3681,7 +3802,7 @@ impl App {
                 "{reason}; the terminal was left untouched"
             )));
         }
-        let verify_staged_candidate = !debug_seamless && preverified != Some(true);
+        let verify_staged_candidate = same_image.is_none() && preverified != Some(true);
 
         let Some(proxy) = self.proxy.clone() else {
             return Err(crate::UpdateHandoffStartError::failed(
@@ -3918,6 +4039,17 @@ impl App {
                         // a different session set. Forking is exact here rather than
                         // degraded: the fd-number term needs nothing from the kernel.
                         None => {
+                            // A REPAIR NEVER FORKS — see the cold-lane refusal above for
+                            // why a forked successor is a replacement that buys nothing.
+                            // This return is pre-park (the readers are parked further
+                            // down), so there is no overlap to roll back and dropping the
+                            // worker's job channel is how it learns to exit.
+                            if same_image.is_some_and(SameImageHandoff::requires_out_of_band) {
+                                return Err(crate::UpdateHandoffStartError::refused(
+                                    "a provenance repair needs the out-of-band lane, and a \
+                                     handed-off PTY would not answer fstat",
+                                ));
+                            }
                             aterm_log::warn!(
                                 "update apply: forking instead of launching — a handed-off PTY would \
                              not answer fstat, so the out-of-band proof term cannot be computed"
@@ -3927,6 +4059,17 @@ impl App {
                     }
                 }
                 Some(reason) => {
+                    // The same rule, through the same pure predicate, so the repair and
+                    // the apply gate can never disagree about which lane is available.
+                    if same_image.is_some_and(SameImageHandoff::requires_out_of_band) {
+                        aterm_log::info!(
+                            "provenance self-repair: not attempted — the out-of-band lane is \
+                             unavailable here ({reason})"
+                        );
+                        return Err(crate::UpdateHandoffStartError::refused(
+                            "a provenance repair needs the out-of-band lane",
+                        ));
+                    }
                     aterm_log::info!("update apply: forking instead of launching — {reason}");
                     (HandoffLane::Fork, adoption.clone())
                 }
@@ -4384,6 +4527,7 @@ impl App {
             child_pid: None,
             mode,
             apply_attempt,
+            same_image,
             target_build,
             target_commit: target_commit.clone(),
             layout: layout.clone(),
@@ -4429,7 +4573,12 @@ impl App {
             // main thread must not touch the staging directory here.
             trial_launches_before: 0,
             #[cfg(target_os = "macos")]
+            activate_successor: self.any_os_window_focused(),
+            #[cfg(target_os = "macos")]
             bundle,
+            // Derived from the authority HERE and nowhere else (see the field's doc).
+            #[cfg(target_os = "macos")]
+            require_out_of_band: same_image.is_some_and(SameImageHandoff::requires_out_of_band),
             cleanup,
             cancel: cancelled,
             arbiter,
@@ -5145,7 +5294,13 @@ impl App {
         // and shown, and it must not touch the durable ledger; the apply streak it
         // used to write is cleared only by a real successful apply, so QA runs
         // accrued forever and escalated to the persistent-failure notification.
-        let debug_seam = pending.apply_attempt.is_none();
+        // WHICH same-image attempt this was, carried rather than inferred. This used to
+        // read `pending.apply_attempt.is_none()`, whose comment said a None ticket
+        // reaches this reduction from exactly one place — the QA seam. A provenance
+        // repair also carries no ticket, so a failed repair was reported as a failed
+        // debug-seam UPDATE and painted "Update stopped safely" for an update that never
+        // existed.
+        let debug_seam = matches!(pending.same_image, Some(SameImageHandoff::DebugSeam));
         let attempted_build = pending
             .apply_attempt
             .as_ref()
@@ -5757,6 +5912,7 @@ mod commit_layout_topology_tests {
                     icon: None,
                     role: None,
                     attention: None,
+                    identity: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -5824,6 +5980,7 @@ mod commit_layout_topology_tests {
                 icon: None,
                 role: None,
                 attention: None,
+                identity: None,
             }));
         assert_ne!(
             commit_layout_topology(&committed),
@@ -6365,18 +6522,79 @@ mod trial_launch_forgiveness_tests {
 mod candidate_exit_watch_tests {
     use super::CandidateExitWatch;
 
+    /// THE ORPHAN'S GATE: the write end of a pipe the orphan blocks on before it
+    /// runs the first command of its script. Nothing the orphan does — exiting
+    /// least of all — can happen before the test releases it, which is what lets
+    /// a caller attach its [`CandidateExitWatch`] to a process that is provably
+    /// still there.
+    ///
+    /// WHY THE FIXTURE NEEDS ONE (2026-09-18). It used to be `sleep 0.3; exit 7`:
+    /// the orphan started dying 300 ms after its fork, and the test thread had to
+    /// read the pid, reap the middle, `kqueue()` and `kevent(EV_ADD)` inside that
+    /// window. Under the full parallel suite that is a race the test cannot win
+    /// by right — a stalled thread comes back to a pid launchd has already reaped,
+    /// `proc_find` answers `ESRCH`, `watch` answers `None`, and the
+    /// `expect("EVFILT_PROC attaches to a same-user process we may SIGKILL")`
+    /// panics. That is the shape of the red main carried from fe4a680fd — this
+    /// test passing alone and failing inside a full `test -p aterm-gui --lib` —
+    /// though that run's own message was not kept, so the window is named here
+    /// as the one hazard the fixture had, not as a captured trace. The same
+    /// window sat under the sibling that asserts "it is alive right now"
+    /// against a `sleep 0.3` orphan.
+    ///
+    /// MEASURED before the gate, on this Apple silicon Mac (2026-09-18): 80
+    /// concurrent copies of this test under 28 CPU hogs, then two more full
+    /// 4944-test runs of the old binary under 20 hogs, and the window did not
+    /// fire once — which is why the fixture is fixed by construction rather
+    /// than by a longer sleep: a window that fires only under a load this
+    /// machine could not reproduce is still a window. The gate is a pipe this
+    /// test owns (per test, never a shared path or a global), CLOEXEC on both
+    /// ends — but on Darwin [`make_cloexec_pipe`](super::make_cloexec_pipe) is
+    /// `pipe()` followed by a separate `set_cloexec` per end, so a sibling's fork on
+    /// another thread inside that gap CAN carry a copy of either end. That is
+    /// tolerated, not prevented: a carried read end is never read from, and a
+    /// carried write end cannot stall the orphan because [`OrphanGate::release`]
+    /// writes the newline `read` is waiting for rather than closing to EOF.
+    /// The orphan's script waits on descriptor 3 (`read -r go <&3`), because a
+    /// non-interactive shell points a background job's STDIN at `/dev/null` and
+    /// descriptor 3 is untouched by that rule in bash, dash and zsh alike.
+    struct OrphanGate(std::os::fd::OwnedFd);
+
+    impl OrphanGate {
+        /// Let the orphan run its script. One newline is what `read` is waiting
+        /// for, so the orphan proceeds whether or not any other holder of the
+        /// read end is still alive; a broken pipe means the orphan is already
+        /// gone, which no caller here reaches and which is not the fixture's
+        /// failure to report either way.
+        fn release(self) {
+            use std::io::Write as _;
+            let mut writer = std::fs::File::from(self.0);
+            let _ = writer.write_all(b"\n");
+        }
+    }
+
     /// Make a process that is NOT our child: fork a middle process, let IT fork the
     /// orphan, then reap the middle so the orphan reparents to launchd. Returns the
-    /// orphan's pid, which `waitid` will answer `ECHILD` about forever after.
-    fn spawn_orphan(script: &str) -> u32 {
+    /// orphan's pid, which `waitid` will answer `ECHILD` about forever after, and
+    /// the [`OrphanGate`] that keeps the orphan from running `script` until the
+    /// caller says so.
+    fn spawn_orphan(script: &str) -> (u32, OrphanGate) {
+        let (gate_read, gate_write) =
+            super::make_cloexec_pipe().expect("a pipe for the orphan's gate");
         // THE ORPHAN'S STANDARD STREAMS GO TO `/dev/null`, not to the pipe this
         // reads: a background job inherits the pipe's write end, so leaving it
         // open would make `read_to_string` below wait for the ORPHAN to exit and
         // hand back a pid that is already gone — which is a fixture that silently
-        // tests nothing.
+        // tests nothing. The gate's read end arrives as the middle's stdin and is
+        // moved to descriptor 3 before the job is forked, so the job's stdin is
+        // the `/dev/null` a background job gets anyway and its gate is the one
+        // descriptor no shell rewrites.
         let mut middle = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("{{ {script} ; }} >/dev/null 2>&1 & echo $!"))
+            .arg(format!(
+                "exec 3<&0 0</dev/null; {{ read -r go <&3; {script} ; }} >/dev/null 2>&1 & echo $!"
+            ))
+            .stdin(std::process::Stdio::from(gate_read))
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn the middle process");
@@ -6391,7 +6609,7 @@ mod candidate_exit_watch_tests {
                 .expect("the middle process reports the orphan's pid");
         }
         middle.wait().expect("reap the middle process");
-        pid.trim().parse().expect("a pid")
+        (pid.trim().parse().expect("a pid"), OrphanGate(gate_write))
     }
 
     /// Wait for the watch to answer, or fail. Bounded HERE ONLY; the production
@@ -6420,9 +6638,12 @@ mod candidate_exit_watch_tests {
     fn a_non_parent_can_read_an_orphan_s_own_exit_status() {
         use std::os::unix::process::ExitStatusExt as _;
 
-        let refused = spawn_orphan("sleep 0.3; exit 7");
+        let (refused, gate) = spawn_orphan("exit 7");
+        // Attached while the orphan is provably alive: it cannot run `exit`
+        // before the gate opens, and the gate opens after this returns.
         let watch = CandidateExitWatch::watch(refused)
             .expect("EVFILT_PROC attaches to a same-user process we may SIGKILL");
+        gate.release();
         let status = wait_for_status(&watch);
         assert_eq!(
             status.code(),
@@ -6431,9 +6652,10 @@ mod candidate_exit_watch_tests {
              what lets the launched lane tell a refusal from a kill at all"
         );
 
-        let starved = spawn_orphan("sleep 30");
+        let (starved, gate) = spawn_orphan("sleep 30");
         let watch = CandidateExitWatch::watch(starved)
             .expect("EVFILT_PROC attaches to a same-user process we may SIGKILL");
+        gate.release();
         assert!(
             watch.exit_status().is_none(),
             "a LIVE candidate must report nothing: the pre-kill read is what \
@@ -6467,9 +6689,10 @@ mod candidate_exit_watch_tests {
         use super::{HandoffCandidate, HandoffCandidateHandle, observe_candidate_death};
         use crate::app_native::{HandoffFailureLane as Lane, PhysicalFailureShape as Shape};
 
-        let starved = spawn_orphan("sleep 30");
+        let (starved, gate) = spawn_orphan("sleep 30");
         // Registered while it is alive, exactly as the rendezvous accept does.
         let watch = CandidateExitWatch::watch(starved).expect("the candidate is alive");
+        gate.release();
         let pid = libc::pid_t::try_from(starved).expect("pid fits");
         // SOMEBODY ELSE'S SIGKILL — the field shape, and the one signal that is
         // indistinguishable from this lane's own rejection.
@@ -6527,17 +6750,20 @@ mod candidate_exit_watch_tests {
     fn an_exit_the_parent_did_not_see_coming_is_still_recovered_after_the_wait() {
         use super::{HandoffCandidate, HandoffCandidateHandle, observe_candidate_death};
 
-        let refusing = spawn_orphan("sleep 0.3; exit 0");
+        let (refusing, gate) = spawn_orphan("exit 0");
         let watch = CandidateExitWatch::watch(refusing).expect("the candidate is alive");
         // A bare pid carries no birth stamp, so nothing is signalled and the
         // candidate reaches its own `exit` — the deterministic form of the race
         // this read exists to widen.
         let candidate = HandoffCandidate::from_bare_pid(refusing);
         let mut handle = HandoffCandidateHandle::Launched(Some(watch));
+        // "ALIVE RIGHT NOW" IS A FACT HERE, NOT A HOPE: the gate is still shut,
+        // so the orphan has not reached its `exit` and cannot until it opens.
         assert!(
             handle.witnessed_exit_status().is_none(),
             "it is alive right now: the pre-kill read must claim nothing"
         );
+        gate.release();
         let (_, death) = observe_candidate_death(
             crate::UpdateHandoffOutcome::ChildDied,
             candidate,
@@ -6556,7 +6782,8 @@ mod candidate_exit_watch_tests {
     /// an error path the reject lane would have to handle.
     #[test]
     fn watching_a_candidate_that_is_already_gone_answers_none() {
-        let gone = spawn_orphan("exit 0");
+        let (gone, gate) = spawn_orphan("exit 0");
+        gate.release();
         let pid = libc::pid_t::try_from(gone).expect("pid fits");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         // SAFETY: signal 0 performs the existence check only and delivers nothing.
@@ -7587,6 +7814,7 @@ mod returned_handoff_completion_lane_tests {
             child_pid: None,
             mode,
             apply_attempt: Some(ticket),
+            same_image: None,
             target_build: build,
             target_commit: TEST_COMMIT.to_string(),
             layout: crate::restore::RestoreManifest::new(Vec::new()),
@@ -7725,6 +7953,7 @@ mod returned_handoff_completion_lane_tests {
             child_pid: None,
             mode: ApplyMode::Immediate,
             apply_attempt: Some(ticket),
+            same_image: None,
             target_build: build,
             target_commit: TEST_COMMIT.to_string(),
             layout: crate::restore::RestoreManifest::new(Vec::new()),

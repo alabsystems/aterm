@@ -580,7 +580,8 @@ pub fn run_with(
         // the ok-branch's name for the same thing.
         let _ = writeln!(
             out,
-            "{p}: warn — managed bin/ is not on PATH; an aterm shell auto-sources \
+            "{p}: warn — managed bin/ is not on PATH here; an aterm shell — and any rc \
+             file carrying atpkg's block (the rc lines below) — sources \
              ~/.aterm/shell.d (which APPENDS it), or add: {}",
             manual_path_hint(&bin_dir)
         );
@@ -1157,6 +1158,95 @@ pub fn run_with(
                         e.file_name().to_string_lossy()
                     );
                 }
+            }
+        }
+        // (6b) RC WIRING — which shells OUTSIDE aterm reach the managed bin/, and for the
+        // ones that do not, WHY. B9 of the 2026-08-31 audit asked doctor to "say plainly"
+        // whether the toolchain is aterm-only on this machine; the report has never
+        // mentioned the rc block at all, so the three states a user can be in — wired,
+        // opted out (they deleted the block and every pass honours that), and skipped at
+        // the consent fence (the rc resolves under a macOS-guarded folder, so no pass
+        // opens it) — were indistinguishable from outside: the rc just sat there, untouched,
+        // with nothing said. One line per rc file that EXISTS (atpkg never creates one).
+        //
+        // The SourcedElsewhere state is what keeps 7b's rule — doctor must not invent a
+        // fault from evidence it did not measure — honest here: `rc_wiring` reads each
+        // file's CONTENT for a `/.aterm/shell.d/` line, and it also reads the two bash
+        // login profiles install.sh can elect that atpkg has no row for
+        // (`hooks::INSTALL_SH_PROFILES`), so a Mac wired by install.sh is not called
+        // unwired. Even so it reads six named files, not every file a shell can start from
+        // ($ZDOTDIR, /etc, fish under $XDG_CONFIG_HOME) — so when none of them sources
+        // shell.d, the note NAMES the six (`hooks::rc_files_read`) instead of calling the
+        // machine aterm-only.
+        #[cfg(unix)]
+        {
+            let wiring = crate::hooks::rc_wiring(home);
+            let names = |want: crate::hooks::RcState| -> Vec<String> {
+                wiring
+                    .iter()
+                    .filter(|(_, s)| *s == want)
+                    .map(|(rc, _)| format!("~/{rc}"))
+                    .collect()
+            };
+            let wired = names(crate::hooks::RcState::Wired);
+            let elsewhere = names(crate::hooks::RcState::SourcedElsewhere);
+            if !wired.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "{p}: ok — {} sources ~/.aterm/shell.d (atpkg's marker block; delete \
+                     the block to opt out — it stays deleted until `aterm pkg repair`)",
+                    wired.join(", ")
+                );
+            }
+            if !elsewhere.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "{p}: ok — {} sources ~/.aterm/shell.d via a line that is not atpkg's \
+                     block (tools/install.sh's, or your own)",
+                    elsewhere.join(", ")
+                );
+            }
+            for (rc, state) in &wiring {
+                match state {
+                    crate::hooks::RcState::Wired | crate::hooks::RcState::SourcedElsewhere => {}
+                    crate::hooks::RcState::OptedOut => {
+                        let _ = writeln!(
+                            out,
+                            "{p}: note — ~/{rc}: atpkg's block was deleted — opted out, \
+                             left alone by every install and update pass (`aterm pkg \
+                             repair` lays it again)"
+                        );
+                    }
+                    crate::hooks::RcState::ConsentFenced => {
+                        let _ = writeln!(
+                            out,
+                            "{p}: note — ~/{rc} resolves under a folder macOS guards with \
+                             a consent dialog, so no atpkg pass opens it — it is left \
+                             unwired; source ~/.aterm/shell.d from it yourself, or reach \
+                             the tools with `aterm <tool>`"
+                        );
+                    }
+                    crate::hooks::RcState::Unwired => {
+                        let _ = writeln!(
+                            out,
+                            "{p}: warn — ~/{rc} does not source ~/.aterm/shell.d (an \
+                             install pass or `aterm pkg repair` appends atpkg's block)"
+                        );
+                    }
+                }
+            }
+            if wired.is_empty() && elsewhere.is_empty() {
+                let checked: Vec<String> = crate::hooks::rc_files_read()
+                    .map(|rc| format!("~/{rc}"))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "{p}: note — none of {} sources ~/.aterm/shell.d, so a shell outside \
+                     aterm that starts from only those files does not reach the managed \
+                     tools; use `aterm <tool>` there, or: {}",
+                    checked.join(", "),
+                    manual_path_hint(&bin_dir)
+                );
             }
         }
         // Privacy of the login-sourced dirs (READ-ONLY — doctor never chmods).
@@ -3471,6 +3561,245 @@ mod tests {
             ),
             "a fish-breaking stray .sh is structural"
         );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Doctor says plainly which rc files reach the managed bin/ (audit B9's ask), in the
+    /// pass's own five states: wired, sourced through a line that is not atpkg's, opted
+    /// out, consent-fenced, or not yet wired. When none reaches, it names every file it
+    /// read rather than calling the machine aterm-only. Before this the report never
+    /// mentioned the rc block, so a user whose rc was skipped at the consent fence, and one
+    /// who had opted out, saw exactly the same thing: nothing.
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_is_reported_in_all_five_states() {
+        let l = layout("rc-wiring");
+        install(&l, "ay", 18);
+        let home = synthetic_home("rc-wiring");
+        let shell_d = home.join(".aterm/shell.d");
+        std::fs::create_dir_all(&shell_d).unwrap();
+        let zshrc = home.join(".zshrc");
+        let report = |home: &Path| {
+            let mut out = Vec::new();
+            let _ = run_with(
+                &l,
+                Some(home),
+                None,
+                0,
+                None,
+                None,
+                "doctor",
+                &Probes::default(),
+                &mut out,
+                &mut std::io::sink(),
+            );
+            String::from_utf8(out).unwrap()
+        };
+
+        // No rc at all: nothing to wire, and the report must say the consequence — about
+        // the files it read, named, never about the machine as a whole.
+        let none = report(&home);
+        assert!(
+            none.contains(
+                "none of ~/.zshrc, ~/.bashrc, ~/.bash_profile, ~/.config/fish/config.fish, \
+                 ~/.bash_login, ~/.profile sources ~/.aterm/shell.d"
+            ) && none.contains("`aterm <tool>`"),
+            "no rc ⇒ the six files read are named, with the way in: {none}"
+        );
+        assert!(
+            !none.contains("aterm-only"),
+            "six files read are not the whole machine: {none}"
+        );
+
+        // An rc that exists but was never wired.
+        std::fs::write(&zshrc, "export FOO=1\n").unwrap();
+        let unwired = report(&home);
+        assert!(
+            unwired.contains("~/.zshrc does not source ~/.aterm/shell.d")
+                && unwired.contains("`aterm pkg repair` appends atpkg's block"),
+            "unwired names the pass that wires it: {unwired}"
+        );
+
+        // Wired — by a REAL pass, so the ledger entry the opt-out state needs is the one
+        // the pass writes, not a shape this test invented.
+        let pass = crate::hooks::pass_at(&l, &home, crate::hooks::RcWiring::HonorOptOut);
+        assert_eq!(
+            pass.rc(),
+            [(".zshrc", crate::hooks::RcOutcome::Appended)],
+            "the pass wired ~/.zshrc"
+        );
+        let wired = report(&home);
+        assert!(
+            wired.contains("ok — ~/.zshrc sources ~/.aterm/shell.d")
+                && wired.contains(
+                    "delete the block to opt out — it stays deleted until `aterm pkg repair`"
+                ),
+            "wired names the rc, the one-motion opt-out, and the one verb that undoes it: \
+             {wired}"
+        );
+        assert!(
+            !wired.contains("none of ~/"),
+            "a wired rc reaches the toolchain: {wired}"
+        );
+
+        // Opted out: recorded as wired, block deleted.
+        std::fs::write(&zshrc, "export FOO=1\n").unwrap();
+        let opted = report(&home);
+        assert!(
+            opted.contains("~/.zshrc: atpkg's block was deleted — opted out")
+                && opted.contains("aterm pkg repair"),
+            "opted-out is honoured and names the one verb that re-wires: {opted}"
+        );
+
+        // Sourced by a line that is NOT atpkg's — tools/install.sh's `wire_shell_path`
+        // marker pair, sourcing the same hook — on top of the opt-out ledger entry above:
+        // the user deleted atpkg's duplicate block and kept install.sh's. The toolchain
+        // reaches this shell, so doctor must say so, and must not call the machine
+        // aterm-only or the rc unwired.
+        std::fs::write(
+            &zshrc,
+            format!(
+                "export FOO=1\n# >>> aterm ALab toolset (managed by install.sh) >>>\n\
+                 if [ -f \"{h}\" ]; then . \"{h}\"; fi\n# <<< aterm ALab toolset <<<\n",
+                h = shell_d.join("00-atpkg.zsh").display()
+            ),
+        )
+        .unwrap();
+        let foreign = report(&home);
+        assert!(
+            foreign.contains(
+                "ok — ~/.zshrc sources ~/.aterm/shell.d via a line that is not atpkg's block"
+            ),
+            "install.sh's block is reported as what it is: {foreign}"
+        );
+        assert!(
+            !foreign.contains("none of ~/")
+                && !foreign.contains("does not source")
+                && !foreign.contains("opted out"),
+            "a shell that reaches the toolchain is neither unreached nor unwired: {foreign}"
+        );
+
+        // CONSENT-FENCED: the rc resolves under a folder macOS guards, so no pass opens it
+        // — and neither does this report. The state exists because nothing else could tell
+        // the user why their rc is perpetually untouched.
+        let docs = home.join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("zshrc"), "export FOO=1\n").unwrap();
+        std::fs::remove_file(&zshrc).unwrap();
+        std::os::unix::fs::symlink(docs.join("zshrc"), &zshrc).unwrap();
+        let fenced = report(&home);
+        assert!(
+            fenced.contains(
+                "~/.zshrc resolves under a folder macOS guards with a consent \
+                 dialog, so no atpkg pass opens it"
+            ),
+            "the fenced rc is named, with why: {fenced}"
+        );
+        assert!(
+            !fenced.contains("does not source"),
+            "doctor did not read it, so it claims nothing about its contents: {fenced}"
+        );
+        assert_eq!(
+            crate::hooks::rc_wiring(&home),
+            vec![(".zshrc", crate::hooks::RcState::ConsentFenced)]
+        );
+
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// tools/install.sh wires macOS bash through a LOGIN profile: `path_block_rc_target`
+    /// elects ~/.bash_profile, then ~/.bash_login, then ~/.profile, never ~/.bashrc,
+    /// because Terminal.app starts a login bash. atpkg has a row for the FIRST of those
+    /// three and none for the other two, so a Mac whose login bash fell through to
+    /// ~/.bash_login would read as "nothing sources ~/.aterm/shell.d" while it plainly
+    /// did. Pinned in both shapes: install.sh's block in ~/.bash_profile — an atpkg row —
+    /// reads as sourced through a line that is not atpkg's (CONTENT before the ledger),
+    /// and the same block in ~/.bash_login, which atpkg never wires, reads the same way. A
+    /// profile that does not source shell.d is not listed at all (atpkg does not wire it,
+    /// so it has nothing to say about it).
+    #[cfg(unix)]
+    #[test]
+    fn an_install_sh_block_in_a_login_profile_is_reported_as_sourcing_shell_d() {
+        let l = layout("rc-login-profile");
+        install(&l, "ay", 18);
+        let home = synthetic_home("rc-login-profile");
+        let shell_d = home.join(".aterm/shell.d");
+        std::fs::create_dir_all(&shell_d).unwrap();
+        // install.sh's block, in the shape `wire_shell_path` writes it for bash.
+        let block = |hook: &str| {
+            format!(
+                "export FOO=1\n\n# >>> aterm ALab toolset (managed by install.sh) >>>\n\
+                 if [ -f \"{h}\" ]; then . \"{h}\"; fi\n# <<< aterm ALab toolset <<<\n",
+                h = shell_d.join(hook).display()
+            )
+        };
+        let report = |home: &Path| {
+            let mut out = Vec::new();
+            let _ = run_with(
+                &l,
+                Some(home),
+                None,
+                0,
+                None,
+                None,
+                "doctor",
+                &Probes::default(),
+                &mut out,
+                &mut std::io::sink(),
+            );
+            String::from_utf8(out).unwrap()
+        };
+
+        // An atpkg ROW carrying install.sh's block, not atpkg's.
+        std::fs::write(home.join(".bash_profile"), block("00-atpkg.bash")).unwrap();
+        // A login profile that does NOT source shell.d is not reported.
+        std::fs::write(home.join(".profile"), "export BAR=1\n").unwrap();
+        let out = report(&home);
+        assert!(
+            out.contains(
+                "ok — ~/.bash_profile sources ~/.aterm/shell.d via a line that is not \
+                 atpkg's block"
+            ),
+            "install.sh's block in an atpkg row is seen for what it is: {out}"
+        );
+        assert!(
+            !out.contains("none of ~/") && !out.contains("aterm-only"),
+            "a machine whose login bash reaches the toolchain is not reported unreached: \
+             {out}"
+        );
+        assert!(
+            !out.contains("~/.profile"),
+            "a profile atpkg does not wire and that does not source shell.d is not listed: \
+             {out}"
+        );
+        assert_eq!(
+            crate::hooks::rc_wiring(&home),
+            vec![(".bash_profile", crate::hooks::RcState::SourcedElsewhere)]
+        );
+
+        // The fall-through profile atpkg has NO row for: the same block, and the same
+        // answer — this is the file whose absence from the roster made the old report lie.
+        std::fs::remove_file(home.join(".bash_profile")).unwrap();
+        std::fs::write(home.join(".bash_login"), block("00-atpkg.bash")).unwrap();
+        let out = report(&home);
+        assert!(
+            out.contains(
+                "ok — ~/.bash_login sources ~/.aterm/shell.d via a line that is not \
+                 atpkg's block"
+            ),
+            "an install.sh-only profile is read, and reported: {out}"
+        );
+        assert!(
+            !out.contains("none of ~/"),
+            "it reaches the toolchain: {out}"
+        );
+        assert_eq!(
+            crate::hooks::rc_wiring(&home),
+            vec![(".bash_login", crate::hooks::RcState::SourcedElsewhere)]
+        );
+
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }

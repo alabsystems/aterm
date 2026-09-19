@@ -2230,8 +2230,13 @@ mod tests {
 
         const CHILD: &str = "ATERM_DOCUMENT_FIFO_TEST_CHILD";
         const PATH: &str = "ATERM_DOCUMENT_FIFO_TEST_PATH";
+        // The child says WHEN it reached the FIFO calls, so the deadline below bounds those
+        // calls and not this machine's process startup. See the parent half for what that
+        // cost measured.
+        let started_marker = |fifo: &Path| fifo.with_file_name("child-reached-the-fifo");
         if std::env::var_os(CHILD).is_some() {
             let path = PathBuf::from(std::env::var_os(PATH).unwrap());
+            fs::write(started_marker(&path), b"1").expect("the child can write beside the fifo");
             assert!(matches!(
                 read_config_atomic_file(&path, 1024, false),
                 Err(DocumentHostError::NotAFile)
@@ -2259,6 +2264,42 @@ mod tests {
             .env(PATH, &path)
             .spawn()
             .unwrap();
+        // TWO BOUNDS, because they answer different questions and only one of them is this
+        // test's subject. What it guards is that opening a writerless FIFO does not block
+        // FOR EVER, so the 3 s below starts when the child says it got there — the marker
+        // it writes as its first act. Timing the child's whole life instead conflated the
+        // block with the cost of spawning a fresh copy of this test binary, and on a loaded
+        // 4-core Intel Mac (the merge gate runs six cargo lanes at once) that cost alone
+        // passed 3 s: measured 2026-09-17, the gate failed here with "blocked past the
+        // deadline" while the same test passed 3 runs in 1.4–3.7 s on the quiet machine.
+        // The startup bound is generous and says what it means when it fires: a child that
+        // never reaches the calls is a different defect from one that hangs in them.
+        let marker = started_marker(&path);
+        let start_by = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let reached = loop {
+            if marker.exists() {
+                break true;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                // It ended without ever writing the marker: report its status, not a hang.
+                panic!(
+                    "the child exited ({status:?}) before it reached the FIFO calls — the \
+                     marker {} was never written",
+                    marker.display()
+                );
+            }
+            if std::time::Instant::now() >= start_by {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(
+            reached,
+            "the child never reached the FIFO calls within 120 s — a startup problem on this \
+             host, not the blocking open this test guards"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -2268,7 +2309,10 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("writerless FIFO observation blocked past the deadline");
+                panic!(
+                    "writerless FIFO observation blocked past the deadline: the child reached \
+                     the calls and did not return from them within 3 s"
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

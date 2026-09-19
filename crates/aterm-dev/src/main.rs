@@ -5,9 +5,10 @@
 //! utility script in the aterm workspace.
 //!
 //! This binary deliberately does NOT reimplement any of the underlying
-//! (battle-tested) logic — cargo-deny / kani / codex / the `cargo ship` release
-//! cutter etc. Each subcommand simply resolves the repo root and execs the
-//! existing tool (`ship` → the `cargo ship` alias; everything else → its repo
+//! (battle-tested) logic — cargo-deny / kani / codex / the `targo --unverified
+//! ship` release cutter etc. Each subcommand simply resolves the repo root and
+//! execs the existing tool (`ship` → the `ship` alias through the resolved Trust
+//! driver — see [`ship_driver`]; everything else → its repo
 //! script) via [`std::process::Command`], forwarding all extra arguments and
 //! propagating the exit code. The value here is discoverability: a single,
 //! grouped, polished `--help` that an AI (or human) can read to learn what
@@ -53,14 +54,14 @@ impl Group {
 }
 
 /// The single Package & Release entry: `aterm-dev ship …` forwards to the
-/// `cargo ship` alias (crates/aterm-release — the whole build/sign/publish
-/// pipeline in one Rust tool; see docs/RELEASING.md). Not a [`Sub`]: it execs
-/// `cargo`, not a repo script, because the cutter must ALWAYS run from the
+/// `ship` alias (crates/aterm-release — the whole build/sign/publish pipeline
+/// in one Rust tool; see docs/RELEASING.md) through the resolved Trust driver,
+/// `targo --unverified ship …` ([`ship_driver`]). Not a [`Sub`]: it execs the
+/// driver, not a repo script, because the cutter must ALWAYS run from the
 /// workspace source via the alias — never a stale installed binary (release
 /// spec decision 13) and never a wrapper reimplementing dispatch.
 const SHIP_NAME: &str = "ship";
-const SHIP_ABOUT: &str =
-    "Release cutter passthrough: `cargo ship <cut|status|verify|yank|provision|recover> ...`";
+const SHIP_ABOUT: &str = "Release cutter passthrough: `targo --unverified ship <cut|status|verify|yank|provision|recover> ...`";
 
 /// The full registry of subcommands. Adding a new dev script is a one-line
 /// edit here. (The former release-script entries — build-app / make-dmg /
@@ -111,7 +112,7 @@ fn main() {
             std::process::exit(0);
         }
         Some(cmd) if cmd == SHIP_NAME => {
-            // Everything after `ship` is forwarded verbatim to `cargo ship`
+            // Everything after `ship` is forwarded verbatim to `<driver> ship`
             // (same in-bounds `get` rationale as the script arm below).
             let forwarded = args.get(1..).unwrap_or(&[]);
             std::process::exit(run_ship(forwarded));
@@ -136,11 +137,15 @@ fn main() {
     }
 }
 
-/// Exec `cargo ship <forwarded…>` from the repo root and return the exit code
-/// to propagate. `ship` is the `.cargo/config.toml` alias for
-/// `run -q --release -p aterm-release --`, so this always compiles + runs the
-/// checkout's cutter — the passthrough adds discoverability, not a second
-/// dispatch path that could drift from the alias.
+/// Exec `<driver> [--unverified] ship <forwarded…>` from the repo root and
+/// return the exit code to propagate. `ship` is the `.cargo/config.toml` alias
+/// for `run -q --release -p aterm-release --`, so this always compiles + runs
+/// the checkout's cutter — the passthrough adds discoverability, not a second
+/// dispatch path that could drift from the alias. The driver is the Trust
+/// `targo` ([`ship_driver`]) and the lane flag is asked of it
+/// ([`cargo_lane_args`]): `run` is a compilation command, and naming its lane
+/// out loud is what keeps the run authorized rather than defaulted (measured
+/// 2026-09-18, see [`cargo_lane_args`]).
 fn run_ship(forwarded: &[String]) -> i32 {
     let root = match repo_root() {
         Some(r) => r,
@@ -149,23 +154,168 @@ fn run_ship(forwarded: &[String]) -> i32 {
             return 1;
         }
     };
-    let status = Command::new("cargo")
+    let driver = ship_driver();
+    let status = Command::new(&driver)
+        .args(cargo_lane_args(&driver))
         .arg(SHIP_NAME)
         .args(forwarded)
-        // From the repo root so cargo resolves THIS workspace (and its alias),
-        // not whatever project the caller's cwd happens to be inside.
+        // From the repo root so the driver resolves THIS workspace (and its
+        // alias), not whatever project the caller's cwd happens to be inside.
         .current_dir(&root)
         .status();
     match status {
-        // Prefer cargo's own exit code; 1 if terminated by a signal (no code).
+        // Prefer the driver's own exit code; 1 if terminated by a signal (no code).
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
-            let mut msg = String::from("aterm-dev: failed to execute cargo ship: ");
+            let mut msg = String::from("aterm-dev: failed to execute ");
+            // Via `call1`: the same hardened byte-loss dodge as `run_script`;
+            // lossy display of the driver path in an error message is the intent.
+            msg.push_str(&call1(Path::to_string_lossy, driver.as_path()));
+            msg.push_str(" ship: ");
             msg.push_str(&e.to_string());
+            msg.push_str(
+                " (fix: aterm pkg install trust, then `aterm pkg which targo`; \
+                          or put a rustup `cargo` on PATH)",
+            );
             eprintln_str(&msg);
             1
         }
     }
+}
+
+/// The build driver `ship` runs through — the same rule the packers and the
+/// source gate apply (tools/atpkg-pack.sh `trust_store_targo` and its twins),
+/// with `$CARGO` in front. Order, first hit wins — measured 2026-09-18 on a
+/// Mac provisioned by `aterm pkg install trust`: no rustup, no cargo, no rustc
+/// on PATH (`command -v cargo rustc rustup` prints nothing; `~/.rustup` does
+/// not exist and `~/.cargo/bin` is empty — the dir holds only cargo's registry
+/// cache), so the bare `cargo` this used to spawn could not start at all:
+///   1. env `CARGO` — the driver running THIS binary when it was launched by
+///      `targo run -p aterm-dev`; keeps the outer lane's toolchain (the rule
+///      crates/aterm-gui/src/lib.rs `harness_manifest` applies).
+///   2. `aterm pkg which targo` — the manager's own answer, which honours a
+///      configured `[packages].prefix` and the channel pin. Its measured line
+///      shape is `targo → <prefix>/bin/targo → <prefix>/store/trust/9192/bin/
+///      targo — managed 9192 — pinned by index 39`; the copy that runs is the
+///      LAST `→` field ([`which_line_store_path`]), and a `SHADOWED` answer —
+///      a foreign copy ahead on PATH — is declined, never adopted.
+///   3. `<default prefix>/store/trust/current/bin/targo` — a shell whose PATH
+///      lacks `aterm` and the shim (a launchd job, `su` without `-`). This
+///      crate has no atpkg dependency, so a configured `[packages].prefix` is
+///      honoured only through step 2; the default is atpkg's platform default
+///      (`crates/atpkg/src/platform/unix.rs::default_prefix`).
+///   4. `targo` on PATH, accepted ONLY when it lives under that default prefix
+///      — the managed shim `<prefix>/bin/targo` — never a rustup-linked or
+///      source-built copy that happens to sort first (the PATH-order hijack the
+///      scripts refuse too, so one release is cut by one toolchain). The shim
+///      is spawned as-is: `ship` is a single spawn that resolves at exec time,
+///      so there is no running-pack window for its body to move under.
+///   5. bare `cargo` — the documented last resort for a rustup box; the spawn
+///      failure in `run_ship` names the product's fix first.
+fn ship_driver() -> PathBuf {
+    if let Some(cargo) = std::env::var_os("CARGO").filter(|c| !c.is_empty()) {
+        return PathBuf::from(cargo);
+    }
+    if let Some(cand) = Command::new("aterm")
+        .args(["pkg", "which", "targo"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| which_line_store_path(&out.stdout))
+        .filter(|cand| is_executable(cand))
+    {
+        return cand;
+    }
+    let prefix = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|home| store_prefix_under(Path::new(&home)));
+    if let Some(prefix) = &prefix {
+        let cand = prefix
+            .join("store")
+            .join("trust")
+            .join("current")
+            .join("bin")
+            .join("targo");
+        if is_executable(&cand) {
+            return cand;
+        }
+    }
+    if let (Some(prefix), Some(path)) = (&prefix, std::env::var_os("PATH")) {
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let cand = dir.join("targo");
+            if cand.starts_with(prefix) && is_executable(&cand) {
+                return cand;
+            }
+        }
+    }
+    PathBuf::from("cargo")
+}
+
+/// The store path in one line of `aterm pkg which targo` output: the LAST
+/// `→` field of the first line, cut before the ` — ` state suffix. `None` for
+/// a `SHADOWED` line (a foreign copy ahead on PATH, which the manager reports
+/// rather than resolves), a line with no `→` (not a resolution), a relative
+/// path, or non-UTF-8 output. Pure, so it is unit-tested against the measured
+/// line shapes.
+fn which_line_store_path(stdout: &[u8]) -> Option<PathBuf> {
+    // Via `call1`: dodges the undischargeable hardened utf8-reject contract on
+    // direct `String::from_utf8` call sites (see `call0`); rejecting a
+    // non-UTF-8 answer (as "no answer") is this function's contract.
+    let text = call1(String::from_utf8, stdout.to_vec()).ok()?;
+    let line = text.lines().next()?;
+    if line.contains("SHADOWED") {
+        return None;
+    }
+    let (_, path) = line.rsplit_once(" → ")?;
+    let path = path.split(" — ").next()?.trim();
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// atpkg's default store prefix under `home` — the platform rule of
+/// `crates/atpkg/src/platform/unix.rs::default_prefix` (macOS:
+/// `~/Library/Application Support/aterm/pkg`; other Unix:
+/// `~/.local/share/aterm/pkg`), mirrored here because this crate carries no
+/// atpkg dependency. Windows takes `%LOCALAPPDATA%`'s shape by `home` only.
+fn store_prefix_under(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let prefix = home
+        .join("Library")
+        .join("Application Support")
+        .join("aterm")
+        .join("pkg");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let prefix = home.join(".local").join("share").join("aterm").join("pkg");
+    #[cfg(not(unix))]
+    let prefix = home.join("AppData").join("Local").join("aterm").join("pkg");
+    prefix
+}
+
+/// The lane flag for `driver` — a copy of crates/aterm-gui/src/lib.rs
+/// `cargo_lane_args`: ask the resolved driver for `--version`, and when it
+/// answers as targo every compilation command gets `--unverified`
+/// (`.cargo/config.toml` sets `-Ztrust-verify=off` workspace-wide). What the
+/// flag does, measured 2026-09-18 on targo 1.99.0-dev (321aaeda7): an unflagged
+/// `targo build` is REFUSED ("refuses to create an implicitly unverified
+/// artifact"), but an unflagged `targo run` — and so `targo ship`, the `run`
+/// alias — is NOT: it proceeds with `warning: UNVERIFIED: \`targo run\` has no
+/// verified lane, so Trust verification is off; nobody was asked`. The flag
+/// is passed so the lane is explicitly authorized (targo's "was explicitly
+/// authorized" wording) instead of silently defaulted — it NAMES the lane, it
+/// does not unlock the command. Stock cargo gets nothing. Bytes are searched,
+/// not decoded: nothing here needs the text, and a non-UTF-8 banner is simply
+/// "not targo".
+fn cargo_lane_args(driver: &Path) -> &'static [&'static str] {
+    let is_targo = Command::new(driver)
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success() && out.stdout.windows(5).any(|w| w == b"targo"));
+    if is_targo { &["--unverified"] } else { &[] }
 }
 
 /// The could-not-find-the-workspace error line, shared by both dispatch paths.
@@ -358,7 +508,9 @@ fn print_help() {
         name_width,
     ));
     println_str("");
-    println_str("Each command wraps an existing project tool (`ship` -> `cargo ship`, the rest ->");
+    println_str(
+        "Each command wraps an existing project tool (`ship` -> `targo --unverified ship`, the rest ->",
+    );
     println_str(
         "repo scripts) and forwards your arguments to it verbatim, `--help` included: `ship`",
     );
@@ -467,5 +619,56 @@ fn eprintln_str(line: &str) {
     if !ok {
         // See `println_str` for why this goes through [`call1_diverging`].
         call1_diverging(std::panic::panic_any, "failed printing to stderr");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line shape measured 2026-09-18 on this Mac (`aterm pkg which targo`).
+    #[test]
+    fn which_line_yields_the_last_arrow_field_before_the_state() {
+        let line = b"targo \xe2\x86\x92 /p/bin/targo \xe2\x86\x92 /p/store/trust/9192/bin/targo \xe2\x80\x94 managed 9192 \xe2\x80\x94 pinned by index 39\n";
+        assert_eq!(
+            which_line_store_path(line),
+            Some(PathBuf::from("/p/store/trust/9192/bin/targo"))
+        );
+    }
+
+    /// A SHADOWED answer names the foreign copy; it is declined, not adopted.
+    #[test]
+    fn a_shadowed_line_is_declined() {
+        let line = "targo → /opt/homebrew/bin/targo — managed 9 — SHADOWED by /opt/homebrew/bin/targo (earlier on PATH)\n";
+        assert_eq!(which_line_store_path(line.as_bytes()), None);
+    }
+
+    /// No `→` (a refusal or a notice), a relative field, an empty answer and
+    /// non-UTF-8 bytes are all "no answer".
+    #[test]
+    fn non_resolutions_are_no_answer() {
+        assert_eq!(
+            which_line_store_path(b"atpkg: targo is not installed"),
+            None
+        );
+        assert_eq!(
+            which_line_store_path("targo → bin/targo — managed 9".as_bytes()),
+            None
+        );
+        assert_eq!(which_line_store_path(b""), None);
+        assert_eq!(which_line_store_path(b"targo \xe2\x86\x92 /p\xff"), None);
+    }
+
+    /// Only the first line is a resolution; a dev-linked second field with
+    /// spaces in the prefix (this Mac's `Application Support`) survives intact.
+    #[test]
+    fn a_prefix_with_spaces_and_a_second_line_are_handled() {
+        let line = "targo → /Users//x/Library/Application Support/aterm/pkg/bin/targo → /Users//x/Library/Application Support/aterm/pkg/store/trust/9192/bin/targo — managed 9192\nsecond line → /nope\n";
+        assert_eq!(
+            which_line_store_path(line.as_bytes()),
+            Some(PathBuf::from(
+                "/Users//x/Library/Application Support/aterm/pkg/store/trust/9192/bin/targo"
+            ))
+        );
     }
 }

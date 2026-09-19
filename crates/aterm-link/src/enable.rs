@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! aterm fabric on  [--dry-run] [--fleet <F>] [--service launchd|systemd|none]
+//!                  [--tcp <host:port> --key-file <k> [--allow-remote]]
 //! aterm fabric off [--dry-run] [--service launchd|systemd|none]
 //! aterm fabric doctor
 //! ```
@@ -143,13 +144,40 @@
 //! `aterm fabric`'s WARNINGS, each with the fix for it ([`fix_for`]), plus the
 //! one check status does not make: whether the rendezvous file is there.
 //!
-//! ## What `--tcp --key-file` does here
+//! ## `--tcp <host:port> --key-file <k> [--allow-remote]` (round 16)
 //!
-//! Nothing yet, and it says so rather than storing a flag the bridge could not
-//! dial: `aterm link broker` serves the Unix socket only, and the sealed TCP
-//! listener is behind astream's `aead` feature that a default build (and the
-//! shipped binary) does not carry. Round 16 adds it; until then the flags are
-//! refused by name with that reason.
+//! The broker is served on the SEALED TCP wire as well as the Unix socket, so
+//! a second host can join the fleet (`aterm fabric join`, [`crate::join`]).
+//! Only in a `sealed` build ([`crate::transport::SEALED`]); a default build
+//! refuses the flags naming the feature, before anything is written. The
+//! steps are the same steps with three differences:
+//!
+//! * the KEY: an existing `<k>` must be 64 hex characters, mode 0600, and is
+//!   never replaced (a joined host holds it); a missing one is minted, 0600;
+//! * the BROKER runs `link broker --tcp <bind> --key-file <k> --secret-file
+//!   <root>/mint.secret [--allow-remote] --unix <root>/bus.sock <root>/bus.log`
+//!   — always GUARDED with the secret the caps are minted under, because the
+//!   key is one secret every host holds and only a capability says which node
+//!   may publish what — under the SAME root-derived label and plist, with the
+//!   same idempotence rules (a job that runs this argv and answers is
+//!   `already`; one that ran the Unix socket alone is "the job changed" and
+//!   restarted); `--service none` probes a broker something else runs and,
+//!   when none answers, prints the argv to run;
+//! * the broker serves the root's Unix socket AS WELL, and THIS host's bridges
+//!   dial that — the same `[fabric] command` a one-host `on` writes. The TCP
+//!   port is for the hosts that join, and only for them: astream admits 64
+//!   connections into the sealed handshake at once, and a peer that can reach
+//!   the port can hold every one without the key (round 16 review, measured);
+//!   on the socket, this host's own bridges, `aterm fabric` and `aterm link
+//!   ls|glance|tui` never wait on those slots. The run PROVES the sealed wire
+//!   separately (the `wire` step: the handshake, the node's grants attached and
+//!   a read, at `<bind>` or its loopback twin when `<bind>` is
+//!   `0.0.0.0`/`[::]`), and the rendezvous file records it as `serves_tcp` and
+//!   `serves_key_file` — what `mint-for` names in the `join` it prints.
+//!
+//! The port must be FIXED (it is written into every joining host's bridge
+//! command), and a non-loopback bind is refused without `--allow-remote`,
+//! which says why.
 
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -264,10 +292,14 @@ pub struct OnOpts {
     pub service: Option<Service>,
     /// `--fleet`; `None` is `$ATERM_FABRIC_FLEET`, else [`DEFAULT_FLEET`].
     pub fleet: Option<String>,
-    /// `--tcp <bind>` — refused for now (module doc).
+    /// `--tcp <bind>`: serve the broker on the SEALED TCP wire at `<host:port>`
+    /// as well as the Unix socket (a `sealed` build; module doc).
     pub tcp: Option<String>,
-    /// `--key-file <path>` — refused for now (module doc).
+    /// `--key-file <path>`: the pre-shared key for `--tcp` — minted here, 64
+    /// hex characters in a 0600 file, when the file does not exist yet.
     pub key_file: Option<String>,
+    /// `--allow-remote`: let `--tcp` bind a non-loopback address.
+    pub allow_remote: bool,
 }
 
 /// `aterm fabric off`'s flags.
@@ -302,6 +334,35 @@ pub struct Paths {
     pub config: Option<PathBuf>,
     /// The rendezvous file, if the control-socket dir resolves.
     pub rendezvous: Option<PathBuf>,
+    /// How this host's bridges reach the broker, and whether this host serves
+    /// it: [`Wire::Unix`] unless `on --tcp` or `join` said otherwise.
+    pub wire: Wire,
+}
+
+/// How this host's bridges reach the broker — and whether THIS host serves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wire {
+    /// `<root>/bus.sock`, served here: the one-host fabric (round 13).
+    Unix,
+    /// The SEALED TCP wire (round 16): astream's XChaCha20-Poly1305 record
+    /// layer under a pre-shared key, to a broker that is always guarded.
+    Sealed {
+        /// `Some(<host:port>)` when THIS host serves the broker (`on --tcp`):
+        /// on the sealed wire at `<bind>` for the hosts that join, and on the
+        /// root's `bus.sock` for its own bridges ([`Paths::endpoint`]). `None`
+        /// on a host that joined another's (`join`).
+        bind: Option<String>,
+        /// The sealed endpoint: on the host that serves it, the address its
+        /// `wire` probe dials and the rendezvous file records for joiners —
+        /// the loopback twin of an unspecified bind
+        /// ([`crate::transport::dial_for_bind`]), else the bind itself; on a
+        /// joined host, the remote broker its bridges dial.
+        dial: String,
+        /// The pre-shared key file, absolute.
+        key_file: PathBuf,
+        /// `--allow-remote` on the broker this host serves.
+        allow_remote: bool,
+    },
 }
 
 impl Paths {
@@ -347,6 +408,7 @@ impl Paths {
             fleet,
             config: fabric::config_path(),
             rendezvous: rendezvous_path(),
+            wire: Wire::Unix,
         })
     }
 
@@ -364,24 +426,27 @@ impl Paths {
             .ok()
             .flatten()
             .and_then(|(_, cmd)| fabric::bridge_config(&cmd).ok())
-            .filter(|cfg| matches!(cfg.transport, crate::transport::Transport::Unix))
-            .map(|cfg| (cfg.broker, "[fabric] command"));
+            .and_then(|cfg| root_of(&cfg.transport, &cfg.broker, cfg.cap_files.first()))
+            .map(|root| (root, "[fabric] command"));
         let found = configured.or_else(|| {
             Rendezvous::read()
                 .ok()
                 .flatten()
-                .map(|r| (r.broker, "the rendezvous file"))
+                .and_then(|r| {
+                    let transport = if r.key_file.is_some() {
+                        crate::transport::Transport::Tcp
+                    } else {
+                        crate::transport::Transport::Unix
+                    };
+                    root_of(&transport, &r.broker, Some(&r.cap_file))
+                })
+                .map(|root| (root, "the rendezvous file"))
         });
-        let Some((broker, source)) = found else {
+        let Some((root, source)) = found else {
             return Ok((p, "the environment"));
         };
-        match Path::new(&broker).parent() {
-            Some(root) if root.is_absolute() => {
-                p.root = root.to_path_buf();
-                Ok((p, source))
-            }
-            _ => Ok((p, "the environment")),
-        }
+        p.root = root;
+        Ok((p, source))
     }
 
     /// Whether this root is the default one, whose label is the plain
@@ -409,24 +474,49 @@ impl Paths {
     fn sock(&self) -> String {
         self.root.join("bus.sock").to_string_lossy().into_owned()
     }
+    /// What this host's bridges dial: the root's socket on the Unix wire AND
+    /// on the sealed wire this host serves (its broker serves both; the TCP
+    /// port is the joining hosts'), the remote broker on a joined host.
+    pub(crate) fn endpoint(&self) -> String {
+        match &self.wire {
+            Wire::Unix | Wire::Sealed { bind: Some(_), .. } => self.sock(),
+            Wire::Sealed { dial, .. } => dial.clone(),
+        }
+    }
+    /// The `--tcp --key-file <k>` words a bridge carries on a JOINED host —
+    /// none where the bridges dial the socket.
+    fn wire_flags(&self) -> Vec<String> {
+        match &self.wire {
+            Wire::Unix | Wire::Sealed { bind: Some(_), .. } => Vec::new(),
+            Wire::Sealed { key_file, .. } => vec![
+                "--tcp".to_string(),
+                "--key-file".to_string(),
+                key_file.to_string_lossy().into_owned(),
+            ],
+        }
+    }
     fn log(&self) -> String {
         self.root.join("bus.log").to_string_lossy().into_owned()
     }
-    fn cap(&self) -> PathBuf {
+    pub(crate) fn cap(&self) -> PathBuf {
         self.root.join("node.cap")
     }
-    fn secret(&self) -> PathBuf {
+    pub(crate) fn secret(&self) -> PathBuf {
         self.root.join("mint.secret")
     }
-    fn state(&self) -> PathBuf {
+    pub(crate) fn state(&self) -> PathBuf {
         self.root.join("link-state")
+    }
+    /// Where `join` installs the pre-shared key it was given.
+    pub(crate) fn installed_key(&self) -> PathBuf {
+        self.root.join("fleet.key")
     }
     /// The launchd job's plist: `~/Library/LaunchAgents/<label>.plist` under
     /// the default root, `<root>/<label>.plist` under any other — THE PLIST
     /// FOLLOWS THE ROOT, like the label (module doc, step 6): a redirected run
     /// keeps its persistent job inside its own root instead of the operator's
     /// LaunchAgents dir.
-    fn plist(&self) -> PathBuf {
+    pub(crate) fn plist(&self) -> PathBuf {
         let name = format!("{}.plist", self.label());
         if self.default_root() {
             self.home.join("Library/LaunchAgents").join(name)
@@ -434,7 +524,7 @@ impl Paths {
             self.root.join(name)
         }
     }
-    fn unit(&self) -> PathBuf {
+    pub(crate) fn unit(&self) -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|x| !x.is_empty())
             .map_or_else(|| self.home.join(".config"), PathBuf::from);
@@ -444,7 +534,7 @@ impl Paths {
 
     /// Whether the binary is the `aterm-link` shim (a test build) rather than
     /// the front door, which decides the spelling of every command written.
-    fn is_link_shim(&self) -> bool {
+    pub(crate) fn is_link_shim(&self) -> bool {
         Path::new(&self.aterm)
             .file_name()
             .is_some_and(|n| n == "aterm-link")
@@ -452,7 +542,15 @@ impl Paths {
 
     /// The bridge command aterm launches: `<aterm> link serve …`, or
     /// `<aterm-link> serve …` for the shim. `--accept-from` carries the node.
-    fn bridge_command(&self, node: &str) -> Vec<String> {
+    pub(crate) fn bridge_command(&self, node: &str) -> Vec<String> {
+        self.bridge_command_accepting(node, &[])
+    }
+
+    /// [`Paths::bridge_command`] whose `--accept-from` also lists `others` —
+    /// the principals a JOINED host takes tasks from (the first host's node,
+    /// say), after its own node. On the sealed wire it carries `--tcp
+    /// --key-file <k>` after `--broker`.
+    pub(crate) fn bridge_command_accepting(&self, node: &str, others: &[String]) -> Vec<String> {
         let mut argv = vec![self.aterm.clone()];
         if !self.is_link_shim() {
             argv.push("link".to_string());
@@ -463,13 +561,22 @@ impl Paths {
                 "--fleet",
                 &self.fleet,
                 "--broker",
-                &self.sock(),
+                &self.endpoint(),
+            ]
+            .iter()
+            .map(|s| (*s).to_string()),
+        );
+        argv.extend(self.wire_flags());
+        let mut accept = vec![node.to_string()];
+        accept.extend(others.iter().filter(|o| *o != node).cloned());
+        argv.extend(
+            [
                 "--cap-file",
                 &self.cap().to_string_lossy(),
                 "--state",
                 &self.state().to_string_lossy(),
                 "--accept-from",
-                node,
+                &accept.join(","),
             ]
             .iter()
             .map(|s| (*s).to_string()),
@@ -477,13 +584,41 @@ impl Paths {
         argv
     }
 
-    /// The broker's argv as launchd runs it: the words, no shell.
+    /// The broker's argv as launchd runs it: the words, no shell. On the
+    /// sealed wire THIS host serves, `broker --tcp <bind> --key-file <k>
+    /// --secret-file <root>/mint.secret [--allow-remote] --unix
+    /// <root>/bus.sock <log>` — guarded with the secret the caps were minted
+    /// under, and serving the root's socket for this host's own bridges.
     fn broker_argv(&self) -> Vec<String> {
         let mut argv = vec![self.aterm.clone()];
         if !self.is_link_shim() {
             argv.push("link".to_string());
         }
-        argv.extend(["broker".to_string(), self.sock(), self.log()]);
+        argv.push("broker".to_string());
+        match &self.wire {
+            Wire::Sealed {
+                bind: Some(bind),
+                key_file,
+                allow_remote,
+                ..
+            } => {
+                argv.extend([
+                    "--tcp".to_string(),
+                    bind.clone(),
+                    "--key-file".to_string(),
+                    key_file.to_string_lossy().into_owned(),
+                    "--secret-file".to_string(),
+                    self.secret().to_string_lossy().into_owned(),
+                ]);
+                if *allow_remote {
+                    argv.push("--allow-remote".to_string());
+                }
+                argv.push("--unix".to_string());
+                argv.push(self.sock());
+                argv.push(self.log());
+            }
+            _ => argv.extend([self.sock(), self.log()]),
+        }
         argv
     }
 
@@ -521,6 +656,16 @@ impl Paths {
     /// The broker command a shell-quoted supervisor line runs (the systemd
     /// unit, and the script's legacy plist argv).
     fn broker_words(&self) -> String {
+        if matches!(self.wire, Wire::Sealed { .. }) {
+            // Every word single-quoted; `argv_safe` already refused a word
+            // with a quote in it, so none can close its quote early.
+            return self
+                .broker_argv()
+                .iter()
+                .map(|w| format!("'{w}'"))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
         if self.is_link_shim() {
             format!("'{}' broker '{}' '{}'", self.aterm, self.sock(), self.log())
         } else {
@@ -569,15 +714,20 @@ impl Paths {
         )
     }
 
-    /// The `systemd --user` unit.
+    /// The `systemd --user` unit. The stale-socket `rm -f` is the Unix wire's
+    /// alone: a TCP broker has no socket file.
     #[must_use]
     pub fn unit_text(&self) -> String {
+        let pre = match self.wire {
+            Wire::Unix => format!("ExecStartPre=/bin/rm -f {}\n", self.sock()),
+            Wire::Sealed { .. } => String::new(),
+        };
         format!(
             "[Unit]\n\
              Description=aterm fabric broker ({label})\n\
              \n\
              [Service]\n\
-             ExecStartPre=/bin/rm -f {sock}\n\
+             {pre}\
              ExecStart=/bin/sh -c \"exec {broker}\"\n\
              WorkingDirectory={root}\n\
              Restart=always\n\
@@ -586,7 +736,6 @@ impl Paths {
              [Install]\n\
              WantedBy=default.target\n",
             label = self.label(),
-            sock = self.sock(),
             broker = self.broker_words(),
             root = self.root.to_string_lossy(),
         )
@@ -595,6 +744,30 @@ impl Paths {
 
 fn default_root(home: &Path) -> PathBuf {
     home.join(".local/share/aterm-fabric")
+}
+
+/// The fabric ROOT a bridge command (or a rendezvous file) points into: the
+/// socket's directory on the Unix wire, and on the sealed wire — whose broker
+/// is a `<host:port>` and says nothing about a directory — the cap file's,
+/// when it is `<root>/node.cap`, the name `on` and `join` install it under.
+/// `None` for anything else: a hand-written command whose files live
+/// elsewhere has no root this command may act on.
+fn root_of(
+    transport: &crate::transport::Transport,
+    broker: &str,
+    cap_file: Option<&String>,
+) -> Option<PathBuf> {
+    let root = match transport {
+        crate::transport::Transport::Unix => Path::new(broker).parent()?.to_path_buf(),
+        _ => {
+            let cap = Path::new(cap_file?);
+            if cap.file_name()? != "node.cap" {
+                return None;
+            }
+            cap.parent()?.to_path_buf()
+        }
+    };
+    root.is_absolute().then_some(root)
 }
 
 /// `&`, `<` and `>` as XML character data: what plistlib does for every value.
@@ -816,12 +989,38 @@ pub struct Rendezvous {
     pub state: String,
     /// The whole bridge command, as `[fabric] command` has it.
     pub command: String,
+    /// The pre-shared key file when this host's bridges dial the SEALED TCP
+    /// wire (`join`); `None` for the Unix socket — which is what they dial on
+    /// the host that serves the sealed wire, too. A file written before round
+    /// 16 has no such key and reads as the socket, which it was.
+    pub key_file: Option<String>,
+    /// On the host that SERVES the sealed wire (`on --tcp`): the endpoint a
+    /// joining host dials (the bind, or its loopback twin) — what `mint-for`
+    /// names in the `join` it prints, and what `aterm fabric` shows beside the
+    /// socket. `None` everywhere else.
+    pub serves_tcp: Option<String>,
+    /// With [`Rendezvous::serves_tcp`]: the pre-shared key file that wire is
+    /// sealed under — the file a joining host is given a copy of.
+    pub serves_key_file: Option<String>,
 }
 
 impl Rendezvous {
     /// Render the file.
     #[must_use]
     pub fn render(&self) -> String {
+        let mut wire = self.key_file.as_ref().map_or_else(String::new, |k| {
+            format!(
+                "transport = \"tcp+sealed\"\n\
+                 key_file = {}\n",
+                toml_str(k)
+            )
+        });
+        if let Some(tcp) = &self.serves_tcp {
+            wire.push_str(&format!("serves_tcp = {}\n", toml_str(tcp)));
+        }
+        if let Some(k) = &self.serves_key_file {
+            wire.push_str(&format!("serves_key_file = {}\n", toml_str(k)));
+        }
         format!(
             "# Written by `aterm fabric on` — where this machine's fabric is. `aterm link\n\
              # ls|glance|tui|mirror` and `aterm fabric` read it when their flags are omitted;\n\
@@ -832,7 +1031,8 @@ impl Rendezvous {
              node = {}\n\
              cap_file = {}\n\
              state = {}\n\
-             command = {}\n",
+             command = {}\n\
+             {wire}",
             toml_str(&self.fleet),
             toml_str(&self.broker),
             toml_str(&self.node),
@@ -857,6 +1057,18 @@ impl Rendezvous {
                 .map(str::to_string)
                 .ok_or_else(|| format!("`{k}` is missing or not a string"))
         };
+        // `key_file` and the `serves_*` pair are OPTIONAL — absent is the Unix
+        // socket, and a host that serves no sealed wire — but present and not
+        // a string is as malformed as any required key.
+        let optional = |k: &str| -> Result<Option<String>, String> {
+            match table.get(k) {
+                None => Ok(None),
+                Some(v) => v
+                    .as_str()
+                    .map(|s| Some(s.to_string()))
+                    .ok_or_else(|| format!("`{k}` is not a string")),
+            }
+        };
         Ok(Self {
             fleet: get("fleet")?,
             broker: get("broker")?,
@@ -864,6 +1076,9 @@ impl Rendezvous {
             cap_file: get("cap_file")?,
             state: get("state")?,
             command: get("command")?,
+            key_file: optional("key_file")?,
+            serves_tcp: optional("serves_tcp")?,
+            serves_key_file: optional("serves_key_file")?,
         })
     }
 
@@ -928,10 +1143,16 @@ pub fn with_rendezvous_defaults(args: &[String]) -> Vec<String> {
 
 /// [`with_rendezvous_defaults`]'s pure half: `args` with each of the four
 /// flags prepended from `r` when absent.
+///
+/// THE SEALED WIRE COMES WITH ITS BROKER, as one unit: when `--broker` is
+/// defaulted from a rendezvous file that names a `key_file`, `--tcp
+/// --key-file <k>` are defaulted with it (each unless given). A `--broker`
+/// the caller spelled out gets no wire flags it did not ask for — a socket
+/// path handed `--tcp` would be dialed as a `<host>:<port>`.
 #[must_use]
 pub fn fill_defaults(args: &[String], r: &Rendezvous) -> Vec<String> {
     let has = |flag: &str| args.iter().any(|a| a == flag);
-    let mut out = Vec::with_capacity(args.len() + 8);
+    let mut out = Vec::with_capacity(args.len() + 11);
     for (flag, value) in [
         ("--fleet", &r.fleet),
         ("--broker", &r.broker),
@@ -941,6 +1162,15 @@ pub fn fill_defaults(args: &[String], r: &Rendezvous) -> Vec<String> {
         if !has(flag) {
             out.push(flag.to_string());
             out.push(value.clone());
+        }
+    }
+    if let (Some(key), false) = (&r.key_file, has("--broker")) {
+        if !has("--tcp") {
+            out.push("--tcp".to_string());
+        }
+        if !has("--key-file") {
+            out.push("--key-file".to_string());
+            out.push(key.clone());
         }
     }
     out.extend_from_slice(args);
@@ -1170,30 +1400,71 @@ pub fn remove_fabric_table(text: &str) -> (String, Vec<String>) {
 // ---------------------------------------------------------------------------
 
 /// Write `bytes` to `path` with `mode`: a temp beside it, fsync, rename.
-fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+///
+/// THE TEMP IS CREATED, NEVER OPENED ([`create_temp_beside`]): the operator
+/// names `path` now (`mint-for --out`, `on --key-file`), and it can sit in a
+/// directory other users write. The temp was `<path>.tmp.<pid>` opened with
+/// `create(true)` and chmod'ed BY PATH — so a symlink planted at that
+/// predictable name had the cap written into its target and that target made
+/// 0600 (round 16 review, measured). Now the name is unpredictable, the open
+/// refuses anything already there, and the mode is set on the descriptor.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let (tmp, mut f) = create_temp_beside(path, mode)?;
     let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
         // `create` with a mode is masked by the umask; the rename keeps
-        // whatever the temp got, so say the mode again explicitly.
-        std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        // whatever the temp got, so say the mode again — on the DESCRIPTOR,
+        // which is the file this process created and nothing else.
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        f.sync_all()?;
+        drop(f);
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// A NEW file beside `path` to write it through: `.<name>.tmp.<pid>.<8 hex>`,
+/// opened `O_CREAT|O_EXCL` (`create_new`) with `mode`. The exclusive create
+/// fails on anything already at the name — a symlink included, dangling or
+/// not (POSIX `open(2)`: with `O_CREAT` and `O_EXCL`, a symbolic link is not
+/// followed) — so nothing planted there is ever written through; a clash is
+/// retried under fresh random hex, a few times, then refused.
+///
+/// # Errors
+///
+/// No entropy for the name, a clash on every try, or the create's own error.
+fn create_temp_beside(path: &Path, mode: u32) -> io::Result<(PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    for _ in 0..8 {
+        let salt = aterm_uds::rand::hex_token::<4>()?;
+        let tmp = path.with_file_name(format!(".{name}.tmp.{}.{salt}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+        {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "every temporary name tried beside {} was already taken",
+            path.display()
+        ),
+    ))
 }
 
 /// Replace `path`'s text, keeping what was there as `<path>.bak` (only when
@@ -1218,13 +1489,13 @@ fn write_with_backup(path: &Path, text: &str, mode: u32) -> io::Result<Option<Pa
 /// `n` random bytes through the ONE audited entropy helper
 /// (`aterm_uds::rand`): a hand-rolled device read is the incident the B4 guard
 /// exists for.
-fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     aterm_uds::rand::fill(&mut buf)?;
     Ok(buf)
 }
 
-fn read_node(state: &Path) -> Option<String> {
+pub(crate) fn read_node(state: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(state.join("node")).ok()?;
     let node = raw.trim();
     (node.starts_with("n-") && crate::subject::is_principal(node)).then(|| node.to_string())
@@ -1321,14 +1592,14 @@ fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
 // ---------------------------------------------------------------------------
 
 /// The step lines, printed as they happen.
-struct Out {
-    dry_run: bool,
-    changed: usize,
-    failed: bool,
+pub(crate) struct Out {
+    pub(crate) dry_run: bool,
+    pub(crate) changed: usize,
+    pub(crate) failed: bool,
 }
 
 impl Out {
-    fn new(dry_run: bool) -> Self {
+    pub(crate) fn new(dry_run: bool) -> Self {
         Self {
             dry_run,
             changed: 0,
@@ -1336,21 +1607,21 @@ impl Out {
         }
     }
 
-    fn line(&self, name: &str, verdict: &str, detail: &str) {
+    pub(crate) fn line(&self, name: &str, verdict: &str, detail: &str) {
         let mut out = io::stdout().lock();
         let _ = writeln!(out, "  {name:<11} {verdict:<9} {detail}");
         let _ = out.flush();
     }
 
     /// Nothing to do: it was already so.
-    fn already(&self, name: &str, detail: &str) {
+    pub(crate) fn already(&self, name: &str, detail: &str) {
         self.line(name, "already", detail);
     }
 
     /// Something was (or, dry, would be) done. An empty `did` prints `would`
     /// — the step's description — rather than an empty line (a `cap done`
     /// with nothing after it was the review's reading of it).
-    fn done(&mut self, name: &str, would: &str, did: &str) {
+    pub(crate) fn done(&mut self, name: &str, would: &str, did: &str) {
         self.changed += 1;
         if self.dry_run {
             self.line(name, "would", would);
@@ -1360,27 +1631,27 @@ impl Out {
     }
 
     /// Something the operator has to know that is not this run's failure.
-    fn warn(&self, name: &str, detail: &str) {
+    pub(crate) fn warn(&self, name: &str, detail: &str) {
         self.line(name, "WARNING", detail);
     }
 
-    fn ok(&self, name: &str, detail: &str) {
+    pub(crate) fn ok(&self, name: &str, detail: &str) {
         self.line(name, "ok", detail);
     }
 
-    fn fail(&mut self, name: &str, detail: &str) {
+    pub(crate) fn fail(&mut self, name: &str, detail: &str) {
         self.failed = true;
         self.line(name, "FAILED", detail);
     }
 
-    fn note(&self, name: &str, detail: &str) {
+    pub(crate) fn note(&self, name: &str, detail: &str) {
         self.line(name, "-", detail);
     }
 }
 
 /// Whether the binary carries `link` — `<aterm> link` prints the bridge's
 /// usage, which names `aterm-link`; the shim prints it with no argument.
-fn binary_has_link(p: &Paths) -> Result<(), String> {
+pub(crate) fn binary_has_link(p: &Paths) -> Result<(), String> {
     if !is_executable(Path::new(&p.aterm)) {
         return Err(format!(
             "no executable at {} (set ATERM_BIN, or install aterm)",
@@ -1410,17 +1681,116 @@ fn binary_has_link(p: &Paths) -> Result<(), String> {
     }
 }
 
+/// On the sealed wire, whether the binary a bridge command will run CARRIES
+/// the sealed transport: its `link` usage ends with the build line
+/// (`cli.rs`'s `build_line!`), and a default build's says it has none. Written
+/// into a bridge command anyway, a default-build binary would dial nothing but
+/// `Unsupported` — `fabric=stalled` for ever, with the reason in a log.
+/// `Ok(())` on the Unix wire.
+pub(crate) fn binary_has_sealed(p: &Paths) -> Result<(), String> {
+    if matches!(p.wire, Wire::Unix) {
+        return Ok(());
+    }
+    let mut cmd = Command::new(&p.aterm);
+    if !p.is_link_shim() {
+        cmd.arg("link");
+    }
+    let out = cmd
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{}: {e}", safe(&p.aterm, 256)))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if text.contains(crate::cli::SEALED_BUILD_MARK) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} carries no sealed TCP transport (a default build, or one that predates round \
+             16) — a bridge it runs could not dial the sealed wire. Point ATERM_BIN at a sealed \
+             build: {}",
+            safe(&p.aterm, 256),
+            crate::transport::SEALED_UNAVAILABLE
+        ))
+    }
+}
+
 /// Reach the broker for real, through the report's own probe.
-fn probe(p: &Paths, node: &str) -> fabric::BrokerView {
+pub(crate) fn probe(p: &Paths, node: &str) -> fabric::BrokerView {
     let cmd = p.bridge_command(node).join(" ");
     match fabric::bridge_config(&cmd) {
         Ok(cfg) => fabric::probe_broker(&cfg, &fabric::process_table()).0,
         Err(e) => fabric::BrokerView {
-            endpoint: p.sock(),
-            transport: "unix",
+            endpoint: p.endpoint(),
+            transport: if matches!(p.wire, Wire::Sealed { bind: None, .. }) {
+                "tcp+sealed"
+            } else {
+                "unix"
+            },
             error: Some(e),
             ..fabric::BrokerView::default()
         },
+    }
+}
+
+/// On the sealed wire THIS host serves: the TCP listener answers too, with
+/// the key — the handshake, the node's own grants attached and a read, at the
+/// endpoint a joining host dials. The broker step probes the SOCKET (what
+/// this host's bridges use), so without this nothing in `on` would notice a
+/// broker whose TCP listener never came up. `true` elsewhere.
+fn wire_step(p: &Paths, out: &mut Out) -> bool {
+    let Wire::Sealed {
+        bind: Some(_),
+        dial,
+        key_file,
+        ..
+    } = &p.wire
+    else {
+        return true;
+    };
+    let key = match crate::transport::read_private_key_file(&key_file.to_string_lossy()) {
+        Ok(k) => k,
+        Err(e) => {
+            out.fail("wire", &format!("{}: {e}", key_file.display()));
+            return false;
+        }
+    };
+    let cfg = crate::bridge::Config {
+        fleet: p.fleet.clone(),
+        broker: dial.clone(),
+        transport: crate::transport::Transport::Sealed(Box::new(key)),
+        cap_files: vec![p.cap().to_string_lossy().into_owned()],
+        state_dir: String::new(),
+        accept_from: Vec::new(),
+        screen: Vec::new(),
+        sock: None,
+        token: None,
+        presence: crate::presence::Mode::Meta,
+        receipts: false,
+    };
+    let (view, _) = fabric::probe_broker(&cfg, &[]);
+    if view.read_ok() {
+        out.ok(
+            "wire",
+            &format!(
+                "the sealed TCP wire answers at {dial}: handshake, the node's grants attached \
+                 and a read in {} ms — the one port a joining host dials",
+                view.rtt_ms.unwrap_or(0)
+            ),
+        );
+        true
+    } else {
+        out.fail(
+            "wire",
+            &format!(
+                "the broker answers on {} but not on the sealed wire at {dial}: {}",
+                p.sock(),
+                safe(view.error.as_deref().unwrap_or("no answer"), 256)
+            ),
+        );
+        false
     }
 }
 
@@ -1439,7 +1809,7 @@ fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, String> 
     }
 }
 
-fn uid() -> String {
+pub(crate) fn uid() -> String {
     Command::new("id")
         .arg("-u")
         .stdin(Stdio::null())
@@ -1451,7 +1821,7 @@ fn uid() -> String {
 }
 
 /// `launchctl <args>`; `Ok(())` on exit 0.
-fn launchctl(args: &[&str]) -> Result<(), String> {
+pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
     let out = Command::new("launchctl")
         .args(args)
         .stdin(Stdio::null())
@@ -1487,7 +1857,7 @@ fn launchd_pid(label: &str) -> Option<u32> {
         })
 }
 
-fn launchd_loaded(label: &str) -> bool {
+pub(crate) fn launchd_loaded(label: &str) -> bool {
     let out = Command::new("launchctl")
         .arg("list")
         .stdin(Stdio::null())
@@ -1500,7 +1870,7 @@ fn launchd_loaded(label: &str) -> bool {
     })
 }
 
-fn systemctl(args: &[&str]) -> Result<(), String> {
+pub(crate) fn systemctl(args: &[&str]) -> Result<(), String> {
     let out = Command::new("systemctl")
         .arg("--user")
         .args(args)
@@ -1522,7 +1892,7 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
 /// Step 6: the broker, supervised. `Ok(true)` when it answers.
 fn broker_step(p: &Paths, node: &str, service: Service, out: &mut Out) -> bool {
     trace("Supervise");
-    let sock = p.sock();
+    let sock = p.endpoint();
     let label = p.label();
     match service {
         Service::None => {
@@ -1542,11 +1912,9 @@ fn broker_step(p: &Paths, node: &str, service: Service, out: &mut Out) -> bool {
                     "broker",
                     &format!(
                         "no broker answers on {sock} ({}) and --service none starts none: run \
-                         `{} {}broker {sock} {}` yourself, or drop --service none",
+                         `{}` yourself, or drop --service none",
                         safe(view.error.as_deref().unwrap_or("-"), 256),
-                        p.aterm,
-                        if p.is_link_shim() { "" } else { "link " },
-                        p.log()
+                        p.broker_argv().join(" ")
                     ),
                 );
                 false
@@ -1819,8 +2187,7 @@ fn instances(out: &mut Out) -> Vec<Instance> {
 
 /// Step 9: arm every running instance. Answers the ones that carry this
 /// command (armed now or before), in the order they were listed.
-fn arm_instances(p: &Paths, node: &str, out: &mut Out) -> Vec<Instance> {
-    let argv = p.bridge_command(node);
+fn arm_instances(argv: &[String], out: &mut Out) -> Vec<Instance> {
     let ours = fabric::serve_flags(&argv.join(" "));
     let found = instances(out);
     if found.is_empty() {
@@ -1864,6 +2231,10 @@ fn arm_instances(p: &Paths, node: &str, out: &mut Out) -> Vec<Instance> {
             &format!("armed {pid}"),
         );
         if out.dry_run {
+            // Listed as armed so the dry run's PROOF line names the session it
+            // would post through, rather than "no armed instance" — the
+            // instance is untouched either way.
+            armed.push(inst);
             continue;
         }
         let Ok(mut ctl) = Ctl::connect(&inst.sock, &inst.token) else {
@@ -2131,33 +2502,175 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
 // on
 // ---------------------------------------------------------------------------
 
+/// `on --tcp <bind> --key-file <k> [--allow-remote]`, validated into the
+/// [`Wire`] THIS host serves — before anything is written. `Ok(Wire::Unix)`
+/// with neither flag.
+///
+/// # Errors
+///
+/// A usage-level refusal (exit 2): one flag without the other, a default build
+/// ([`crate::transport::SEALED_UNAVAILABLE`]), a bind that does not resolve or
+/// has no fixed port (the port is written into every bridge command, so an
+/// ephemeral one is refused), or a non-loopback bind without
+/// `--allow-remote`.
+pub fn wire_for_on(opts: &OnOpts) -> Result<Wire, String> {
+    let (bind, key) = match (&opts.tcp, &opts.key_file) {
+        (None, None) => {
+            if opts.allow_remote {
+                return Err(
+                    "--allow-remote needs --tcp <bind> (a Unix socket is never remote)".to_string(),
+                );
+            }
+            return Ok(Wire::Unix);
+        }
+        (Some(_), None) => {
+            return Err(
+                "--tcp needs --key-file: the broker serves TCP only SEALED (a missing file is \
+                 minted there, 0600)"
+                    .to_string(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "--key-file needs --tcp <bind> (the sealed wire is a TCP transport)".to_string(),
+            );
+        }
+        (Some(b), Some(k)) => (b, k),
+    };
+    if !crate::transport::SEALED {
+        return Err(format!("--tcp: {}", crate::transport::SEALED_UNAVAILABLE));
+    }
+    match crate::transport::endpoint_port(bind) {
+        Some(0) | None => {
+            return Err(format!(
+                "--tcp {}: a <host>:<port> with a FIXED port — it is written into every joining \
+                 host's bridge command, so an ephemeral one would change under them",
+                safe(bind, 128)
+            ));
+        }
+        Some(_) => {}
+    }
+    match crate::transport::is_loopback_endpoint(bind) {
+        Ok(true) => {}
+        Ok(false) if opts.allow_remote => {}
+        Ok(false) => {
+            return Err(format!(
+                "--tcp {}: not a loopback address, and a broker bound there is reachable from the \
+                 network. The sealed wire keeps out a peer WITHOUT the key, but the key is one \
+                 pre-shared secret every host of the fleet holds — a transport boundary, not a \
+                 per-host identity. Add --allow-remote to say that is what you mean (a second \
+                 host needs it; open that one port to it, no wider)",
+                safe(bind, 128)
+            ));
+        }
+        Err(e) => return Err(format!("--tcp {}: {e}", safe(bind, 128))),
+    }
+    let key_file = absolute(key);
+    Ok(Wire::Sealed {
+        bind: Some(bind.clone()),
+        dial: crate::transport::dial_for_bind(bind),
+        key_file,
+        allow_remote: opts.allow_remote,
+    })
+}
+
+/// `path` as an absolute path: itself, or joined to the working directory. A
+/// relative path written into a plist or a bridge command would resolve
+/// against whatever directory THAT process starts in.
+pub(crate) fn absolute(path: &str) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().map_or(p.clone(), |cwd| cwd.join(&p))
+    }
+}
+
+/// The pre-shared key THIS host's broker serves under (`on --tcp`): an
+/// existing file is CHECKED — 64 hex characters, mode 0600 — and never
+/// replaced (a key another host already holds is the fleet's, and a silent
+/// re-key would cut every joined host off with a handshake failure); a missing
+/// one is minted, 32 random bytes as 64 hex, 0600. `false` stops the run.
+fn key_step(key_file: &Path, out: &mut Out) -> bool {
+    let shown = key_file.display().to_string();
+    let path = key_file.to_string_lossy();
+    if key_file.exists() {
+        return match crate::transport::read_private_key_file(&path) {
+            Ok(_) => {
+                out.already(
+                    "key",
+                    &format!("{shown} (0600, 64 hex: the fleet's pre-shared key)"),
+                );
+                true
+            }
+            Err(e) => {
+                out.fail(
+                    "key",
+                    &format!(
+                        "{}: it is never replaced silently — a joined host holds this key; fix \
+                         it, or name a new --key-file and re-join every host",
+                        safe(&e.to_string(), 256)
+                    ),
+                );
+                false
+            }
+        };
+    }
+    out.done(
+        "key",
+        &format!("mint a pre-shared key into {shown} (64 hex, 0600)"),
+        &format!("minted {shown} (0600) — the file a joining host copies"),
+    );
+    if out.dry_run {
+        return true;
+    }
+    let minted = random_bytes(32).and_then(|b| {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&b);
+        write_atomic(
+            key_file,
+            crate::transport::key_file_text(&key).as_bytes(),
+            0o600,
+        )
+    });
+    if let Err(e) = minted {
+        out.fail("key", &format!("{shown}: {e}"));
+        return false;
+    }
+    true
+}
+
 /// `aterm fabric on`.
 #[must_use]
 pub fn on(opts: &OnOpts) -> ExitCode {
-    if opts.tcp.is_some() || opts.key_file.is_some() {
-        eprintln!(
-            "aterm fabric on: --tcp/--key-file are refused in this build: `aterm link broker` \
-             serves the Unix socket only, and the sealed TCP listener is behind astream's `aead` \
-             feature, which a default build (and the shipped binary) does not carry — so the \
-             flags would be written into a config the bridge could not dial. Round 16 adds the \
-             listener; until then the fabric is one host over the Unix socket."
-        );
-        return ExitCode::from(2);
-    }
-    let p = match Paths::resolve(opts.fleet.as_deref()) {
+    let wire = match wire_for_on(opts) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("aterm fabric on: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut p = match Paths::resolve(opts.fleet.as_deref()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("aterm fabric on: {e}");
             return ExitCode::from(2);
         }
     };
+    p.wire = wire;
     let service = opts.service.unwrap_or_else(Service::default_here);
     let mut out = Out::new(opts.dry_run);
     println!(
-        "aterm fabric on — fleet {} · root {} · service {}{}",
+        "aterm fabric on — fleet {} · root {} · service {}{}{}",
         safe(&p.fleet, 64),
         p.root.display(),
         service.name(),
+        match &p.wire {
+            Wire::Sealed {
+                bind: Some(bind), ..
+            } => format!(" · broker on the SEALED TCP wire at {}", safe(bind, 128)),
+            _ => String::new(),
+        },
         if opts.dry_run {
             " · DRY RUN: every step printed, nothing touched"
         } else {
@@ -2166,7 +2679,9 @@ pub fn on(opts: &OnOpts) -> ExitCode {
     );
 
     // The refusals that must come before anything is written.
-    let sock = p.sock();
+    // The socket is the broker's on BOTH wires `on` serves: the sealed one
+    // serves it beside the TCP port, for this host's own bridges.
+    let sock = p.endpoint();
     if sock.len() >= SUN_PATH_MAX {
         out.fail(
             "socket",
@@ -2179,26 +2694,36 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         return ExitCode::from(2);
     }
     let state = p.state();
+    let key_word = match &p.wire {
+        Wire::Sealed { key_file, .. } => key_file.to_string_lossy().into_owned(),
+        Wire::Unix => String::new(),
+    };
     for word in [
         p.aterm.as_str(),
         p.fleet.as_str(),
         sock.as_str(),
         &p.cap().to_string_lossy(),
         &state.to_string_lossy(),
+        key_word.as_str(),
     ] {
         if let Err(e) = argv_safe(word) {
             out.fail("argv", &e);
             return ExitCode::from(2);
         }
     }
-    match binary_has_link(&p) {
+    match binary_has_link(&p).and_then(|()| binary_has_sealed(&p)) {
         Ok(()) => out.ok(
             "binary",
             &format!(
-                "{} ({}serve + {}broker)",
+                "{} ({}serve + {}broker{})",
                 p.aterm,
                 if p.is_link_shim() { "" } else { "link " },
-                if p.is_link_shim() { "" } else { "link " }
+                if p.is_link_shim() { "" } else { "link " },
+                if matches!(p.wire, Wire::Sealed { .. }) {
+                    ", sealed TCP compiled in"
+                } else {
+                    ""
+                }
             ),
         ),
         Err(e) => {
@@ -2301,6 +2826,14 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         }
     }
 
+    // 4b. the pre-shared key, on the sealed wire THIS host serves
+    if let Wire::Sealed { key_file, .. } = &p.wire {
+        let key_file = key_file.clone();
+        if !key_step(&key_file, &mut out) {
+            return ExitCode::from(2);
+        }
+    }
+
     // 5. the cap file
     let cap = p.cap();
     let cap_ok = if cap.exists() {
@@ -2333,12 +2866,49 @@ pub fn on(opts: &OnOpts) -> ExitCode {
 
     // 6. the broker. A dry run keeps going past one that does not answer —
     // the point of a dry run is to see EVERY step — and exits 1 at the end.
-    if !broker_step(&p, &node, service, &mut out) && !opts.dry_run {
+    // On the sealed wire, a broker that answers on its socket must answer on
+    // the TCP port too (6b).
+    let broker_ok = broker_step(&p, &node, service, &mut out);
+    if !broker_ok && !opts.dry_run {
+        return ExitCode::FAILURE;
+    }
+    if broker_ok && !wire_step(&p, &mut out) && !opts.dry_run {
         return ExitCode::FAILURE;
     }
 
-    // 7. aterm.toml
+    // 7–12: the config, the rendezvous file, the instances, the proof, the
+    // undo and the status — the same tail `join` runs.
     let argv = p.bridge_command(&node);
+    finish(&p, &node, &argv, &mut out, opts.dry_run, Verb::On)
+}
+
+/// Which command [`finish`] is finishing — the words its last lines use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verb {
+    /// `aterm fabric on`.
+    On,
+    /// `aterm fabric join` (`crate::join`).
+    Join,
+}
+
+/// Steps 7–12 of `on`, and the same steps of `join`: write `[fabric] command`
+/// (atomically, with a `.bak`), write the rendezvous file, arm every running
+/// instance with `argv`, PROVE the round trip, print the undo scoped like this
+/// run, then the status. The exit code is this run's: the steps and the proof.
+pub(crate) fn finish(
+    p: &Paths,
+    node: &str,
+    argv: &[String],
+    out: &mut Out,
+    dry_run: bool,
+    verb: Verb,
+) -> ExitCode {
+    let opts = FinishOpts { dry_run };
+    let node = node.to_string();
+    let state = p.state();
+    let sock = p.endpoint();
+    let cap = p.cap();
+    // 7. aterm.toml
     let command = argv.join(" ");
     let Some(config) = p.config.clone() else {
         out.fail(
@@ -2361,7 +2931,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
             &format!("[fabric] command in {} is this command", config.display()),
         ),
         Ok((new_text, true)) => {
-            let (verb, did) = if text.contains("[fabric]") {
+            let (word, did) = if text.contains("[fabric]") {
                 ("update", "updated")
             } else {
                 ("add", "added")
@@ -2369,7 +2939,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
             out.done(
                 "config",
                 &format!(
-                    "{verb} [fabric] command in {} (previous saved as .bak)",
+                    "{word} [fabric] command in {} (previous saved as .bak)",
                     config.display()
                 ),
                 "",
@@ -2408,6 +2978,30 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         cap_file: cap.to_string_lossy().into_owned(),
         state: state.to_string_lossy().into_owned(),
         command: command.clone(),
+        key_file: match &p.wire {
+            Wire::Sealed {
+                bind: None,
+                key_file,
+                ..
+            } => Some(key_file.to_string_lossy().into_owned()),
+            _ => None,
+        },
+        serves_tcp: match &p.wire {
+            Wire::Sealed {
+                bind: Some(_),
+                dial,
+                ..
+            } => Some(dial.clone()),
+            _ => None,
+        },
+        serves_key_file: match &p.wire {
+            Wire::Sealed {
+                bind: Some(_),
+                key_file,
+                ..
+            } => Some(key_file.to_string_lossy().into_owned()),
+            _ => None,
+        },
     };
     match p.rendezvous.clone() {
         None => out.fail(
@@ -2442,7 +3036,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
     }
 
     // 9. the running instances
-    let armed = arm_instances(&p, &node, &mut out);
+    let armed = arm_instances(argv, out);
 
     // 10. the proof
     let proof_failed = if armed.is_empty() {
@@ -2453,7 +3047,7 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         );
         false
     } else {
-        match prove(&armed, &mut out) {
+        match prove(&armed, out) {
             Ok(_) => false,
             Err(e) => {
                 out.fail("proof", &e);
@@ -2517,7 +3111,13 @@ pub fn on(opts: &OnOpts) -> ExitCode {
         };
     }
     if out.changed == 0 {
-        println!("\nnothing changed: the fabric was already on, and the proof ran again.");
+        println!(
+            "\nnothing changed: {}, and the proof ran again.",
+            match verb {
+                Verb::On => "the fabric was already on",
+                Verb::Join => "this host had already joined",
+            }
+        );
     }
 
     // 11. status. THE EXIT CODE IS THIS RUN'S: the proof and the steps. The
@@ -2546,6 +3146,11 @@ pub fn on(opts: &OnOpts) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The one flag [`finish`] reads.
+struct FinishOpts {
+    dry_run: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2646,10 +3251,17 @@ pub fn off(opts: &OffOpts) -> ExitCode {
         }
         Service::None => out.note(
             "broker",
-            &format!(
-                "--service none: whatever runs `link broker {}` is yours to stop",
-                p.sock()
-            ),
+            &if Path::new(&p.log()).exists() {
+                format!(
+                    "--service none: whatever runs this root's `link broker` (its log is {}) is \
+                     yours to stop",
+                    p.log()
+                )
+            } else {
+                "--service none: this root runs no broker of its own (a joined host dials the \
+                 first host's)"
+                    .to_string()
+            },
         ),
     }
 
@@ -2718,20 +3330,38 @@ pub fn off(opts: &OffOpts) -> ExitCode {
         None => out.note("rendezvous", "no control-socket dir resolves"),
     }
 
+    let kept: Vec<&str> = [
+        ("mint.secret", p.secret()),
+        ("node.cap", p.cap()),
+        ("fleet.key", p.installed_key()),
+    ]
+    .iter()
+    .filter(|(_, path)| path.exists())
+    .map(|(name, _)| *name)
+    .collect();
     out.note(
         "kept",
         &format!(
-            "{}: node id{}, mint.secret and node.cap — identity is provisioned, never discarded",
+            "{}: node id{}{}{} — identity is provisioned, never discarded",
             p.root.display(),
-            read_node(&p.state()).map_or_else(String::new, |n| format!(" {n}"))
+            read_node(&p.state()).map_or_else(String::new, |n| format!(" {n}")),
+            if kept.is_empty() { "" } else { ", " },
+            kept.join(", ")
         ),
     );
     out.note(
         "bus log",
-        &format!(
-            "{} stays; delete it yourself if you want the log gone",
-            p.log()
-        ),
+        &if Path::new(&p.log()).exists() {
+            format!(
+                "{} stays; delete it yourself if you want the log gone",
+                p.log()
+            )
+        } else {
+            format!(
+                "none in {} — the bus this host used is the broker's, on the host that serves it",
+                p.root.display()
+            )
+        },
     );
     let running: BTreeSet<u32> = aterm_ctl::local_instances()
         .unwrap_or_default()
@@ -2917,6 +3547,77 @@ pub fn doctor() -> ExitCode {
 mod tests {
     use super::*;
 
+    /// **A PLANTED NAME IS NEVER WRITTEN THROUGH** (round 16 review, defect 4).
+    /// `mint-for --out` into a directory another user writes: the writer's
+    /// temp was `<out>.tmp.<pid>`, opened `create(true)` and chmod'ed by path,
+    /// so a symlink planted there took the cap into ITS target and made that
+    /// file 0600 (measured: the operator's own file held the eight grants).
+    /// Now the temp is a fresh name created exclusively: the planted link and
+    /// its target are untouched, the cap lands as a regular 0600 file, and no
+    /// temp is left behind. A symlink AT the path itself is replaced by the
+    /// rename — its target is never written either.
+    #[test]
+    fn write_atomic_never_writes_through_a_planted_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("atfo-plant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(&shared).expect("scratch");
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "the operator's own file\n").expect("victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let out = shared.join("m7.cap");
+        let planted = shared.join(format!("m7.tmp.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant");
+        write_atomic(&out, b"eight grant lines\n", 0o600).expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "the operator's own file\n"
+        );
+        assert_eq!(
+            mode(&victim),
+            0o644,
+            "the victim's mode was changed through the link"
+        );
+        let meta = std::fs::symlink_metadata(&out).expect("out");
+        assert!(meta.file_type().is_file(), "{meta:?}");
+        assert_eq!(mode(&out), 0o600);
+        assert_eq!(std::fs::read(&out).expect("out"), b"eight grant lines\n");
+        assert!(std::fs::symlink_metadata(&planted)
+            .expect("planted")
+            .file_type()
+            .is_symlink());
+        let mut names: Vec<String> = std::fs::read_dir(&shared)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "m7.cap".to_string(),
+                format!("m7.tmp.{}", std::process::id())
+            ],
+            "a temp was left behind"
+        );
+        // A symlink AT the path: replaced, its target never written.
+        let target = dir.join("elsewhere");
+        std::fs::write(&target, "untouched\n").expect("target");
+        let linked = shared.join("fleet.key");
+        std::os::unix::fs::symlink(&target, &linked).expect("link");
+        write_atomic(&linked, b"key\n", 0o600).expect("write over the link");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target"),
+            "untouched\n"
+        );
+        assert!(std::fs::symlink_metadata(&linked)
+            .expect("linked")
+            .file_type()
+            .is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// THE LABEL RULE: the default root keeps the plain label; any other root
     /// derives one from POSIX `cksum` of its path — the number
     /// `tools/fabric-enable.sh` computed, measured on this machine:
@@ -2938,6 +3639,7 @@ mod tests {
             fleet: "local".to_string(),
             config: None,
             rendezvous: None,
+            wire: Wire::Unix,
         };
         assert_eq!(p("/Users//example/.local/share/aterm-fabric").label(), LABEL);
         assert_eq!(
@@ -2963,6 +3665,7 @@ mod tests {
             fleet: "local".to_string(),
             config: None,
             rendezvous: None,
+            wire: Wire::Unix,
         };
         let live = paths("/Users//example", Some("/Users//example"));
         let redirected = paths("/tmp/x", Some("/Users//example"));
@@ -2998,6 +3701,7 @@ mod tests {
             fleet: "local".to_string(),
             config: None,
             rendezvous: None,
+            wire: Wire::Unix,
         };
         let text = p.plist_text();
         assert!(
@@ -3124,6 +3828,7 @@ mod tests {
             fleet: "local".to_string(),
             config: None,
             rendezvous: None,
+            wire: Wire::Unix,
         };
         assert_eq!(
             p(
@@ -3284,6 +3989,9 @@ mod tests {
             cap_file: "/tmp/x/node.cap".to_string(),
             state: "/tmp/x/link-state".to_string(),
             command: "/x/aterm link serve --fleet local --broker /tmp/x/bus.sock".to_string(),
+            key_file: None,
+            serves_tcp: None,
+            serves_key_file: None,
         };
         let text = r.render();
         assert!(text.starts_with("# Written by `aterm fabric on`"));
@@ -3363,6 +4071,202 @@ mod tests {
         assert_eq!(fix_for("something new"), "see `aterm help fabric`");
     }
 
+    /// ROUND 16: THE SEALED WIRE this host serves is one argv to launchd and a
+    /// unit with no socket to unlink — the broker always guarded with the
+    /// root's own mint secret, and serving the root's socket BESIDE the port,
+    /// which is what this host's own bridges dial (the review: a peer that can
+    /// reach the port can hold its handshake slots). A JOINED host's bridges
+    /// carry `--tcp --key-file` to the remote broker.
+    #[test]
+    fn the_sealed_wire_is_one_broker_argv_and_one_set_of_bridge_flags() {
+        let p = Paths {
+            home: PathBuf::from("/Users//u"),
+            login_home: Some(PathBuf::from("/Users//u")),
+            root: PathBuf::from("/tmp/r"),
+            aterm: "/usr/local/bin/aterm".to_string(),
+            fleet: "local".to_string(),
+            config: None,
+            rendezvous: None,
+            wire: Wire::Sealed {
+                bind: Some("0.0.0.0:7000".to_string()),
+                dial: crate::transport::dial_for_bind("0.0.0.0:7000"),
+                key_file: PathBuf::from("/k/fleet.key"),
+                allow_remote: true,
+            },
+        };
+        assert_eq!(
+            p.broker_argv().join(" "),
+            "/usr/local/bin/aterm link broker --tcp 0.0.0.0:7000 --key-file /k/fleet.key \
+             --secret-file /tmp/r/mint.secret --allow-remote --unix /tmp/r/bus.sock \
+             /tmp/r/bus.log"
+        );
+        assert_eq!(
+            p.bridge_command("n-a").join(" "),
+            "/usr/local/bin/aterm link serve --fleet local --broker /tmp/r/bus.sock \
+             --cap-file /tmp/r/node.cap --state /tmp/r/link-state --accept-from n-a",
+            "this host's own bridges dial the socket, not the port"
+        );
+        let joined = Paths {
+            wire: Wire::Sealed {
+                bind: None,
+                dial: "m100.local:7000".to_string(),
+                key_file: PathBuf::from("/tmp/r/fleet.key"),
+                allow_remote: false,
+            },
+            ..p.clone()
+        };
+        assert_eq!(
+            joined.bridge_command("n-b").join(" "),
+            "/usr/local/bin/aterm link serve --fleet local --broker m100.local:7000 --tcp \
+             --key-file /tmp/r/fleet.key --cap-file /tmp/r/node.cap --state \
+             /tmp/r/link-state --accept-from n-b"
+        );
+        assert!(
+            p.bridge_command_accepting("n-a", &["n-b".to_string(), "n-a".to_string()])
+                .join(" ")
+                .ends_with("--accept-from n-a,n-b"),
+            "the node first, each principal once"
+        );
+        let unit = p.unit_text();
+        assert!(!unit.contains("rm -f"), "{unit}");
+        assert!(
+            unit.contains("'--tcp' '0.0.0.0:7000'") && unit.contains("'--secret-file'"),
+            "{unit}"
+        );
+        let plist = p.plist_text();
+        assert!(p.plist_is_current(&plist), "{plist}");
+        // The Unix plist of the SAME root is not this job: switching a root
+        // to the sealed wire restarts its broker.
+        let unix = Paths {
+            wire: Wire::Unix,
+            ..p.clone()
+        };
+        assert!(!p.plist_is_current(&unix.plist_text()));
+        assert_eq!(
+            p.label(),
+            unix.label(),
+            "the label follows the root, not the wire"
+        );
+        // Every flag `on --tcp` refuses, it refuses before a path is resolved.
+        let on = |tcp: Option<&str>, key: Option<&str>, remote: bool| {
+            wire_for_on(&OnOpts {
+                tcp: tcp.map(str::to_string),
+                key_file: key.map(str::to_string),
+                allow_remote: remote,
+                ..OnOpts::default()
+            })
+        };
+        assert_eq!(on(None, None, false), Ok(Wire::Unix));
+        assert!(on(None, None, true).is_err(), "--allow-remote alone");
+        assert!(on(Some("127.0.0.1:7000"), None, false).is_err());
+        assert!(on(None, Some("/k"), false).is_err());
+        if crate::transport::SEALED {
+            assert!(
+                on(Some("127.0.0.1:0"), Some("/k"), false).is_err(),
+                "port 0"
+            );
+            assert!(
+                on(Some("0.0.0.0:7000"), Some("/k"), false).is_err(),
+                "remote"
+            );
+            assert_eq!(
+                on(Some("0.0.0.0:7000"), Some("/k"), true),
+                Ok(Wire::Sealed {
+                    bind: Some("0.0.0.0:7000".to_string()),
+                    dial: "127.0.0.1:7000".to_string(),
+                    key_file: PathBuf::from("/k"),
+                    allow_remote: true,
+                })
+            );
+        } else {
+            let e = on(Some("127.0.0.1:7000"), Some("/k"), false).expect_err("default build");
+            assert!(e.contains("`sealed` cargo feature"), "{e}");
+        }
+    }
+
+    /// THE RENDEZVOUS FILE CARRIES THE WIRE: a joined host's round-trips with
+    /// its key file, and `ls|glance|tui` default `--tcp --key-file` WITH the
+    /// broker — never onto a `--broker` the caller spelled out. The host that
+    /// SERVES the sealed wire records it as `serves_tcp`/`serves_key_file`
+    /// beside its socket, and its own tools default to the socket.
+    #[test]
+    fn a_sealed_rendezvous_defaults_its_wire_flags_with_its_broker() {
+        let served = Rendezvous {
+            fleet: "f".to_string(),
+            broker: "/r/bus.sock".to_string(),
+            node: "n-a".to_string(),
+            cap_file: "/r/node.cap".to_string(),
+            state: "/r/link-state".to_string(),
+            command: "x".to_string(),
+            key_file: None,
+            serves_tcp: Some("127.0.0.1:7000".to_string()),
+            serves_key_file: Some("/k/fleet.key".to_string()),
+        };
+        let text = served.render();
+        assert!(
+            text.contains("serves_tcp = \"127.0.0.1:7000\"")
+                && text.contains("serves_key_file = \"/k/fleet.key\"")
+                && !text.contains("transport ="),
+            "{text}"
+        );
+        assert_eq!(Rendezvous::parse(&text), Ok(served.clone()));
+        assert_eq!(
+            fill_defaults(&[], &served).join(" "),
+            "--fleet f --broker /r/bus.sock --cap-file /r/node.cap --state /r/link-state"
+        );
+        assert!(Rendezvous::parse(&text.replace("\"127.0.0.1:7000\"", "7000")).is_err());
+        let r = Rendezvous {
+            fleet: "f".to_string(),
+            broker: "127.0.0.1:7000".to_string(),
+            node: "n-a".to_string(),
+            cap_file: "/r/node.cap".to_string(),
+            state: "/r/link-state".to_string(),
+            command: "x".to_string(),
+            key_file: Some("/r/fleet.key".to_string()),
+            serves_tcp: None,
+            serves_key_file: None,
+        };
+        let text = r.render();
+        assert!(text.contains("transport = \"tcp+sealed\""), "{text}");
+        assert_eq!(Rendezvous::parse(&text), Ok(r.clone()));
+        let fill = |args: &[&str]| -> String {
+            let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            fill_defaults(&args, &r).join(" ")
+        };
+        assert_eq!(
+            fill(&[]),
+            "--fleet f --broker 127.0.0.1:7000 --cap-file /r/node.cap --state /r/link-state \
+             --tcp --key-file /r/fleet.key"
+        );
+        assert_eq!(
+            fill(&["--broker", "/tmp/b.sock"]),
+            "--fleet f --cap-file /r/node.cap --state /r/link-state --broker /tmp/b.sock",
+            "a spelled-out broker gets no wire flags it did not ask for"
+        );
+        assert!(
+            Rendezvous::parse(&text.replace("key_file = \"/r/fleet.key\"", "key_file = 1"))
+                .is_err()
+        );
+        // The root is found from the cap on the sealed wire.
+        assert_eq!(
+            root_of(
+                &crate::transport::Transport::Tcp,
+                "127.0.0.1:7000",
+                Some(&"/r/node.cap".to_string())
+            ),
+            Some(PathBuf::from("/r"))
+        );
+        assert_eq!(
+            root_of(
+                &crate::transport::Transport::Tcp,
+                "127.0.0.1:7000",
+                Some(&"/elsewhere/m7.cap".to_string())
+            ),
+            None,
+            "a hand-written command's files have no root this command may act on"
+        );
+    }
+
     /// THE DEFAULTS are filled only for flags that are absent.
     #[test]
     fn rendezvous_defaults_fill_only_absent_flags() {
@@ -3373,6 +4277,9 @@ mod tests {
             cap_file: "/c".to_string(),
             state: "/s".to_string(),
             command: "x".to_string(),
+            key_file: None,
+            serves_tcp: None,
+            serves_key_file: None,
         };
         let fill = |args: &[&str]| -> Vec<String> {
             let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();

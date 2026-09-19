@@ -1600,6 +1600,26 @@ mod tests {
         out
     }
 
+    /// Make `path` unreadable, answering the permissions it HAD — restore with
+    /// [`restore_mode`], NEVER with a literal. A file `std::fs::write` lays carries
+    /// `0o666 & !umask`: `0o644` under the `022` most shells set, `0o664` under the `002` a
+    /// Debian-style per-user-group login gives, and this fleet runs both. A literal restore
+    /// therefore does not put the file back — it CHANGES the store file — and a view whose
+    /// entries are identified by length, permission bits and mtime
+    /// ([`crate::clone::is_clone_of`]) is then correctly re-laid. That reads exactly like the
+    /// destructive production defect these tests pin, from a fixture that never staged it.
+    #[must_use]
+    fn unreadable(path: &Path) -> std::fs::Permissions {
+        let had = std::fs::symlink_metadata(path).unwrap().permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        had
+    }
+
+    /// Put back exactly what [`unreadable`] measured.
+    fn restore_mode(path: &Path, had: &std::fs::Permissions) {
+        std::fs::set_permissions(path, had.clone()).unwrap();
+    }
+
     fn debris(layout: &Layout) -> Vec<String> {
         std::fs::read_dir(roots_dir(layout))
             .map(|l| {
@@ -2819,7 +2839,7 @@ mod tests {
             (vec![8595], vec![shim.clone()])
         );
         let rustc = build.join("bin").join("rustc");
-        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let rustc_mode = unreadable(&rustc);
         assert!(needs_root(&build).is_err(), "{:?}", needs_root(&build));
         let before = (
             stamps(&build),
@@ -2848,17 +2868,28 @@ mod tests {
             stamps(&compat_dir(&fx.layout)),
             stamps(&fx.layout.bin_dir()),
         );
-        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o644)).unwrap();
+        restore_mode(&rustc, &rustc_mode);
         assert_eq!(after, before, "an unproven answer moved something");
         assert!(route_for_shim(&shim, &fx.tool(8595, "tippy")).is_some());
         let healed = reconcile(&fx.layout, Depth::Deep);
         assert!(!healed.changed(), "{healed:?}");
         // The error arm of `needs_root` itself: a `bin/trustc` that cannot be opened.
         let trustc = build.join("bin").join("trustc");
-        std::fs::set_permissions(&trustc, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let trustc_mode = unreadable(&trustc);
         let read = needs_root(&build);
-        std::fs::set_permissions(&trustc, std::fs::Permissions::from_mode(0o644)).unwrap();
+        restore_mode(&trustc, &trustc_mode);
         assert!(read.is_err(), "{read:?}");
+        // THE FIXTURE PROVES ITS OWN PRECONDITION. Both chmod round-trips above must leave
+        // the store exactly as they found it: the view's `bin/rustc` and `bin/trustc` are
+        // clones of the store's `bin/trustc`, and a clone is identified by length,
+        // permission bits and mtime, so a restore that invented a mode instead of measuring
+        // one leaves the root CORRECTLY stale — and every `!changed()` below would then read
+        // as the destructive defect this test pins rather than as a broken fixture.
+        assert_eq!(
+            root_first_mismatch(&build, &root_dir(&fx.layout, 8595), Depth::Deep),
+            None,
+            "the fixture's chmod round-trip, not a reconcile, moved the store"
+        );
         // A `store/trust` that cannot be searched: the build directory's own `lstat` fails,
         // which is no more proof that the build is GONE than a failed read is proof that it
         // needs none. The sweep and strays keep the root, inspect answers `Err`, nothing

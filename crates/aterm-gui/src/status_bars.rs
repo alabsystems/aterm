@@ -84,9 +84,10 @@ pub(crate) const HOLD_NOTICE: Duration = Duration::from_secs(30);
 pub(crate) const HOLD_MANAGED: Duration = Duration::from_secs(15);
 /// How long a STAGED update bar stays up while the AUTOMATIC lane is armed to
 /// apply it — the pull-down IS the "update ready" surface now (2026-09-07),
-/// so it holds until the apply lands (forced within ~2 min; the typing hold can
-/// stand the lane down for up to ten) rather than folding after eight seconds
-/// and leaving the moment to a floating card.
+/// so it holds until the apply lands (at the first quiet moment; past its
+/// two-minute grace the lane waits only for a gap in typing and output, and the
+/// typing hold can stand it down for up to ten) rather than folding after eight
+/// seconds and leaving the moment to a floating card.
 pub(crate) const HOLD_STAGED_AUTOMATIC: Duration = Duration::from_secs(10 * 60);
 /// How long a STAGED bar holds when the build applies only on a press: long
 /// enough to be seen and clicked, short enough that a declined update does not
@@ -107,19 +108,18 @@ const TAILED_STALE: Duration = Duration::from_secs(30);
 /// progress file to tail — no store layout): a terminal marker normally answers
 /// it; if none ever comes, it folds after the same hold the old pill had.
 const ANNOUNCE_STALE: Duration = Duration::from_secs(20 * 60);
-/// The cap on the "waiting for another install" row ([`StatusBars::toolchain_waiting`],
-/// 2026-09-10): it is normally retired by the sibling's first tailed snapshot, by
-/// this child's own markers, or by the child's exit — this is the backstop for a
-/// launch thread that died, and it must OUTLAST the child's own `--wait-lock` bound
-/// (`crate::ATPKG_WAIT_LOCK_SECS`; a test pins the order).
-const WAIT_STALE: Duration = Duration::from_secs(35 * 60);
-/// The title of that row — also how [`Bar::is_waiting`] recognises it.
-/// The waiting row's title. No "lock" and no "blocked" anywhere in it: the owner read
-/// the 2026-09-14 row (a self-update's successor queued behind the outgoing window's
-/// pass) as "an error about a lock blocking atpkg installation" and relaunched the
-/// app. The state is benign — another aterm process is installing, and this window's
-/// pass runs when it finishes — so the row says exactly that.
-const WAITING_TITLE: &str = "Another aterm is installing the ALab toolchain";
+// THERE IS NO "WAITING" ROW (2026-09-18). A launch child queued behind another
+// atpkg pass at the store lock (`lock-waiting:`) used to paint a live Info row —
+// "Another aterm is installing the ALab toolchain · this window continues when it
+// finishes" — for ANY announced wait. The owner read it on 2026-09-18 with one
+// aterm on the machine: the holder was this app's own predecessor's launch pass
+// after a self-update, so "another aterm" was false, and "this window continues"
+// named a wait the window never had (only the background child was queued). The
+// row could also only ever be on glass when the holder was doing nothing worth
+// showing — a real install's tailed meter outranks it, and a no-op holder paints
+// nothing (`toolchain_snapshot`'s no-op rule) — so it is gone: the wait is one INFO
+// log line (`Wake::PkgLockWaiting`), a holder WITH a plan shows through the tailer,
+// and a wait that runs out is still the deferred notice ([`StatusBars::toolchain_deferred`]).
 /// The cap on a LIVE update bar. The updater's download poller reports only on
 /// size CHANGE and its verify phase (codesign / Gatekeeper) can sit silent for
 /// tens of seconds, so this is long — but a check is bounded by curl's own
@@ -240,8 +240,10 @@ const APPLY_FROM_MENU: &str = if cfg!(target_os = "macos") {
 
 /// The press affordance on a Staged bar (2026-09-07): a left press on the row
 /// applies the build in place, the way the retired floating card's press did.
-/// Not offered where the handoff is off — there a press can only open the
-/// details page, which the bar does for every other state.
+/// Offered only where a press IS the way the build applies ([`with_affordance`],
+/// 2026-09-18): not where the handoff is off (a press can only open the
+/// details page, which the bar does for every other state), and not under the
+/// automatic posture (the lane lands by itself; a press still applies, silently).
 const CLICK_TO_APPLY: &str = "click to apply now";
 
 /// The "Installing / Finishing" row's title: names the version when there is
@@ -259,16 +261,25 @@ fn handoff_title(verb: &str, version: &str) -> String {
 /// The separator between a bar title and the press affordance appended to it.
 const TITLE_SEP: &str = " \u{b7} ";
 
-/// `base` plus the press affordance ([`CLICK_TO_APPLY`]) wherever a press
-/// applies — in the TITLE, which the layout keeps whole at every ordinary
-/// width, never at the truncated end of the detail (where it was measured cut
-/// off at 100 columns on 2026-09-07). Omitted where the handoff is off: there
-/// a press can only open the details page.
+/// `base` plus the press affordance ([`CLICK_TO_APPLY`]) ONLY where a press is
+/// the way the build applies — in the TITLE, which the layout keeps whole at
+/// every ordinary width, never at the truncated end of the detail (where it was
+/// measured cut off at 100 columns on 2026-09-07). Omitted where the handoff is
+/// off (a press can only open the details page) — and omitted where the lane
+/// applies BY ITSELF (2026-09-18): a row that asked "click to apply now" for an
+/// update the automatic lane would land within seconds read as an instruction,
+/// the owner clicked, and the click took the explicit lane's immediate freeze.
+/// A press on the bare row still applies (a silent accelerator), it is just not
+/// asked for. A caller that computed no posture (`None`) keeps the manual
+/// affordance: no shipping caller passes `None` for a Staged report
+/// (`note_update_progress` always computes one), and its paired detail
+/// (`staged_detail_unknown`) names only the menu.
 fn with_affordance(base: &str, posture: Option<ApplyPosture>) -> String {
-    if matches!(posture, Some(ApplyPosture::HandoffDisabled { .. })) {
-        base.to_string()
-    } else {
-        format!("{base}{TITLE_SEP}{CLICK_TO_APPLY}")
+    match posture {
+        Some(ApplyPosture::HandoffDisabled { .. })
+        | Some(ApplyPosture::Automatic)
+        | Some(ApplyPosture::ManualOnlyLatched { lapses: true }) => base.to_string(),
+        _ => format!("{base}{TITLE_SEP}{CLICK_TO_APPLY}"),
     }
 }
 
@@ -450,12 +461,14 @@ fn staged_hold(posture: Option<ApplyPosture>) -> Duration {
 #[must_use]
 pub(crate) fn staged_detail(build: u64, posture: ApplyPosture) -> String {
     let how = match posture {
+        // The mechanism, not a number (2026-09-18): the lane lands at the first
+        // quiet moment — seconds, usually — and past its grace it waits for a gap
+        // in typing and output; "within ~2 min" read as a wait beside a click
+        // affordance, and it was false whenever the typing hold ran past it.
         ApplyPosture::Automatic => {
-            // The promise tracks the constant that enforces it.
-            let minutes = crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE
-                .as_secs()
-                .div_ceil(60);
-            format!("applies in place within ~{minutes} min — your shells keep running")
+            "applies by itself at the next quiet moment — nothing to do; your shells keep \
+             running"
+                .to_string()
         }
         ApplyPosture::ManualByConfig => format!(
             "auto-apply is off — {APPLY_FROM_MENU} or Software Update (in place; your shells \
@@ -565,11 +578,6 @@ impl Bar {
         self.fold_at.is_some()
     }
 
-    /// The "queued behind another install" row ([`StatusBars::toolchain_waiting`]).
-    fn is_waiting(&self) -> bool {
-        self.text.title == WAITING_TITLE
-    }
-
     /// The instant this bar leaves on its own: its hold, or its staleness cap.
     fn retires_at(&self) -> Option<Instant> {
         self.fold_at.or(self.stale_at)
@@ -632,35 +640,13 @@ fn installing_bar(version: &str, now: Instant) -> Bar {
         text: BarText {
             glyph: '\u{2191}',
             title: handoff_title("Installing", version),
-            detail: "your shells are safe; the screen pauses for a moment".to_string(),
+            detail: "in place — your shells keep running".to_string(),
             stats: String::new(),
             tone: Tone::Info,
         },
         fill: None,
         fold_at: None,
         stale_at: Some(now + HANDOFF_STALE),
-        pass_id: None,
-        staged_build: None,
-        health: false,
-    }
-}
-
-/// The "queued behind another install" row ([`StatusBars::toolchain_waiting`]):
-/// live, no meter, Info, capped [`WAIT_STALE`] from `since` — the instant the
-/// child announced its wait, whether the row goes up then or when a held row
-/// folds.
-fn waiting_bar(since: Instant) -> Bar {
-    Bar {
-        text: BarText {
-            glyph: '\u{2139}',
-            title: WAITING_TITLE.to_string(),
-            detail: "this window continues when it finishes".to_string(),
-            stats: String::new(),
-            tone: Tone::Info,
-        },
-        fill: None,
-        fold_at: None,
-        stale_at: Some(since + WAIT_STALE),
         pass_id: None,
         staged_build: None,
         health: false,
@@ -705,19 +691,6 @@ pub(crate) struct StatusBars {
     /// (a new pass is the lane's newest truth) but records it as a fold does
     /// ([`Self::record_displaced_toolchain`]).
     toolchain_queue: std::collections::VecDeque<(Bar, Duration)>,
-    /// A store-lock wait ([`Self::toolchain_waiting`]) announced while a TERMINAL
-    /// row or the sibling holder's LIVE meter held the lane, as the instant it was
-    /// announced. That bar keeps the lane (a sentence meant to be read; a meter
-    /// that says more) and the wait is REMEMBERED — atpkg announces it once per
-    /// child, so a wait the lane could not show at once is otherwise never shown,
-    /// and the lane stood empty for up to the whole half-hour wait — and takes the
-    /// lane when that bar leaves, behind anything queued, capped from this instant
-    /// ([`Self::settle_with`]). Cleared by whatever would retire the row itself:
-    /// the child's exit (`toolchain_snapshot(None)`), any terminal post, the
-    /// child's own acquisition ([`Self::toolchain_wait_over`]), and a tailed
-    /// writer that is no longer running (the holder's pass ended: the lock frees
-    /// for our child within a poll).
-    waiting_behind: Option<Instant>,
     /// The `managed-current:` wire text the lane last raised a row for. atpkg
     /// prints the marker on EVERY pass, changed or not, and the recurring 6 h
     /// pass parses it exactly like the seed pass — so the row went up on every
@@ -747,10 +720,10 @@ pub(crate) struct StatusBars {
 /// file that already EXISTS (`hooks::ensure_rc_sources_hooks` never creates one,
 /// skips protected and symlinked rcs, and honours the block's own opt-out), so
 /// on a fresh Mac with no `~/.zshrc` the promise was simply false. What atpkg's
-/// own rc block does is `[ -f "<hook>" ] && . "<hook>"`; sourcing that hook in
-/// the live shell is the whole remedy — it moves `<prefix>/agents/` to the front
-/// of PATH, exports `ATPKG_AGENTS` and appends `bin/`, idempotently — and the
-/// tab keeps the integration it has. The file names are pinned from
+/// own rc block does is `if [ -f "<hook>" ]; then . "<hook>"; fi`; sourcing that
+/// hook in the live shell is the whole remedy — it moves `<prefix>/agents/` to
+/// the front of PATH, exports `ATPKG_AGENTS` and appends `bin/`, idempotently —
+/// and the tab keeps the integration it has. The file names are pinned from
 /// `crates/atpkg/src/hooks.rs` (`HOOK_BASENAME`, one file per dialect; POSIX
 /// `.` for zsh and bash, fish's `source`, PowerShell's dot-source), written by
 /// every pass before the marker this row is built from is printed. A shell
@@ -935,16 +908,6 @@ impl StatusBars {
             self.toolchain = Some(bar);
             promoted = true;
         }
-        // Nothing queued and nothing live: a wait the lane could not show when
-        // it was announced takes it now, capped from the announce — the child's
-        // own bound has been running since then, not since the fold.
-        if self.toolchain.is_none()
-            && self.toolchain_queue.is_empty()
-            && let Some(since) = self.waiting_behind.take()
-        {
-            self.toolchain = Some(waiting_bar(since));
-            promoted = true;
-        }
         self.rows() != before || restored || promoted
     }
 
@@ -1005,10 +968,12 @@ impl StatusBars {
                 || "-".to_string(),
                 |f| format!("{}/100", (f.clamp(0.0, 1.0) * 100.0).round() as u32),
             );
+            // Never "click to apply now" on a surface that cannot click: the live
+            // row's title is recorded the way a folded one is (2026-09-18).
             rows.push(format!(
                 "activity kind={} phase=live progress={progress} title={} detail={} stats={} outcome=-",
                 lane.as_str(),
-                enc(&bar.text.title),
+                enc(without_affordance(&bar.text.title)),
                 enc(&bar.text.detail),
                 enc(&bar.text.stats),
             ));
@@ -1114,48 +1079,9 @@ impl StatusBars {
         });
     }
 
-    /// An announcement or a terminal takes the lane outright, and a wait
-    /// remembered behind whatever was up is over: this child holds the lock, or
-    /// its outcome is in ([`Self::waiting_behind`]).
+    /// An announcement or a terminal takes the lane outright.
     fn replace_toolchain(&mut self, bar: Bar) {
-        self.waiting_behind = None;
         self.toolchain = Some(bar);
-    }
-
-    /// The launch-time child is QUEUED behind another atpkg process at the store
-    /// lock (`lock-waiting:`, the `--wait-lock` lanes): a LIVE Info row with no
-    /// meter, capped at [`WAIT_STALE`] from the announce, which the sibling's own
-    /// tailed snapshot replaces with the real install, a terminal marker outranks,
-    /// the child's own acquisition retires ([`Self::toolchain_wait_over`]) and
-    /// `toolchain_snapshot(None)` clears at the child's exit. It fills only an
-    /// EMPTY lane or refreshes itself: behind a live meter or a held terminal row
-    /// the wait is REMEMBERED instead ([`Self::waiting_behind`]) and goes up when
-    /// that bar leaves. Never the failure bar: a deferred pass is not a failed one.
-    pub(crate) fn toolchain_waiting(&mut self, now: Instant) {
-        if self
-            .toolchain
-            .as_ref()
-            .is_some_and(|live| live.terminal() || !live.is_waiting())
-        {
-            self.waiting_behind = Some(now);
-            return;
-        }
-        self.toolchain = Some(waiting_bar(now));
-    }
-
-    /// The wait ENDED IN THE LOCK (`lock-acquired:`, 2026-09-14): the waiting row
-    /// leaves, and so does a wait remembered behind another bar — and nothing
-    /// else: a meter is the tailer's to replace, and a held terminal row (the
-    /// sibling's outcome, posted at the holder's exit — the very thing that freed
-    /// the lock) is still a sentence meant to be read. atpkg used to print
-    /// nothing between acquisition and exit, so a child that waited and then ran
-    /// a QUIET verb kept the row up for the length of its own work under the lock
-    /// (a seed's index read: 6–18 s online, minutes offline).
-    pub(crate) fn toolchain_wait_over(&mut self) {
-        self.waiting_behind = None;
-        if self.toolchain.as_ref().is_some_and(Bar::is_waiting) {
-            self.toolchain = None;
-        }
     }
 
     /// The wait ran out (atpkg exit 75): the pass is DEFERRED — the loop retries on
@@ -1241,23 +1167,12 @@ impl StatusBars {
         let Some(snap) = snap else {
             // No data: a live bar without its file is a bar with nothing honest
             // to say — unless a terminal marker already gave it its last words.
-            // The child is gone, so a wait remembered behind those words is over
-            // too.
-            self.waiting_behind = None;
             if self.toolchain.as_ref().is_some_and(|b| !b.terminal()) {
                 self.toolchain = None;
             }
             return;
         };
         let f = &snap.file;
-        // The tailed writer is NOT running — its pass ended, or it died and this is
-        // our own child's final read — so the lock our child was queued on frees
-        // within one poll: a wait remembered behind the meter is over, whatever
-        // this read goes on to show. (Kept only while the writer RUNS: that is the
-        // holder our child waits for.)
-        if !snap.running {
-            self.waiting_behind = None;
-        }
         if self.toolchain.as_ref().is_some_and(Bar::terminal) {
             if let Some(bar) = self.toolchain.as_mut()
                 && bar.fill.is_some()
@@ -1500,8 +1415,7 @@ impl StatusBars {
     /// A bad terminal outcome for the toolchain lane (`seed-partial:` /
     /// `seed-failed:` / `net-failed:` / `seed-unusable:` / the synthetic
     /// "child died after announcing"). `what` is the whole sentence. Never for a
-    /// store-lock wait or its timeout — those are [`Self::toolchain_waiting`] and
-    /// [`Self::toolchain_deferred`] (2026-09-10).
+    /// store-lock wait's timeout — that is [`Self::toolchain_deferred`] (2026-09-10).
     pub(crate) fn toolchain_failed(&mut self, what: &str, now: Instant) {
         // A FAILURE ROW CARRIES NO METER. It used to inherit the live meter it
         // replaced ("how far the pass got before it broke"), filtered to a
@@ -1560,9 +1474,6 @@ impl StatusBars {
         now: Instant,
         ahead_of_notices: bool,
     ) {
-        // A terminal outranks a wait (the child ran, or its wait timed out):
-        // whatever was remembered behind the held row is over.
-        self.waiting_behind = None;
         let held = self
             .toolchain
             .as_ref()
@@ -1996,7 +1907,7 @@ impl StatusBars {
             text: BarText {
                 glyph: '\u{2191}',
                 title: handoff_title("Finishing", version),
-                detail: "keys you type now are queued and will arrive".to_string(),
+                detail: "your shells carried over; keys typed now arrive in a moment".to_string(),
                 stats: String::new(),
                 tone: Tone::Info,
             },
@@ -2188,8 +2099,9 @@ impl StatusBars {
 
     /// Drop the Staged row waiting behind an outcome ([`Self::update_outcome`]):
     /// for an outcome that means the stage is no longer merely waiting — it is
-    /// installed and activating — handing back "is ready · click to apply now"
-    /// when the outcome folds would offer a build that is already on its way in.
+    /// installed and activating — handing back the "is ready" row (bare under the
+    /// automatic posture, with the press affordance under a manual one) when the
+    /// outcome folds would offer a build that is already on its way in.
     pub(crate) fn forget_staged_behind_outcome(&mut self) {
         self.staged_behind_outcome = None;
     }
@@ -3111,12 +3023,8 @@ mod tests {
         bars.toolchain_failed("partly installed", now);
         bars.toolchain_announced("installing 1", now + Duration::from_secs(1));
         assert_eq!(bars.ledger().next().unwrap().outcome, Outcome::Warn);
-        // A LIVE bar (a meter, the waiting row) is not a finished activity: an
-        // announcement over one records nothing, as before.
-        let mut bars = StatusBars::default();
-        bars.toolchain_waiting(now);
-        bars.toolchain_announced("installing 1", now + Duration::from_secs(1));
-        assert_eq!(bars.ledger().count(), 0);
+        // A LIVE bar (a meter) is not a finished activity: an announcement over
+        // one records nothing, as before.
         let mut bars = StatusBars::default();
         bars.toolchain_snapshot(Some(&snap(true)), now);
         bars.toolchain_announced("installing 1", now + Duration::from_secs(1));
@@ -3223,361 +3131,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_lock_wait_opens_a_live_waiting_row_that_progress_replaces_and_none_clears() {
-        let mut bars = StatusBars::default();
-        let now = t0();
-        bars.toolchain_waiting(now);
-        assert_eq!(bars.rows(), 1);
-        let (lane, bar) = bars.bars().next().unwrap();
-        assert_eq!(lane, Lane::Toolchain);
-        assert_eq!(
-            bar.text.title,
-            "Another aterm is installing the ALab toolchain"
-        );
-        // Neither word the owner read as a fault (2026-09-14): no "lock", no "blocked".
-        assert!(
-            !format!("{} {}", bar.text.title, bar.text.detail)
-                .to_ascii_lowercase()
-                .contains("lock"),
-            "{} — {}",
-            bar.text.title,
-            bar.text.detail
-        );
-        assert_eq!(bar.text.detail, "this window continues when it finishes");
-        assert_eq!(bar.text.tone, Tone::Info);
-        assert_eq!(bar.text.glyph, '\u{2139}');
-        assert_eq!(bar.fill, None, "no meter of its own");
-        assert_eq!(bar.fold_at, None, "live");
-        assert_eq!(bar.stale_at, Some(now + WAIT_STALE), "…with a cap");
-        assert!(!bar.terminal());
-        assert!(!bar.text.detail.contains("failed"));
-        // A second marker line (the update child, queued behind the same holder)
-        // refreshes the row in place.
-        bars.toolchain_waiting(now + Duration::from_secs(5));
-        assert_eq!(bars.rows(), 1);
-        assert_eq!(
-            bars.bars().next().unwrap().1.stale_at,
-            Some(now + Duration::from_secs(5) + WAIT_STALE)
-        );
-        // The sibling's real progress replaces it…
-        bars.toolchain_snapshot(Some(&snap(true)), now);
-        assert_eq!(
-            bars.bars().next().unwrap().1.text.title,
-            "Installing the ALab toolchain"
-        );
-        // …`None` (the child's exit after a quiet run) clears it…
-        let mut fresh = StatusBars::default();
-        fresh.toolchain_waiting(now);
-        fresh.toolchain_snapshot(None, now);
-        assert_eq!(fresh.rows(), 0, "the clear retires a waiting row");
-        // …an announcement (this child's own pass starting) replaces it…
-        let mut fresh = StatusBars::default();
-        fresh.toolchain_waiting(now);
-        fresh.toolchain_announced("installing 10 ALab program(s) (about 3 GB)", now);
-        assert_eq!(
-            fresh.bars().next().unwrap().1.text.title,
-            "Installing the ALab toolchain"
-        );
-        // …and a real refusal after the wait still wins.
-        let mut fresh = StatusBars::default();
-        fresh.toolchain_waiting(now);
-        fresh.toolchain_failed(
-            "install failed \u{2014} see Settings \u{25b8} Packages",
-            now,
-        );
-        assert_eq!(fresh.bars().next().unwrap().1.text.tone, Tone::Warn);
-    }
-
-    /// The waiting row never covers what says more: a live meter already up (the
-    /// sibling's pass, tailed before the marker line was read) stays, and a held
-    /// terminal outcome the user was meant to read stays — the wait is logged and
-    /// remembered, not shown, in those two orderings (the two tests after the next
-    /// pin what the remembered wait does).
-    #[test]
-    fn the_waiting_row_never_covers_a_meter_or_a_held_outcome() {
-        let now = t0();
-        let mut bars = StatusBars::default();
-        bars.toolchain_snapshot(Some(&snap(true)), now);
-        bars.toolchain_waiting(now);
-        let bar = bars.bars().next().unwrap().1;
-        assert_eq!(bar.text.title, "Installing the ALab toolchain");
-        assert!(bar.fill.is_some(), "the meter survived");
-        let mut bars = StatusBars::default();
-        bars.toolchain_installed("\u{2713} ALab toolchain installed: ay, trust", now);
-        bars.toolchain_waiting(now);
-        assert_eq!(
-            bars.bars().next().unwrap().1.text.title,
-            "ALab toolchain installed"
-        );
-        assert_eq!(bars.rows(), 1);
-        let mut bars = StatusBars::default();
-        bars.toolchain_failed("install failed", now);
-        bars.toolchain_waiting(now);
-        assert_eq!(bars.bars().next().unwrap().1.text.tone, Tone::Warn);
-    }
-
-    /// …but NOT DROPPED behind it: atpkg prints `lock-waiting:` exactly once per
-    /// child, so a wait that lands while a terminal row is inside its hold — the
-    /// ✓ managed-current row a quiet launch seed puts up for 15 s while the update
-    /// child, spawned at once, finds the lock held by a session tab's `aterm pkg
-    /// update` with no progress file to tail — used to be discarded, and the lane
-    /// then stood empty for up to the whole half-hour wait while the launch thread
-    /// believed its row was open (2026-09-13). The held row keeps the lane (it was
-    /// meant to be read) and the wait takes it when that row folds — behind
-    /// anything already queued — capped from the announce, not the fold. The
-    /// child's exit (`None`) or a terminal marker before the fold retires the
-    /// remembered wait exactly as it retires the row.
-    #[test]
-    fn a_wait_behind_a_held_row_takes_the_lane_when_that_row_folds() {
-        let now = t0();
-        let mut bars = StatusBars::default();
-        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
-        bars.toolchain_waiting(now + Duration::from_secs(2));
-        assert_eq!(bars.rows(), 1);
-        assert_eq!(
-            bars.bars().next().unwrap().1.text.glyph,
-            '\u{2713}',
-            "the held row keeps the lane"
-        );
-        assert!(!bars.settle(now + HOLD_MANAGED / 2));
-        assert!(
-            bars.settle(now + HOLD_MANAGED),
-            "the fold promotes the wait"
-        );
-        assert_eq!(bars.rows(), 1);
-        let bar = bars.bars().next().unwrap().1;
-        assert_eq!(bar.text.title, WAITING_TITLE);
-        assert!(!bar.terminal(), "live, as the row itself is");
-        assert_eq!(
-            bar.stale_at,
-            Some(now + Duration::from_secs(2) + WAIT_STALE),
-            "capped from the announce, not the fold"
-        );
-        assert_eq!(bars.ledger().count(), 1, "the held row was recorded");
-        assert!(
-            !bars.settle(now + HOLD_MANAGED + Duration::from_secs(1)),
-            "one wait, promoted once"
-        );
-        // Behind a held row AND a queued terminal row: the queue goes first.
-        let mut bars = StatusBars::default();
-        bars.toolchain_deferred("another install is still running", now);
-        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
-        bars.toolchain_waiting(now + Duration::from_secs(5));
-        assert!(bars.settle(now + HOLD_NOTICE));
-        assert_eq!(bars.bars().next().unwrap().1.text.glyph, '\u{2713}');
-        assert!(bars.settle(now + HOLD_NOTICE + HOLD_MANAGED));
-        assert_eq!(bars.bars().next().unwrap().1.text.title, WAITING_TITLE);
-        // The child exited (a quiet run once the holder let go) BEFORE the fold:
-        // `None` retires the remembered wait, and nothing is promoted.
-        let mut bars = StatusBars::default();
-        bars.toolchain_deferred("another install is still running", now);
-        bars.toolchain_waiting(now + Duration::from_secs(5));
-        bars.toolchain_snapshot(None, now + Duration::from_secs(9));
-        assert_eq!(bars.rows(), 1, "`None` clears only a live bar");
-        assert!(bars.settle(now + HOLD_NOTICE), "the fold");
-        assert_eq!(bars.rows(), 0, "…promotes nothing");
-        // A terminal marker outranks the wait: the child's own outcome (it ran),
-        // or the wait's own timeout (it did not) — in both the wait is over.
-        for (i, terminal) in [
-            (
-                0,
-                &(|b: &mut StatusBars, at| b.toolchain_failed("install failed", at))
-                    as &dyn Fn(&mut StatusBars, Instant),
-            ),
-            (1, &|b: &mut StatusBars, at| {
-                b.toolchain_installed("\u{2713} ALab toolchain installed: ay", at)
-            }),
-            (2, &|b: &mut StatusBars, at| {
-                b.toolchain_ended("finished", at)
-            }),
-            (3, &|b: &mut StatusBars, at| {
-                b.toolchain_announced("installing 10", at)
-            }),
-            (4, &|b: &mut StatusBars, at| {
-                b.toolchain_deferred("another install is still running", at)
-            }),
-        ] {
-            let mut bars = StatusBars::default();
-            bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
-            bars.toolchain_waiting(now + Duration::from_secs(2));
-            terminal(&mut bars, now + Duration::from_secs(3));
-            // Long enough for every hold in the lane to run out.
-            let later = now + Duration::from_secs(3) + HOLD_WARN + HOLD_MANAGED + HOLD_NOTICE;
-            bars.settle(later);
-            bars.toolchain_snapshot(None, later);
-            bars.settle(later + Duration::from_secs(1));
-            assert!(
-                bars.bars().all(|(_, b)| b.text.title != WAITING_TITLE),
-                "case {i}: a wait outranked by a terminal is not promoted later"
-            );
-        }
-    }
-
-    /// …and not dropped behind a LIVE meter either (2026-09-14 audit): the same
-    /// once-per-child announcement lands while the sibling's tailed meter is up —
-    /// the common ordering, since the tailer follows the holder's file from the
-    /// spawn and the wait is announced after a 2 s grace — and the meter says more,
-    /// so it keeps the lane. But a meter folds on its own staleness cap when the
-    /// holder wedges (a SIGSTOPped sibling, a heartbeat thread that died: the
-    /// tailer classifies the file as a dead writer's and posts nothing), and our
-    /// child is still queued behind it for up to its whole half-hour bound. The
-    /// wait is remembered behind the meter exactly as it is behind a held row, and
-    /// takes the lane when the meter folds, capped from the announce.
-    #[test]
-    fn a_wait_behind_a_live_meter_takes_the_lane_when_that_meter_folds() {
-        let now = t0();
-        let mut bars = StatusBars::default();
-        bars.toolchain_snapshot(Some(&snap(true)), now);
-        bars.toolchain_waiting(now + Duration::from_secs(2));
-        let bar = bars.bars().next().unwrap().1;
-        assert_eq!(
-            bar.text.title, "Installing the ALab toolchain",
-            "the meter keeps the lane"
-        );
-        assert!(bar.fill.is_some());
-        assert!(!bars.settle(now + TAILED_STALE / 2));
-        assert!(
-            bars.settle(now + TAILED_STALE),
-            "the wedged holder's meter folds on its cap and the fold promotes the wait"
-        );
-        assert_eq!(bars.rows(), 1);
-        let bar = bars.bars().next().unwrap().1;
-        assert_eq!(bar.text.title, WAITING_TITLE);
-        assert!(!bar.terminal(), "live, as the row itself is");
-        assert_eq!(
-            bar.stale_at,
-            Some(now + Duration::from_secs(2) + WAIT_STALE),
-            "capped from the announce, not the fold"
-        );
-        assert_eq!(bars.ledger().count(), 1, "the meter was recorded");
-        assert!(
-            !bars.settle(now + TAILED_STALE + Duration::from_secs(1)),
-            "one wait, promoted once"
-        );
-    }
-
-    /// …but never a FALSE wait: the sibling's pass ENDING (its file's `ended_unix`
-    /// set, posted as the ✓ terminal row) frees the lock for our child within one
-    /// poll, so the wait remembered behind the meter is over — the ✓ folds after
-    /// its hold and the lane is empty while our child runs, exactly as it is after
-    /// the child's own exit. (A THIRD holder taking the freed lock ahead of our
-    /// child is not distinguished: that needs the bars to know our child's pid.)
-    #[test]
-    fn a_wait_behind_a_live_meter_is_over_when_the_sibling_ends() {
-        let now = t0();
-        let mut bars = StatusBars::default();
-        bars.toolchain_snapshot(Some(&snap(true)), now);
-        bars.toolchain_waiting(now + Duration::from_secs(2));
-        let mut ended = file(None, "net");
-        ended.ended_unix = Some(1_700_000_030);
-        ended.overall.programs_done = 10;
-        bars.toolchain_snapshot(
-            Some(&crate::PkgProgressSnapshot {
-                file: ended,
-                running: false,
-            }),
-            now + Duration::from_secs(30),
-        );
-        let bar = bars.bars().next().unwrap().1;
-        assert_eq!(bar.text.glyph, '\u{2713}', "the sibling's ✓ outcome");
-        assert!(bar.terminal());
-        assert!(
-            bars.settle(now + Duration::from_secs(30) + HOLD_OK),
-            "the ✓ folds"
-        );
-        assert_eq!(
-            bars.rows(),
-            0,
-            "no wait is promoted: the lock is free and our child is running"
-        );
-        assert!(!bars.settle(now + Duration::from_secs(600)));
-        assert_eq!(bars.rows(), 0);
-    }
-
-    /// The wait ENDS IN THE LOCK (`lock-acquired:`, 2026-09-14): the waiting row
-    /// leaves, and so does a wait remembered behind a held row — and nothing else
-    /// does. atpkg used to print nothing between acquisition and exit, so a child
-    /// that waited and then ran a QUIET verb (a seed's index read under the lock:
-    /// 6–18 s online, minutes offline) kept "waiting for another aterm's install"
-    /// on the glass for the length of its own work.
-    #[test]
-    fn the_wait_ends_when_the_child_takes_the_lock() {
-        let now = t0();
-        let mut bars = StatusBars::default();
-        bars.toolchain_waiting(now);
-        assert_eq!(bars.rows(), 1);
-        bars.toolchain_wait_over();
-        assert_eq!(bars.rows(), 0, "the waiting row is retired");
-        assert_eq!(bars.ledger().count(), 0, "…quietly: nothing finished");
-        assert!(!bars.settle(now + WAIT_STALE), "nothing left to fold");
-        // Remembered behind a held row: the row stands, the wait is forgotten.
-        let mut bars = StatusBars::default();
-        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
-        bars.toolchain_waiting(now + Duration::from_secs(2));
-        bars.toolchain_wait_over();
-        assert_eq!(bars.bars().next().unwrap().1.text.glyph, '\u{2713}');
-        assert!(bars.settle(now + HOLD_MANAGED), "the held row folds");
-        assert_eq!(bars.rows(), 0, "…and promotes no wait");
-        // A sibling's terminal outcome posted at the holder's exit — the very
-        // thing that let our child take the lock — keeps standing.
-        let mut bars = StatusBars::default();
-        bars.toolchain_waiting(now);
-        bars.toolchain_ended("finished", now + Duration::from_secs(1));
-        bars.toolchain_wait_over();
-        assert_eq!(bars.rows(), 1);
-        assert!(bars.bars().next().unwrap().1.terminal());
-        // A live meter is never touched: it is the tailer's to replace.
-        let mut bars = StatusBars::default();
-        bars.toolchain_snapshot(Some(&snap(true)), now);
-        bars.toolchain_waiting(now + Duration::from_secs(2));
-        bars.toolchain_wait_over();
-        assert_eq!(bars.rows(), 1);
-        assert!(bars.bars().next().unwrap().1.fill.is_some());
-        assert!(
-            bars.settle(now + TAILED_STALE),
-            "the meter folds on its cap"
-        );
-        assert_eq!(bars.rows(), 0, "…and promotes no wait: it is over");
-    }
-
-    /// Its backstop: with nothing retiring it, the waiting row folds at its cap
-    /// into an Ok ledger row (nothing was wrong), and the `appstatus` grammar for
-    /// the live row is the ordinary live one.
-    #[test]
-    fn the_waiting_row_folds_at_its_cap_into_an_ok_ledger_row() {
-        let mut bars = StatusBars::default();
-        let now = t0();
-        bars.toolchain_waiting(now);
-        assert_eq!(bars.deadline(), Some(now + WAIT_STALE));
-        let live = bars.activity_rows(now);
-        assert_eq!(live.len(), 1);
-        assert!(
-            live[0].starts_with("activity kind=toolchain phase=live "),
-            "{}",
-            live[0]
-        );
-        assert!(live[0].ends_with(" outcome=-"), "{}", live[0]);
-        assert!(!bars.settle(now + WAIT_STALE / 2));
-        assert!(bars.settle(now + WAIT_STALE), "the cap retires it");
-        assert_eq!(bars.rows(), 0);
-        let row = bars.ledger().next().expect("recorded");
-        assert_eq!(row.outcome, Outcome::Ok);
-        assert_eq!(row.title, "Another aterm is installing the ALab toolchain");
-    }
-
-    /// The cap must outlast the child's own wait, or a still-queued child would
-    /// lose its row before it could either proceed or time out.
-    #[test]
-    fn the_waiting_cap_outlasts_the_childs_own_wait() {
-        assert!(WAIT_STALE > Duration::from_secs(crate::ATPKG_WAIT_LOCK_SECS));
-        assert!(
-            WAIT_STALE
-                < Duration::from_secs(crate::ATPKG_WAIT_LOCK_SECS) + Duration::from_secs(10 * 60),
-            "…but not by much: a dead launch thread should not keep the row for long"
-        );
-    }
-
     /// A wait that ran out is a DEFERRED notice — Info, ⏸, held like a notice,
     /// never the word "failed" — and behind a held Warn row it queues like any
     /// terminal row so both are read.
@@ -3585,9 +3138,8 @@ mod tests {
     fn a_lock_wait_timeout_is_a_deferred_notice_not_a_failure() {
         let mut bars = StatusBars::default();
         let now = t0();
-        bars.toolchain_waiting(now);
         bars.toolchain_deferred(
-            "another install is still running \u{2014} trying again in 30 s (each try waits up to 30 min)",
+            "an earlier toolchain pass is still running \u{2014} trying again in 30 s (each try waits up to 30 min)",
             now,
         );
         assert_eq!(bars.rows(), 1);
@@ -3596,13 +3148,13 @@ mod tests {
         assert_eq!(bar.text.tone, Tone::Info);
         assert_eq!(bar.text.glyph, '\u{23f8}');
         assert_eq!(bar.fold_at, Some(now + HOLD_NOTICE));
-        assert!(bar.terminal(), "it replaced the live waiting row");
+        assert!(bar.terminal(), "a deferred notice is a terminal row");
         assert!(!bar.text.detail.contains("failed"), "{}", bar.text.detail);
         assert!(bar.text.detail.contains("trying again in 30 s"));
         // Behind a held Warn row it queues, and is promoted when that folds.
         let mut bars = StatusBars::default();
         bars.toolchain_failed("partly installed", now);
-        bars.toolchain_deferred("another install is still running", now);
+        bars.toolchain_deferred("an earlier toolchain pass is still running", now);
         assert_eq!(bars.bars().next().unwrap().1.text.tone, Tone::Warn);
         assert!(bars.settle(now + HOLD_WARN));
         assert_eq!(bars.bars().next().unwrap().1.text.glyph, '\u{23f8}');
@@ -3847,7 +3399,7 @@ mod tests {
         );
         assert_eq!(rows[1].outcome, Outcome::Ok);
         assert!(
-            rows[1].detail.contains("applies in place") && !rows[1].detail.contains("restart"),
+            rows[1].detail.contains("applies by itself") && !rows[1].detail.contains("restart"),
             "the ledger row carries the honest sentence: {:?}",
             rows[1].detail
         );
@@ -4907,14 +4459,16 @@ mod tests {
             now,
         );
         let bar = bars.bars().next().unwrap().1;
-        assert_eq!(
-            bar.text.title,
-            "aterm v0.48.0 is ready · click to apply now"
-        );
+        // The AUTOMATIC posture asks for nothing (2026-09-18): no press
+        // affordance in the title, and a detail that names the mechanism rather
+        // than a number of minutes.
+        assert_eq!(bar.text.title, "aterm v0.48.0 is ready");
         assert_eq!(
             bar.text.detail,
-            "build 99 — verified; applies in place within ~2 min — your shells keep running"
+            "build 99 — verified; applies by itself at the next quiet moment — nothing to do; \
+             your shells keep running"
         );
+        assert!(!bar.text.title.contains("click"), "{}", bar.text.title);
         assert_eq!(bar.fill, None, "no meter on a staged row");
         assert!(!bar.text.detail.contains("restart"));
         assert_eq!(bar.staged_build, Some(99));
@@ -4961,16 +4515,29 @@ mod tests {
         staged(&mut bars, Some(P::Automatic));
         let bar = bars.bars().next().unwrap().1;
         assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_AUTOMATIC));
-        assert!(
-            bar.text.title.ends_with(CLICK_TO_APPLY),
-            "the press affordance rides in the title: {}",
+        // A lane that applies BY ITSELF asks for nothing (2026-09-18): no press
+        // affordance in the title — a press still applies, silently.
+        assert_eq!(
+            bar.text.title, "aterm v0.76.0 is ready",
+            "{}",
             bar.text.title
         );
         assert!(bars.update_bar_is_staged());
         staged(&mut bars, Some(P::ManualOnlyLatched { lapses: true }));
-        assert_eq!(
-            bars.bars().next().unwrap().1.fold_at,
-            Some(now + HOLD_STAGED_AUTOMATIC)
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_AUTOMATIC));
+        assert!(
+            !bar.text.title.contains(CLICK_TO_APPLY),
+            "{}",
+            bar.text.title
+        );
+        // Where the build applies only on a press, the title says so.
+        staged(&mut bars, Some(P::ManualOnlyLatched { lapses: false }));
+        let bar = bars.bars().next().unwrap().1;
+        assert!(
+            bar.text.title.ends_with(CLICK_TO_APPLY),
+            "the press affordance rides in the title: {}",
+            bar.text.title
         );
         staged(&mut bars, Some(P::ManualByConfig));
         let bar = bars.bars().next().unwrap().1;
@@ -5000,7 +4567,9 @@ mod tests {
         assert_eq!(bars.rows(), 1, "never a new row");
         let bar = bars.bars().next().unwrap().1;
         assert_eq!(bar.text.title, "Installing aterm v0.76.0");
-        assert!(bar.text.detail.contains("shells are safe"));
+        // Never "pause", "freeze" or "safe" (2026-09-18): the row names what
+        // stays true — the shells keep running — and nothing alarming.
+        assert_eq!(bar.text.detail, "in place — your shells keep running");
         assert_eq!(bar.fold_at, None, "live until the successor takes over");
         assert_eq!(bar.stale_at, Some(now + HANDOFF_STALE));
         assert!(!bars.update_bar_is_staged(), "a press no longer applies");
@@ -5014,7 +4583,7 @@ mod tests {
         assert!(bars.update_bar_is_staged());
         assert_eq!(
             bars.bars().next().unwrap().1.text.title,
-            "aterm v0.76.0 is ready · click to apply now"
+            "aterm v0.76.0 is ready"
         );
         // With NO row up, installing adds none…
         let mut none = StatusBars::default();
@@ -5059,7 +4628,12 @@ mod tests {
         bars.update_finishing("0.76.0", now);
         let bar = bars.bars().next().unwrap().1;
         assert_eq!(bar.text.title, "Finishing aterm v0.76.0");
-        assert!(bar.text.detail.contains("queued"));
+        // Never "queued" or "pause" (2026-09-18): what stays true is that the
+        // shells carried over and typed keys arrive.
+        assert_eq!(
+            bar.text.detail,
+            "your shells carried over; keys typed now arrive in a moment"
+        );
         assert_eq!(bar.stale_at, Some(now + HANDOFF_STALE));
         bars.update_landed("0.76.0", 7, true, now);
         let bar = bars.bars().next().unwrap().1;
@@ -5558,7 +5132,11 @@ mod tests {
         let mut cases: Vec<(P, Vec<&str>)> = vec![
             (
                 P::Automatic,
-                vec!["applies in place", "~2 min", "shells keep running"],
+                vec![
+                    "applies by itself",
+                    "next quiet moment",
+                    "shells keep running",
+                ],
             ),
             (P::ManualByConfig, vec!["auto-apply is off", "Version menu"]),
             (
@@ -5627,10 +5205,17 @@ mod tests {
                 "{}",
                 bar.text.title
             );
+            // The affordance rides in the title where a press IS the way the build
+            // applies; a lane that applies by itself asks for nothing (2026-09-18).
             assert_eq!(
                 bar.text.title.contains(CLICK_TO_APPLY),
-                !matches!(posture, P::HandoffDisabled { .. }),
-                "the press affordance rides in the title wherever a press applies: {}",
+                matches!(
+                    posture,
+                    P::ManualByConfig
+                        | P::VetoedByEnv { .. }
+                        | P::ManualOnlyLatched { lapses: false }
+                ),
+                "the press affordance rides in the title only where a press applies: {}",
                 bar.text.title
             );
             assert_eq!(bar.staged_build, Some(7));
@@ -5697,8 +5282,10 @@ mod tests {
         );
         let bar = bars.bars().next().unwrap().1;
         assert_eq!(bar.text.detail, staged_detail(7, P::Automatic));
-        assert!(
-            bar.text.title.ends_with(CLICK_TO_APPLY),
+        // An ARMED lane asks for nothing: the affordance the no-posture line
+        // carried leaves the title (2026-09-18).
+        assert_eq!(
+            bar.text.title, "aterm v0.67.0 is ready",
             "{}",
             bar.text.title
         );
@@ -5711,14 +5298,16 @@ mod tests {
             !bars.restate_apply_posture(7, P::Automatic, now),
             "the same words again are not a repaint"
         );
-        // STANDING DOWN FOR GOOD shortens the hold to the manual one and keeps
-        // the affordance (a press still applies); the handoff going OFF strips
-        // the affordance; arming again restores both.
-        let title_before = bars.bars().next().unwrap().1.text.title.clone();
+        // STANDING DOWN FOR GOOD shortens the hold to the manual one and OFFERS
+        // the affordance (a press is now the way the build applies); the handoff
+        // going OFF strips it; arming again strips it too — the lane will land
+        // by itself.
+        let bare = bars.bars().next().unwrap().1.text.title.clone();
         assert!(bars.restate_apply_posture(7, P::ManualOnlyLatched { lapses: false }, now));
         let bar = bars.bars().next().unwrap().1;
         assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_MANUAL), "shortened");
-        assert_eq!(bar.text.title, title_before);
+        assert_eq!(bar.text.title, format!("{bare}{TITLE_SEP}{CLICK_TO_APPLY}"));
+        assert_eq!(without_affordance(&bar.text.title), bare);
         assert!(bars.restate_apply_posture(
             7,
             P::HandoffDisabled {
@@ -5733,13 +5322,10 @@ mod tests {
             "{}",
             bar.text.title
         );
-        assert_eq!(bar.text.title, without_affordance(&title_before));
+        assert_eq!(bar.text.title, bare);
         assert!(bars.restate_apply_posture(7, P::Automatic, now));
         let bar = bars.bars().next().unwrap().1;
-        assert_eq!(
-            bar.text.title, title_before,
-            "rebuilt from the exact suffix"
-        );
+        assert_eq!(bar.text.title, bare, "rebuilt from the exact suffix");
         assert_eq!(
             bar.fold_at,
             Some(now + HOLD_STAGED_AUTOMATIC),
@@ -5776,6 +5362,102 @@ mod tests {
         assert!(!bars.restate_apply_posture(7, P::Automatic, now));
     }
 
+    /// NO "LOCK", "BLOCKED", "ANOTHER ATERM", "PAUSE" OR "QUEUED" ON THE GLASS
+    /// (owner rulings 2026-09-14 and 2026-09-18): every sentence the update lane
+    /// composes for a Staged, Installing or Finishing row, under every posture,
+    /// names what stays true and nothing that reads as a fault or a stall.
+    #[test]
+    fn the_update_lanes_sentences_carry_no_fault_or_stall_words() {
+        use ApplyPosture as P;
+        let now = t0();
+        let banned = [
+            "lock",
+            "blocked",
+            "another aterm",
+            "pause",
+            "queued",
+            "freeze",
+        ];
+        let mut postures = vec![
+            P::Automatic,
+            P::ManualByConfig,
+            P::VetoedByEnv {
+                var: "ATERM_NO_AUTO_APPLY",
+            },
+            P::ManualOnlyLatched { lapses: true },
+            P::ManualOnlyLatched { lapses: false },
+        ];
+        for why in HandoffUnavailable::ALL {
+            postures.push(P::HandoffDisabled { why, veto: None });
+        }
+        let mut sentences: Vec<String> = postures
+            .iter()
+            .flat_map(|posture| {
+                [
+                    staged_title("0.88.0", Some(*posture)),
+                    staged_detail(7, *posture),
+                ]
+            })
+            .collect();
+        sentences.push(staged_detail_unknown(7));
+        let installing = installing_bar("0.88.0", now).text;
+        sentences.push(installing.title);
+        sentences.push(installing.detail);
+        let mut finishing = StatusBars::default();
+        finishing.update_finishing("0.88.0", now);
+        let bar = finishing.bars().next().unwrap().1;
+        sentences.push(bar.text.title.clone());
+        sentences.push(bar.text.detail.clone());
+        for sentence in sentences {
+            let words = sentence.to_lowercase();
+            for word in banned {
+                // "blocked" is banned; "unblocked"/"block" elsewhere are not on the
+                // update lane's rows at all, so a plain contains is the right pin.
+                assert!(!words.contains(word), "{word:?} in {sentence:?}");
+            }
+        }
+    }
+
+    /// `appstatus` CANNOT CLICK: a live Staged row is recorded without the press
+    /// affordance its glass title carries under a manual posture (2026-09-18), and
+    /// a bare automatic title records as itself.
+    #[test]
+    fn appstatus_records_a_live_staged_row_without_the_press_affordance() {
+        let now = t0();
+        let staged = aterm_update::Progress::Staged {
+            version: "0.88.0".into(),
+            build: 7,
+        };
+        let mut manual = StatusBars::default();
+        manual.update_progress(&staged, Some(ApplyPosture::ManualByConfig), now);
+        assert!(
+            manual
+                .bars()
+                .next()
+                .unwrap()
+                .1
+                .text
+                .title
+                .ends_with(CLICK_TO_APPLY),
+            "the glass keeps the affordance under a manual posture"
+        );
+        let rows = manual.activity_rows(now);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].contains("title=aterm%20v0.88.0%20is%20ready ") && !rows[0].contains("click"),
+            "{}",
+            rows[0]
+        );
+        let mut automatic = StatusBars::default();
+        automatic.update_progress(&staged, Some(ApplyPosture::Automatic), now);
+        let rows = automatic.activity_rows(now);
+        assert!(
+            rows[0].contains("title=aterm%20v0.88.0%20is%20ready ") && !rows[0].contains("click"),
+            "{}",
+            rows[0]
+        );
+    }
+
     /// THE PRESS AFFORDANCE IS ON GLASS AT ORDINARY WIDTHS (2026-09-07): it
     /// rides in the title, which the layout keeps whole; the detail is what a
     /// narrow window truncates — and where "click to apply now" used to be cut
@@ -5787,13 +5469,20 @@ mod tests {
             version: "0.76.0".into(),
             build: 7,
         };
+        // The affordance is offered where a press is the way the build applies
+        // (auto-apply off by config); the automatic posture asks for nothing
+        // (2026-09-18).
         let mut bars = StatusBars::default();
-        bars.update_progress(&staged, Some(ApplyPosture::Automatic), now);
+        bars.update_progress(&staged, Some(ApplyPosture::ManualByConfig), now);
         for cols in [80usize, 100, 120] {
             let rows = paint_rows(&bars, cols, Theme::default());
             let text = text_of(&rows[0]);
             assert!(text.contains(CLICK_TO_APPLY), "{cols} cols: {text}");
         }
+        let mut automatic = StatusBars::default();
+        automatic.update_progress(&staged, Some(ApplyPosture::Automatic), now);
+        let text = text_of(&paint_rows(&automatic, 120, Theme::default())[0]);
+        assert!(!text.contains(CLICK_TO_APPLY), "{text}");
         // Where the handoff is off a press only opens the details: no affordance.
         let mut off = StatusBars::default();
         off.update_progress(
@@ -5917,13 +5606,24 @@ mod tests {
         assert_eq!(bars.rows(), 1, "in place — no re-grid");
         assert!(bars.update_bar_is_staged());
         assert!(
+            !bars
+                .bars()
+                .next()
+                .unwrap()
+                .1
+                .text
+                .title
+                .contains(CLICK_TO_APPLY),
+            "bare — the automatic posture asks for nothing"
+        );
+        assert!(
             bars.bars()
                 .next()
                 .unwrap()
                 .1
                 .text
                 .title
-                .ends_with(CLICK_TO_APPLY),
+                .ends_with("is ready"),
             "with its affordance"
         );
         assert_eq!(bars.ledger().last().unwrap().title, "Update waiting");

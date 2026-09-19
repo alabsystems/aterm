@@ -11,7 +11,9 @@
 //! Spotlight exclusion), and write the `dist/aterm-<ver>-build.txt` provenance
 //! record.
 //!
-//! Port of the layout phase of `apps/aterm-mac/build-app.sh` (steps 2–6c + 8).
+//! Port of the layout phase of the retired `apps/aterm-mac/build-app.sh`
+//! (steps 2–6c + 8) — that script was deleted with the shell pipeline and is
+//! not in this tree.
 //! PlistBuddy is replaced by [`stamp_info_plist`] — pure string substitution
 //! on the committed template, unit-tested against goldens in
 //! `tests/plist_stamp.rs` — so the stamp is deterministic and testable off-mac.

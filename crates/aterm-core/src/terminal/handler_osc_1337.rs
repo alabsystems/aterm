@@ -314,6 +314,10 @@ impl TerminalHandler<'_> {
             rows,
             z_index: 0,
             band_lift_px: 0,
+            // iTerm2 names its target in CELLS (`width=`/`height=`), so filling
+            // the cells the program asked for IS the spec: FIT, don't pin pixels.
+            // The sixel sibling below is the opposite case.
+            pixel_exact: false,
         });
         // iTerm2 inline images are LEFT-anchored at the margin (column 0).
         self.place_image(&image, cols, rows, 0);
@@ -472,6 +476,14 @@ impl TerminalHandler<'_> {
             rows,
             z_index: 0,
             band_lift_px: 0,
+            // SIXEL NAMES PIXELS, so the raster is drawn 1:1 from the top-left
+            // of the footprint — not scaled out to fill it. The footprint above
+            // is DERIVED from the raster by rounding UP to whole cells, so
+            // filling it back in would magnify the picture by up to one cell on
+            // the binding axis (a 4x6 sprite in a 9x17 cell: 2.25x) and blur it
+            // through an interpolating resample. The rounded-up remainder is
+            // simply left unpainted, as on every other sixel terminal.
+            pixel_exact: true,
         });
 
         // Sixel anchors at the CURRENT cursor column (VT340/xterm), NOT at the

@@ -485,13 +485,24 @@ impl PaneTree {
         // `App::active_visible_content_route` fails closed on, which returns from
         // `redraw_window` BEFORE any present and freezes the window for the rest
         // of its life. Every debug test passed; only the shipped build froze.
+        // WHO INHERITS THE SPACE — read BEFORE the collapse, which is the very
+        // operation that erases the parent naming the sibling sub-tree.
+        let heir = self.root.absorbing_neighbor(closed);
         let removed = self.root.remove_leaf(closed);
         debug_assert_eq!(removed, RemoveLeaf::Removed);
         // Re-seat focus on the nearest surviving leaf if the focused pane was the
         // one removed; otherwise focus stays where it was (a background pane's EOF
         // must not steal focus from the pane the user is typing in).
+        //
+        // NEAREST MEANS ACROSS THE DIVIDER, not `root.first_leaf()`. This line used
+        // to read `self.focus = self.root.first_leaf()`, which is the tree's global
+        // top-left pane: close the focused bottom-right pane of `a | (b / c)` and
+        // the keyboard jumped to `a` in the opposite corner while `b` grew into the
+        // freed space, so the next command the person typed ran in a DIFFERENT live
+        // shell from the one the layout had just pointed at. The pane that absorbs
+        // the space is the pane that gets the keyboard ([`PaneNode::absorbing_neighbor`]).
         if self.focus == closed || !self.contains(self.focus) {
-            self.focus = self.root.first_leaf();
+            self.focus = heir.unwrap_or_else(|| self.root.first_leaf());
         }
         // A structural change exits zoom (the zoomed layout no longer applies).
         self.zoomed = false;
@@ -1036,11 +1047,122 @@ mod tests {
         let outcome = t.close_focused();
         assert_eq!(outcome, CloseOutcome::Collapsed { closed: 3 });
         assert_eq!(t.sessions(), vec![1, 2]);
-        assert_eq!(t.focus(), 1, "focus re-seats on the left/top-most survivor");
+        assert_eq!(
+            t.focus(),
+            2,
+            "focus re-seats on the survivor that ABSORBS the freed space (2, the \
+             pane above the closed one), not on the tree's top-left leaf"
+        );
         // The geometry is now exactly a 2-pane vertical split of 1 | 2.
         let mut expected = PaneTree::new(1);
         expected.split_focused(SplitDir::Vertical, 2);
         assert_eq!(t.compute_layout(24, 80), expected.compute_layout(24, 80));
+    }
+
+    /// THE KEYBOARD FOLLOWS THE SPACE. Closing the focused pane hands its cells to
+    /// exactly one sibling sub-tree, and the pane that visibly grows into the hole
+    /// is the pane the next keystroke must reach.
+    ///
+    /// The bug this pins: focus used to re-point at `root.first_leaf()`, the
+    /// window's TOP-LEFT pane. Measured on glass at 1400x700 on the pre-fix release
+    /// binary — `1 | (2 / 3)` with 3 focused, `aterm ctl invoke CloseTab`: pane 2
+    /// grew from `0,77,19x75` to `0,77,38x75` (it took the space) while focus and
+    /// the divider's bright half crossed to `0,0,38x76`, and `echo` typed into the
+    /// window afterwards ran in pane 1's shell, not pane 2's. A different live
+    /// shell than the one the layout had just pointed at.
+    ///
+    /// Each shape below names the survivor that inherits the freed cells. Three of
+    /// them differ from `first_leaf()`; the fourth is the case where the two
+    /// coincide, kept so the fix cannot be over-rotated into breaking it.
+    #[test]
+    fn close_focuses_the_pane_that_absorbs_the_freed_space() {
+        // Build a tree with `build`, focus the pane about to be closed, and hand
+        // back the tree plus the layout it had while that pane still existed.
+        fn tree(build: &dyn Fn(&mut PaneTree), focus_on: u64) -> (PaneTree, Vec<PaneRect>) {
+            let mut t = PaneTree::new(1);
+            build(&mut t);
+            assert!(t.set_focus(focus_on), "the pane to close must exist");
+            let before = t.compute_layout(40, 120);
+            (t, before)
+        }
+        let rect = |layout: &[PaneRect], session: u64| -> PaneRect {
+            *layout
+                .iter()
+                .find(|r| r.session == session)
+                .expect("laid-out pane")
+        };
+
+        // THE REPORTED SHAPE: 1 | (2 / 3), close the bottom-right pane.
+        // first_leaf() answers 1 — the far column, which grows by nothing.
+        let (mut t, before) = tree(
+            &|t| {
+                t.split_focused(SplitDir::Vertical, 2); // 1 | 2
+                t.split_focused(SplitDir::Horizontal, 3); // 1 | (2 / 3)
+            },
+            3,
+        );
+        let closed_rect = rect(&before, 3);
+        let survivor_before = rect(&before, 2);
+        assert_eq!(t.close_focused(), CloseOutcome::Collapsed { closed: 3 });
+        assert_eq!(t.focus(), 2, "1 | (2 / 3), close 3 -> focus 2");
+        let after = t.compute_layout(40, 120);
+        let survivor_after = rect(&after, 2);
+        assert!(
+            survivor_after.rows > survivor_before.rows,
+            "the pane that gets focus is the one that GREW: {survivor_before:?} -> \
+             {survivor_after:?}"
+        );
+        assert!(
+            survivor_after.row_off <= closed_rect.row_off
+                && survivor_after.row_off + survivor_after.rows
+                    >= closed_rect.row_off + closed_rect.rows
+                && survivor_after.col_off <= closed_rect.col_off,
+            "and it now covers the closed pane's cells: {closed_rect:?} inside \
+             {survivor_after:?}"
+        );
+
+        // NESTED SIBLING: 1 | ((2 | 4) / 3), close 3. The sub-tree `(2 | 4)` takes
+        // the space; the leaf pressed against the seam is its LAST one, 4.
+        let (mut t, _) = tree(
+            &|t| {
+                t.split_focused(SplitDir::Vertical, 2); // 1 | 2
+                t.split_focused(SplitDir::Horizontal, 3); // 1 | (2 / 3)
+                assert!(t.set_focus(2));
+                t.split_focused(SplitDir::Vertical, 4); // 1 | ((2 | 4) / 3)
+            },
+            3,
+        );
+        assert_eq!(t.close_focused(), CloseOutcome::Collapsed { closed: 3 });
+        assert_eq!(
+            t.focus(),
+            4,
+            "1 | ((2 | 4) / 3), close 3 -> focus 4, the leaf against the seam"
+        );
+
+        // FIRST-CHILD CLOSE, mirrored: 1 / (2 | 3), close 2. The sibling now lies
+        // to the RIGHT, so the near leaf is its FIRST one, 3 — not 1 two rows up.
+        let (mut t, _) = tree(
+            &|t| {
+                t.split_focused(SplitDir::Horizontal, 2); // 1 / 2
+                t.split_focused(SplitDir::Vertical, 3); // 1 / (2 | 3)
+            },
+            2,
+        );
+        assert_eq!(t.close_focused(), CloseOutcome::Collapsed { closed: 2 });
+        assert_eq!(t.focus(), 3, "1 / (2 | 3), close 2 -> focus 3");
+
+        // NO REGRESSION where the old answer was already right: (1 / 3) | 2,
+        // close 3. The absorbing neighbour IS the tree's first leaf, 1.
+        let (mut t, _) = tree(
+            &|t| {
+                t.split_focused(SplitDir::Vertical, 2); // 1 | 2
+                assert!(t.set_focus(1));
+                t.split_focused(SplitDir::Horizontal, 3); // (1 / 3) | 2
+            },
+            3,
+        );
+        assert_eq!(t.close_focused(), CloseOutcome::Collapsed { closed: 3 });
+        assert_eq!(t.focus(), 1, "(1 / 3) | 2, close 3 -> focus 1");
     }
 
     /// Closing a BACKGROUND pane (reader EOF on a non-focused pane) collapses it

@@ -14,93 +14,117 @@
 //!
 //! Run: `targo --unverified run --release -p aterm-objc --example objc_containment_bench`
 
-#![cfg(target_os = "macos")]
+// macOS-ONLY BODY, BUT THE EXAMPLE STILL HAS A `main`. `aterm_objc` is
+// `#![cfg(target_os = "macos")]`, so off macOS there is no crate here to call.
+// A crate-level `#![cfg]` on an EXAMPLE, though, deletes its own `fn main` and
+// breaks the whole workspace build: `cargo test --workspace` on x86_64 Linux
+// stopped at `error[E0601]: main function not found in crate
+// objc_containment_bench` (measured 2026-09-17). The bench therefore lives in a
+// gated module and `main` dispatches, so every target builds and the example
+// still says plainly where it can run.
 
-use std::hint::black_box;
-use std::time::Instant;
+#[cfg(target_os = "macos")]
+mod bench {
 
-use aterm_objc::{Id, MainThread, Sel, msg, sel};
+    use std::hint::black_box;
+    use std::time::Instant;
 
-aterm_objc::declare_class! {
-    struct ContainmentBench: NSObject {
-        const NAME: &str = "ATermContainmentBench";
-        type Ivars = ();
+    use aterm_objc::{Id, MainThread, Sel, msg, sel};
 
-        @sel(contained)
-        fn contained(&self) -> i64 {
-            42
+    aterm_objc::declare_class! {
+        struct ContainmentBench: NSObject {
+            const NAME: &str = "ATermContainmentBench";
+            type Ivars = ();
+
+            @sel(contained)
+            fn contained(&self) -> i64 {
+                42
+            }
+
+            @sel(uncontained)
+            @abort_on_exception
+            fn uncontained(&self) -> i64 {
+                42
+            }
         }
+    }
 
-        @sel(uncontained)
-        @abort_on_exception
-        fn uncontained(&self) -> i64 {
-            42
+    /// The trampoline-free IMP, for the floor.
+    unsafe extern "C-unwind" fn bare(_this: Id, _cmd: Sel) -> i64 {
+        42
+    }
+
+    fn bench(label: &str, obj: Id, s: Sel, n: u64) {
+        // SAFETY: `s` is `q@:` on `obj`.
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> i64 = unsafe { msg() };
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            let mut acc = 0i64;
+            for _ in 0..n {
+                // SAFETY: as above.
+                acc = acc.wrapping_add(unsafe { f(obj, s) });
+            }
+            let dt = t.elapsed().as_secs_f64();
+            black_box(acc);
+            best = best.min(dt * 1e9 / n as f64);
         }
+        println!("{label:<58} {best:7.3} ns/call  (n={n}, best of 3)");
+    }
+
+    pub fn run() {
+        let n: u64 = std::env::args()
+            .nth(1)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(200_000_000);
+        // SAFETY: the example's main thread; nothing here is AppKit state.
+        let mtm = unsafe { MainThread::new_unchecked() };
+        let obj = ContainmentBench::alloc_init(mtm, ()).expect("alloc_init");
+        // The bare IMP goes on a second class so the declared one stays as
+        // `declare_class!` registered it.
+        let bare_obj = {
+            let mut b = aterm_objc::begin(c"NSObject", c"ATermContainmentBenchBare");
+            b.add_rust_ivar::<()>();
+            // SAFETY: `bare` is `(id, SEL) -> long`, matching `q@:`.
+            unsafe {
+                b.add_method(sel!(answer), bare as *const std::ffi::c_void, "q@:");
+            }
+            let meta = b.register();
+            // SAFETY: `+new` on a registered NSObject subclass.
+            unsafe { aterm_objc::send::send_id(meta.class().as_id(), sel!(new)) }
+        };
+        println!("declared-method call cost by trampoline shape (IMP returns 42):");
+        bench(
+            "IMP = bare Rust extern \"C-unwind\" fn (no trampoline)",
+            bare_obj,
+            sel!(answer),
+            n,
+        );
+        bench(
+            "IMP = declare_class! @abort_on_exception (catch_unwind only)",
+            obj.as_id(),
+            sel!(uncontained),
+            n,
+        );
+        bench(
+            "IMP = declare_class! default (catch_unwind + @try containment)",
+            obj.as_id(),
+            sel!(contained),
+            n,
+        );
+        println!("containment count: {}", aterm_objc::contained_count());
     }
 }
 
-/// The trampoline-free IMP, for the floor.
-unsafe extern "C-unwind" fn bare(_this: Id, _cmd: Sel) -> i64 {
-    42
-}
-
-fn bench(label: &str, obj: Id, s: Sel, n: u64) {
-    // SAFETY: `s` is `q@:` on `obj`.
-    let f: unsafe extern "C-unwind" fn(Id, Sel) -> i64 = unsafe { msg() };
-    let mut best = f64::MAX;
-    for _ in 0..3 {
-        let t = Instant::now();
-        let mut acc = 0i64;
-        for _ in 0..n {
-            // SAFETY: as above.
-            acc = acc.wrapping_add(unsafe { f(obj, s) });
-        }
-        let dt = t.elapsed().as_secs_f64();
-        black_box(acc);
-        best = best.min(dt * 1e9 / n as f64);
-    }
-    println!("{label:<58} {best:7.3} ns/call  (n={n}, best of 3)");
-}
-
+#[cfg(target_os = "macos")]
 fn main() {
-    let n: u64 = std::env::args()
-        .nth(1)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(200_000_000);
-    // SAFETY: the example's main thread; nothing here is AppKit state.
-    let mtm = unsafe { MainThread::new_unchecked() };
-    let obj = ContainmentBench::alloc_init(mtm, ()).expect("alloc_init");
-    // The bare IMP goes on a second class so the declared one stays as
-    // `declare_class!` registered it.
-    let bare_obj = {
-        let mut b = aterm_objc::begin(c"NSObject", c"ATermContainmentBenchBare");
-        b.add_rust_ivar::<()>();
-        // SAFETY: `bare` is `(id, SEL) -> long`, matching `q@:`.
-        unsafe {
-            b.add_method(sel!(answer), bare as *const std::ffi::c_void, "q@:");
-        }
-        let meta = b.register();
-        // SAFETY: `+new` on a registered NSObject subclass.
-        unsafe { aterm_objc::send::send_id(meta.class().as_id(), sel!(new)) }
-    };
-    println!("declared-method call cost by trampoline shape (IMP returns 42):");
-    bench(
-        "IMP = bare Rust extern \"C-unwind\" fn (no trampoline)",
-        bare_obj,
-        sel!(answer),
-        n,
+    bench::run();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!(
+        "objc_containment_bench measures Objective-C exception containment, which exists \
+         only on macOS; this target has no `aterm_objc` to call."
     );
-    bench(
-        "IMP = declare_class! @abort_on_exception (catch_unwind only)",
-        obj.as_id(),
-        sel!(uncontained),
-        n,
-    );
-    bench(
-        "IMP = declare_class! default (catch_unwind + @try containment)",
-        obj.as_id(),
-        sel!(contained),
-        n,
-    );
-    println!("containment count: {}", aterm_objc::contained_count());
 }

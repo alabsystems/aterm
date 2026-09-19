@@ -1226,6 +1226,7 @@ fn test_image(rows: u16, cols: u16, payload: usize) -> Arc<aterm_types::ImageDat
         rows,
         z_index: 0,
         band_lift_px: 0,
+        pixel_exact: false,
     })
 }
 

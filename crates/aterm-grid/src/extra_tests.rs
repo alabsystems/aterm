@@ -164,6 +164,7 @@ fn cell_extra_with_image() {
         rows: 2,
         z_index: 0,
         band_lift_px: 0,
+        pixel_exact: false,
     });
     extra.set_image(Some(ImageRef {
         image: Arc::clone(&image),

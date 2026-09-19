@@ -1474,8 +1474,8 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
 ///
 /// This stage did not exist until 2026-08-31, and the gap was declared rather
 /// than hidden: `verify.sh` ran a tippy stage and no fmt stage, and said so.
-/// Declaring a limit is not covering it. `.githooks/pre-push` has been advisory
-/// since 2026-08-24, so between those two facts NOTHING in this repository ran
+/// Declaring a limit is not covering it. `.githooks/pre-push` was advisory from
+/// 2026-08-24, so between those two facts NOTHING in this repository ran
 /// the formatter unless a human chose to — and the MEASURED consequence was
 /// three consecutive rebases of `main` arriving with drift (5 files, 2, 1), one
 /// of them in `aterm-link`, a crate outside `members = ["crates/*"]` that
@@ -1592,15 +1592,47 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
 /// each cross toolchain (uname/rustup/linker are stubs), so one box measures
 /// both architectures. Its static twin is
 /// `crates/atpkg/tests/publish_lane_targets.rs`.
-pub const ATPKG_SUITES: [&str; 6] = [
+///
+/// `test-atpkg-spec-catch-up.sh` joined them on 2026-09-17: the rustc-group lane
+/// authors four rows of `tools/atpkg-programs.spec` and hands the indexer the whole
+/// table, and a row another publisher had moved (the vendor tracker's `claude`, three
+/// times in six days) was refused as a pin downgrade — correctly — and answered with
+/// a hand edit each time. The lane now catches every row outside its group up to the
+/// public baseline's pin (`atpkg_spec_catch_up`: never lower, never a group row, every
+/// move printed); the suite reproduces the refusal against the real indexer, measures
+/// the catch-up, and drives the lane end to end in STAGE mode with the pack scripts
+/// stubbed.
+pub const ATPKG_SUITES: [&str; 10] = [
     "test-atpkg-vendor-tooling.sh",
     "test-atpkg-mirror-extras.sh",
     "test-atpkg-auto-vendor.sh",
     "test-atpkg-target-pins.sh",
+    "test-atpkg-index-target-pins.sh",
+    "test-atpkg-index-staging-collision.sh",
+    "test-atpkg-stale-pin.sh",
+    "test-atpkg-spec-catch-up.sh",
     "test-linux-auto-atpkg.sh",
     "test-atpkg-pack-one-compiler.sh",
 ];
 
+/// THREE SUITES OVER `atpkg-index.sh` JOINED ON 2026-09-17, and two of them had been
+/// sitting in `tools/` wired into NOTHING — the same shape the mirror-extras note above
+/// describes, in the same directory, over the script that signs the toolchain index:
+/// `test-atpkg-index-target-pins.sh` (28 checks over `TARGET_PINS`' rendering and its
+/// per-target downgrade gate) and `test-atpkg-index-staging-collision.sh` (42 checks over
+/// the staging registry). A suite no gate runs is a test that passes forever.
+///
+/// `test-atpkg-stale-pin.sh` is new, and it pins the arm that let the compiler go stale in
+/// public. The STALE-PIN GATE refuses an ALab pin below the repo's newest signed vX.Y.Z
+/// release; when the pin was ABOVE that release the gate printed `NOTE — … a pack cut past
+/// the last promote` and moved on — a bound returned as a fact, since the comparison had
+/// just established that the release says nothing about staleness. The whole trust tuple
+/// takes that arm by construction (its bundle is packed from a stage2, never from a tag), so
+/// nothing ever judged it: measured 2026-09-17, trust pinned 8595, newest release v0.8.0
+/// counts 7888, `$HOME/trust` HEAD counts 9454 — 859 commits of compiler, published as index
+/// after index of "up to date". The gate now asks the repo's own source and refuses under
+/// the same `ALLOW_STALE_PINS` escape; the suite drives a real git checkout with a tag at
+/// build 2 and HEAD at build 10.
 /// The one suite that drives a real `atpkg` rather than stubs of its own
 /// making: section D of the pack contract, the end-to-end pack.
 pub const ATPKG_DRIVEN_SUITE: &str = "test-atpkg-pack-one-compiler.sh";
@@ -1786,7 +1818,12 @@ fn feature_gates(ctx: &Ctx, r: &mut Report) {
         r.skip("feature gates (no targo)");
         return;
     }
-    for gate in ["drift", "dormant", "mainloop"] {
+    // `citations` rides here because it is a directory walk — under a second on
+    // this roster — and because `gate all`, which is the only other thing that
+    // runs it, is MANUAL ONLY. A gate nothing automatic invokes is a gate that
+    // catches rot whenever somebody remembers, which is how four documents came
+    // to describe behaviour the code did not have.
+    for gate in ["drift", "dormant", "mainloop", "citations"] {
         run_labeled(
             ctx,
             r,
@@ -2480,6 +2517,54 @@ fn differential_oracle(ctx: &Ctx, r: &mut Report) {
 //    An unavailable toolchain is reported PROMINENTLY and skipped, exactly as the
 //    --full contract promises; it is never described as discharged.
 // ---------------------------------------------------------------------------
+/// The sentence `xtask gate cells` prints when it RAN but one or more cells were
+/// never compiled. ONE definition, in the crate both readers already depend on:
+/// `crates/xtask/src/gate.rs` formats it, [`cells_outcome`] matches it. Two
+/// copies of a sentinel is how a sentinel stops being one.
+pub const CELLS_NOT_PROVEN: &str = "gate cells: NOT PROVEN";
+
+/// How the ladder reads `gate cells`: the exit code AND the transcript.
+///
+/// A FUNCTION, and tested, for the reason [`redraw_outcome`] is — plus one this
+/// stage owns. `gate cells` MAY NOT answer an uninstalled std with a non-zero
+/// exit: a cross std is a property of the box, no change to this repository can
+/// conjure one, and a red nobody can clear is a red nobody reads. So it exits 0
+/// and says so IN WORDS. Read on the exit code alone — which is what this stage
+/// did until 2026-09-17 — a run where NO COMPILER STARTED was byte-identical to
+/// the matrix discharged: measured that day, five `SKIPPED(no-std)` rows,
+/// `gate cells: GREEN — all 5 cells type-check`, exit 0, `ok gate cells` on the
+/// ladder and `merge contract satisfied` underneath it.
+///
+/// [`Outcome::Skip`] is the honest reading: counted, NAMED, exit code untouched,
+/// and the merge-contract sentence withheld by
+/// [`crate::verdict::discharges_merge_contract`] because a skipped stage claims
+/// nothing.
+#[must_use]
+pub fn cells_outcome(ok: bool, transcript: &str) -> (Outcome, String) {
+    if !ok {
+        return (
+            Outcome::Fail(Severity::GateFailed),
+            "gate cells".to_string(),
+        );
+    }
+    // AT COLUMN 0, never `contains`. The gate prints its verdict unindented and
+    // everything it echoes from a compiler is indented or carries cargo's own
+    // prefix, so an anchored match cannot be fed a line of TREE TEXT — the same
+    // restriction `guard_announced_skip` is built on, and for the same reason.
+    if transcript
+        .lines()
+        .any(|line| line.starts_with(CELLS_NOT_PROVEN))
+    {
+        return (
+            Outcome::Skip,
+            "gate cells (a forge cell had no installed std — NOTHING was compiled for it; the \
+             NOT PROVEN line above names which)"
+                .to_string(),
+        );
+    }
+    (Outcome::Ok, "gate cells".to_string())
+}
+
 /// `--full` only: every forge cell type-checked FOR ITS OWN TRIPLE.
 ///
 /// The rest of this gate compiles aterm for one target. aterm ships five, and
@@ -2489,7 +2574,9 @@ fn differential_oracle(ctx: &Ctx, r: &mut Report) {
 /// a cwd and into a target directory OUTSIDE this repo. A cell whose toolchain
 /// is not installed SKIPS inside the verb and says out loud that nothing was
 /// compiled for it; a cell that runs and fails is a FAILURE, never re-read as a
-/// skip.
+/// skip. AND THE SKIP REACHES THIS LADDER — see [`cells_outcome`]. It did not
+/// until 2026-09-17: the verb said "nothing was compiled" on its own stderr and
+/// then exited 0, and this stage, reading only the code, wrote `ok gate cells`.
 ///
 /// AND IT READS THIS REPO'S OWN CODE ON ALL FIVE. For the first day of its life
 /// the verb was GREEN on linux and win while neither cell had type-checked one
@@ -2507,7 +2594,10 @@ fn cross_cells(ctx: &Ctx, r: &mut Report) {
         r.skip("cross-cell type-check (no targo)");
         return;
     }
-    run_labeled(ctx, r, "gate cells", &targo(ctx, xtask_gate_args("cells")));
+    let out = exec::run(&targo(ctx, xtask_gate_args("cells")), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = cells_outcome(out.ok, out.output.as_str());
+    r.record(outcome, label);
 }
 
 fn kani_floor(ctx: &Ctx, r: &mut Report) {
@@ -3524,6 +3614,62 @@ mod tests {
         let bin = a.iter().position(|x| x == "--bin").expect("a --bin");
         assert_eq!(a[bin + 1], REDRAW_CONFORMANCE_BIN);
         assert!(a.contains(&"aterm-gui".to_string()));
+    }
+
+    #[test]
+    fn a_cell_gate_that_compiled_nothing_is_counted_as_a_skip_not_a_pass() {
+        // THE WHOLE POINT OF READING THE TRANSCRIPT. `gate cells` exits 0 for an
+        // uninstalled std on purpose, so the exit code cannot tell the matrix
+        // discharged from no compiler having started. The words can.
+        let unproven = format!(
+            "{CELLS_NOT_PROVEN} — 5 of the 5 cell(s) this run selected had no installed std, \
+             so NO COMPILER READ THEM: mac-arm (aarch64-apple-darwin), …\n"
+        );
+        let (outcome, label) = cells_outcome(true, &unproven);
+        assert_eq!(outcome, Outcome::Skip);
+        assert_ne!(outcome, Outcome::Ok);
+        assert!(label.contains("NOTHING was compiled"), "{label}");
+
+        // A run that really did discharge it is still a pass.
+        let green = "gate cells: GREEN — all 5 cells type-check, with nothing excused or \
+                     shimmed: every one of the 312 in-repo crate-instances …\n";
+        assert_eq!(cells_outcome(true, green).0, Outcome::Ok);
+
+        // A failure stays a failure however the transcript reads — including one
+        // that also carries the marker, which a partly-skipped red run does.
+        assert_eq!(
+            cells_outcome(false, &unproven).0,
+            Outcome::Fail(Severity::GateFailed)
+        );
+        assert_eq!(
+            cells_outcome(false, green).0,
+            Outcome::Fail(Severity::GateFailed)
+        );
+
+        // ANCHORED AT COLUMN 0: a compiler diagnostic that quotes the sentinel
+        // out of this repo's own source is tree text, not a verdict.
+        let quoted = format!(
+            "   |     pub const CELLS_NOT_PROVEN: &str = \"{CELLS_NOT_PROVEN}\";\n\
+             gate cells: GREEN — all 5 cells type-check…\n"
+        );
+        assert_eq!(cells_outcome(true, &quoted).0, Outcome::Ok);
+    }
+
+    #[test]
+    fn a_skipped_cell_gate_cannot_leave_the_merge_contract_claimed() {
+        // The property the mapping exists for, asserted end to end against the
+        // verdict: one skipped stage, whole-tree scope, nothing failed — and the
+        // sentence is still withheld.
+        let mut r = Report::new("cross-cell type-check");
+        let (outcome, label) = cells_outcome(true, &format!("{CELLS_NOT_PROVEN} — 5 of 5 …\n"));
+        r.record(outcome, label);
+        let t = crate::ladder::tally(&[r]);
+        assert_eq!(t.skipped(), 1);
+        assert!(!crate::verdict::discharges_merge_contract(
+            &crate::scope::Scope::workspace(),
+            false,
+            &t
+        ));
     }
 
     #[test]

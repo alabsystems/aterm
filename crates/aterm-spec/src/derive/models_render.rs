@@ -326,7 +326,13 @@ pub fn ligature_gate_model() -> Model {
 /// the swapchain `Rgba16Float`, when does the blit linear-decode, when does
 /// the >1.0 aurora pass run. The real decisions are aterm-gpu's pure
 /// `format_plan::hdr_swapchain_wants_f16` (the Attach seam,
-/// `GpuRenderer::create_window_surface`) and `format_plan::hdr_present_plan`
+/// `GpuRenderer::create_window_surface` — the shipped macOS Metal arm reaches
+/// it through `hdr_swapchain_wants_f16_on_screen`, which narrows it by the
+/// screen's EDR potential and never widens it, so its result implies this
+/// function for every input, and re-picks an 8-bit window live — on a
+/// monitor change and on the frontend's throttled headroom re-query — through
+/// the narrower still `hdr_screen_upgrade_wants_f16`) and
+/// `format_plan::hdr_present_plan`
 /// (the Present seam, `present_input`); the Tier-1 binding is aterm-gpu's
 /// `tests/hdr_gate.rs` exhaustive 2^3 enumeration of BOTH shipping functions
 /// chained Attach→Present, asserting THESE invariants (a complete proof — the

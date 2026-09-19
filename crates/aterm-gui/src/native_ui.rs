@@ -919,13 +919,19 @@ pub(crate) fn text_viewport_geometry(rect: LogicalRect) -> TextViewportGeometry 
     text_viewport_geometry_at_scale(rect, crate::native_appearance::text_scale())
 }
 
+/// The editor rect's fixed chrome bands and text metre, at 1×. These are the
+/// pixels `text_viewport_geometry_at_scale` spends before and after the
+/// document, so any policy that reserves room for the *document* has to know
+/// them — see `editor_shell_metrics_at_scale`, which sizes the completion
+/// palette against whatever is left.
+const EDITOR_HEADER_H: f32 = 44.0;
+const EDITOR_FOOTER_H: f32 = 30.0;
+const EDITOR_LINE_H: f32 = 20.0;
+
 pub(crate) fn text_viewport_geometry_at_scale(
     rect: LogicalRect,
     text_scale: f32,
 ) -> TextViewportGeometry {
-    const HEADER_H: f32 = 44.0;
-    const FOOTER_H: f32 = 30.0;
-    const LINE_H: f32 = 20.0;
     const FALLBACK_CELL_W: f32 = 7.8;
 
     let text_scale = if text_scale.is_finite() && text_scale > 0.0 {
@@ -953,8 +959,8 @@ pub(crate) fn text_viewport_geometry_at_scale(
     // keeps its line capacity for actual document text (the type inside them
     // is already clamped to the same chrome steps).
     let chrome_scale = text_scale.min(1.35);
-    let header_h = (HEADER_H * chrome_scale).min(rect.height);
-    let footer_h = (FOOTER_H * chrome_scale).min((rect.height - header_h).max(0.0));
+    let header_h = (EDITOR_HEADER_H * chrome_scale).min(rect.height);
+    let footer_h = (EDITOR_FOOTER_H * chrome_scale).min((rect.height - header_h).max(0.0));
     let body_y = rect.y + header_h;
     let body_h = (rect.height - header_h - footer_h).max(0.0);
     let gutter_w = if rect.width < 480.0 * text_scale {
@@ -969,7 +975,7 @@ pub(crate) fn text_viewport_geometry_at_scale(
         body_h,
         gutter_w,
         text_x: rect.x + gutter_w + 12.0 * text_scale,
-        line_h: LINE_H * text_scale,
+        line_h: EDITOR_LINE_H * text_scale,
         cell_w,
     }
 }
@@ -1040,7 +1046,19 @@ pub(crate) fn editor_shell_metrics_at_scale(
     let palette_header_height = (28.0 * text_scale).clamp(28.0, 40.0);
     let palette_row_height = (34.0 * text_scale).clamp(34.0, 48.0);
     let palette_row_gap = 3.0 * chrome_scale;
-    let minimum_editor_height = (78.0 * text_scale).clamp(78.0, 120.0);
+    // THE EDITOR FLOOR IS COUNTED IN DOCUMENT ROWS, NOT RECT PIXELS. The rect
+    // this reserves is not document: `text_viewport_geometry_at_scale` spends
+    // EDITOR_HEADER_H on the modeline and EDITOR_FOOTER_H on the status strip
+    // before one line of the file is painted. The old floor — a flat 78 px —
+    // therefore promised 78 - 74 = 4 px of body, i.e. ZERO complete text rows,
+    // and at the default 80x24 window (viewport 744x420) the arithmetic landed
+    // on a 94 px editor rect: one visible line of aterm.toml under a 262 px
+    // completion list the user never asked for, on a page that advertises
+    // "Edit aterm.toml with live help". Reserve the chrome plus whole lines so
+    // the floor means what it says, and let the palette page what is left.
+    let editor_chrome_height = (EDITOR_HEADER_H + EDITOR_FOOTER_H) * chrome_scale;
+    let minimum_editor_height =
+        editor_chrome_height + MINIMUM_EDITOR_DOCUMENT_ROWS as f32 * EDITOR_LINE_H * text_scale;
     let available_palette_height = (viewport.height
         - outer_padding * 2.0
         - command_bar_height
@@ -1079,6 +1097,13 @@ pub(crate) fn editor_shell_metrics_at_scale(
 }
 
 const COMMAND_COMPLETION_RENDER_LIMIT: usize = 8;
+
+/// Document rows the editor keeps before the completion palette may claim a
+/// single pixel. Six is the smallest run that shows an erroring config line
+/// *in context* — the line above it and the line below — at the default window,
+/// and it is what makes the buffer the larger of the two regions there
+/// (205 px of editor against 151 px of palette at viewport 744x420).
+const MINIMUM_EDITOR_DOCUMENT_ROWS: usize = 6;
 
 /// Exact editor paint rectangle derived from the same responsive shell metrics
 /// consumed by `EditorApp::view`. The host uses this before reducer input so
@@ -2914,24 +2939,39 @@ fn text_visual_projection(spec: &TextSpec, available: f32) -> TextVisualProjecti
 }
 
 fn text_typography(spec: &TextSpec) -> (TypeStep, crate::widget::TextFace) {
+    text_typography_for(spec.role, spec.style)
+}
+
+/// The size and face the painter will draw a [`TextSpec`] of this role and
+/// style at.
+///
+/// Copy that an author WRAPS has to be measured at exactly these metrics.
+/// Wrapping at any other size hands the painter a line it must then elide,
+/// which is the whole failure [`text_fit_audit`] reports as `overflow=true` —
+/// the reason this pair is published instead of re-derived by each author.
+pub(crate) fn text_paint_metrics(
+    role: SemanticRole,
+    style: StyleRef,
+) -> (f32, crate::widget::TextFace) {
+    let (step, face) = text_typography_for(role, style);
+    (native_type_px(step).get(), face)
+}
+
+fn text_typography_for(role: SemanticRole, style: StyleRef) -> (TypeStep, crate::widget::TextFace) {
     use crate::widget::TextFace;
 
-    match spec.role {
-        SemanticRole::Heading if spec.style == StyleRef::Hero => {
-            (TypeStep::Display, TextFace::UiBold)
-        }
-        SemanticRole::Heading if matches!(spec.style, StyleRef::Quiet | StyleRef::Accent) => {
+    match role {
+        SemanticRole::Heading if style == StyleRef::Hero => (TypeStep::Display, TextFace::UiBold),
+        SemanticRole::Heading if matches!(style, StyleRef::Quiet | StyleRef::Accent) => {
             (TypeStep::Caption, TextFace::UiBold)
         }
         // Compact native pages use Plain for a large-type heading: Body-bold
         // remains visibly hierarchical at the platform maximum without
         // forcing route names to ellipsize in a 320-point host.
-        SemanticRole::Heading if spec.style == StyleRef::Plain => {
-            (TypeStep::Body, TextFace::UiBold)
-        }
+        SemanticRole::Heading if style == StyleRef::Plain => (TypeStep::Body, TextFace::UiBold),
         SemanticRole::Heading => (TypeStep::Title, TextFace::UiBold),
-        _ if spec.style == StyleRef::Code => (TypeStep::Body, TextFace::Mono),
-        SemanticRole::Status if spec.style == StyleRef::Primary => (TypeStep::Body, TextFace::Ui),
+        _ if style == StyleRef::Code => (TypeStep::Body, TextFace::Mono),
+        SemanticRole::Status if style == StyleRef::Primary => (TypeStep::Body, TextFace::Ui),
         SemanticRole::Status => (TypeStep::Caption, TextFace::Ui),
         _ => (TypeStep::Body, TextFace::Ui),
     }
@@ -7135,6 +7175,79 @@ mod tests {
         assert_eq!(scaled_phone_lines, 10);
         assert!(scaled_phone_lines < phone_lines);
         assert!(desktop_lines > landscape_lines);
+    }
+
+    /// Opening Settings → Manual must not bury aterm.toml under its own help.
+    ///
+    /// The landing state measured on glass at the default 80×24 window
+    /// (viewport 744×420, caret at Ln 1 Col 1, the eight metadata-derived key
+    /// completions offered): a 262 px completion list — 62% of the window — over
+    /// a 94 px editor rect whose header and footer left 20 px of document, ONE
+    /// visible line of the file the page exists to edit. The cause was the
+    /// floor: `minimum_editor_height` reserved 78 rect pixels, 74 of which
+    /// [`text_viewport_geometry_at_scale`] spends on chrome, so the reservation
+    /// guaranteed no complete text row at all.
+    #[test]
+    fn manual_landing_keeps_the_buffer_larger_than_its_completion_list() {
+        let viewport = LogicalRect::new(0.0, 0.0, 744.0, 420.0);
+        let shell = editor_shell_metrics_at_scale(viewport, 8, 1.0);
+        let editor = editor_text_viewport_rect_at_scale(viewport, 8, 1.0);
+        let geometry = text_viewport_geometry_at_scale(editor, 1.0);
+        let painted_rows = (geometry.body_h / geometry.line_h).floor() as usize;
+
+        assert_eq!(
+            painted_rows, MINIMUM_EDITOR_DOCUMENT_ROWS,
+            "the default window paints {painted_rows} document rows under a \
+             {}-row completion page (editor rect {} px, palette {} px)",
+            shell.palette_visible_rows, editor.height, shell.palette_height
+        );
+        assert!(
+            shell.palette_height < editor.height,
+            "unrequested help {} px must not outweigh the edited file {} px",
+            shell.palette_height,
+            editor.height
+        );
+        // The exact split this lands on: three of the eight candidates paged in
+        // 151 px, the file in 205 px. It is the same split the assist already
+        // used once the caret moved off a key position, where the whole file fit.
+        assert_eq!(shell.palette_visible_rows, 3);
+        assert_eq!(shell.palette_height, 151.0);
+        assert_eq!(editor.height, 205.0);
+    }
+
+    /// The floor is a promise about DOCUMENT rows, so it has to hold across the
+    /// window sizes a person actually uses — not only at the default one. Below
+    /// ~335 px of viewport the palette's own "always show one candidate" floor
+    /// takes over, which is deliberate: an assist with zero visible candidates
+    /// helps nobody.
+    #[test]
+    fn a_full_completion_page_never_costs_the_editor_its_document_rows() {
+        for width in [480, 744, 900, 1_440] {
+            for height in 335..=1_200 {
+                for candidates in [1, 3, 8] {
+                    let viewport = LogicalRect::new(0.0, 0.0, width as f32, height as f32);
+                    let editor = editor_text_viewport_rect_at_scale(viewport, candidates, 1.0);
+                    let geometry = text_viewport_geometry_at_scale(editor, 1.0);
+                    let rows = (geometry.body_h / geometry.line_h).floor() as usize;
+                    assert!(
+                        rows >= MINIMUM_EDITOR_DOCUMENT_ROWS,
+                        "{width}x{height} with {candidates} candidates paints {rows} rows"
+                    );
+                }
+            }
+        }
+
+        // Dynamic Type scales the floor with the text it protects: a 2× reader
+        // keeps whole rows of their own 40 px lines rather than a taller list.
+        let large_type = LogicalRect::new(0.0, 0.0, 744.0, 760.0);
+        let editor = editor_text_viewport_rect_at_scale(large_type, 8, 2.0);
+        let geometry = text_viewport_geometry_at_scale(editor, 2.0);
+        assert!(
+            (geometry.body_h / geometry.line_h).floor() as usize >= MINIMUM_EDITOR_DOCUMENT_ROWS,
+            "2× landing paints {} px of body over {} px lines",
+            geometry.body_h,
+            geometry.line_h
+        );
     }
 
     #[test]

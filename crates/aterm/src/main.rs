@@ -380,6 +380,26 @@ fn main() -> ExitCode {
     // The session: flags → quiet, then the passthrough (never returns).
     let quiet = aterm_cli::parse_args(mode_args);
 
+    // THE MANAGED `agents/` HANDOFF (2026-09-18, closing R3 of 2026-09-16). The
+    // session used to DERIVE `<prefix>/agents` as the sibling of `$ATERM_REROUTE_DIR`
+    // — handed only when the reroute is engaged — so `--no-reroute` /
+    // `ATERM_NO_REROUTE`, the escape hatch for the UPSTREAM RUST NAMES, also dropped
+    // the managed `claude`/`codex` front-insert, and nothing named the directory
+    // unless an enclosing shell that sourced the hook had exported `$ATPKG_AGENTS`.
+    // Now the one binary that links atpkg resolves the layout, ENSURES the directory
+    // (`Layout::ensure_agents_dir` — the window's mkdir/mode rule: one `mkdir`, mode by
+    // prefix shape, never a wait — plus a symlink/file refusal the window's
+    // `spawn::managed_agents_dir` does not yet make: it warns and still hands a linked
+    // `agents/`, this lane hands nothing) and hands it to `session_main` as
+    // `$ATERM_AGENTS_DIR` on EVERY lane, engaged reroute or not. No export means
+    // NOT SET: an inherited stray from an enclosing session is cleared, so "absent
+    // or empty" reads as "none" in the session (`aterm-cli::managed_agents_dir`).
+    // Never `ATPKG_AGENTS`: the shell integration keys its hook-sourcing on that
+    // being unset. Same trusted-launcher discipline as the reroute handoff below:
+    // set here, single-threaded, before the reroute lay and the update checker
+    // spawn the lane's first threads.
+    hand_agents_dir(atpkg::store::resolve_configured().as_ref());
+
     // THE REROUTE SEAM of the session lane (`docs/DESIGN-toolchain-reroute-2026-09-07.md`
     // §"Reaching PATH" 1): resolve the configured store, lay the session-scoped stubs
     // of the upstream Rust names (idempotent, eight tiny files, never over a foreign
@@ -533,6 +553,68 @@ fn main() -> ExitCode {
     }
 
     session_lane(quiet)
+}
+
+/// THE `$ATERM_AGENTS_DIR` DECISION, pure over the resolved layout (2026-09-18):
+/// `Some(dir)` — the absolute managed `<prefix>/agents/`, ensured to exist as a real
+/// directory by [`atpkg::store::Layout::ensure_agents_dir`] — is what the session is
+/// handed; `None` when there is no layout (no `$HOME`), when the directory could not
+/// be created or is a symlink/file (said on stderr ONCE, [`agents_dir_refusal_line`]),
+/// or when its path is not UTF-8. The reroute switch is deliberately NOT an input: the
+/// escape hatch is for the upstream Rust names, never for the managed agent programs.
+fn agents_dir_handoff(layout: Option<&atpkg::store::Layout>) -> Option<String> {
+    let layout = layout?;
+    // A RELATIVE prefix is never handed and never created: an empty `$HOME` used to
+    // resolve `Library/Application Support/aterm/pkg` against the cwd, and the first
+    // cut of this handoff laid `<cwd>/Library/…/agents` inside whatever directory the
+    // session was started in (found in the repository root, 2026-09-18). `home_dir`
+    // refuses that `$HOME` now; this guard is the seam's own promise, kept whatever
+    // resolves the layout.
+    if !layout.prefix.is_absolute() {
+        eprintln!(
+            "aterm: managed agents dir not created (the package prefix {} is not an absolute path — is `$HOME` set?); the managed `claude`/`codex` are NOT in front of PATH in this session",
+            layout.prefix.display()
+        );
+        return None;
+    }
+    match layout.ensure_agents_dir() {
+        Ok(dir) => dir.to_str().map(str::to_owned),
+        Err(error) => {
+            eprintln!("{}", agents_dir_refusal_line(&layout.agents_dir(), &error));
+            None
+        }
+    }
+}
+
+/// The one stderr line for a refused `agents/`, with the remedy that is TRUE for what
+/// is there: a symlink or a regular file at `agents/` must be removed by hand — `aterm
+/// pkg repair` reaches the directory through the same `ensure_dir` and refuses the same
+/// entry rather than replacing it (`activate::reconcile_agents`), so naming repair
+/// there would send the user in a loop; anything else (the `mkdir` refused: a system
+/// prefix without root, an unowned prefix) is what `repair` re-lays, as root where the
+/// prefix needs it. `error` already starts with the path ([`atpkg::store::Layout::ensure_agents_dir`]).
+fn agents_dir_refusal_line(dir: &std::path::Path, error: &str) -> String {
+    let remedy = match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.file_type().is_symlink() || !md.is_dir() => {
+            "remove that entry by hand, then `aterm pkg repair` lays the directory and the twins"
+        }
+        _ => "`aterm pkg repair` re-lays it (a system prefix needs root)",
+    };
+    format!(
+        "aterm: managed agents dir not created ({error}); the managed `claude`/`codex` are NOT in front of PATH in this session — {remedy}"
+    )
+}
+
+/// Establish [`agents_dir_handoff`]'s answer in THIS process's environment as
+/// [`atpkg::reroute::AGENTS_DIR_ENV`] — set to the directory, or REMOVED (never left
+/// as an inherited stray) when there is none — through the workspace's one
+/// lock-scoped env helper, before the session's first thread, exactly as the
+/// reroute handoff is established.
+fn hand_agents_dir(layout: Option<&atpkg::store::Layout>) {
+    match agents_dir_handoff(layout) {
+        Some(dir) => aterm_log::env::set(atpkg::reroute::AGENTS_DIR_ENV, dir),
+        None => aterm_log::env::unset(atpkg::reroute::AGENTS_DIR_ENV),
+    }
 }
 
 /// Whether this `--session` launch is a PERSON's terminal rather than a harness's
@@ -1715,6 +1797,227 @@ mod tests {
         assert!(
             aterm_ctl::front_door_completion_script("powershell", &verbs, COMPLETION_FLAGS)
                 .is_none()
+        );
+    }
+
+    /// A fresh scratch directory for one test, named by pid and nanos.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-front-door-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// THE `$ATERM_AGENTS_DIR` HANDOFF (2026-09-18, closing R3): a resolved layout
+    /// yields the absolute managed `agents/`, CREATED by the call (private in a `$HOME`
+    /// prefix) — the window's mkdir/mode rule (`spawn::managed_agents_dir`), so the
+    /// TTY session on a fresh machine has the directory before atpkg lays a twin; a
+    /// second call is a no-op with the same answer; NO layout (an unset `$HOME`) hands
+    /// nothing; and an ENGAGED reroute escape changes nothing — the switch is not an
+    /// input, which is the whole point of the handoff (`--no-reroute` restores the
+    /// upstream Rust names, never the managed `claude`/`codex`).
+    #[test]
+    fn the_agents_dir_is_handed_on_every_lane_regardless_of_the_reroute_switch() {
+        let _env_lock = NO_REROUTE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let scratch = scratch_dir("agents-handoff");
+        let layout = atpkg::store::Layout {
+            prefix: scratch.join("pkg"),
+        };
+        assert_eq!(agents_dir_handoff(None), None, "no layout, nothing handed");
+        assert!(
+            !layout.agents_dir().exists(),
+            "a fresh prefix has no agents/"
+        );
+        let handed = agents_dir_handoff(Some(&layout)).expect("created, hence handed");
+        assert_eq!(handed, layout.agents_dir().to_str().unwrap());
+        assert!(std::path::Path::new(&handed).is_absolute());
+        assert!(
+            std::fs::symlink_metadata(&handed).unwrap().is_dir(),
+            "a real directory"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&handed).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "a $HOME prefix's directory is private");
+        }
+        assert_eq!(
+            agents_dir_handoff(Some(&layout)).as_deref(),
+            Some(handed.as_str()),
+            "a second call is a no-op with the same answer"
+        );
+        // The reroute escape, engaged both ways it can be: still handed.
+        let env = atpkg::reroute::NO_REROUTE_ENV;
+        let before = std::env::var_os(env);
+        for value in ["1", "yes"] {
+            aterm_log::env::set(env, value);
+            assert!(atpkg::reroute::engaged(std::env::var(env).ok().as_deref()));
+            assert_eq!(
+                agents_dir_handoff(Some(&layout)).as_deref(),
+                Some(handed.as_str()),
+                "{env}={value} must not drop the managed agents dir"
+            );
+        }
+        match before {
+            Some(v) => aterm_log::env::set(env, v),
+            None => aterm_log::env::unset(env),
+        }
+        // And what `hand_agents_dir` establishes is exactly that value — or NOTHING:
+        // an inherited stray is removed, never left for the session to trust.
+        let var = atpkg::reroute::AGENTS_DIR_ENV;
+        assert_eq!(var, "ATERM_AGENTS_DIR", "the contract's spelling");
+        hand_agents_dir(Some(&layout));
+        assert_eq!(std::env::var(var).ok().as_deref(), Some(handed.as_str()));
+        hand_agents_dir(None);
+        assert_eq!(
+            std::env::var_os(var),
+            None,
+            "no layout ⇒ not set, not empty"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A prefix that REFUSES the `mkdir` (read-only, owned by us) hands nothing —
+    /// said on stderr, never a nonexistent entry first on the session's PATH — and
+    /// creates nothing; a symlink at `agents/` is refused the same way and left alone.
+    /// `hand_agents_dir` then REMOVES an inherited value rather than passing it on.
+    /// Root ignores mode bits, so the read-only leg is skipped there.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_agents_dir_hands_nothing_and_clears_an_inherited_stray() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env_lock = NO_REROUTE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let scratch = scratch_dir("agents-refused");
+        let var = atpkg::reroute::AGENTS_DIR_ENV;
+        // A symlink at agents/ — even one resolving to a real directory: refused.
+        let real = scratch.join("real-agents");
+        std::fs::create_dir_all(&real).unwrap();
+        let linked = atpkg::store::Layout {
+            prefix: scratch.join("linked"),
+        };
+        std::fs::create_dir_all(&linked.prefix).unwrap();
+        std::os::unix::fs::symlink(&real, linked.agents_dir()).unwrap();
+        assert!(linked.agents_dir().is_dir(), "the link resolves");
+        assert_eq!(agents_dir_handoff(Some(&linked)), None);
+        assert!(
+            std::fs::symlink_metadata(linked.agents_dir())
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "left alone"
+        );
+        // The line names the path ONCE, never `ensure_private_dir`'s `update directory`
+        // noun, and does not send the user to a `repair` that refuses the same link.
+        let refusal = linked.ensure_agents_dir().expect_err("refused");
+        let line = agents_dir_refusal_line(&linked.agents_dir(), &refusal);
+        assert_eq!(
+            line.matches(&linked.agents_dir().display().to_string())
+                .count(),
+            1,
+            "{line}"
+        );
+        assert!(!line.contains("update directory"), "{line}");
+        assert!(line.contains("is a symlink; refusing"), "{line}");
+        assert!(line.contains("remove that entry by hand"), "{line}");
+        assert!(!line.contains("re-lays it"), "{line}");
+        // A regular file at agents/: the same by-hand remedy.
+        let filed = atpkg::store::Layout {
+            prefix: scratch.join("filed"),
+        };
+        std::fs::create_dir_all(&filed.prefix).unwrap();
+        std::fs::write(filed.agents_dir(), b"not a dir").unwrap();
+        let refusal = filed.ensure_agents_dir().expect_err("refused");
+        let line = agents_dir_refusal_line(&filed.agents_dir(), &refusal);
+        assert!(line.contains("exists and is not a directory"), "{line}");
+        assert!(line.contains("remove that entry by hand"), "{line}");
+        aterm_log::env::set(var, real.to_str().unwrap());
+        hand_agents_dir(Some(&linked));
+        assert_eq!(
+            std::env::var_os(var),
+            None,
+            "an inherited stray must not survive a refusal"
+        );
+        // SAFETY: getuid() takes no arguments and cannot fail.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("running as root; a read-only prefix refuses nothing — skipping that leg");
+            let _ = std::fs::remove_dir_all(&scratch);
+            return;
+        }
+        let layout = atpkg::store::Layout {
+            prefix: scratch.join("pkg"),
+        };
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(agents_dir_handoff(Some(&layout)), None);
+        assert!(!layout.agents_dir().exists(), "nothing created");
+        // A refused mkdir: the path once, and `repair` IS the remedy (root where needed).
+        let refusal = layout.ensure_agents_dir().expect_err("refused");
+        let line = agents_dir_refusal_line(&layout.agents_dir(), &refusal);
+        assert_eq!(
+            line.matches(&layout.agents_dir().display().to_string())
+                .count(),
+            1,
+            "{line}"
+        );
+        assert!(line.contains("`aterm pkg repair` re-lays it"), "{line}");
+        assert!(!line.contains("by hand"), "{line}");
+        aterm_log::env::set(var, real.to_str().unwrap());
+        hand_agents_dir(Some(&layout));
+        assert_eq!(std::env::var_os(var), None);
+        // Writable again: created, private, handed.
+        std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
+        hand_agents_dir(Some(&layout));
+        assert_eq!(
+            std::env::var(var).ok().as_deref(),
+            layout.agents_dir().to_str()
+        );
+        assert_eq!(
+            std::fs::metadata(layout.agents_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        aterm_log::env::unset(var);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The handoff is established in the session lane OUTSIDE the reroute gate — before
+    /// it, and before the lane's first background thread — so an engaged
+    /// `ATERM_NO_REROUTE` cannot skip it and no thread races the `setenv`. A scrape, in
+    /// the idiom of `the_session_lane_applies_the_machine_settings_outside_every_package_gate`.
+    #[test]
+    fn the_agents_dir_handoff_sits_outside_the_reroute_gate() {
+        let src = include_str!("main.rs");
+        let handoff = src
+            .find("hand_agents_dir(atpkg::store::resolve_configured().as_ref());")
+            .expect("the session lane hands the agents dir");
+        let quiet = src
+            .find("let quiet = aterm_cli::parse_args(mode_args);")
+            .expect("the session lane's start");
+        let gate = src
+            .find("if !atpkg::reroute::engaged(")
+            .expect("the session lane's reroute gate");
+        assert!(
+            quiet < handoff && handoff < gate,
+            "the handoff sits in the session lane BEFORE the reroute gate, never inside it"
+        );
+        let lay = src
+            .find(".name(\"aterm-reroute-lay\".into())")
+            .expect("the gate's background lay");
+        assert!(
+            handoff < lay,
+            "established single-threaded, before the lane's first thread"
         );
     }
 }

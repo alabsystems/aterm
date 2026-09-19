@@ -174,12 +174,14 @@ fn solid_image_survives_any_ratio() {
     }
 }
 
-/// W10 (d): the sixel/OSC-1337 inline-image route goes through the SAME
-/// upgraded resampler — a raw-RGBA checkerboard minified 4x into its footprint
-/// lands the identical uniform linear mid-grey (byte-identical to
-/// `resample_rgba`), not the old tap-skipping bilinear. The GPU image pass
-/// calls this same `decode_image_to_footprint`, so parity holds by
-/// construction.
+/// W10 (d): the FITTED inline-image route (OSC 1337, and Kitty with an explicit
+/// `c=`/`r=` cell box) goes through the SAME upgraded resampler — a raw-RGBA
+/// checkerboard minified 4x into its footprint lands the identical uniform
+/// linear mid-grey (byte-identical to `resample_rgba`), not the old tap-skipping
+/// bilinear. The GPU image pass calls this same `decode_image_to_footprint`, so
+/// parity holds by construction. (`pixel_exact` placements — sixel, un-sized
+/// Kitty — deliberately run NO resampler at all; that is
+/// `sixel_footprint_decode_is_pixel_exact` in `tests/inline_image.rs`.)
 #[test]
 fn inline_image_footprint_uses_the_same_resampler() {
     use aterm_core::grid::extra::ImageFormat;
@@ -203,6 +205,7 @@ fn inline_image_footprint_uses_the_same_resampler() {
         },
         2,
         2,
+        false,
     )
     .expect("raw RGBA resamples");
     assert_eq!(

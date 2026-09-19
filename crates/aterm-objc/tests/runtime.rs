@@ -335,3 +335,78 @@ fn utf8_string_of_a_nil_receiver_is_empty() {
     // SAFETY: null is the documented `None` input.
     assert_eq!(unsafe { ns_string_to_rust(Id::NIL) }, "");
 }
+
+/// Fills the stack depth the next call at this level will occupy with 0xAB.
+#[inline(never)]
+fn poison_the_next_frame() -> u64 {
+    let junk = [0xABu8; 1024];
+    std::hint::black_box(&junk);
+    junk.iter().map(|&b| u64::from(b)).sum()
+}
+
+/// `send_rect` on nil with the result held in THIS frame, so its struct-return
+/// slot is stack [`poison_the_next_frame`] just filled with 0xAB. A call written
+/// in the test body forwards the slot to the test's own local, whose bytes
+/// nothing dirtied, and reads zero by luck; that is how the first cut of this
+/// test passed on an Intel Mac with the guard deleted.
+#[inline(never)]
+fn nil_rect_in_a_poisoned_frame() -> [u64; 4] {
+    // SAFETY: `-frame` is `-(NSRect)frame`, and nil is a valid receiver.
+    let r = unsafe { aterm_objc::send::send_rect(aterm_objc::Id::NIL, aterm_objc::sel!(frame)) };
+    let r = std::hint::black_box(r);
+    [
+        r.origin.x.to_bits(),
+        r.origin.y.to_bits(),
+        r.size.width.to_bits(),
+        r.size.height.to_bits(),
+    ]
+}
+
+/// A nil receiver on a struct-returning send hands back ZERO — on x86_64 too.
+///
+/// libobjc zeroes register-class returns on the nil path and leaves an
+/// INDIRECT (`objc_msgSend_stret`) return untouched (pinned below). A 32-byte
+/// CGRect is indirect on x86_64 and register-class (d0-d3) on arm64, so without
+/// `send_rect`'s own nil check it reads whatever the return slot held on an
+/// Intel Mac and zero on every arm64 dev machine.
+#[test]
+fn a_nil_receiver_returns_a_zero_rect_on_this_arch() {
+    for _ in 0..8 {
+        let _ = std::hint::black_box(poison_the_next_frame());
+        let bits = nil_rect_in_a_poisoned_frame();
+        assert_eq!(bits, [0; 4], "a nil send_rect returned {bits:#018x?}");
+    }
+}
+
+/// The premise the guard exists for, measured on the arch that has it: a nil
+/// `objc_msgSend_stret` returns without writing its out-buffer. The x86_64
+/// stret ABI passes the hidden result pointer first, so declaring the entry as
+/// `(out, self, _cmd) -> ()` is the same call with the pointer made explicit —
+/// and the buffer can be poisoned deterministically.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn libobjc_leaves_a_nil_stret_return_untouched_on_x86_64() {
+    #[link(name = "objc", kind = "dylib")]
+    unsafe extern "C" {
+        fn objc_msgSend_stret();
+    }
+    let mut out = [0xABu8; size_of::<aterm_objc::CGRect>()];
+    // SAFETY: on x86_64 `objc_msgSend_stret` takes the result pointer in rdi,
+    // self in rsi and _cmd in rdx, which is exactly this prototype; a nil self
+    // returns at once, and `out` is large enough for the CGRect `-frame` would
+    // return.
+    unsafe {
+        let f: unsafe extern "C" fn(*mut u8, aterm_objc::Id, aterm_objc::Sel) =
+            std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
+        f(
+            out.as_mut_ptr(),
+            aterm_objc::Id::NIL,
+            aterm_objc::sel!(frame),
+        );
+    }
+    assert!(
+        out.iter().all(|&b| b == 0xAB),
+        "libobjc wrote the out-buffer of a nil stret send ({out:02x?}); `send_rect`'s \
+         nil check would then be redundant on x86_64"
+    );
+}

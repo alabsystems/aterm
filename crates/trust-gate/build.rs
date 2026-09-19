@@ -2,11 +2,14 @@
 // Copyright 2026 Andrew Yates
 //
 // build.rs — THE compiler gate. This workspace compiles with the Trust toolchain
-// and nothing else: rust-toolchain.toml pins rustup's `trust` toolchain (a
-// symlink atpkg maintains at ~/.rustup/toolchains/trust -> <prefix>/store/trust/
-// current) and .cargo/config.toml's verification opt-out is scoped to that
-// compiler by `[target.'cfg(trust_verify)']`, so an upstream rustc never even
-// sees the `-Z` flag. Before this crate, reaching an upstream rustc — a
+// and nothing else: rust-toolchain.toml pins `channel = "trust"`, which is the
+// aterm-managed store's toolchain (`<prefix>/store/trust/<build>/bin/{targo,
+// trustc}`, reached through the `<prefix>/bin` shims — `aterm pkg which targo`;
+// on a machine that also has rustup, atpkg maintains ~/.rustup/toolchains/trust
+// -> <prefix>/store/trust/current so rustup's proxy resolves the same pin;
+// stated 2026-09-18) and .cargo/config.toml's verification opt-out is scoped to
+// that compiler by `[target.'cfg(trust_verify)']`, so an upstream rustc never
+// even sees the `-Z` flag. Before this crate, reaching an upstream rustc — a
 // `RUSTUP_TOOLCHAIN=stable` override, a Homebrew cargo that ignores the pin, a
 // dangling `trust` link after a store swap — failed the build on whichever
 // first-party unit hit Trust-only syntax first: deep in the graph, with an error

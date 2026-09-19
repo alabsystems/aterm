@@ -5,11 +5,26 @@
 //!
 //! ```sh
 //! cargo test -p aterm-effects --release --test cursor_bench -- --ignored --nocapture --test-threads=1
+//! # the same gates on a host with no measurement on record — scales the four
+//! # ABSOLUTE wall-clock bounds only (p90 500 / median 500 / p90 1 000 /
+//! # p90 2 000 µs); the quad caps, shares and fixture checks are never scaled
+//! # (see `common::budget_scale`):
+//! RK_FRAME_COST_BUDGET_SCALE=2 cargo test -p aterm-effects --release --test cursor_bench \
+//!     -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! The knob is the one `tests/rainbow_kitty_v2_frame_cost.rs` reads — one name
+//! across both gates, so a host's scale is set once; every red prints the
+//! effective bound beside the reference and the scale it came from. Its parse
+//! is pinned here, by the non-ignored
+//! `the_budget_scale_is_a_positive_float_and_everything_else_is_the_reference`.
+
+mod common;
 
 use std::time::{Duration, Instant};
 
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+use common::{BUDGET_SCALE_VAR, budget_scale, parse_budget_scale, scaled_budget_us};
 
 const ITERATIONS: usize = 300;
 
@@ -142,17 +157,23 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture, min_total
     samples.sort();
     let median = samples[ITERATIONS / 2];
     let p90 = samples[ITERATIONS * 9 / 10];
+    // The reference machine's bound; this host's is it times the scale.
+    const P90_REFERENCE_US: u64 = 500;
+    let scale = budget_scale();
+    let p90_bound_us = scaled_budget_us(P90_REFERENCE_US, scale);
     println!(
         "{label}: median {median:?} (p90 {p90:?}), \
-         max quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over)"
+         max quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over); \
+         p90 bound {p90_bound_us} us (reference {P90_REFERENCE_US} × {BUDGET_SCALE_VAR} {scale})"
     );
     assert!(
         max_total_quads > min_total_quads,
         "fixture must exercise substantial geometry ({max_total_quads} quads)"
     );
     assert!(
-        p90.as_micros() < 500,
-        "{label} cursor frame p90 {p90:?} >= 500 us (median {median:?})"
+        p90.as_micros() < u128::from(p90_bound_us),
+        "{label} cursor frame p90 {p90:?} >= {p90_bound_us} us \
+         (reference {P90_REFERENCE_US} us × {BUDGET_SCALE_VAR} {scale}; median {median:?})"
     );
 }
 
@@ -300,9 +321,17 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
     samples.sort();
     let median = samples[ITERATIONS / 2];
     let p90 = samples[ITERATIONS * 9 / 10];
+    // The reference machine's bounds; this host's are them times the scale.
+    const MEDIAN_REFERENCE_US: u64 = 500;
+    const P90_REFERENCE_US: u64 = 1_000;
+    let scale = budget_scale();
+    let median_bound_us = scaled_budget_us(MEDIAN_REFERENCE_US, scale);
+    let p90_bound_us = scaled_budget_us(P90_REFERENCE_US, scale);
     println!(
         "bench_cursor_rainbow_hot_ribbon_worstcase: median {median:?} (p90 {p90:?}), \
-         max quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over)"
+         max quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over); \
+         median bound {median_bound_us} us / p90 bound {p90_bound_us} us \
+         (reference {MEDIAN_REFERENCE_US}/{P90_REFERENCE_US} × {BUDGET_SCALE_VAR} {scale})"
     );
     assert!(
         max_under_quads > 2_000,
@@ -322,14 +351,18 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
     // another crate compiled measured stable medians of 268–434 µs but p90
     // scheduler tails of 511–839 µs; a 500 µs p90 therefore rejected healthy
     // work for unrelated CPU contention. Keep the CPU median under the 500 µs
-    // production budget and use one millisecond only as a generous tail smoke.
+    // production budget and use one millisecond only as a generous tail smoke
+    // (both the reference machine's numbers; `RK_FRAME_COST_BUDGET_SCALE`
+    // scales them for a host with none on record, and only them).
     assert!(
-        median.as_micros() < 500,
-        "worst-case hot nyan cursor frame median {median:?} >= 500 us"
+        median.as_micros() < u128::from(median_bound_us),
+        "worst-case hot nyan cursor frame median {median:?} >= {median_bound_us} us \
+         (reference {MEDIAN_REFERENCE_US} us × {BUDGET_SCALE_VAR} {scale})"
     );
     assert!(
-        p90.as_micros() < 1_000,
-        "worst-case hot nyan cursor frame p90 {p90:?} >= 1 ms (median {median:?})"
+        p90.as_micros() < u128::from(p90_bound_us),
+        "worst-case hot nyan cursor frame p90 {p90:?} >= {p90_bound_us} us \
+         (reference {P90_REFERENCE_US} us × {BUDGET_SCALE_VAR} {scale}; median {median:?})"
     );
 }
 
@@ -397,10 +430,15 @@ fn bench_cursor_water_outlier_jump() {
     samples.sort();
     let median = samples[JUMP_ITERATIONS / 2];
     let p90 = samples[JUMP_ITERATIONS * 9 / 10];
+    // The reference machine's bound; this host's is it times the scale.
+    const P90_REFERENCE_US: u64 = 2_000;
+    let scale = budget_scale();
+    let p90_bound_us = scaled_budget_us(P90_REFERENCE_US, scale);
     println!(
         "bench_cursor_water_outlier_jump: median {median:?} (p90 {p90:?}), \
          over quads {min_over_quads}..={max_over_quads}, \
-         under quads {min_under_quads}..={max_under_quads}"
+         under quads {min_under_quads}..={max_under_quads}; \
+         p90 bound {p90_bound_us} us (reference {P90_REFERENCE_US} × {BUDGET_SCALE_VAR} {scale})"
     );
     assert!(
         min_under_quads >= MIN_UNDER_QUADS,
@@ -419,7 +457,73 @@ fn bench_cursor_water_outlier_jump() {
         "every synthetic jump frame must retain Water's over-ink splash accents"
     );
     assert!(
-        p90.as_micros() < 2_000,
-        "bounded 4095-cell jump p90 {p90:?} >= 2 ms"
+        p90.as_micros() < u128::from(p90_bound_us),
+        "bounded 4095-cell jump p90 {p90:?} >= {p90_bound_us} us \
+         (reference {P90_REFERENCE_US} us × {BUDGET_SCALE_VAR} {scale}; median {median:?})"
+    );
+}
+
+/// The scale knob's parse (shared with tests/rainbow_kitty_v2_frame_cost.rs
+/// through `common`; pinned here, once), without touching the process
+/// environment: unset or any malformed spelling is the reference budget
+/// exactly, for every reference number either gate uses; a positive float
+/// scales an absolute budget; and a scale small enough to round a budget to
+/// 0 is floored at 1 µs, so no spelling asserts `p50 ≤ 0`; nothing here
+/// reaches a deterministic law. It lives in this binary, not the frame-cost
+/// one: that binary's counting allocator counts every thread, and libtest
+/// allocates outside a test's body (spawning its thread, capturing its
+/// output, sending and printing its result) where no mutex reaches, so a
+/// second non-ignored test there could land allocations inside the
+/// zero-alloc driver's counted window.
+#[test]
+fn the_budget_scale_is_a_positive_float_and_everything_else_is_the_reference() {
+    // §18's pair (the frame-cost gate), then this binary's four bounds.
+    const REFERENCES_US: [u64; 6] = [400, 600, 500, 500, 1_000, 2_000];
+    for raw in [
+        None,
+        Some(""),
+        Some("x"),
+        Some("2x"),
+        Some("0"),
+        Some("-1"),
+        Some("NaN"),
+        Some("inf"),
+        Some("-inf"),
+    ] {
+        let scale = parse_budget_scale(raw);
+        for reference_us in REFERENCES_US {
+            assert_eq!(
+                scaled_budget_us(reference_us, scale),
+                reference_us,
+                "{raw:?} × {reference_us}"
+            );
+        }
+    }
+    assert_eq!(scaled_budget_us(400, parse_budget_scale(Some("2"))), 800);
+    assert_eq!(scaled_budget_us(600, parse_budget_scale(Some("2"))), 1_200);
+    assert_eq!(
+        scaled_budget_us(2_000, parse_budget_scale(Some("2"))),
+        4_000
+    );
+    assert_eq!(
+        scaled_budget_us(600, parse_budget_scale(Some(" 1.5 "))),
+        900
+    );
+    assert_eq!(scaled_budget_us(400, parse_budget_scale(Some("0.75"))), 300);
+    // A positive scale that rounds a budget to 0 is floored at 1 µs, never 0
+    // (`1e-9` is accepted by the parse — finite and positive — and rounds
+    // every reference here to 0). The floor is a floor, not a clamp: `0.001`
+    // rounds 400 µs to 0 (floored to 1) but 2 000 µs to 2.
+    for reference_us in REFERENCES_US {
+        assert_eq!(
+            scaled_budget_us(reference_us, parse_budget_scale(Some("1e-9"))),
+            1,
+            "1e-9 × {reference_us}"
+        );
+    }
+    assert_eq!(scaled_budget_us(400, parse_budget_scale(Some("0.001"))), 1);
+    assert_eq!(
+        scaled_budget_us(2_000, parse_budget_scale(Some("0.001"))),
+        2
     );
 }

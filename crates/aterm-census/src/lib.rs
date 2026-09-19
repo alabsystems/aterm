@@ -23,11 +23,19 @@
 //! ONE implementation, TWO consumers (so the verb and the gate cannot diverge):
 //!
 //!   * `cargo xtask gate mainloop` (crates/xtask/src/gate.rs) — the standalone
-//!     verb: part of `gate all`, and invoked by tools/verify.sh (line 495). NOT
-//!     "the pre-push hook", which this sentence used to claim: MEASURED
-//!     2026-08-01, `.githooks/pre-push` runs exactly ONE command — the
-//!     freeze-safety-gate build below (line 111 of the hook), which fuses this
-//!     same census. So the CENSUS does run pre-push; this VERB does not.
+//!     verb: part of `gate all`, and invoked by tools/verify.sh.
+//!
+//!     THIS PARAGRAPH WAS THE LAST SURVIVING COPY of a claim the rest of the
+//!     repo corrected in twenty files, and it was the load-bearing one: it said
+//!     "MEASURED 2026-08-01, `.githooks/pre-push` runs exactly ONE command —
+//!     the freeze-safety-gate build (line 111 of the hook) … So the CENSUS does
+//!     run pre-push". From 2026-08-24 to 2026-09-17 that hook ran NOTHING: its
+//!     whole body was one printf and `exit 0`, so this census had no pre-push
+//!     enforcement at all while this file said it did. Since 2026-09-17 the
+//!     hook gates again by READING A RECEIPT rather than running a build
+//!     (`crates/aterm-verify/src/receipt.rs`), so the census reaches a push
+//!     through the merge contract that wrote the receipt — never through the
+//!     hook running it.
 //!   * `tools/freeze-safety-gate/build.rs` — the SAME `cargo build` that runs
 //!     the temporal proof gate runs this census and fails the compile on any
 //!     obligation violation. That fusion is what makes the census AUTOMATIC:

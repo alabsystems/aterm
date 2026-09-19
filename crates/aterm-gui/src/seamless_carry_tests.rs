@@ -92,6 +92,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 attention: r.attention,
                 control: None,
                 frozen_path: false,
+                identity: None,
             })
             .collect(),
     })
@@ -686,6 +687,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             attention: None,
             control: Some(handoff_carry::stamp(b"{}")),
             frozen_path: true,
+            identity: Some("worker".to_string()),
         }],
     };
     let wire = new.to_toml().unwrap();
@@ -697,6 +699,10 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
     let old_wire = aterm_toml::to_string(&old).unwrap();
     assert!(!old_wire.contains("control") && !old_wire.contains("next_turn_id"));
     assert!(!old_wire.contains("outgoing_build") && !old_wire.contains("frozen_path"));
+    assert!(
+        wire.contains("identity = \"worker\"") && !old_wire.contains("identity"),
+        "the identity label rides this build's wire and an old reader drops it"
+    );
     let read = SessionHandoff::from_toml(&old_wire).expect("this build reads an old manifest");
     assert_eq!(read.next_turn_id, None);
     assert_eq!(
@@ -704,6 +710,10 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         "absent: the old build's wire predates"
     );
     assert!(!read.sessions[0].frozen_path);
+    assert_eq!(
+        read.sessions[0].identity, None,
+        "dropped by the old build: the label is gone"
+    );
     assert_eq!(read.sessions[0].control, None);
     assert_eq!(read.sessions[0].screen.as_ref(), Some(&screen));
     assert_eq!(

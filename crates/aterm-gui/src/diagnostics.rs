@@ -60,8 +60,99 @@ pub(crate) struct DiagInfo {
     /// macOS nothing is claimed and the list is empty.
     pub objc_protocols_absent: Vec<&'static str>,
     pub config_path: String,
-    pub config_exists: bool,
+    pub config_presence: ConfigPresence,
     pub env: Vec<(String, String)>,
+}
+
+/// What `aterm.toml` is DOING for this process — the state both stdout reports
+/// print beside its path.
+///
+/// Until 2026-09-18 this was a bare `bool` from `Path::exists()`, so a config
+/// that failed to load at launch got the SAME `[present]` token as one that is
+/// in force, above a settings listing that was silently the defaults; the one
+/// sentence explaining it went only to stderr, which `aterm --diagnose >
+/// report.txt` — the exact gesture the flag exists for — throws away. A
+/// filesystem probe cannot tell "loaded" from "rejected"; only the launch's own
+/// load result can, so [`Rejected`](Self::Rejected) carries it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigPresence {
+    /// No file at the path. The defaults are in force and the report says so.
+    Absent,
+    /// The file was read and parsed: the values in the report came from disk.
+    Loaded,
+    /// The file is on disk and did NOT load — unreadable, or not a valid
+    /// configuration — so every value in the report is a built-in default.
+    /// Carries `app_config::launch_config_notice`'s sentence (path, problem,
+    /// consequence, and what ends it).
+    Rejected(String),
+}
+
+impl ConfigPresence {
+    /// The bracketed token beside the path. The rejected spelling names the
+    /// CONSEQUENCE, like its `absent — defaults` sibling, because that is what
+    /// the reader is actually asking the flag.
+    fn token(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent — defaults",
+            Self::Loaded => "present",
+            Self::Rejected(_) => "present but REJECTED — running defaults",
+        }
+    }
+
+    fn rejection_reason(&self) -> Option<&str> {
+        match self {
+            Self::Rejected(reason) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// The config-file line (plus, for a rejected file, the consequence and the
+/// reason) as BOTH stdout reports print it. Shared so `--diagnose` and
+/// `--show-config` cannot drift back into disagreeing about the same file;
+/// `label` is each report's own gutter, and the continuation lines align under
+/// the path. The parse error is multi-line, so every line of it is indented and
+/// right-trimmed rather than pasted in raw.
+fn config_line(label: &str, path: &str, presence: &ConfigPresence) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "{label}{path} [{}]", presence.token());
+    let Some(reason) = presence.rejection_reason() else {
+        return s;
+    };
+    let indent = " ".repeat(label.chars().count());
+    let _ = writeln!(
+        s,
+        "{indent}every value below is a built-in DEFAULT — nothing came from this file."
+    );
+    for (i, line) in reason.lines().enumerate() {
+        let row = if i == 0 {
+            format!("{indent}reason: {line}")
+        } else {
+            format!("{indent}        {line}")
+        };
+        let _ = writeln!(s, "{}", row.trim_end());
+    }
+    s
+}
+
+/// The config path + its presence for a report, resolved the only honest way:
+/// the filesystem probe answers absent-vs-there, and the launch's own load
+/// failure (`launch_failure`, from `app_config::launch_load_failure`) is what
+/// separates a config in force from one that was thrown away. Call it AFTER
+/// `load_config`, which is what records that failure.
+fn report_config_target(launch_failure: Option<&str>) -> (String, ConfigPresence) {
+    let Some(path) = crate::app_config::config_path() else {
+        return (
+            "(no HOME / XDG_CONFIG_HOME)".to_string(),
+            ConfigPresence::Absent,
+        );
+    };
+    let presence = match launch_failure {
+        Some(reason) => ConfigPresence::Rejected(reason.to_string()),
+        None if path.exists() => ConfigPresence::Loaded,
+        None => ConfigPresence::Absent,
+    };
+    (path.display().to_string(), presence)
 }
 
 fn checkbox(on: bool) -> char {
@@ -106,16 +197,11 @@ impl DiagInfo {
                 self.objc_protocols_absent.join(", ")
             );
         }
-        let _ = writeln!(
-            s,
-            "config:    {} [{}]",
-            self.config_path,
-            if self.config_exists {
-                "present"
-            } else {
-                "absent — defaults"
-            }
-        );
+        s.push_str(&config_line(
+            "config:    ",
+            &self.config_path,
+            &self.config_presence,
+        ));
         let _ = writeln!(s);
         let _ = writeln!(s, "features:");
         for (name, on) in &self.features {
@@ -299,13 +385,10 @@ pub(crate) fn collect() -> DiagInfo {
     let gpu = crate::app_config::resolve_want_gpu(&config);
     let renderer_default = renderer_label(gpu);
 
-    let (config_path, config_exists) = match crate::app_config::config_path() {
-        Some(p) => {
-            let exists = p.exists();
-            (p.display().to_string(), exists)
-        }
-        None => ("(no HOME / XDG_CONFIG_HOME)".to_string(), false),
-    };
+    // AFTER `load_config` above: a rejected file is only distinguishable from a
+    // loaded one by the failure that load recorded.
+    let (config_path, config_presence) =
+        report_config_target(crate::app_config::launch_load_failure());
 
     let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| k.starts_with("ATERM_"))
@@ -338,7 +421,7 @@ pub(crate) fn collect() -> DiagInfo {
         capabilities: capability_list(),
         objc_protocols_absent: objc_protocols_absent(),
         config_path,
-        config_exists,
+        config_presence,
         env,
     }
 }
@@ -408,11 +491,36 @@ fn keybinding_row_warning(
     action: &str,
     shadow: Option<&'static str>,
 ) -> Option<ConfigSemanticWarning> {
-    if let Err(e) = crate::keybinding::Chord::parse(chord) {
-        return Some(ConfigSemanticWarning {
-            key: "keybindings",
-            message: format!("keybindings: chord {chord:?} invalid ({e})"),
-        });
+    match crate::keybinding::Chord::parse(chord) {
+        Err(e) => {
+            return Some(ConfigSemanticWarning {
+                key: "keybindings",
+                message: format!("keybindings: chord {chord:?} invalid ({e})"),
+            });
+        }
+        // A CHORD THAT PARSES CAN STILL BE UNREACHABLE, and nothing said so.
+        // The runtime matches on the UNSHIFTED layout key, so a chord whose key
+        // is a shift-composed glyph never fires — it was accepted with no
+        // warning, called green by `--validate-config`, and printed by
+        // `--list-keybinds` like any working row. Silence for a line that does
+        // nothing, which is the one thing a config checker exists to prevent.
+        Ok(parsed) => {
+            if let Some(glyph) = crate::keybinding::shift_composed_key(&parsed) {
+                let base = crate::keybinding::unshifted_us_spelling(glyph);
+                let advice = base.map_or_else(
+                    || " — write the UNSHIFTED key instead".to_string(),
+                    |b| format!(" — write it with the unshifted key, e.g. {b:?} plus shift"),
+                );
+                return Some(ConfigSemanticWarning {
+                    key: "keybindings",
+                    message: format!(
+                        "keybindings: chord {chord:?} names {glyph:?}, which a US/UK \
+                         layout only produces WITH shift; chords match the unshifted \
+                         key, so this row will not fire on such a layout{advice}"
+                    ),
+                });
+            }
+        }
     }
     if crate::keybinding::is_unbind_action(action) {
         return shadow.map(|label| ConfigSemanticWarning {
@@ -2309,13 +2417,25 @@ fn show_config_font_px(value: f32, explicit: bool) -> String {
 /// exists. An unset font size is necessarily reported as its auto-scale base:
 /// the final physical size is selected only when the real window/display scale
 /// is known. The config FILE path + presence is shown so the reader knows
-/// whether any of this came from disk.
+/// whether any of this came from disk — including the case where the file is
+/// there and none of this came from it, which the header has to say out loud
+/// because every line under it is then a default.
 pub(crate) fn show_config() -> String {
+    show_config_report(None)
+}
+
+/// [`show_config`] with the launch's load failure OVERRIDDEN, so the rejected
+/// header is reachable from a test without moving this process's config path out
+/// from under every other test. `None` — what production passes — asks the live
+/// launch state, and asks it AFTER the `load_config` below, because that call is
+/// what records it.
+fn show_config_report(launch_failure: Option<&str>) -> String {
     let config = crate::app_config::load_config();
-    let (config_path, config_exists) = match crate::app_config::config_path() {
-        Some(p) => (p.display().to_string(), p.exists()),
-        None => ("(no HOME / XDG_CONFIG_HOME)".to_string(), false),
+    let failure: Option<&str> = match launch_failure {
+        Some(reason) => Some(reason),
+        None => crate::app_config::launch_load_failure(),
     };
+    let (config_path, config_presence) = report_config_target(failure);
     let gpu = crate::app_config::resolve_want_gpu(&config);
     let font_px = show_config_font_px(
         crate::app_config::resolve_font_px(&config),
@@ -2340,16 +2460,11 @@ pub(crate) fn show_config() -> String {
     let mut s = String::new();
     let _ = writeln!(s, "resolved launch config (env > config > default)");
     let _ = writeln!(s, "=========================================");
-    let _ = writeln!(
-        s,
-        "config file: {} [{}]",
-        config_path,
-        if config_exists {
-            "present"
-        } else {
-            "absent — defaults"
-        }
-    );
+    s.push_str(&config_line(
+        "config file: ",
+        &config_path,
+        &config_presence,
+    ));
     let _ = writeln!(s);
     let _ = writeln!(s, "font_px:        {font_px}");
     let _ = writeln!(s, "font_family:    {font_family}");
@@ -3642,6 +3757,51 @@ ink = "rainbow"
     /// file as valid is the worst possible answer — the reader came asking why
     /// their edit did nothing and left believing the file was fine.
     #[test]
+    fn a_shift_composed_chord_is_reported_rather_than_accepted_in_silence() {
+        // The runtime matches the UNSHIFTED layout key, so these can never fire
+        // on a US/UK layout — and every one of them used to load green.
+        for (chord, glyph, base) in [
+            ("ctrl+shift+?", '?', '/'),
+            ("cmd+shift+}", '}', ']'),
+            ("ctrl+_", '_', '-'),
+            ("alt+:", ':', ';'),
+        ] {
+            let warning = super::keybinding_row_warning(chord, "next_tab", None)
+                .unwrap_or_else(|| panic!("{chord} can never fire and must say so"));
+            assert!(
+                warning.message.contains(chord),
+                "the warning names the row: {}",
+                warning.message
+            );
+            assert!(
+                warning.message.contains(glyph),
+                "...and the glyph that cannot arrive: {}",
+                warning.message
+            );
+            assert!(
+                warning.message.contains(base),
+                "...and the spelling that works: {}",
+                warning.message
+            );
+        }
+
+        // NEGATIVE CONTROL: ordinary chords stay silent. Without this the
+        // warning could fire on everything and still pass the loop above.
+        for ok in [
+            "ctrl+shift+t",
+            "cmd+1",
+            "ctrl+shift+right",
+            "alt+enter",
+            "cmd+=",
+        ] {
+            assert!(
+                super::keybinding_row_warning(ok, "next_tab", None).is_none(),
+                "{ok} is reachable and must not warn"
+            );
+        }
+    }
+
+    #[test]
     fn validate_refuses_to_green_light_a_config_whose_key_is_misspelled() {
         let joined = validate_config_text("cursor_trail_stlye = \"rainbow kitty\"\n")
             .expect("structurally valid TOML")
@@ -3775,7 +3935,7 @@ ink = "rainbow"
             capabilities: vec![("kitty_graphics", true), ("soft_fonts", false)],
             objc_protocols_absent: vec!["NSApplicationDelegate"],
             config_path: "/home/u/.config/aterm/aterm.toml".into(),
-            config_exists: false,
+            config_presence: ConfigPresence::Absent,
             env: vec![("ATERM_GPU".into(), "1".into())],
         }
     }
@@ -3894,6 +4054,182 @@ ink = "rainbow"
         assert!(
             r.contains("primer:    claude installed, codex not detected — auto-prime: on"),
             "agent primer state + knob line"
+        );
+    }
+
+    /// The gutter the continuation lines of a report's config block hang in.
+    fn gutter(label: &str) -> String {
+        " ".repeat(label.chars().count())
+    }
+
+    /// The hanging indent under `reason: `, where the later lines of a
+    /// multi-line parse error land.
+    fn hanging(label: &str) -> String {
+        " ".repeat(label.chars().count() + "reason: ".len())
+    }
+
+    /// The launch notice for an `aterm.toml` that will not parse — the real,
+    /// multi-line `aterm_toml` error shape, so the indenting is exercised.
+    fn rejected_invalid() -> String {
+        crate::app_config::launch_config_notice(
+            std::path::Path::new("/home/u/.config/aterm/aterm.toml"),
+            crate::app_config::LaunchConfigProblem::Invalid(
+                &"TOML parse error at line 1, column 11\n  |\n1 | font_px = \n  |           \
+                  ^\nexpected a value",
+            ),
+        )
+    }
+
+    /// STDOUT has to say when a config was thrown away. `--diagnose >
+    /// report.txt` is the gesture the flag exists for and it keeps stdout
+    /// alone: until 2026-09-18 a rejected `aterm.toml` printed the SAME
+    /// `[present]` token as one in force, over a report whose config-derived
+    /// lines were all defaults, and the reason went to stderr only — so the
+    /// saved report omitted the one fact that explains why `font_px` does
+    /// nothing.
+    #[test]
+    fn diagnose_says_a_rejected_config_is_not_the_one_in_force() {
+        let mut info = sample();
+        info.config_presence = ConfigPresence::Rejected(rejected_invalid());
+        let r = info.render();
+        let g = gutter("config:    ");
+        let h = hanging("config:    ");
+
+        assert!(
+            r.contains(
+                "config:    /home/u/.config/aterm/aterm.toml \
+                 [present but REJECTED — running defaults]"
+            ),
+            "the rejected state has its own token: {r}"
+        );
+        assert!(
+            !r.contains("[present]"),
+            "the in-force token must never stand for a rejected file: {r}"
+        );
+        assert!(
+            r.contains(&format!(
+                "{g}every value below is a built-in DEFAULT — nothing came from this file."
+            )),
+            "the consequence is stated, aligned under the path: {r}"
+        );
+        assert!(
+            r.contains(&format!(
+                "{g}reason: aterm.toml is not a valid configuration (TOML parse error at line 1, \
+                 column 11"
+            )),
+            "the launch's own sentence is carried onto stdout: {r}"
+        );
+        assert!(
+            r.contains(&format!("{h}expected a value")),
+            "and every later line of the parse error, indented under it: {r}"
+        );
+        // The reader's actual gesture: grep the saved report for any sign the
+        // file was not taken. The old stdout scored zero on all of these.
+        assert!(
+            r.lines()
+                .filter(|l| l.contains("REJECTED")
+                    || l.contains("DEFAULT")
+                    || l.contains("not a valid configuration"))
+                .count()
+                >= 3,
+            "a grep over the saved report finds the rejection: {r}"
+        );
+
+        // A config that IS in force keeps the token it always had.
+        let mut loaded = sample();
+        loaded.config_presence = ConfigPresence::Loaded;
+        assert!(
+            loaded
+                .render()
+                .contains("config:    /home/u/.config/aterm/aterm.toml [present]"),
+            "a loaded config still reads exactly as before"
+        );
+    }
+
+    /// `--show-config` calls its listing the "resolved launch config". When the
+    /// file was rejected that listing IS the defaults, and the header has to
+    /// say so. The launch failure is injected so the state is reachable without
+    /// moving the process's config path out from under the other tests.
+    #[test]
+    fn show_config_marks_a_rejected_config_and_its_listing_as_defaults() {
+        let notice = crate::app_config::launch_config_notice(
+            std::path::Path::new("/home/u/.config/aterm/aterm.toml"),
+            crate::app_config::LaunchConfigProblem::Unreadable(&"Permission denied (os error 13)"),
+        );
+        let out = show_config_report(Some(&notice));
+        let g = gutter("config file: ");
+
+        assert!(
+            out.contains("[present but REJECTED — running defaults]"),
+            "the header names the third state: {out}"
+        );
+        assert!(
+            !out.contains("[present]") && !out.contains("[absent — defaults]"),
+            "neither honest-file token may stand in for a rejected one: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "{g}every value below is a built-in DEFAULT — nothing came from this file."
+            )),
+            "the value list is marked as defaults, aligned under the path: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "{g}reason: aterm.toml could not be read at launch (Permission denied (os error \
+                 13))"
+            )),
+            "the unreadable reason reaches stdout: {out}"
+        );
+        // The listing still prints underneath — the header explains it, it does
+        // not replace it.
+        assert!(out.contains("font_px:"), "the resolved values still print");
+    }
+
+    /// The shared config line, so `--diagnose` and `--show-config` cannot drift
+    /// apart about the same file. The two honest states are pinned BYTE-EXACT:
+    /// that is the line every platform's report has always printed.
+    #[test]
+    fn config_line_renders_three_states_and_aligns_the_reason() {
+        assert_eq!(
+            config_line("config:    ", "/p/aterm.toml", &ConfigPresence::Loaded),
+            "config:    /p/aterm.toml [present]\n"
+        );
+        assert_eq!(
+            config_line("config file: ", "/p/aterm.toml", &ConfigPresence::Absent),
+            "config file: /p/aterm.toml [absent — defaults]\n"
+        );
+        assert_eq!(
+            config_line(
+                "config:    ",
+                "(no HOME / XDG_CONFIG_HOME)",
+                &ConfigPresence::Absent
+            ),
+            "config:    (no HOME / XDG_CONFIG_HOME) [absent — defaults]\n"
+        );
+
+        let g = gutter("config:    ");
+        let h = hanging("config:    ");
+        let rejected = config_line(
+            "config:    ",
+            "/p/aterm.toml",
+            // A parse error's own blank row is what would otherwise paste a
+            // whitespace-padded line into a bug report.
+            &ConfigPresence::Rejected("broken (line 1\n\n  ^ here)".to_string()),
+        );
+        assert_eq!(
+            rejected,
+            format!(
+                "config:    /p/aterm.toml [present but REJECTED — running defaults]\n\
+                 {g}every value below is a built-in DEFAULT — nothing came from this file.\n\
+                 {g}reason: broken (line 1\n\
+                 \n\
+                 {h}  ^ here)\n"
+            ),
+            "continuation lines hang under the path, the error's own indent preserved"
+        );
+        assert!(
+            rejected.lines().all(|l| l.trim_end() == l),
+            "no whitespace-padded rows reach a pasted report: {rejected:?}"
         );
     }
 

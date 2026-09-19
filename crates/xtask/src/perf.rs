@@ -141,17 +141,22 @@ pub(crate) fn baseline_path() -> std::path::PathBuf {
 /// debug build would itself read as a "regression" — which is, deliberately, what
 /// we want the gate to catch if someone ships one).
 pub(crate) fn measure() -> Result<PerfReport, String> {
-    eprintln!("  $ cargo run --release -q -p aterm-bench --example perf_harness");
-    let out = Command::new("cargo")
-        .args([
-            "run",
-            "--release",
-            "-q",
-            "-p",
-            "aterm-bench",
-            "--example",
-            "perf_harness",
-        ])
+    // THE HOST DRIVER, never a bare `cargo` (crate::driver — the store's targo
+    // on a product-provisioned box, where `cargo` is not on PATH at all;
+    // measured 2026-09-18). The lane flag is the driver's to add.
+    let driver = crate::driver::cargo_driver();
+    let args = [
+        "--release",
+        "-q",
+        "-p",
+        "aterm-bench",
+        "--example",
+        "perf_harness",
+    ];
+    eprintln!("  $ {}", driver.display("run", &args));
+    let out = driver
+        .command("run")
+        .args(args)
         .current_dir(workspace_root())
         .output()
         .map_err(|e| format!("could not spawn perf_harness: {e}"))?;
@@ -231,17 +236,22 @@ pub(crate) fn pathological_baseline_json(medians: &[(&str, f64)], ratio: f64) ->
 
 /// Run the release pathological harness and parse its per-corpus report.
 fn measure_pathological() -> Result<Vec<(&'static str, f64)>, String> {
-    eprintln!("  $ cargo run --release -q -p aterm-bench --example pathological_harness");
-    let out = Command::new("cargo")
-        .args([
-            "run",
-            "--release",
-            "-q",
-            "-p",
-            "aterm-bench",
-            "--example",
-            "pathological_harness",
-        ])
+    // THE HOST DRIVER, never a bare `cargo` (crate::driver — the store's targo
+    // on a product-provisioned box, where `cargo` is not on PATH at all;
+    // measured 2026-09-18). The lane flag is the driver's to add.
+    let driver = crate::driver::cargo_driver();
+    let args = [
+        "--release",
+        "-q",
+        "-p",
+        "aterm-bench",
+        "--example",
+        "pathological_harness",
+    ];
+    eprintln!("  $ {}", driver.display("run", &args));
+    let out = driver
+        .command("run")
+        .args(args)
         .current_dir(workspace_root())
         .output()
         .map_err(|e| format!("could not spawn pathological_harness: {e}"))?;
@@ -414,17 +424,22 @@ pub(crate) fn scroll_baseline_json(medians: &[(&str, f64)], ratio: f64) -> Strin
 
 /// Run the release scroll-scrub harness and parse its per-phase report.
 fn measure_scroll() -> Result<Vec<(&'static str, f64)>, String> {
-    eprintln!("  $ cargo run --release -q -p aterm-bench --example scroll_scrub_harness");
-    let out = Command::new("cargo")
-        .args([
-            "run",
-            "--release",
-            "-q",
-            "-p",
-            "aterm-bench",
-            "--example",
-            "scroll_scrub_harness",
-        ])
+    // THE HOST DRIVER, never a bare `cargo` (crate::driver — the store's targo
+    // on a product-provisioned box, where `cargo` is not on PATH at all;
+    // measured 2026-09-18). The lane flag is the driver's to add.
+    let driver = crate::driver::cargo_driver();
+    let args = [
+        "--release",
+        "-q",
+        "-p",
+        "aterm-bench",
+        "--example",
+        "scroll_scrub_harness",
+    ];
+    eprintln!("  $ {}", driver.display("run", &args));
+    let out = driver
+        .command("run")
+        .args(args)
         .current_dir(workspace_root())
         .output()
         .map_err(|e| format!("could not spawn scroll_scrub_harness: {e}"))?;
@@ -841,17 +856,14 @@ fn keyed_baseline_path(lane: &FloorLane) -> std::path::PathBuf {
 
 /// Run a lane's `aterm-bench` example and return its raw JSON line.
 fn measure_example_json(example: &str) -> Result<String, String> {
-    eprintln!("  $ cargo run --release -q -p aterm-bench --example {example}");
-    let out = Command::new("cargo")
-        .args([
-            "run",
-            "--release",
-            "-q",
-            "-p",
-            "aterm-bench",
-            "--example",
-            example,
-        ])
+    // Same host driver as the three harnesses above (crate::driver): the
+    // store's targo where there is no `cargo`, with the lane flag it needs.
+    let driver = crate::driver::cargo_driver();
+    let args = ["--release", "-q", "-p", "aterm-bench", "--example", example];
+    eprintln!("  $ {}", driver.display("run", &args));
+    let out = driver
+        .command("run")
+        .args(args)
         .current_dir(workspace_root())
         .output()
         .map_err(|e| format!("could not spawn {example}: {e}"))?;

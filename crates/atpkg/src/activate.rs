@@ -325,8 +325,9 @@ pub fn reconcile_agents(layout: &Layout) {
         // shim plus one `[ -f <landing marker> ]` ahead of its exports, so a `claude`
         // typed while a newer build is landing waits for it instead of silently running
         // the old one. Rendered here, the one place the twin is laid, from the marker
-        // path this layout owns and the co-located `atpkg` this process runs as.
-        let prelude = platform::sh_landing_prelude(
+        // path this layout owns and the co-located `atpkg` this process runs as — in
+        // the dialect of the twin this platform lays (`sh`, or `.cmd` since 2026-09-17).
+        let prelude = platform::landing_prelude(
             name,
             &layout.prefix,
             &layout.landing_marker(&tool),
@@ -379,9 +380,15 @@ fn twin_is_rendered(
     env: &crate::shim_env::ShimEnv,
     prelude: &str,
 ) -> bool {
-    if cfg!(not(unix)) {
-        return true;
-    }
+    // On every platform since 2026-09-17: the `.cmd` twin renders differently from the
+    // `.cmd` shim too (its landing prelude), so a Windows twin laid by a client from
+    // before it — the plain shim under the twin's name — is re-laid the same way. That
+    // ONE re-lay used to be the Windows twin's one unclosed window: `cmd.exe` resumes a
+    // batch file at a byte offset, and a pre-change twin executing at that moment ran
+    // its agent a second time when it exited. Closed by construction since 2026-09-18:
+    // every `.cmd` starts with the frame (`platform::CMD_FRAME_HEAD`), whose padding is
+    // where such a resume lands and returns; every later re-lay was already safe, the
+    // text ending its batch on the line that runs the program. Unverified on Windows.
     platform::twin_executable_to_env(shim, target, env, prelude).is_ok_and(|want| {
         crate::metadata_io::read_bounded_regular(shim, platform::MAX_SHIM_BYTES)
             .is_ok_and(|have| have == want.body)
@@ -2061,7 +2068,10 @@ mod tests {
             #[cfg(windows)]
             {
                 let body = std::fs::read_to_string(layout.shim(&alias)).unwrap();
-                assert!(body.contains(&format!("\\bin\\{name}.exe\" %*")), "{body}");
+                assert!(
+                    body.contains(&format!("\\bin\\{name}.exe\" %* & @exit /b")),
+                    "{body}"
+                );
             }
         }
         assert_eq!(crate::ops::active_builds(&layout).get("ay"), Some(&18));
@@ -2216,15 +2226,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The Windows `.cmd` alias, as content: the shim named for the ALIAS forwards to the
-    /// PRIMARY's `.exe` — pure, so it is pinned from every build host.
+    /// The Windows `.cmd` alias, as content: the resume-proof frame every `.cmd` starts
+    /// with (2026-09-18), then the shim named for the ALIAS forwarding to the PRIMARY's
+    /// `.exe`, ending its batch on that line — pure, so it is pinned from every build
+    /// host.
     #[test]
     fn the_cmd_alias_forwards_to_the_primary_exe() {
         let target = Path::new(r"C:\Users\me\.aterm\pkg\store\ay\18\bin\ay.exe");
-        assert_eq!(
-            crate::platform::cmd_shim_content(target),
-            "@\"C:\\Users\\me\\.aterm\\pkg\\store\\ay\\18\\bin\\ay.exe\" %*\r\n"
+        let mut want = crate::platform::cmd_frame();
+        want.push_str(
+            "@\"C:\\Users\\me\\.aterm\\pkg\\store\\ay\\18\\bin\\ay.exe\" %* & @exit /b\r\n",
         );
+        assert_eq!(crate::platform::cmd_shim_content(target), want);
         assert_eq!(
             crate::platform::parse_cmd_shim_target(&crate::platform::cmd_shim_content(target)),
             Some(target.to_path_buf())

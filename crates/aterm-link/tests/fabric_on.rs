@@ -1087,20 +1087,39 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     assert!(gone, "the managed broker {pid} must be dead after off");
 }
 
-/// **REFUSALS AND HELP**: `--tcp --key-file` is refused by name with the
-/// reason (the sealed listener is round 16's), a bad `--service` is a usage
-/// error, and `help` names every subcommand.
+/// **REFUSALS AND HELP**: `--tcp --key-file` is refused by name BEFORE
+/// anything is written — in a default build naming the `sealed` feature, in a
+/// sealed one for a non-loopback bind without `--allow-remote` and for an
+/// ephemeral port — a bad `--service` is a usage error, and `help` names every
+/// subcommand.
 #[test]
 fn tcp_is_refused_by_name_and_help_names_every_verb() {
     let s = Scratch::new("usage");
-    let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:7000", "--key-file", "/k"]);
+    let key = s.path("fleet.key");
+    if cfg!(feature = "sealed") {
+        let (code, _, err) = s.fabric(&["on", "--tcp", "0.0.0.0:7000", "--key-file", &key]);
+        assert_eq!(code, 2, "{err}");
+        assert!(
+            err.contains("not a loopback address") && err.contains("--allow-remote"),
+            "{err}"
+        );
+        let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:0", "--key-file", &key]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("FIXED port"), "{err}");
+    } else {
+        let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:7000", "--key-file", &key]);
+        assert_eq!(code, 2, "{err}");
+        assert!(
+            err.contains("the sealed TCP transport is not in this build")
+                && err.contains("`sealed` cargo feature"),
+            "{err}"
+        );
+    }
+    let (code, _, err) = s.fabric(&["on", "--tcp", "127.0.0.1:7000"]);
     assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--tcp needs --key-file"), "{err}");
     assert!(
-        err.contains("--tcp/--key-file are refused in this build") && err.contains("Round 16"),
-        "{err}"
-    );
-    assert!(
-        !s.root().join("link-state").exists(),
+        !s.root().join("link-state").exists() && !Path::new(&key).exists(),
         "a refused flag provisioned something"
     );
     let (code, _, err) = s.fabric(&["on", "--service", "cron"]);
@@ -1116,7 +1135,9 @@ fn tcp_is_refused_by_name_and_help_names_every_verb() {
         "aterm fabric off [--dry-run]",
         "aterm fabric doctor",
         "--service <s>",
-        "REFUSED in this build",
+        "aterm fabric mint-for <node-id>|new",
+        "aterm fabric join --broker <host:port> --tcp",
+        "--allow-remote",
     ] {
         assert!(out.contains(needle), "help must name `{needle}`:\n{out}");
     }

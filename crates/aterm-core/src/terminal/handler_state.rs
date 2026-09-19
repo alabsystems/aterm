@@ -865,6 +865,50 @@ mod erase_pending_wrap_tests {
         );
     }
 
+    /// A SECOND `CSI ?1049h` CLEARS THE SCREEN IT FINDS.
+    ///
+    /// xterm's arm is three calls — `CursorSave(xw); ToAlternate(xw, True);
+    /// ClearScreen(xw);` (charproc.c `srm_OPT_ALTBUF_CURSOR`) — and only the
+    /// MIDDLE one stands down when the alt screen is already up
+    /// (`ToAlternate`: `if (screen->whichBuf == 0)`). aterm returned early from
+    /// the whole arm, so a full-screen app restarting, or one that re-arms 1049
+    /// defensively, inherited the previous app's screen.
+    ///
+    /// The exit assertion is the other half: `CursorSave` writes the CURRENT
+    /// buffer's slot (`screen->sc[whichBuf]`), so the second enter saves into
+    /// the ALT slot and the main cursor 1049 RESET restores is still the one
+    /// the FIRST enter recorded.
+    #[test]
+    fn a_second_1049_enter_clears_the_alt_screen_it_finds() {
+        let mut term = Terminal::new(24, 80);
+        // Park the main cursor somewhere identifiable, then enter.
+        term.process(b"\x1b[5;10H\x1b[?1049h");
+        assert!(term.is_alternate_screen());
+        term.process(b"\x1b[1;1HFIRST APP");
+        assert_eq!(
+            glyph(&term, 0, 0),
+            'F',
+            "the first app painted the alt screen"
+        );
+
+        // The second smcup must not show the first app's screen.
+        term.process(b"\x1b[?1049h");
+        assert!(term.is_alternate_screen(), "still on the alt screen");
+        assert!(
+            row_is_blank(&term, 0),
+            "a second 1049 SET runs ClearScreen — the previous app's row must be gone"
+        );
+
+        // ...and it saved into the ALT slot, so the main restore is unharmed.
+        term.process(b"\x1b[?1049l");
+        assert!(!term.is_alternate_screen(), "back on the main screen");
+        assert_eq!(
+            cursor(&term),
+            (4, 9),
+            "the main cursor came from the FIRST save, not the second"
+        );
+    }
+
     #[test]
     fn alt_47_enter_carries_the_wrap_over() {
         // Mode 47 is `ToAlternate(xw, False)` with no ClearScreen: the wrap survives.

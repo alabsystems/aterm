@@ -74,6 +74,16 @@ trust-gate = { path = "../trust-gate" }
 [target.'cfg(unix)'.dependencies]
 aterm-link = { path = "../aterm-link" }
 
+[features]
+# The SEALED cross-host transport in the one binary — `aterm link broker --tcp`,
+# `aterm fabric on --tcp`, `aterm fabric join` (docs/FABRIC-SECOND-HOST.md).
+# OFF BY DEFAULT and off in every shipped binary, for aterm-link's own reason
+# (its Cargo.toml): it compiles astream-aead's chacha20poly1305 + getrandom tree,
+# which a one-host fleet never opens. A host that joins another host's fleet, and
+# the host that serves it, build with `-p aterm --features sealed`. It forwards
+# to a unix-only dependency, so on other targets it enables nothing.
+sealed = ["aterm-link/sealed"]
+
 [dev-dependencies]
 # The front-door verb-routing test drives the binary under a REAL pty: the
 # regression it pins (`aterm ship` reaching the session parser) is invisible

@@ -406,6 +406,12 @@ proptest = { workspace = true }
 # path (keystroke-to-echo, PTY-flood-to-present) had NO bench target at all —
 # the audits' GUI-half findings (CF-6 driver, PET-03 gui) were unpriceable.
 criterion = "0.5"
+# The reflow-ceiling probe (`benches/reflow_smt_probe.rs`) drives the LZ4 block
+# codec directly — decompressing into a REUSED buffer, the shape the x86_64 table
+# in `app_render::reflow_worker_ceiling`'s doc was measured with — which
+# `aterm-scrollback`'s allocating wrapper cannot express. The crate is already in
+# this graph under aterm-scrollback, so this adds an edge, not a package.
+aterm-lz4 = { workspace = true }
 # TRUST_NATIVE_TLA Phase 2: the relocated `spec_xref_closure` gate lives in this
 # binary's TEST build (`#[cfg(test)] mod spec_xref_gate` in main.rs). It collects
 # the ISOLATION-family `#[refines]`/`#[spec_unmodeled]` anchors via `inventory`, so
@@ -602,6 +608,18 @@ required-features = ["bench-support"]
 # at 30 tabs x 4 panes. Same `bench-support` seam, same no-shipping-build law.
 [[bench]]
 name = "workspace_scaling"
+harness = false
+required-features = ["bench-support"]
+
+# The REFLOW-CEILING axis on a hyper-threaded host. `workspace_scaling` measured
+# the reflow pool's ceiling on Apple silicon, where physical cores == logical
+# CPUs; this probe is the instrument behind the x86_64 table in
+# `app_render::reflow_worker_ceiling`'s doc comment — what the workers past the
+# physical cores buy on the history-back drain and what they cost a
+# latency-sensitive thread's wakes. A MODEL of the settle, not the settle (see
+# its header). Same `bench-support` seam, same no-shipping-build law.
+[[bench]]
+name = "reflow_smt_probe"
 harness = false
 required-features = ["bench-support"]
 

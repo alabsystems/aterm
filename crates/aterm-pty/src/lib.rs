@@ -253,6 +253,80 @@ mod tests {
         );
     }
 
+    /// THE IDENTITY SEAM (session identities, 2026-09-17). A session spawned
+    /// with `identity=<name>` gets each agent's home variable pointed into the
+    /// identity dir through `env_add`, which this builder applies AFTER the
+    /// deny pass. For every variable the identity table sets (the primer's
+    /// roster read through its `var` column — `CLAUDE_CONFIG_DIR`, `CODEX_HOME`;
+    /// spelled here because this crate sits below the primer), the parent's
+    /// value is GONE and the identity's is present — and no other `CLAUDE*` /
+    /// `CODEX_*` key of the parent's survives beside it. No `is_ai_env_var`
+    /// pin is needed for that: an inherited key is REPLACED by `env_add`'s
+    /// value whether or not it was denied, so a future row for a variable the
+    /// deny tables do not cover (Gemini's) behaves the same.
+    #[test]
+    fn build_child_env_replaces_the_parents_agent_home_with_the_identitys() {
+        use std::ffi::OsString;
+        let os = |s: &str| OsString::from(s);
+        let table = [
+            ("CLAUDE_CONFIG_DIR", "/state/identities/worker/.claude"),
+            ("CODEX_HOME", "/state/identities/worker/.codex"),
+        ];
+        for (var, identity_value) in table {
+            let inherited = vec![
+                (os("HOME"), os("/Users//human")),
+                (os(var), os("/Users//human/agent-config-of-the-human")),
+                (os("CLAUDECODE"), os("1")),
+                (os("CLAUDE_CODE_ENTRYPOINT"), os("cli")),
+                (os("CODEX_SANDBOX"), os("seatbelt")),
+                (os("PATH"), os("/usr/bin")),
+            ];
+            let env_add = vec![(var.to_string(), identity_value.to_string())];
+            let out = build_child_env(inherited.into_iter(), &env_add);
+            let values: Vec<(String, String)> = out
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect();
+            let of_var: Vec<&str> = values
+                .iter()
+                .filter(|(k, _)| k == var)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            assert_eq!(
+                of_var,
+                vec![identity_value],
+                "{var}: exactly once, and it is the identity's value, not the parent's"
+            );
+            assert!(
+                !values
+                    .iter()
+                    .any(|(_, v)| v.contains("agent-config-of-the-human")),
+                "{var}: the parent's value is gone from the child env: {values:?}"
+            );
+            let agent_keys: Vec<&str> = values
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .filter(|k| k.starts_with("CLAUDE") || k.starts_with("CODEX_"))
+                .collect();
+            assert_eq!(
+                agent_keys,
+                vec![var],
+                "{var}: no other CLAUDE*/CODEX_* key of the parent's rides along"
+            );
+            assert!(
+                values
+                    .iter()
+                    .any(|(k, v)| k == "HOME" && v == "/Users//human"),
+                "HOME is the human's: an identity moves the agent's config, not the user"
+            );
+        }
+    }
+
     // Windows env names are case-insensitive: a non-canonical-case copy of a
     // deny-listed var must be filtered too, or it leaks into the child.
     #[cfg(windows)]

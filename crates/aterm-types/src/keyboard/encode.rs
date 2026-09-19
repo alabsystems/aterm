@@ -643,11 +643,60 @@ fn associated_text_codepoints(
         // the keypad key rather than this twin. The keypad's named keys
         // (`NumpadEnter`, `NumpadEnd`) fold to named twins and carry no text,
         // exactly as `Enter` and `End` do.
-        Key::Named(_) => match key.main_block_twin() {
-            Some(Key::Character(glyph)) if !glyph.is_control() => Some(vec![glyph as u32]),
-            _ => None,
-        },
+        //
+        // …AND A NAMED KEY THAT TYPES A CHARACTER ITSELF ANSWERS FIRST. The
+        // twin is the KEYPAD fold, and asking it alone silenced the SPACEBAR:
+        // `Space` is a main-block key, so it has no twin, and the one key
+        // whose glyph IS its own key code reported no text at all (`ESC[32u`
+        // where kitty sends `ESC[32;1;32u`). A client that inserts strictly
+        // from the associated-text field — the field's whole purpose, since
+        // that is how a non-US layout or an IME delivers the character
+        // actually typed — typed every letter, digit, symbol and keypad glyph
+        // but never a space. `named_key_text` is that "what does this key
+        // type" question, and the SAME control-code filter the `Character`
+        // arm applies decides the rest, exactly as the spec's single
+        // exclusion does ("code points below U+0020"): Enter's `\r`, Tab's
+        // `\t` and Backspace's `\x7f` are dropped BY THE RULE rather than by
+        // never being asked, and U+0020, which is not below U+0020, survives.
+        Key::Named(named) => {
+            let text = named_key_text(*named).or(match key.main_block_twin() {
+                Some(Key::Character(glyph)) => Some(glyph),
+                _ => None,
+            });
+            match text {
+                Some(glyph) if !glyph.is_control() => Some(vec![glyph as u32]),
+                _ => None,
+            }
+        }
     }
+}
+
+/// The character a NAMED key types — the text its press puts on the screen,
+/// before any control-code filter. `None` for the keys that type nothing
+/// (arrows, nav, F-keys, modifiers) and for the dedicated keypad keys, whose
+/// glyph comes from [`Key::main_block_twin`] instead.
+///
+/// The list is the named keys with an ASCII code point rather than a kitty PUA
+/// functional number: Space (`' '`), and the legacy text keys Enter (`'\r'`),
+/// Tab (`'\t'`) and Backspace (`'\x7f'`). The three control codes are listed
+/// HONESTLY, not omitted — `associated_text_codepoints` drops them with the
+/// same `is_control` test it applies to a character key, which is the kitty
+/// spec's one exclusion ("the associated text must not contain control
+/// codes … code points below U+0020"). Spelling them as "types nothing" would
+/// hide the rule that must keep U+0020 in while keeping U+000D out.
+///
+/// Backspace's WIRE byte swaps with DECBKM (`0x7f`/`0x08`); both are control
+/// codes, so the filter answers the same for either and this table need not
+/// know the mode.
+#[must_use]
+fn named_key_text(named: NamedKey) -> Option<char> {
+    Some(match named {
+        NamedKey::Space => ' ',
+        NamedKey::Enter => '\r',
+        NamedKey::Tab => '\t',
+        NamedKey::Backspace => '\x7f',
+        _ => return None,
+    })
 }
 
 /// The glyph SHIFT composes from base key `c` on the US layout (`'h'`→`'H'`, `'2'`→`'@'`,

@@ -582,12 +582,19 @@ pub const SHOULDER_MIN_CELLS: f32 = 1.0;
 /// Shoulder length ceiling, in cells (§6.5 layer 3).
 pub const SHOULDER_MAX_CELLS: f32 = 4.0;
 
-/// The SLOWEST effect frame the lane produces, in ms — a 60 Hz panel at
-/// `EFFECT_PRESENT_PANEL_PERIODS = 2` (T7, §18). The shoulder's continuity
-/// floor is the head's travel over THIS long, so the head is spatially
-/// continuous at every panel rate without the emit path keeping a
-/// previous-frame position (which would make a frame a function of its
-/// predecessor rather than of `now`).
+/// The effect frame the continuity floor is sized to, in ms — a 60 Hz panel
+/// under `EFFECT_PRESENT_PANEL_PERIODS = 2` (T7, §18), which is every 60 Hz
+/// panel off the Intel-Mac arm, and an Intel Mac's 30 Hz panel at panel rate.
+/// A LOWER BOUND on continuity, not the slowest frame the lane can produce: a
+/// slower panel under the halving (a 30 Hz panel off that arm, 66.7 ms) makes
+/// a slower frame still, and an Intel Mac's 60 Hz panel presents the lane at
+/// PANEL rate while its drawable pool stays free (`aterm-gui`'s
+/// `EFFECT_LANE_PANEL_RATE_AT_60HZ`, measured there), so that frame is half
+/// this and the floor spans two of them — kept as is, because a shorter floor
+/// could only shrink the shoulder. The shoulder's continuity floor is the
+/// head's travel over THIS long, so the head is spatially continuous at every
+/// panel rate without the emit path keeping a previous-frame position (which
+/// would make a frame a function of its predecessor rather than of `now`).
 pub const SHOULDER_FRAME_MS: f32 = 33.4;
 
 /// The corona's reach as a multiple of the nucleus radius (§6.5 layer 6's

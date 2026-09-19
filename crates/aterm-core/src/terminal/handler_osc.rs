@@ -1502,6 +1502,78 @@ mod tests {
         assert_eq!(*captured.lock().expect("poisoned"), None);
     }
 
+    /// THE TERMINAL ANSWERS EVERY CLIPBOARD IT ADMITS. The handler caps the
+    /// DECODED clipboard at `MAX_OSC52_QUERY_RESPONSE_BYTES` and then answers in
+    /// base64, which expands 3 bytes to 4 — so the wire response is ~1.34x the
+    /// payload. Both response budgets were sized on the DECODED number and
+    /// dropped anything larger than capacity outright, so every clipboard from
+    /// 49,145 to 65,536 bytes passed the handler's own cap and then produced
+    /// SILENCE: not a refusal, not a truncation, no byte on the wire at all.
+    /// Both budgets carried the same false comment, that "a single legitimate
+    /// response never exceeds `capacity_bytes` by construction".
+    ///
+    /// This pins the relationship from aterm-core, across the crate boundary to
+    /// aterm-policy's `standard()` profile — the one `spawn.rs` installs — so
+    /// the two numbers cannot drift apart again without a red test. The sizes
+    /// bracket the old cliff: below it, at it, and at the admitted maximum.
+    #[test]
+    fn osc52_query_answers_every_clipboard_it_admits() {
+        for len in [
+            1_024,
+            49_144,
+            49_145,
+            64 * 1024 - 1,
+            super::super::MAX_OSC52_QUERY_RESPONSE_BYTES,
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.authorize_clipboard_access(
+                crate::terminal::clipboard_auth::ClipboardAccess::Query,
+            );
+            term.set_clipboard_callback(move |op| match op {
+                crate::terminal::ClipboardOperation::Query { .. } => Some("x".repeat(len)),
+                _ => None,
+            });
+            term.apply_policy_engine(PolicyEngine::new(profiles::standard()));
+
+            term.process(b"\x1b]52;c;?\x07");
+
+            let response = term.take_response().unwrap_or_else(|| {
+                panic!(
+                    "a {len}-byte clipboard is within the handler's own \
+                     {}-byte cap, so it must be ANSWERED, not silently dropped",
+                    super::super::MAX_OSC52_QUERY_RESPONSE_BYTES
+                )
+            });
+            assert!(
+                response.starts_with(b"\x1b]52;c;"),
+                "the answer is an OSC 52 reply"
+            );
+        }
+    }
+
+    /// The other side of the same bound: a clipboard ABOVE the cap is still
+    /// refused, so the fix widened what is answered without widening what is
+    /// admitted. Without this the test above would pass a handler that answered
+    /// anything at all.
+    #[test]
+    fn osc52_query_still_refuses_a_clipboard_over_the_cap() {
+        let mut term = Terminal::new(24, 80);
+        term.authorize_clipboard_access(crate::terminal::clipboard_auth::ClipboardAccess::Query);
+        let len = super::super::MAX_OSC52_QUERY_RESPONSE_BYTES + 1;
+        term.set_clipboard_callback(move |op| match op {
+            crate::terminal::ClipboardOperation::Query { .. } => Some("x".repeat(len)),
+            _ => None,
+        });
+        term.apply_policy_engine(PolicyEngine::new(profiles::standard()));
+
+        term.process(b"\x1b]52;c;?\x07");
+
+        assert!(
+            term.take_response().is_none(),
+            "a clipboard past the cap is refused, as before"
+        );
+    }
+
     #[test]
     fn osc_52_standard_policy_wildcard_does_not_overgrant_revoked_query() {
         let mut term = Terminal::new(24, 80);

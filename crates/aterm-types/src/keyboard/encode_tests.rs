@@ -943,6 +943,92 @@ fn kitty_associated_text_carries_the_keypad_glyph() {
     );
 }
 
+/// THE SPACEBAR TYPES A SPACE, and `REPORT_ASSOCIATED_TEXT` must say so.
+/// The flag's whole purpose is to carry the text the press produced — it is
+/// how a non-US layout or an IME-composed key delivers the character actually
+/// typed — and the kitty spec names exactly ONE exclusion: "the associated
+/// text must not contain control codes (control codes are code points below
+/// U+0020 and codepoints in the C0 and C1 blocks)". U+0020 is not BELOW
+/// U+0020, so the rule that correctly silences Enter (`\r`), Tab (`\t`) and
+/// Backspace (`\x7f`) does not reach Space. kitty agrees in code: its
+/// `startswith_ascii_control_char` is `codep < 32 || codep == 127`, which 32
+/// passes.
+///
+/// The `Key::Named` arm derived its text SOLELY from `main_block_twin()`, the
+/// KEYPAD fold — and Space is a main-block key, so it has no twin and fell to
+/// `None`. A physical spacebar reaches this encoder as
+/// `Key::Named(NamedKey::Space)` (the winit seam's
+/// `WinitNamed::Space => NamedKey::Space`), so a client that inserts strictly
+/// from the associated-text field typed every letter, digit, symbol and
+/// keypad glyph but never a space: `ESC[32u`, with no text field at all.
+#[test]
+fn kitty_associated_text_carries_the_spacebars_space() {
+    let report_all_text = KeyboardMode::REPORT_ALL_KEYS_AS_ESC
+        | KeyboardMode::REPORT_ASSOCIATED_TEXT
+        | KeyboardMode::DISAMBIGUATE_ESC_CODES;
+    let full =
+        report_all_text | KeyboardMode::REPORT_EVENT_TYPES | KeyboardMode::REPORT_ALTERNATE_KEYS;
+
+    for mode in [report_all_text, full] {
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Space), Modifiers::empty(), mode),
+            b"\x1b[32;1;32u",
+            "the spacebar reports the space it typed alongside its key code"
+        );
+        // SHIFT composes nothing new on the spacebar — the text is still a
+        // space — but the modifier field still reports the chord.
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Space), Modifiers::SHIFT, mode),
+            b"\x1b[32;2;32u"
+        );
+        // The ONE exclusion, unmoved: the legacy text keys type control codes
+        // and therefore carry no text.
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Enter), Modifiers::empty(), mode),
+            b"\x1b[13u",
+            "Enter types `\\r`, a control code"
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Tab), Modifiers::empty(), mode),
+            b"\x1b[9u"
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Backspace), Modifiers::empty(), mode),
+            b"\x1b[127u"
+        );
+        // A Ctrl/Alt/Super chord is not a text event on ANY key (Ctrl+Space is
+        // NUL, not a space), so the payload stays off.
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Space), Modifiers::CTRL, mode),
+            b"\x1b[32;5u"
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Space), Modifiers::ALT, mode),
+            b"\x1b[32;3u"
+        );
+    }
+
+    // A RELEASE reports no text, exactly as a character release does.
+    assert_eq!(
+        encode_key_with_event(
+            &Key::Named(NamedKey::Space),
+            Modifiers::empty(),
+            full,
+            KeyEventType::Release
+        ),
+        b"\x1b[32;1:3u"
+    );
+    // And without the flag there is no payload at all.
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Space),
+            Modifiers::empty(),
+            KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::DISAMBIGUATE_ESC_CODES
+        ),
+        b"\x1b[32u"
+    );
+}
+
 /// A KEYPAD KEY DOES NOT COMPOSE, and a kitty REPORTING flag cannot make it.
 /// The legacy fold above names the key for the CSI-u report; handing that name
 /// to the legacy encoder too ran the MAIN ROW's tables over it, so under a bare

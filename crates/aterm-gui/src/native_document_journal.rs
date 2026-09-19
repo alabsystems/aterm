@@ -583,27 +583,44 @@ impl DraftJournalHost {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT: AtomicU64 = AtomicU64::new(1);
             // A RECYCLED PID MUST NEVER RESOLVE TO A DEAD RUN'S ROOT. These
-            // roots are draft-recovery journals and they are never cleaned up,
-            // so a pid+ordinal name alone let macOS pid recycling hand a fresh
-            // test process a prior run's unsaved draft — which crash recovery
-            // then dutifully replayed into the new test's document (the proven
-            // six-tests-at-once app_documents flake: one Enter on "abc" landed
-            // on a resurrected "abc\n" and read back "abc\n\n"). Stamp the
-            // root with a per-process boot nonce so the name is unique per
-            // process INSTANCE, and remove any same-named corpse: a live
-            // process cannot share our pid AND our stamp.
+            // roots are draft-recovery journals, so a pid+ordinal name alone let
+            // macOS pid recycling hand a fresh test process a prior run's
+            // unsaved draft — which crash recovery then dutifully replayed into
+            // the new test's document (the proven six-tests-at-once
+            // app_documents flake: one Enter on "abc" landed on a resurrected
+            // "abc\n" and read back "abc\n\n"). Stamp the root with a
+            // per-process boot nonce so the name is unique per process
+            // INSTANCE, and remove any same-named corpse: a live process cannot
+            // share our pid AND our stamp.
+            //
+            // AND THEN TAKE THEM BACK. This comment used to say these roots
+            // "are never cleaned up", and it was true: every call left one
+            // directory in the system temp dir forever. On m17-tower that
+            // reached 224,002 of them — enough that `/tmp`, a RAM-backed tmpfs
+            // there, held them in memory and the box ran itself out of swap.
+            // The leak is invisible per-run (a few empty directories) and lethal
+            // over a few thousand runs, which is exactly the shape that never
+            // gets attributed to the thing causing it. Two changes: every root
+            // for this process now nests under ONE per-process parent, so a run
+            // is a single directory rather than an unbounded family, and the
+            // first call sweeps the parents that dead runs left behind. The
+            // sweep is what makes it self-healing rather than merely tidy: a
+            // test binary that crashes or is killed cleans up on the NEXT run
+            // instead of never.
             static STAMP: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
             let stamp = *STAMP.get_or_init(|| {
+                sweep_abandoned_test_draft_roots();
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos()
             });
-            let root = std::env::temp_dir().join(format!(
-                "aterm-test-drafts-{}-{stamp:x}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let root = std::env::temp_dir()
+                .join(format!(
+                    "{TEST_DRAFT_ROOT_PREFIX}{}-{stamp:x}",
+                    std::process::id()
+                ))
+                .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string());
             let _ = std::fs::remove_dir_all(&root);
             Self::new(root)
         }
@@ -897,6 +914,96 @@ pub(crate) fn checkpoint_plan(
         bytes: Arc::from(bytes),
         fingerprint,
     })
+}
+
+/// The one name every test draft root in this process hangs under.
+#[cfg(test)]
+const TEST_DRAFT_ROOT_PREFIX: &str = "aterm-test-drafts-";
+
+/// Reclaim the per-process draft parents that earlier test runs abandoned.
+///
+/// Called once per process, from the `STAMP` initialiser, before this run
+/// creates its own parent. It exists because the previous scheme leaked one
+/// directory per `system_default()` call with no owner and no expiry: 224,002 of
+/// them accumulated in `/tmp` on m17-tower, which is a RAM-backed tmpfs, and the
+/// machine exhausted its swap holding empty directories.
+///
+/// WHAT IT WILL AND WILL NOT DELETE. Only entries directly under the system temp
+/// dir whose name carries this crate's prefix, and only those a run cannot still
+/// be using:
+///
+/// - Same pid as ours but a DIFFERENT stamp: certainly dead, because we are that
+///   pid now. Removed unconditionally.
+/// - A different pid: removed only once we can show the owner is gone. On Linux
+///   that is exact — `/proc/<pid>` either exists or it does not. Everywhere else
+///   there is no dependency-free liveness check, so it falls back to age, and
+///   the threshold is deliberately a whole day: deleting a live run's journal
+///   would resurrect the very flake the stamp was added to kill, so the failure
+///   mode of waiting too long is a few stale directories and the failure mode of
+///   acting too early is a corrupted test. The sweep is best-effort throughout —
+///   every error is discarded, because a test run must not fail over housekeeping.
+#[cfg(test)]
+fn sweep_abandoned_test_draft_roots() {
+    /// Only for hosts with no `/proc`: how long an untouched parent must sit
+    /// before we treat its owner as gone.
+    const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+    let temp = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&temp) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(TEST_DRAFT_ROOT_PREFIX) else {
+            continue;
+        };
+        // `<pid>-<stamp>`; anything else is not ours to judge.
+        let Some((pid, _stamp)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let abandoned = if pid == me {
+            // Our own pid, and the stamp is not this run's (this runs before
+            // ours exists), so it belongs to a dead process we were recycled
+            // from — the exact case the stamp was introduced to survive.
+            true
+        } else {
+            !test_draft_owner_is_alive(pid)
+                || entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .and_then(|m| m.elapsed().map_err(std::io::Error::other))
+                    .is_ok_and(|age| age > ABANDONED_AFTER)
+        };
+        if abandoned {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether a draft-root owner is still running, as far as this host can say.
+///
+/// Linux answers exactly from `/proc`. Every other host has no dependency-free
+/// way to ask, so it answers "alive" and lets the age rule in the caller decide
+/// — erring toward keeping a directory, never toward deleting a live one.
+#[cfg(test)]
+fn test_draft_owner_is_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 #[cfg(not(test))]

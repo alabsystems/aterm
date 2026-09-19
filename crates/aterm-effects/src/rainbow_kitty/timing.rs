@@ -67,8 +67,11 @@ pub const FLIGHT_BASE_MS: f32 = 50.0;
 pub const FLIGHT_PER_CELL_MS: f32 = 1.0;
 
 /// Floor of the flight clock. Below this the head cannot be seen to travel at
-/// all on a 60 Hz panel (T7: a 60 ms flight is 2-4 effect frames there), and a
-/// shorter gesture would read as a teleport with a smear.
+/// all on a 60 Hz panel (T7: a 60 ms flight is ~2 effect frames there under
+/// the halving — every 60 Hz panel off the Intel-Mac arm — and 3-4 at panel
+/// rate on an Intel Mac, whose lane runs at 60 fps only while its drawable
+/// pool keeps up; `SHOULDER_FRAME_MS` has the arm), and a shorter gesture
+/// would read as a teleport with a smear.
 pub const FLIGHT_MIN_MS: f32 = 60.0;
 
 /// Ceiling of the flight clock. §2.1's T3 says release is the art but the

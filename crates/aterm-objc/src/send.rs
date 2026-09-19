@@ -333,6 +333,18 @@ pub unsafe fn send_f64(recv: Id, sel: Sel) -> f64 {
 /// See the module note.
 #[must_use]
 pub unsafe fn send_rect(recv: Id, sel: Sel) -> CGRect {
+    // A nil receiver: libobjc zeroes REGISTER-class returns on the nil path
+    // (rax/rdx, xmm0/xmm1; d0-d3 on arm64) but never touches an INDIRECT
+    // struct return — and a 32-byte CGRect is `objc_msgSend_stret` on x86_64,
+    // so `[nil frame]` handed back whatever was on the stack (measured
+    // 2026-09-06 on an Intel Mac: 0xAB poison survives; clang-compiled ObjC
+    // only reads zero because clang wraps every stret send in its own nil
+    // check + memset). arm64 returns CGRect in d0-d3, zeroed, which is why the
+    // "nil returns zero" contract held on every dev machine. The check is the
+    // one clang makes.
+    if recv.is_null() {
+        return CGRect::default();
+    }
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = msg();
@@ -457,6 +469,11 @@ pub unsafe fn send_point_point_id(recv: Id, sel: Sel, a: CGPoint, b: Id) -> CGPo
 /// See the module note.
 #[must_use]
 pub unsafe fn send_rect_rect_id(recv: Id, sel: Sel, a: CGRect, b: Id) -> CGRect {
+    // Nil receiver: an indirect struct return is left uninitialised by libobjc
+    // on x86_64 — see `send_rect`.
+    if recv.is_null() {
+        return CGRect::default();
+    }
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Id) -> CGRect = msg();
@@ -705,6 +722,11 @@ pub unsafe fn send_id_idptr_usize(recv: Id, sel: Sel, a: *const Id, b: usize) ->
 /// See the module note.
 #[must_use]
 pub unsafe fn send_rect_rect(recv: Id, sel: Sel, a: CGRect) -> CGRect {
+    // Nil receiver: an indirect struct return is left uninitialised by libobjc
+    // on x86_64 — see `send_rect`.
+    if recv.is_null() {
+        return CGRect::default();
+    }
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> CGRect = msg();

@@ -252,9 +252,7 @@ pub fn connect(transport: &Transport, endpoint: &str) -> io::Result<(Conn, Close
             let _ = (key, endpoint);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "the sealed TCP transport is not in this build: rebuild with \
-                 `--features sealed` (it compiles astream-aead's cipher tree, which \
-                 a local fleet never opens); a local fleet uses the Unix socket",
+                SEALED_UNAVAILABLE,
             ))
         }
         #[cfg(feature = "sealed")]
@@ -298,6 +296,109 @@ pub fn read_key_file(path: &str) -> io::Result<[u8; 32]> {
             io::ErrorKind::InvalidData,
             format!("{path}: the sealed transport's key is 64 hex characters (32 bytes)"),
         ))
+    }
+}
+
+/// Whether THIS build carries the sealed TCP transport — the `sealed` cargo
+/// feature (this crate's Cargo.toml says why it is off by default). Every verb
+/// that needs it asks here first and refuses by name with
+/// [`SEALED_UNAVAILABLE`] when it is not, rather than parsing its flags and
+/// failing later with an `Unsupported` from a connect.
+pub const SEALED: bool = cfg!(feature = "sealed");
+
+/// What a default build says when a verb needs the sealed transport: the
+/// feature, the rebuild, and why the shipped binary does not carry it.
+pub const SEALED_UNAVAILABLE: &str = "the sealed TCP transport is not in this build: it is \
+     the `sealed` cargo feature, off by default and off in the shipped `aterm` (it compiles \
+     astream-aead's chacha20poly1305 + getrandom tree, which a one-host fleet never opens) — \
+     rebuild with `targo --unverified build --release -p aterm --features sealed` \
+     (or `-p aterm-link --features sealed` for the `aterm-link` binary alone)";
+
+/// Refuse a SECRET file anyone but its owner can read: a mint secret, a
+/// pre-shared key, a capability file. `mode & 0o077` must be zero — 0600 or
+/// tighter — and the refusal names the `chmod` that fixes it rather than
+/// fixing it silently, because a key that sat world-readable may already have
+/// been read and the operator should know that it did.
+///
+/// # Errors
+///
+/// The `stat`, or a mode with any group/other bit set.
+pub fn check_private(path: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{path} is mode {mode:04o}: a secret file must be readable by its owner alone \
+                 (0600) — `chmod 600 {path}`, and treat what it holds as already seen if other \
+                 users share this machine"
+            ),
+        ))
+    }
+}
+
+/// [`read_key_file`] behind [`check_private`]: what the broker and `aterm
+/// fabric on|join` read a pre-shared key with. The bridge's own `--key-file`
+/// keeps the plain reader, so a fleet whose key predates this check still
+/// dials.
+///
+/// # Errors
+///
+/// A key file that is not 0600, or not 64 hex characters.
+pub fn read_private_key_file(path: &str) -> io::Result<[u8; 32]> {
+    check_private(path)?;
+    read_key_file(path)
+}
+
+/// A key as the key FILE spells it: 64 lowercase hex characters and a newline —
+/// the shape [`read_key_file`] and `asb --key-file` read.
+#[must_use]
+pub fn key_file_text(key: &[u8; 32]) -> String {
+    let mut s: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    s.push('\n');
+    s
+}
+
+/// Whether every address `endpoint` (`<host>:<port>`) resolves to is a
+/// LOOPBACK address — the only kind a TCP broker binds without
+/// `--allow-remote`. `0.0.0.0` and `[::]` are the unspecified addresses, which
+/// listen on EVERY interface, so they are not loopback.
+///
+/// # Errors
+///
+/// An endpoint that does not resolve, or resolves to nothing.
+pub fn is_loopback_endpoint(endpoint: &str) -> io::Result<bool> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = endpoint.to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{endpoint} resolves to no address"),
+        ));
+    }
+    Ok(addrs.iter().all(|a| a.ip().is_loopback()))
+}
+
+/// The port of a `<host>:<port>` endpoint, when it has one that parses.
+#[must_use]
+pub fn endpoint_port(endpoint: &str) -> Option<u16> {
+    endpoint.rsplit_once(':')?.1.parse().ok()
+}
+
+/// The address THIS host's own clients dial for a broker bound at `bind`: the
+/// loopback address of the same family when `bind` is an unspecified address
+/// (`0.0.0.0:<p>` → `127.0.0.1:<p>`, `[::]:<p>` → `[::1]:<p>`), which a bind
+/// accepts on every interface but a connect cannot name; `bind` itself
+/// otherwise.
+#[must_use]
+pub fn dial_for_bind(bind: &str) -> String {
+    match bind.rsplit_once(':') {
+        Some(("0.0.0.0", port)) => format!("127.0.0.1:{port}"),
+        Some(("[::]", port)) => format!("[::1]:{port}"),
+        _ => bind.to_string(),
     }
 }
 
@@ -386,6 +487,65 @@ mod tests {
         );
         drop(peer);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ROUND 16'S SECRET-FILE RULE: 0600 or tighter passes, any group/other
+    /// bit is refused with the `chmod` that fixes it — and the checked key
+    /// reader applies it before it parses a byte.
+    #[test]
+    fn a_secret_file_other_users_can_read_is_refused_naming_the_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("atlink-priv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("k");
+        let p = path.to_str().expect("utf8");
+        std::fs::write(&path, key_file_text(&[0x5a; 32])).expect("write");
+        for (mode, ok) in [(0o600, true), (0o400, true), (0o640, false), (0o604, false)] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            assert_eq!(check_private(p).is_ok(), ok, "{mode:o}");
+            assert_eq!(read_private_key_file(p).is_ok(), ok, "{mode:o}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let e = read_private_key_file(p).expect_err("0644").to_string();
+        assert!(
+            e.contains("0644") && e.contains(&format!("chmod 600 {p}")),
+            "{e}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert_eq!(read_private_key_file(p).expect("read"), [0x5a; 32]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE KEY FILE A HOST MINTS reads back through the reader every host and
+    /// the broker use: 64 lowercase hex and a newline.
+    #[test]
+    fn a_minted_key_file_is_sixty_four_hex_and_reads_back() {
+        let text = key_file_text(&[0xab; 32]);
+        assert_eq!(text, format!("{}\n", "ab".repeat(32)));
+        let mut out = [0u8; 32];
+        assert!(decode_hex(text.trim().as_bytes(), &mut out));
+        assert_eq!(out, [0xab; 32]);
+    }
+
+    /// LOOPBACK, UNSPECIFIED, AND WHAT A CLIENT DIALS: 127.0.0.1 and ::1 are
+    /// loopback; 0.0.0.0 is not (it listens everywhere); a bind on it is
+    /// dialed on loopback by this host's own bridges; the port is read off the
+    /// end.
+    #[test]
+    fn loopback_binds_and_the_address_this_host_dials() {
+        assert!(is_loopback_endpoint("127.0.0.1:7000").expect("resolves"));
+        assert!(is_loopback_endpoint("[::1]:7000").expect("resolves"));
+        assert!(!is_loopback_endpoint("0.0.0.0:7000").expect("resolves"));
+        assert!(!is_loopback_endpoint("[::]:7000").expect("resolves"));
+        assert!(is_loopback_endpoint("no-port-here").is_err());
+        assert_eq!(dial_for_bind("0.0.0.0:7000"), "127.0.0.1:7000");
+        assert_eq!(dial_for_bind("[::]:7000"), "[::1]:7000");
+        assert_eq!(dial_for_bind("10.0.0.5:7000"), "10.0.0.5:7000");
+        assert_eq!(dial_for_bind("127.0.0.1:7000"), "127.0.0.1:7000");
+        assert_eq!(endpoint_port("h1:7000"), Some(7000));
+        assert_eq!(endpoint_port("[::1]:0"), Some(0));
+        assert_eq!(endpoint_port("h1"), None);
+        assert_eq!(endpoint_port("h1:x"), None);
     }
 
     /// A `Transport`'s `Debug` NEVER carries the key. `Config` derives `Debug`,

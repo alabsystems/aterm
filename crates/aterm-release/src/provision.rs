@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo ship provision --id <machine-id>` — a checkout becomes a PUBLISHING machine,
+//! `targo --unverified ship provision --id <machine-id>` — a checkout becomes a PUBLISHING machine,
 //! with the paper phrase as the only human input.
 //!
 //! "Publishing" is the load-bearing word: a machine on the roster builds what it signs,
@@ -9,8 +9,9 @@
 //! smoke-compile under the native-lane rustflags, via the same `gates` probes the cut
 //! runs), the trust-named gate drivers (`targo`/`tippy`/`ty`/`trustdoc`), the doc-tool
 //! farm link (`~/.local/bin/trustdoc`, repaired in place when safely mechanical —
-//! [`doc_tool_check`]), the rustup front door (`cargo` in this repo dispatches into the
-//! linked `trust` toolchain — the link is a provisioned artifact, not an accident), the
+//! [`doc_tool_check`]), the front door (`targo` and `trustc` from the store's stage2 bin
+//! answering `--version` — every host lane is `targo --unverified …`, and no rustup is
+//! needed; a rustup `trust` link is reported beside it, informationally), the
 //! stable `x86_64-apple-darwin` slice of the universal binary, Apple's packaging tools,
 //! the Developer ID identity, a
 //! LIVE-tested notarytool credential, the credentials profile, `gh` auth and the
@@ -260,7 +261,7 @@ pub fn run_provision(
         })?;
         if identity.id != id {
             return Err(Error::new(format!(
-                "this machine is already provisioned as '{}' — run `cargo ship provision \
+                "this machine is already provisioned as '{}' — run `{SHIP} provision \
                  --id {}` to audit it. A machine never re-mints under a second id: revoke \
                  the old id first if it must be replaced (`atpkg-keys machine-revoke`)",
                 identity.id, identity.id,
@@ -336,6 +337,7 @@ pub fn run_provision(
     if let Some(bin) = &stage2_bin {
         record("verifiers", verifiers_check(bin), &mut checks);
         record("front door", front_door_check(bin), &mut checks);
+        record("rustup", rustup_note(bin), &mut checks);
     }
     // NOT gated on a proven stage2, unlike the two above: this one reads the farm link
     // and PATH, which exist (and can be wrong) whether or not a stage2 resolves — so it
@@ -669,7 +671,7 @@ pub(crate) fn report_next_before_cut(r: &atpkg_keys::provision::Report) -> Vec<S
 ///
 /// The head-key requirement sits directly under the copy step so the two read as one
 /// escalation. It used to be `render_report`'s step 1 while the last line on the screen —
-/// `READY TO CUT — next: cargo ship cut --dry-run …` — named neither the head key nor the
+/// `READY TO CUT — next: targo --unverified ship cut --dry-run …` — named neither the head key nor the
 /// flag. Both were true and they looked like a disagreement, and the last one is the one a
 /// stressed operator copies.
 #[cfg(unix)]
@@ -704,6 +706,23 @@ pub(crate) fn report_next_after_cut(r: &atpkg_keys::provision::Report) -> Vec<St
         out.push(line);
     }
     out
+}
+
+/// The product's spelling of the release verbs in every remedy this audit prints.
+///
+/// 2026-09-18: a Mac provisioned by `aterm pkg install trust` has no `cargo` on PATH
+/// (`command -v cargo` → nothing), so a copyable `cargo ship …` line was a command that
+/// did not exist on the machine the audit had just called READY TO CUT. `.cargo/config.toml`
+/// sets `-Ztrust-verify=off` workspace-wide, so targo needs its explicit lane flag.
+pub(crate) const SHIP: &str = "targo --unverified ship";
+
+/// The one line an operator copies off a READY TO CUT transcript. It RUNS as printed:
+/// the profile path is the real one the audit resolved, never a `<profile>` placeholder.
+fn cut_dry_run_next(profile_path: &Path) -> String {
+    format!(
+        "{SHIP} cut --dry-run --release-credentials {}",
+        profile_path.display()
+    )
 }
 
 /// One band header: a heading and NOTHING else on the line.
@@ -773,7 +792,7 @@ fn close(c: Closing<'_>) -> Result<()> {
     // ---- NEXT -------------------------------------------------------------------
     // One list, because there used to be two answers to "how do I cut?" five lines apart:
     // the mint's own step 1 named the head key and `--strand-pre-roster-clients`, and the
-    // last line on the screen said `READY TO CUT — next: cargo ship cut --dry-run …` with
+    // last line on the screen said `READY TO CUT — next: … ship cut --dry-run …` with
     // neither. Both were true and they looked like a disagreement — and the LAST one is
     // the one a stressed operator copies, which makes dropping `--dry-run` from it the
     // obvious next move. So: the dry run is step 1, printed once; the head-key
@@ -785,7 +804,7 @@ fn close(c: Closing<'_>) -> Result<()> {
     }
     let profile_path = Path::new(c.home).join(".aterm/release-credentials.toml");
     // `c.fails + c.waiting == 0` is the whole point: this list used to print
-    // `cargo ship cut --dry-run …` on a run whose own verdict, four lines later, was
+    // `… ship cut --dry-run …` on a run whose own verdict, four lines later, was
     // `NOT DONE`. An operator who copies the last runnable command on the screen — which
     // is what a stressed operator does — was handed the one command the machine was not
     // yet allowed to run.
@@ -793,10 +812,7 @@ fn close(c: Closing<'_>) -> Result<()> {
         // The command as printed RUNS. It used to spell the profile `<profile>` even
         // though the audit had printed its real path two lines up, so the one thing the
         // operator came here to copy had to be assembled by hand.
-        next.push(format!(
-            "cargo ship cut --dry-run --release-credentials {}",
-            profile_path.display()
-        ));
+        next.push(cut_dry_run_next(&profile_path));
     }
     if let Some(r) = c.report {
         next.extend(report_next_after_cut(r));
@@ -816,7 +832,7 @@ fn close(c: Closing<'_>) -> Result<()> {
             println!(
                 "CHECK ONLY — unminted; {}",
                 if open.is_empty() {
-                    format!("a real `cargo ship provision --id {}` would mint", c.id)
+                    format!("a real `{SHIP} provision --id {}` would mint", c.id)
                 } else {
                     format!("{open} before a real run mints")
                 }
@@ -827,7 +843,7 @@ fn close(c: Closing<'_>) -> Result<()> {
         // — say so through the exit code too.
         return Err(Error::new(format!(
             "NOT DONE — {}: {}.\nNothing was written and no roster id was spent. Re-run \
-             `cargo ship provision --id {}` once those are settled — it resumes exactly \
+             `{SHIP} provision --id {}` once those are settled — it resumes exactly \
              there.",
             gaps(c.fails, c.waiting),
             c.open.join(", "),
@@ -835,7 +851,7 @@ fn close(c: Closing<'_>) -> Result<()> {
         )));
     }
     // `--check` answers BEFORE the generic failure arm, because that arm's remedy —
-    // "re-run `cargo ship provision`" — is wrong here twice over: this run wrote nothing,
+    // "re-run `… ship provision`" — is wrong here twice over: this run wrote nothing,
     // and re-running the audit changes nothing. An audit reports; it does not prescribe
     // its own repetition. It still exits non-zero when something is open, so a caller can
     // gate on it.
@@ -852,7 +868,7 @@ fn close(c: Closing<'_>) -> Result<()> {
     }
     if c.fails + c.waiting > 0 {
         return Err(Error::new(format!(
-            "NOT DONE — {}: {}.\nRe-run `cargo ship provision --id {}` once those are \
+            "NOT DONE — {}: {}.\nRe-run `{SHIP} provision --id {}` once those are \
              settled — it resumes exactly there.",
             gaps(c.fails, c.waiting),
             c.open.join(", "),
@@ -981,7 +997,7 @@ fn prompt_master_with_retries() -> Result<atpkg_keys::master::MasterPhrase> {
             Err(typo) => {
                 return Err(Error::new(format!(
                     "{} — {TRIES} attempts, and nothing was written: no key, no roster, no \
-                     roster id spent. Re-run `cargo ship provision` and it resumes exactly \
+                     roster id spent. Re-run `{SHIP} provision` and it resumes exactly \
                      here.",
                     typo.message()
                 )));
@@ -1405,6 +1421,7 @@ fn restore_kept_pair(
 /// One audit line: proven, missing-with-remedy, or impossible on this host. A `Skip`
 /// is NOT a pass — a host that skips Apple checks can never say READY TO CUT.
 #[cfg(unix)]
+#[derive(Debug)]
 enum Check {
     Pass(String),
     Fail {
@@ -1592,7 +1609,7 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
     // replace it, which is exactly what typing the command states.
     let fix = format!(
         "ln -sf {} {} — the farm link `[build] rustdoc = \"trustdoc\"` \
-         (.cargo/config.toml) resolves; a full `cargo ship provision` run repairs it",
+         (.cargo/config.toml) resolves; a full `{SHIP} provision` run repairs it",
         target.display(),
         farm.display(),
     );
@@ -1708,50 +1725,128 @@ fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
     })
 }
 
-/// The rustup front door: `cargo` in this repo must dispatch INTO the trust stage2 —
-/// that is what makes `cargo ship …` a Trust invocation and not stock Cargo. The link
-/// is a provisioned artifact (`rustup toolchain link trust <stage2>`), so it is
-/// audited like one.
+/// The front door of every host lane — `targo --unverified ship …`, `targo --unverified
+/// test`, the cut's own build — is the stage2's `targo` beside its `trustc`, and this
+/// row proves both ANSWER: each runs `--version` from the resolved bin dir. No rustup:
+/// a Mac provisioned the product's way (`aterm pkg install trust`) has no rustup and no
+/// `cargo`/`rustc` on PATH, and until 2026-09-18 this row ran `rustup … which cargo`
+/// and reported exactly that correctly provisioned machine as a GAP (measured:
+/// `command -v cargo rustc rustup` → nothing; `aterm pkg which targo` → the store's
+/// build 9192). The rustup link is reported beside it, informationally
+/// ([`rustup_note`]).
 #[cfg(unix)]
 fn front_door_check(bin: &Path) -> Check {
+    front_door_verdict(bin, |tool| {
+        let out = Command::new(tool)
+            .arg("--version")
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    })
+}
+
+/// The front-door verdict, pure over the `--version` probe so both outcomes are tests.
+/// The remedy names the product first: `aterm pkg install trust` lays the pair down,
+/// `aterm pkg which targo` shows where; rustup is not a remedy for this row at all.
+#[cfg(unix)]
+fn front_door_verdict(
+    bin: &Path,
+    version: impl Fn(&Path) -> std::result::Result<String, String>,
+) -> Check {
+    let fix = format!(
+        "aterm pkg install trust   (then `aterm pkg which targo` names the store's targo, \
+         `aterm pkg doctor` the prefix)\n  or, from source: python3 x.py build --stage 2, \
+         in $HOME/trust\n  or point TRUST_STAGE2_BIN at a stage2 bin dir carrying both — this \
+         audit resolved {}",
+        bin.display()
+    );
+    let mut targo_version = String::new();
+    for tool in ["targo", "trustc"] {
+        let path = bin.join(tool);
+        if !path.is_file() {
+            return Check::Fail {
+                what: format!("{tool} is missing from {}", bin.display()),
+                fix,
+            };
+        }
+        match version(&path) {
+            Ok(answer) => {
+                if tool == "targo" {
+                    targo_version = answer.lines().next().unwrap_or("").to_string();
+                }
+            }
+            Err(why) => {
+                return Check::Fail {
+                    what: format!("{} exists but failed --version: {why}", path.display()),
+                    fix,
+                };
+            }
+        }
+    }
+    Check::Pass(format!(
+        "targo + trustc answer --version in {} ({targo_version}) — `targo --unverified \
+         ship …` needs no rustup",
+        bin.display()
+    ))
+}
+
+/// INFORMATIONAL — never a GAP. rustup is not this repo's toolchain and no host lane
+/// dispatches through it; the ONE thing it is for is the x86_64 compat slice's
+/// upstream-stable std, which `x86_slice_check` audits on its own. A `trust` link is
+/// still worth a line: an operator who types stock `cargo` in this checkout gets
+/// whatever that link points at (rust-toolchain.toml pins `channel = "trust"`).
+#[cfg(unix)]
+fn rustup_note(bin: &Path) -> Check {
     let out = Command::new("rustup")
         .env("RUSTUP_TOOLCHAIN", "trust")
         .args(["which", "cargo"])
         .output();
-    let fix = format!(
-        "rustup toolchain link trust {} (then `cargo` in this repo dispatches into the \
-         Trust toolchain via rust-toolchain.toml)",
-        bin.parent().unwrap_or(bin).display()
-    );
-    match out {
-        Ok(o) if o.status.success() => {
-            let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            // The link must point at a REAL trust toolchain, not a stray dir. The
-            // canonical stage2 and the linked one may be different installs (atpkg
-            // store vs $HOME/trust); what matters is that the linked dir carries trustc.
-            let linked_ok = Path::new(&path)
+    rustup_note_from(
+        bin,
+        out.ok().map(|o| {
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            )
+        }),
+    )
+}
+
+/// `probe`: `None` when rustup is not runnable; `Some((linked, path))` otherwise.
+/// Always a `Pass` — the line informs, it never counts.
+#[cfg(unix)]
+fn rustup_note_from(bin: &Path, probe: Option<(bool, String)>) -> Check {
+    let root = bin.parent().unwrap_or(bin).display();
+    Check::Pass(match probe {
+        None => "not installed — informational; no host lane needs it (the x86 slice row \
+                 says what upstream stable is for)"
+            .to_string(),
+        Some((true, path)) => {
+            let carries_trustc = Path::new(&path)
                 .parent()
-                .map(|bin| bin.join("trustc").is_file() || bin.join("rustc").is_file())
+                .map(|linked| linked.join("trustc").is_file() || linked.join("rustc").is_file())
                 .unwrap_or(false);
-            if linked_ok {
-                Check::Pass(format!("rustup 'trust' toolchain linked ({path})"))
+            if carries_trustc {
+                format!(
+                    "'trust' linked ({path}) — informational; no host lane dispatches through it"
+                )
             } else {
-                Check::Fail {
-                    what: format!(
-                        "rustup 'trust' resolves to {path}, which does not look like a \
-                         Trust toolchain bin"
-                    ),
-                    fix,
-                }
+                format!(
+                    "'trust' linked ({path}) but that dir carries no trustc — informational; \
+                     stock `cargo` typed here would not be Trust. optional: rustup toolchain \
+                     link trust {root}"
+                )
             }
         }
-        _ => Check::Fail {
-            what: "rustup has no 'trust' toolchain — `cargo` in this repo cannot \
-                   dispatch (rust-toolchain.toml pins channel = \"trust\")"
-                .into(),
-            fix,
-        },
-    }
+        Some((false, _)) => format!(
+            "installed, no 'trust' link — informational; optional: rustup toolchain link \
+             trust {root}"
+        ),
+    })
 }
 
 /// The x86_64 compat slice of the universal binary rides upstream stable.
@@ -1833,7 +1928,7 @@ fn apple_identity_check(
                     return (
                         Check::Fail {
                             what: "no Developer ID Application identity after acquisition".into(),
-                            fix: format!("re-run `cargo ship provision --id {id}`"),
+                            fix: format!("re-run `{SHIP} provision --id {id}`"),
                         },
                         None,
                     );
@@ -2024,7 +2119,7 @@ fn profile_check(
     // exist yet. And an existing profile is never clobbered (`create_new`, apple.rs), so
     // the remedy for a bad one is to move it aside, not to edit it.
     let rewrite = format!(
-        "move {} aside and re-run `cargo ship provision --id {id}` — provision writes it",
+        "move {} aside and re-run `{SHIP} provision --id {id}` — provision writes it",
         path.display()
     );
     if !path.exists() {
@@ -2043,7 +2138,7 @@ fn profile_check(
         }
         return Check::Fail {
             what: format!("no credentials profile at {}", path.display()),
-            fix: format!("re-run `cargo ship provision --id {id}` — provision writes it"),
+            fix: format!("re-run `{SHIP} provision --id {id}` — provision writes it"),
         };
     }
     let creds = match sign::ReleaseCredentials::load(&path) {
@@ -2661,6 +2756,111 @@ mod tests {
             release_asset_url("alabsystems/aterm", "aterm-machines.toml"),
             "https://github.com/alabsystems/aterm/releases/latest/download/aterm-machines.toml"
         );
+    }
+
+    /// The front door is `targo` + `trustc` answering `--version` from the resolved
+    /// bin — a machine with no rustup passes it (measured 2026-09-18 on a Trust-only
+    /// Mac, where the old `rustup … which cargo` probe reported a GAP), a missing or
+    /// mute tool fails it with `aterm pkg install trust` as the first remedy and no
+    /// rustup in the fix at all.
+    #[test]
+    fn the_copyable_remedies_spell_the_products_verb_never_cargo() {
+        // 2026-09-18: on a Trust-only Mac `command -v cargo` → nothing; a remedy that
+        // starts with `cargo ` is command-not-found on the machine that printed it.
+        assert!(SHIP.starts_with("targo --unverified ship"), "{SHIP}");
+        let next = cut_dry_run_next(Path::new("/tmp/x/release.toml"));
+        assert_eq!(
+            next,
+            "targo --unverified ship cut --dry-run --release-credentials /tmp/x/release.toml"
+        );
+        assert!(!next.starts_with("cargo "), "{next}");
+        assert!(!SHIP.contains("cargo"), "{SHIP}");
+    }
+
+    #[test]
+    fn the_front_door_is_targo_and_trustc_answering_version_with_no_rustup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("provision-front-door-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("store/trust/9192/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in ["targo", "trustc"] {
+            std::fs::write(bin.join(tool), b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let answers = |tool: &Path| -> std::result::Result<String, String> {
+            Ok(format!(
+                "{} 1.99.0-dev (321aaeda7 2026-09-17)\nrelease: 1.99.0-dev",
+                tool.file_name().unwrap().to_string_lossy()
+            ))
+        };
+
+        match front_door_verdict(&bin, answers) {
+            Check::Pass(line) => {
+                assert!(
+                    line.contains("targo 1.99.0-dev (321aaeda7 2026-09-17)"),
+                    "{line}"
+                );
+                assert!(line.contains("needs no rustup"), "{line}");
+            }
+            other => panic!("a store bin whose pair answers is the golden path: {other:?}"),
+        }
+
+        // A mute trustc: the fault names the file, the fix names the product first
+        // and never rustup.
+        let mute = |tool: &Path| -> std::result::Result<String, String> {
+            if tool.ends_with("trustc") {
+                Err("dyld: Library not loaded".into())
+            } else {
+                answers(tool)
+            }
+        };
+        match front_door_verdict(&bin, mute) {
+            Check::Fail { what, fix } => {
+                assert!(
+                    what.contains("trustc exists but failed --version"),
+                    "{what}"
+                );
+                assert!(what.contains("dyld: Library not loaded"), "{what}");
+                assert!(fix.starts_with("aterm pkg install trust"), "{fix}");
+                assert!(
+                    !fix.contains("rustup"),
+                    "rustup is not a remedy here: {fix}"
+                );
+            }
+            other => panic!("a mute compiler is a GAP: {other:?}"),
+        }
+
+        // No targo at all.
+        std::fs::remove_file(bin.join("targo")).unwrap();
+        match front_door_verdict(&bin, answers) {
+            Check::Fail { what, fix } => {
+                assert_eq!(what, format!("targo is missing from {}", bin.display()));
+                assert!(fix.starts_with("aterm pkg install trust"), "{fix}");
+            }
+            other => panic!("a missing driver is a GAP: {other:?}"),
+        }
+
+        // The rustup row is informational in EVERY state — never a Fail, never a Skip
+        // (a Skip marks the host unable to cut).
+        for probe in [
+            None,
+            Some((false, String::new())),
+            Some((
+                true,
+                dir.join("elsewhere/bin/cargo")
+                    .to_string_lossy()
+                    .into_owned(),
+            )),
+            Some((true, bin.join("cargo").to_string_lossy().into_owned())),
+        ] {
+            match rustup_note_from(&bin, probe.clone()) {
+                Check::Pass(line) => assert!(line.contains("informational"), "{line}"),
+                other => panic!("rustup never counts: {probe:?} → {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

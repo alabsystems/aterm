@@ -1205,6 +1205,11 @@ fn refresh_view_untracked(
 /// cannot be made — the last is the store on another volume, and it refuses rather than
 /// byte-copying the toolchain.
 pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refreshed> {
+    // FIRST, before every early return below: the debris a KILLED rebuild left under
+    // another pid. It is not a mismatch (`first_mismatch` ignores it on purpose), so a
+    // view that already matches — the common case, and the one that returns two lines
+    // down — is exactly where an abandoned sysroot's clones would otherwise sit forever.
+    sweep_view_debris(&view_dir(layout, name));
     #[cfg(unix)]
     if let ViewSource::Linked(checkout) = view_source(layout) {
         return refresh_linked_view(layout, name, &checkout);
@@ -1287,6 +1292,68 @@ pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refres
         stock,
         changed,
     })
+}
+
+/// Whether `name` is the dot-named scratch a view rebuild makes for itself:
+/// `.<stem>.tmp-<pid>` or `.<stem>.old-<pid>`, where `<stem>` is `bin` or one of
+/// [`VIEW_DIRS`] and `<pid>` a non-empty run of ASCII digits — the PRODUCER's exact
+/// shape, the one [`refresh_view_in_process`] and [`take_down`] render.
+///
+/// As narrow as [`crate::store::stage_scratch_of`], and for its reason: this authorizes
+/// an unguarded `remove_dir_all` inside a directory a user can also put things in
+/// (`~/.rustup/toolchains/<name>/`), so "looks like something we made" is not a good
+/// enough test — `.lib.old-notes/` is not ours to delete.
+fn is_view_debris(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some((stem, rest)) = rest.split_once('.') else {
+        return false;
+    };
+    if stem != "bin" && !VIEW_DIRS.contains(&stem) {
+        return false;
+    }
+    let Some(pid) = rest
+        .strip_prefix("tmp-")
+        .or_else(|| rest.strip_prefix("old-"))
+    else {
+        return false;
+    };
+    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Remove the staging debris a KILLED rebuild left in `view` — every [`is_view_debris`]
+/// entry, whatever shape it is (a mirrored tree, a directory link, a file).
+///
+/// WHY IT IS NEEDED. A rebuild stages into `.<stem>.tmp-<pid>` and retires what stood at
+/// the name through `.<stem>.old-<pid>`, removing both as it goes — but only its OWN
+/// pid's, and only on the path it completes. A pass killed between those renames (a `^C`,
+/// the window's apply deadline, a power loss) parks a whole superseded sysroot under a
+/// name no later pass ever looks at: [`first_mismatch`] ignores top-level entries beside
+/// `bin/` deliberately (counting debris would rebuild the view forever), so the tree is
+/// not a mismatch, the view reads as current, and the clones it holds keep a superseded
+/// build's blocks allocated for as long as the prefix lives — one more per crash.
+///
+/// WHY IT IS SAFE HERE. A view is laid under the store-wide writer lock, as every verb
+/// that lays or discards a build is ([`crate::lock::try_lock_store`]; the untracked lane's
+/// helper runs inside its parent's hold), so debris found here is owned by a process that
+/// no longer exists — the argument [`crate::compat::sweep`] makes for the identical shape
+/// under `compat/trust`. Best-effort throughout: what will not go is left for the next
+/// pass, exactly as a failed in-pass removal already is.
+fn sweep_view_debris(view: &Path) {
+    let Ok(entries) = std::fs::read_dir(view) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_str().is_some_and(is_view_debris) {
+            continue;
+        }
+        let path = entry.path();
+        // `remove_dir_all` first (the tree case), then the link/file case — the pair
+        // `take_down` already uses, so a symlink at the name is unlinked, never followed.
+        let _ = std::fs::remove_dir_all(&path);
+        crate::platform::remove_link(&path);
+    }
 }
 
 /// What the view presents: the store's live build, or a dev-linked checkout.
@@ -1539,6 +1606,18 @@ impl Entry {
             Entry::File => "a regular file".to_string(),
             Entry::Other => "neither a symlink nor a directory".to_string(),
         }
+    }
+}
+
+/// The bare noun for what sits at a seam path, with no layout to compare against — the
+/// half of [`Entry::describe`] a caller that already names the path needs.
+fn entry_noun(entry: &Entry) -> &'static str {
+    match entry {
+        Entry::Absent => "absent",
+        Entry::Link(_) => "a symlink",
+        Entry::Dir => "a real directory",
+        Entry::File => "a regular file",
+        Entry::Other => "neither a symlink nor a directory",
     }
 }
 
@@ -2341,6 +2420,100 @@ pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
     lines
 }
 
+/// WHAT THIS MACHINE ACTUALLY COMPILES WITH, when that is not the build atpkg manages —
+/// one clause naming the dissent, or `None` when rustup's entry IS the managed seam, is
+/// absent, or there is no rustup at all.
+///
+/// **THE FAILURE THIS ANSWERS.** `aterm pkg update trust` printed `atpkg: rustc up to date`
+/// for two weeks while every `targo`, every `cargo +trust` and every repo pinning
+/// `channel = "trust"` ran a hand-placed toolchain in the home directory that was 859
+/// commits behind — measured on m3, 2026-09-17: pin 8595, `$HOME/trust` HEAD 9454. Both halves
+/// of that sentence were true of what atpkg MANAGES and neither was true of what the
+/// machine USES, and nothing in the update lane had ever been given the second question to
+/// ask. `doctor` knew — [`crate::doctor`]'s seam check had reported the same entry, twice —
+/// but a verdict a person only sees when they run a different verb is not a verdict the
+/// verb they ran gave them.
+///
+/// **THE FACT ONLY, NEVER THE REMEDY.** The one-line `ln -sfn` re-point (and the
+/// [`DETACH_FIX`] for the shapes a link cannot be laid over) is spelled in exactly one
+/// place, `doctor`'s `seam_line`, and this clause points there rather than growing a second
+/// copy that can drift from it. What belongs here is the thing the update lane alone is in
+/// a position to say: the verdict it just printed is about a build this machine does not
+/// run.
+///
+/// Pure over the probe, so the words are testable without a rustup — the same rule
+/// `seam_line` follows.
+#[must_use]
+pub fn dissent_line(st: &SeamStatus) -> Option<String> {
+    if !st.rustup_present {
+        return None;
+    }
+    let names_what = |what: String| {
+        // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
+        let mut s = String::from("rustup's `");
+        s.push_str(DEFAULT_SEAM);
+        s.push_str("` resolves to ");
+        s.push_str(&what);
+        s.push_str(", which atpkg does not manage — `cargo +");
+        s.push_str(DEFAULT_SEAM);
+        s.push_str("`, `rustup run ");
+        s.push_str(DEFAULT_SEAM);
+        s.push_str("` and every repo pinning `channel = \"");
+        s.push_str(DEFAULT_SEAM);
+        s.push_str(
+            "\"` compile with THAT copy; `aterm pkg doctor` names the one-line \
+                    re-point",
+        );
+        s
+    };
+    match &st.entry {
+        // A link somewhere else entirely: the hand-placed toolchain, the case this exists for.
+        Ok(Entry::Link(raw)) if !st.in_prefix => Some(names_what(raw.display().to_string())),
+        // A real directory, a regular file, something that is not a symlink at all: whatever
+        // it holds is what `+trust` runs, and no re-point can be laid over it.
+        Ok(entry @ (Entry::Dir | Entry::File | Entry::Other)) => {
+            let mut what = st.path.display().to_string();
+            what.push_str(" (");
+            what.push_str(entry_noun(entry));
+            what.push(')');
+            Some(names_what(what))
+        }
+        // A link INTO the prefix but not at the view is atpkg's own older layout: `repair`
+        // re-points it and the tools it reaches are this build's either way. Not a dissent.
+        Ok(Entry::Link(_) | Entry::Absent) => None,
+        // Nobody looked. A bound on what this process may know is never reported as a fact
+        // about the machine — but it is not silence either: say that the question could not
+        // be answered, so a reader is not left with a bare "up to date" that was never
+        // checked.
+        Err(e) => {
+            let mut s = String::from("rustup's `");
+            s.push_str(DEFAULT_SEAM);
+            s.push_str("` at ");
+            s.push_str(&st.path.display().to_string());
+            s.push_str(" could not be inspected (");
+            s.push_str(e);
+            s.push_str("), so whether this machine compiles with the build above is UNKNOWN");
+            Some(s)
+        }
+    }
+}
+
+/// [`dissent_line`] for `program`, against the rustup home the REAL process edge armed —
+/// `None` for any program but [`SEAM_PROGRAM`], and `None` in every unit test by
+/// construction ([`arm_from_env`]), so no test can be made to depend on the developer's own
+/// `~/.rustup`.
+///
+/// This is the accessor the update and install lanes call. Their tests reach
+/// [`dissent_line`] directly, which is where the words are.
+#[must_use]
+pub fn dissent_if_armed(layout: &Layout, program: &str) -> Option<String> {
+    if program != SEAM_PROGRAM {
+        return None;
+    }
+    let home = armed()?;
+    dissent_line(&status(layout, home, DEFAULT_SEAM))
+}
+
 /// Detach every recorded seam (never `--force`): the whole-set removal's companion.
 /// Returns one line per seam acted on or refused.
 #[must_use]
@@ -2838,6 +3011,95 @@ mod tests {
         assert!(refusals(&fx.layout).is_empty());
         assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
         assert_eq!(refused_key("trust"), "refused:rustup:trust");
+    }
+
+    /// WHAT `update` NOW ASKS THAT IT NEVER USED TO. `aterm pkg update trust` printed
+    /// `atpkg: rustc up to date` for two weeks on m3 while `~/.rustup/toolchains/trust`
+    /// pointed at a hand-placed toolchain 859 commits behind the pin. Every shape the entry
+    /// can take, judged.
+    #[cfg(unix)]
+    #[test]
+    fn dissent_names_a_foreign_entry_and_stays_silent_about_the_managed_one() {
+        let fx = Fixture::new("dissent");
+        fx.install_trust(8595);
+
+        // ABSENT: nothing to dissent about — the store IS the only answer rustup has.
+        assert_eq!(dissent_line(&status(&fx.layout, &fx.rustup, "trust")), None);
+
+        // THE m3 SHAPE: a link to a hand-placed toolchain in the home directory.
+        let elsewhere = fx.root.join("toolchains").join("trust-957012d3");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        link(&elsewhere, &fx.seam("trust"));
+        let why = dissent_line(&status(&fx.layout, &fx.rustup, "trust"))
+            .expect("a foreign link is a dissent");
+        assert!(
+            why.contains(&elsewhere.display().to_string()),
+            "it NAMES what runs instead: {why}"
+        );
+        assert!(why.contains("cargo +trust"), "{why}");
+        assert!(
+            why.contains("aterm pkg doctor"),
+            "the remedy has ONE spelling and it is doctor's: {why}"
+        );
+
+        // A REAL DIRECTORY: no re-point can be laid over it, and it is still a dissent.
+        std::fs::remove_file(fx.seam("trust")).unwrap();
+        std::fs::create_dir_all(fx.seam("trust")).unwrap();
+        let why = dissent_line(&status(&fx.layout, &fx.rustup, "trust"))
+            .expect("a real directory is a dissent");
+        assert!(why.contains("a real directory"), "{why}");
+
+        // THE MANAGED SEAM ITSELF: silent. A verb that narrates a healthy machine trains
+        // its reader to skip the line that matters.
+        std::fs::remove_dir_all(fx.seam("trust")).unwrap();
+        refresh_view(&fx.layout, "trust").unwrap();
+        link(&seam_target(&fx.layout, "trust"), &fx.seam("trust"));
+        assert_eq!(dissent_line(&status(&fx.layout, &fx.rustup, "trust")), None);
+
+        // A link INTO the store but not at the view — atpkg's own older layout. `repair`
+        // re-points it; the compiler it reaches is this build either way, so not a dissent.
+        std::fs::remove_file(fx.seam("trust")).unwrap();
+        link(&store_current(&fx.layout), &fx.seam("trust"));
+        assert_eq!(dissent_line(&status(&fx.layout, &fx.rustup, "trust")), None);
+    }
+
+    /// NO RUSTUP IS NOT A DISSENT, and an entry nobody could inspect is not silence.
+    #[cfg(unix)]
+    #[test]
+    fn dissent_is_silent_without_rustup_and_says_so_when_it_cannot_look() {
+        let fx = Fixture::new("dissent-norustup");
+        fx.install_trust(8595);
+        std::fs::remove_dir_all(fx.rustup.join("toolchains")).unwrap();
+        assert_eq!(
+            dissent_line(&status(&fx.layout, &fx.rustup, "trust")),
+            None,
+            "a machine with no rustup compiles with what is on PATH; this check has no \
+             opinion about it"
+        );
+        // An inspection that FAILED is reported as unknown, never as "fine": a bound on
+        // what this process may know must not be written down as a fact about the machine.
+        let st = SeamStatus {
+            key: String::from("rustup:trust"),
+            recorded: false,
+            path: fx.seam("trust"),
+            rustup_present: true,
+            entry: Err(String::from("Permission denied (os error 13)")),
+            target: None,
+            in_prefix: false,
+            targets_view: false,
+        };
+        let why = dissent_line(&st).expect("an unreadable entry is said, not skipped");
+        assert!(why.contains("UNKNOWN"), "{why}");
+        assert!(why.contains("Permission denied"), "{why}");
+    }
+
+    /// The armed accessor is inert under test — no unit test can be made to read the
+    /// developer's own `~/.rustup` — and it answers only for the seam program.
+    #[test]
+    fn dissent_if_armed_is_inert_in_tests_and_only_ever_about_trust() {
+        let fx = Fixture::new("dissent-armed");
+        assert_eq!(dissent_if_armed(&fx.layout, "ay"), None);
+        assert_eq!(dissent_if_armed(&fx.layout, SEAM_PROGRAM), None);
     }
 
     #[cfg(unix)]
@@ -3764,6 +4026,73 @@ mod tests {
         // Debris beside bin/ is not a mismatch: counting it would rebuild forever.
         std::fs::create_dir_all(view.join(".bin.old-1")).unwrap();
         assert!(view_matches(&build, &view, Depth::Deep));
+    }
+
+    /// A KILLED REBUILD'S DEBRIS IS THE NEXT PASS'S TO SWEEP. A rebuild stages into
+    /// `.<stem>.tmp-<pid>` and retires the standing tree through `.<stem>.old-<pid>`,
+    /// removing only its own pid's; a pass killed between the two renames parks a whole
+    /// superseded sysroot under a name nothing later looks at — `first_mismatch` ignores
+    /// top-level entries beside `bin/` on purpose — so the view reads as current while
+    /// the clones keep a reclaimed build's blocks allocated. The next refresh removes
+    /// them, and only them: a name the producer cannot render is not ours to delete.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_rebuilds_debris_is_swept_by_the_next_refresh() {
+        let fx = Fixture::new("view-debris");
+        let build = fx.install_trust(8595);
+        refresh_view(&fx.layout, "trust").unwrap();
+        let view = view_dir(&fx.layout, "trust");
+        assert!(view_matches(&build, &view, Depth::Deep));
+
+        // What a kill in a rebuild leaves: another pid's staged and retired trees, each
+        // holding clones of a whole sysroot.
+        let ours: Vec<PathBuf> = [
+            ".bin.old-424242",
+            ".bin.tmp-7",
+            ".lib.old-424242",
+            ".share.tmp-99",
+        ]
+        .iter()
+        .map(|name| {
+            let dir = view.join(name);
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::write(dir.join("bin").join("trustc"), b"a superseded build").unwrap();
+            dir
+        })
+        .collect();
+        // …beside names this producer can never render, which are not ours to delete.
+        let theirs: Vec<PathBuf> = [
+            ".bin.old-notapid",
+            ".bin.old-",
+            ".notes.tmp-1",
+            "bin.old-1",
+            ".bin.keep-1",
+        ]
+        .iter()
+        .map(|name| {
+            let dir = view.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        })
+        .collect();
+
+        // The view already matches, so this refresh lays nothing: the sweep is all it does.
+        assert!(!refresh_view(&fx.layout, "trust").unwrap().changed);
+
+        for gone in &ours {
+            assert!(
+                std::fs::symlink_metadata(gone).is_err(),
+                "{} still holds a superseded build's clones",
+                gone.display()
+            );
+        }
+        for kept in &theirs {
+            assert!(kept.is_dir(), "{} is not ours to delete", kept.display());
+        }
+        assert!(
+            view_matches(&build, &view, Depth::Deep),
+            "and the view it did not touch still stands"
+        );
     }
 
     /// A REBUILD RE-LAYS ONLY WHAT DIFFERS. A `.DS_Store` planted under the view's `share/`

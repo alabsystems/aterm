@@ -427,15 +427,21 @@ fn a_helper_killed_at_exec_is_reported_by_its_signal() {
 #[test]
 fn a_label_whose_owning_pid_is_dead_is_swept_by_the_next_job() {
     let d = scratch("sweep");
-    // A pid nothing runs under: macOS pids stay below 99999.
-    let dead_pid = 99_998u32;
-    let alive = Command::new("/bin/ps")
-        .args(["-p", &dead_pid.to_string()])
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(!alive, "pid {dead_pid} is unexpectedly alive; pick another");
+    // A pid nothing runs under. macOS pids stay below 99999, but under a full test
+    // sweep's process churn a fixed 99998 WAS alive once (2026-09-18: the one red in an
+    // otherwise green tree), so the fixture walks down from there to a pid `ps` cannot
+    // find rather than asserting a single number's luck.
+    let dead_pid = (99_990u32..=99_998)
+        .rev()
+        .find(|pid| {
+            !Command::new("/bin/ps")
+                .args(["-p", &pid.to_string()])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        })
+        .expect("one of pids 99990..=99998 is dead");
     let orphan = format!("systems.alab.atpkg.stage-helper-{dead_pid}-0-deadbeef");
     let out = Command::new("/bin/launchctl")
         .args(["submit", "-l", &orphan, "--", "/usr/bin/true"])
@@ -450,7 +456,25 @@ fn a_label_whose_owning_pid_is_dead_is_swept_by_the_next_job() {
         let out = Command::new("/bin/launchctl").arg("list").output().unwrap();
         String::from_utf8_lossy(&out.stdout).contains(&orphan)
     };
-    assert!(listed(), "the orphan is registered before the sweep");
+    // LAUNCHD IS ASYNCHRONOUS AT BOTH ENDS. `launchctl submit` returns once launchd has
+    // taken the request, not once `launchctl list` shows the job, and `remove` likewise
+    // returns before the label is gone. Measured 2026-09-17 inside the merge gate on a
+    // loaded 4-core Intel Mac: this case failed at "the orphan is registered before the
+    // sweep" — the submit had succeeded and the list simply had not caught up — while the
+    // same test passed twice on the quiet machine. So both ends are bounded waits, and a
+    // timeout says which end it was rather than blaming the sweep.
+    let wait_listed = |want: bool, why: &str| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while listed() != want {
+            assert!(std::time::Instant::now() < deadline, "{why}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    wait_listed(
+        true,
+        "launchd never listed the orphan label within 60 s, though `submit` reported \
+         success — the fixture never stood, so this run says nothing about the sweep",
+    );
 
     // Any lane call prepares a job, and preparing sweeps. A silent helper keeps it short.
     let archive = bundle_archive(&d);
@@ -461,9 +485,10 @@ fn a_label_whose_owning_pid_is_dead_is_swept_by_the_next_job() {
     let fake = fake_dir.join("atpkg");
     std::fs::copy("/usr/bin/true", &fake).unwrap();
     let _ = stage_untracked(&fake, &spec(), &archive, &dest, &d);
-    assert!(
-        !listed(),
-        "the orphan label was swept by the next job's prepare"
+    wait_listed(
+        false,
+        "the orphan label was still listed 60 s after the next job's prepare: the sweep \
+         did not remove it",
     );
     // Belt and braces for a failed assertion above: never leave it behind.
     let _ = Command::new("/bin/launchctl")

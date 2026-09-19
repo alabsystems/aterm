@@ -98,10 +98,21 @@ pub(crate) fn offscreen_clear_color(rgb: u32, srgb_offscreen: bool) -> wgpu::Col
 /// is `tests/hdr_gate.rs`'s complete 2^3 enumeration of THESE functions).
 ///
 /// ATTACH seam ([`hdr_swapchain_wants_f16`], consumed by
-/// `GpuRenderer::create_window_surface`): the swapchain is `Rgba16Float` (wgpu's
-/// Metal backend then auto-sets `wantsExtendedDynamicRangeContent`) iff the user
-/// opted in (`hdr_glow = true`) AND the surface offers the format. Off or
-/// unsupported → the legacy non-sRGB 8-bit pick, byte-identical to pre-M3.
+/// `GpuRenderer::create_window_surface`): the swapchain is `Rgba16Float` iff
+/// the user opted in (`hdr_glow = true`) AND the surface offers the format —
+/// the base gate, which the wgpu-oracle arm and every non-Metal backend pick
+/// through directly. Off or unsupported → the legacy non-sRGB 8-bit pick,
+/// byte-identical to pre-M3. The shipped macOS Metal arm (`cfg(not(wgpu_arm))`)
+/// reaches the base gate through [`hdr_swapchain_wants_f16_on_screen`], which
+/// narrows it by the window's screen's EDR potential and never widens it (its
+/// result implies the base gate), and re-picks an 8-bit window live — on a
+/// monitor change and on the frontend's throttled headroom re-query — through
+/// the narrower still [`hdr_screen_upgrade_wants_f16`]
+/// (`GpuRenderer::upgrade_surface_for_screen`). Whichever swapchain owns the
+/// layer derives `wantsExtendedDynamicRangeContent` from
+/// `format == Rgba16Float`: the first-party Metal swapchain
+/// (`metal/swapchain.rs`) and wgpu-hal's Metal backend (the oracle arm) do so
+/// identically.
 ///
 /// PRESENT seam ([`hdr_present_plan`], consumed by `present_input`): keyed on
 /// the swapchain's ACTUAL format, so live config flips degrade safely by
@@ -134,6 +145,91 @@ pub struct HdrPlan {
 #[must_use]
 pub fn hdr_swapchain_wants_f16(hdr_glow: bool, supports_f16: bool) -> bool {
     hdr_glow && supports_f16
+}
+
+/// ATTACH, narrowed by the SCREEN (the macOS Metal arm): [`hdr_swapchain_wants_f16`]
+/// AND the window's screen can ever show extended range —
+/// `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`
+/// (`screen_edr_potential`) above 1.0. On a screen whose potential is
+/// exactly 1.0 (an external SDR monitor) an f16 swapchain draws NO glow crown
+/// at all: the >1.0 aurora never lands (the present's sanitized headroom is
+/// 0), and [`sdr_boost_pass`] is off on every f16 swapchain (the two boost
+/// passes are mutually exclusive), so the SDR glow-boost crown never draws
+/// either. It is also not free: measured on a 2017 15" MacBook Pro (Intel HD
+/// 630, 3360x2100 backing, 60 fps full-frame present) the `Rgba16Float` +
+/// extended-linear layer costs 3.1-3.4 ms of GPU time per frame against
+/// 1.7 ms for `Bgra8Unorm`, doubles the drawable pool (3 x 53.8 MB vs 3 x
+/// 26.9 MB), and the integrated GPU's whole-device busy reading (ioreg
+/// "Device Utilization %", sampled during each run, attributed to no stage)
+/// went from ~31% to ~58%. That probe timed the full-frame blit only; the
+/// scissored SDR crown pass the 8-bit swapchain adds on frames with glow was
+/// not measured. So a screen that reports NO potential gets the 8-bit pick,
+/// which saves that cost AND restores the SDR crown there. On SDR monitors
+/// that is a visible change: with the default `cursor_glow_sdr_boost` (0.25)
+/// on a dark theme, a window attached there now draws the crown, which no
+/// window drew there while every window attached f16.
+///
+/// The POTENTIAL, not the brightness-tracking current value: Apple's split is
+/// potential ⇒ "enable EDR rendering at all", current ⇒ "scale content" (the
+/// present seam's `edr_max`, re-queried on the frontend's
+/// `EDR_REQUERY_INTERVAL` cadence). Gating the attach on the current value
+/// would freeze each window's format to the brightness slider's position at
+/// creation. The potential is brightness-independent (the SDK's NSScreen.h:
+/// "regardless of whether or not extended dynamic range is currently
+/// enabled") and fixed for the life of one `NSScreen` object (Apple's
+/// property doc: "determined when you create the NSScreen object, and doesn't
+/// change afterwards"). That is not the same as constant per monitor: the
+/// `NSScreen` a window reports belongs to the current display configuration,
+/// which a Displays settings change (High Dynamic Range on an external HDR
+/// monitor, an XDR preset) rebuilds, and neither document says what the
+/// rebuilt object answers. So the pick is not frozen at attach: the frontend
+/// re-reads the potential for an 8-bit window on a monitor change AND on the
+/// headroom re-query's throttle, through [`hdr_screen_upgrade_wants_f16`].
+/// Note this MacBook Pro's built-in panel is NOT an SDR screen in macOS's
+/// model: it reported potential 2.0 (headroom from the backlight), so it
+/// keeps the f16 pick and the aurora boost.
+///
+/// `None` (the screen could not be resolved) keeps the unconditional pick —
+/// this narrows only on a POSITIVE "cannot show EDR" answer, so the proven
+/// chain (`SdrInvariance`, `F16NeedsSupport`) is untouched: the result
+/// implies [`hdr_swapchain_wants_f16`]. A non-finite potential is treated as
+/// SDR exactly as the present sanitizer treats a non-finite `edr_max`.
+#[must_use]
+pub fn hdr_swapchain_wants_f16_on_screen(
+    hdr_glow: bool,
+    supports_f16: bool,
+    screen_edr_potential: Option<f32>,
+) -> bool {
+    hdr_swapchain_wants_f16(hdr_glow, supports_f16)
+        && screen_edr_potential.is_none_or(|p| aterm_render::hdr::sanitize_edr_max(p) > 1.0)
+}
+
+/// LIVE SDR→f16 on the macOS Metal arm — the screen re-pick
+/// (`GpuRenderer::upgrade_surface_for_screen`, run from the frontend's
+/// monitor-change hook and from its throttled headroom re-query): an 8-bit
+/// swapchain becomes
+/// `Rgba16Float` iff the attach gate would pick f16 here AND the screen the
+/// window NOW sits on gives a POSITIVE "can show EDR" answer. Deliberately
+/// asymmetric with [`hdr_swapchain_wants_f16_on_screen`] on `None`: the attach
+/// keeps the unconditional pick when the screen cannot be resolved (it fails
+/// toward the pre-gate behaviour), whereas moving an already-decided 8-bit
+/// window to f16 is a widening and rides only on evidence — a window in
+/// transit (`-screen` nil) stays as it is. The result implies
+/// [`hdr_swapchain_wants_f16_on_screen`], which implies
+/// [`hdr_swapchain_wants_f16`], so the Tier-1 chain bounds this too.
+/// `swapchain_is_f16` keeps the decision total (an f16 surface never
+/// "upgrades"); the caller short-circuits those, and every input the base
+/// gate refuses, before the AppKit read.
+#[must_use]
+pub fn hdr_screen_upgrade_wants_f16(
+    hdr_glow: bool,
+    supports_f16: bool,
+    swapchain_is_f16: bool,
+    screen_edr_potential: Option<f32>,
+) -> bool {
+    !swapchain_is_f16
+        && hdr_swapchain_wants_f16(hdr_glow, supports_f16)
+        && screen_edr_potential.is_some_and(|p| aterm_render::hdr::sanitize_edr_max(p) > 1.0)
 }
 
 /// PRESENT: what the HDR path does THIS present. See [`HdrPlan`].
@@ -544,5 +640,128 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The screen-capability narrowing of the attach pick: it can only ever
+    /// take f16 AWAY from the proven gate (so `SdrInvariance` and
+    /// `F16NeedsSupport` survive by implication), it takes it away exactly on
+    /// a positive "this screen cannot show EDR" answer (potential <= 1.0, or a
+    /// non-finite read), and an unresolved screen changes nothing.
+    #[test]
+    fn screen_gate_narrows_only_on_a_known_sdr_screen() {
+        let potentials = [
+            None,
+            Some(1.0),  // an external SDR monitor
+            Some(2.0),  // this 2017 MacBook Pro's built-in panel (measured)
+            Some(16.0), // Pro Display XDR
+            Some(1.0 + f32::EPSILON),
+            Some(0.0),
+            Some(-1.0),
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+        ];
+        let mut narrowed = 0usize;
+        for hdr_glow in [false, true] {
+            for supports_f16 in [false, true] {
+                let base = hdr_swapchain_wants_f16(hdr_glow, supports_f16);
+                for potential in potentials {
+                    let got = hdr_swapchain_wants_f16_on_screen(hdr_glow, supports_f16, potential);
+                    assert!(
+                        !got || base,
+                        "({hdr_glow},{supports_f16},{potential:?}): the screen gate widened the pick"
+                    );
+                    let capable = potential.is_none_or(|p| p.is_finite() && p > 1.0);
+                    assert_eq!(
+                        got,
+                        base && capable,
+                        "({hdr_glow},{supports_f16},{potential:?}): wrong screen decision"
+                    );
+                    narrowed += usize::from(base && !got);
+                }
+            }
+        }
+        // NON-VACUITY: the SDR-screen answers (1.0, 0.0, -1.0, NaN, +inf) each
+        // narrow the one (on, supported) corner — five real narrowings, no more.
+        assert_eq!(narrowed, 5, "the screen gate must bite on every SDR answer");
+        // The pinned corners, spelled out.
+        assert!(hdr_swapchain_wants_f16_on_screen(true, true, None));
+        assert!(hdr_swapchain_wants_f16_on_screen(true, true, Some(2.0)));
+        assert!(!hdr_swapchain_wants_f16_on_screen(true, true, Some(1.0)));
+        assert!(!hdr_swapchain_wants_f16_on_screen(false, true, Some(16.0)));
+    }
+
+    /// The live monitor-change re-pick: it moves an 8-bit surface to f16 only
+    /// on a POSITIVE "this screen can show EDR" answer — never on an
+    /// unresolved screen (unlike the attach gate, whose `None` keeps the
+    /// unconditional pick), never on an already-f16 surface, and never wider
+    /// than the attach gate: upgrade ⇒ on-screen pick ⇒ base gate, for every
+    /// input.
+    #[test]
+    fn screen_upgrade_gate_needs_a_positive_edr_answer() {
+        let potentials = [
+            None,
+            Some(1.0),
+            Some(2.0),
+            Some(16.0),
+            Some(1.0 + f32::EPSILON),
+            Some(0.0),
+            Some(-1.0),
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+        ];
+        let mut upgraded = 0usize;
+        for hdr_glow in [false, true] {
+            for supports_f16 in [false, true] {
+                for swapchain_is_f16 in [false, true] {
+                    for potential in potentials {
+                        let got = hdr_screen_upgrade_wants_f16(
+                            hdr_glow,
+                            supports_f16,
+                            swapchain_is_f16,
+                            potential,
+                        );
+                        let on_screen =
+                            hdr_swapchain_wants_f16_on_screen(hdr_glow, supports_f16, potential);
+                        assert!(
+                            !got || on_screen,
+                            "({hdr_glow},{supports_f16},{swapchain_is_f16},{potential:?}): \
+                             the upgrade widened the attach gate"
+                        );
+                        assert!(
+                            !got || !swapchain_is_f16,
+                            "({hdr_glow},{supports_f16},{swapchain_is_f16},{potential:?}): \
+                             an f16 surface was upgraded"
+                        );
+                        let positive = potential.is_some_and(|p| p.is_finite() && p > 1.0);
+                        assert_eq!(
+                            got,
+                            !swapchain_is_f16
+                                && hdr_swapchain_wants_f16(hdr_glow, supports_f16)
+                                && positive,
+                            "({hdr_glow},{supports_f16},{swapchain_is_f16},{potential:?}): \
+                             wrong upgrade decision"
+                        );
+                        upgraded += usize::from(got);
+                    }
+                }
+            }
+        }
+        // NON-VACUITY: the three EDR answers (2.0, 16.0, 1+ε) each upgrade the
+        // one (on, supported, 8-bit) corner — three real upgrades, no more.
+        assert_eq!(upgraded, 3, "the upgrade must bite on every EDR answer");
+        // The pinned corners, spelled out.
+        assert!(hdr_screen_upgrade_wants_f16(true, true, false, Some(2.0)));
+        assert!(
+            !hdr_screen_upgrade_wants_f16(true, true, false, None),
+            "an unresolved screen is not evidence"
+        );
+        assert!(!hdr_screen_upgrade_wants_f16(true, true, false, Some(1.0)));
+        assert!(!hdr_screen_upgrade_wants_f16(true, true, true, Some(2.0)));
+        assert!(!hdr_screen_upgrade_wants_f16(
+            false,
+            true,
+            false,
+            Some(16.0)
+        ));
     }
 }

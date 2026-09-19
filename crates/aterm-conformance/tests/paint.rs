@@ -540,8 +540,23 @@ fn probe_with_companion_style(
             "PAINT CONFORMANCE COULD NOT RUN [{shape}]: the probe decided nothing, which is not \
              a pass.\n  {report}\n--- probe stderr ---\n{stderr}"
         ),
+        // EXIT 3, added 2026-09-17: the take RAN and is not evidence — its own
+        // instrument disowns it (`evidence=unproved` on the line). Neither a
+        // pass nor a paint failure, and this row must not be read as either:
+        // the pixels were scored under conditions the probe cannot stand
+        // behind, so nothing follows about the glass. It is a red here for the
+        // same reason a COULD-NOT-RUN is: an unproven row that reads green is
+        // the vacuity this whole matrix exists against. The remedy is the tier
+        // the take ran in, and the report's `reason=` names it.
+        Some(3) => panic!(
+            "PAINT CONFORMANCE UNPROVED [{shape}]: the take is not evidence about paint — see \
+             `starved=`/`evidence=` and `reason=` on the line below for what the instrument \
+             could not stand behind. Re-take on an unloaded machine, from an interactive shell \
+             or a LaunchAgent with ProcessType=Interactive; repeating it under the same tier \
+             cannot help.\n  {report}\n--- probe stderr ---\n{stderr}"
+        ),
         code => panic!(
-            "paint probe [{shape}] died abnormally (exit {code:?}, the protocol is 0/1/2)\n\
+            "paint probe [{shape}] died abnormally (exit {code:?}, the protocol is 0/1/2/3)\n\
              --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         ),
     }
@@ -558,8 +573,35 @@ fn main_screen_prompt_typing_paints_trail_ink() {
 /// path, with only the effect style changed. It must retain real dynamic cursor
 /// pixels while producing no ribbon witness, so the scanner cannot pass row 1
 /// merely by counting cursor motion or echoed text.
+///
+/// IGNORED 2026-09-18, and the reason is measured, not guessed. Since the
+/// capture-cadence rule landed (457dbf4af, 2026-09-10) this take has never
+/// once produced a sound reading, and since exit 3 stopped printing PASS
+/// (301c19eb9, 2026-09-17) it has failed every run: `starved=yes
+/// evidence=unproved`, "hole 53071us is more than 2x the nominal 17688us".
+/// Two gate runs on m3 read the SAME hole, and a re-take ALONE on a quiet
+/// machine (load 1.4, `sched_qos=user-interactive`, worst deschedule 5 ms)
+/// read it again — so it is not load. With `ATERM_PAINT_KEEP=1` the kept
+/// `index.json` says what it is: the recorder is present-driven
+/// (`cmd_video` records the swapchain bytes handed to present), and with the
+/// effect OFF this is the matrix's one STATIC window — every 2x gap (34-36 ms)
+/// falls before the first key or after the last, the one 3x gap (53 ms) sits
+/// at the first keystroke, and the driven stretch in between keeps a clean
+/// 17.7 ms cadence, exactly as the 22 animated takes do end to end. A window
+/// with nothing to present under `video … pace` presents on a timer beating
+/// against vsync, and a missed beat is a "hole" to a rule that reads frame
+/// gaps as scheduling. The rule is right to disown the take; the take is
+/// wrong to be measured this way. The fix belongs in the instrument — pace
+/// presents at cadence on a static window, or the cadence rule reads the
+/// present ledger instead of frame gaps — and until it lands this control is
+/// reported as IGNORED by the harness rather than printed as a PASS it never
+/// earned. What is lost meanwhile: row 1 keeps its ink floors and its
+/// alt-screen effect-off twins (`focused_typed_window_with_effect_off…`,
+/// `unfocused_typed_window_with_effect_off…`), but no video take currently
+/// witnesses "effect off paints no ribbon" on the MAIN screen.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "the present-driven recorder drops ticks on this matrix's one static window (measured 2026-09-18 with ATERM_PAINT_KEEP=1: 2x gaps only outside the driven keys, a 53 ms gap at the first key, clean 17.7 ms cadence while typing, on a quiet machine) so the cadence rule disowns every take; fix the pace present or the rule, then re-enable — see the doc comment"]
 fn main_screen_prompt_with_effect_off_has_no_ribbon() {
     probe_with_style(
         "prompt",

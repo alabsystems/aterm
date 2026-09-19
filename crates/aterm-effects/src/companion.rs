@@ -1190,6 +1190,32 @@ impl CompanionOwner {
         self.pet.note_bell(now);
     }
 
+    /// A KITTY COMMAND was typed at this pet (`sit`, `kitty jump`, `good
+    /// kitty`): the host's `crate::typed_tricks::TrickListener` reported a
+    /// fire. `confirmed` is the listener's `addressed`; a tentative fire is
+    /// followed by this call again with `confirmed = true`, or by
+    /// [`Self::revoke_trick`]. Latch only (`PetBrain::note_trick` — note,
+    /// never act): the next ticks perform it on the ground, so the host
+    /// should ask for the frame that runs one, exactly as for [`Self::press`].
+    /// A typed word never summons — with no resident on glass the latch is
+    /// dropped by the brain's own no-audience rule.
+    pub fn note_trick(&mut self, now: Instant, trick: aterm_lexicon::Trick, confirmed: bool) {
+        self.pet.note_trick(now, trick, confirmed);
+    }
+
+    /// The typed line turned into prose, or was aborted: take back a
+    /// tentative kitty command that has not been performed. Idempotent — the
+    /// listener may report a revoke when nothing tentative is pending here.
+    pub fn revoke_trick(&mut self) {
+        self.pet.revoke_trick();
+    }
+
+    /// The whole submitted line was pet talk (`sit` + Enter at a shell): the
+    /// brain does not grieve the fast `command not found` that follows.
+    pub fn note_trick_submit(&mut self, now: Instant) {
+        self.pet.note_trick_submit(now);
+    }
+
     /// One accepted console input intent. This supplies attention provenance,
     /// never evidence that the program changed a particular range of text.
     pub fn note_console_input(&mut self, now: Instant, kind: PetInputKind) {

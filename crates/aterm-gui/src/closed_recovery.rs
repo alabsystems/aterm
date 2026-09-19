@@ -230,6 +230,7 @@ mod tests {
             icon: None,
             role: None,
             attention: None,
+            identity: None,
         })
     }
 

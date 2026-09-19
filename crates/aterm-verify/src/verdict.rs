@@ -233,7 +233,9 @@ pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict 
 
     // Nothing FAILED and nothing was decided either. Reported as its own verdict
     // so it can never be read as a finding about the change — the same mistake
-    // .githooks/pre-push refuses to make when the driver is missing.
+    // the old blocking .githooks/pre-push refused to make when the driver was
+    // missing, and the same one its receipt-reading successor refuses by
+    // treating an unreadable receipt as no receipt rather than as permission.
     if !t.could_not_run.is_empty() {
         let n = t.could_not_run.len();
         text.push_str(&format!(
@@ -306,8 +308,10 @@ pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict 
 }
 
 /// A finding outranks a broken environment: if any gate actually decided against
-/// the tree, that is the news, and `1` is the code the pre-push hook reads as
-/// FAILED. `3` is reserved for a run where nothing was decided at all.
+/// the tree, that is the news, and `1` is the code `tools/verify.sh` hands back
+/// as FAILED. `3` is reserved for a run where nothing was decided at all. The
+/// pre-push hook reads neither: it reads the RECEIPT this run wrote, whose
+/// `merge-contract` line is false for both.
 fn failure_exit(t: &Tally) -> i32 {
     if !t.gate_failures.is_empty() {
         exit::FAILED

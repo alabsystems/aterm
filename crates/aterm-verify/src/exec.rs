@@ -500,13 +500,13 @@ fn run_untimed(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
     match &cmd.capture {
         Capture::Silent => {
             c.stdout(Stdio::null()).stderr(Stdio::null());
-            finish(c, cmd, env.child_ceiling)
+            finish(c, cmd, env.child_ceiling, None).0
         }
         Capture::Append(path) => match open_append(path) {
             Ok(f) => match f.try_clone() {
                 Ok(f2) => {
                     c.stdout(f).stderr(f2);
-                    finish(c, cmd, env.child_ceiling)
+                    finish(c, cmd, env.child_ceiling, None).0
                 }
                 Err(e) => spawn_failure(cmd, &e.to_string()),
             },
@@ -526,13 +526,15 @@ fn run_untimed(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
                 Err(e) => return spawn_failure(cmd, &e.to_string()),
             };
             c.stdout(file).stderr(file2);
-            let mut r = finish(c, cmd, env.child_ceiling);
+            let (mut r, logged) = finish(c, cmd, env.child_ceiling, Some(&log));
             // `finish` leaves `output` empty except for a ceiling diagnostic, so
             // the child's own bytes go IN FRONT of it rather than over it: a
             // timed-out stage must still show how far it got, and the last line
-            // the child managed to write is usually the whole diagnosis.
-            let logged = std::fs::read_to_string(&log).unwrap_or_default();
-            r.output.insert_str(0, &logged);
+            // the child managed to write is usually the whole diagnosis. Those
+            // bytes are `finish`'s single read of the log, which is also what the
+            // ceiling diagnostic's note was computed from.
+            r.output
+                .insert_str(0, logged.as_deref().unwrap_or_default());
             std::fs::remove_file(&log).ok();
             r
         }
@@ -590,13 +592,32 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
 /// same inherited stdio defaults, the same `waitpid`), so the no-ceiling path
 /// below is byte-for-byte the behaviour this function had before and costs
 /// nothing.
-fn finish(mut c: Command, cmd: &Cmd, ceiling: Option<Duration>) -> Run {
+///
+/// `log` is the file the child's stdout and stderr are going to, when the
+/// caller has one. It is read back ONCE, here, after the child is reaped, and
+/// returned beside the `Run`: the ceiling diagnostic needs it to name the test a
+/// killed `targo test` child was still running ([`crate::libtest`]) and the
+/// caller needs the same bytes to splice in front of that diagnostic. Reading it
+/// twice would let a surviving grandchild — the kill reaches the direct child
+/// only — append between the reads, and then the note's line numbers would
+/// describe text the ladder does not show. Lossy, so one stray byte costs
+/// neither the log nor the note.
+fn finish(
+    mut c: Command,
+    cmd: &Cmd,
+    ceiling: Option<Duration>,
+    log: Option<&Path>,
+) -> (Run, Option<String>) {
+    let read_log = |log: Option<&Path>| {
+        log.map(|p| String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned())
+    };
     let mut child = match c.spawn() {
         Ok(ch) => ch,
-        Err(e) => return failed_to_wait(&e.to_string()),
+        Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
     };
     let Some(limit) = ceiling else {
-        return reaped(child.wait());
+        let r = reaped(child.wait());
+        return (r, read_log(log));
     };
 
     // POLL, DON'T BLOCK. std offers no wait-with-deadline: `Child::wait` takes
@@ -628,13 +649,20 @@ fn finish(mut c: Command, cmd: &Cmd, ceiling: Option<Duration>) -> Run {
     let mut nap = Duration::from_millis(1);
     loop {
         match child.try_wait() {
-            Ok(Some(st)) => return reaped(Ok(st)),
+            Ok(Some(st)) => return (reaped(Ok(st)), read_log(log)),
             Ok(None) => {}
-            Err(e) => return failed_to_wait(&e.to_string()),
+            Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
         }
         let elapsed = started.elapsed();
         let Some(left) = limit.checked_sub(elapsed) else {
-            return over_ceiling(&mut child, cmd, elapsed, limit);
+            // Kill and reap FIRST, then read: the bytes the child wrote before it
+            // died are the ones the note and the splice both describe.
+            let killed = kill_and_reap(&mut child);
+            let logged = read_log(log);
+            return (
+                over_ceiling(cmd, elapsed, limit, &killed, logged.as_deref()),
+                logged,
+            );
         };
         // Never sleep past the ceiling: the last nap lands exactly on it.
         std::thread::sleep(nap.min(left));
@@ -645,12 +673,10 @@ fn finish(mut c: Command, cmd: &Cmd, ceiling: Option<Duration>) -> Run {
 /// The ceiling fired. Kill, reap, and return a FAILURE that says so out loud —
 /// never a skip, never a pass, and never something a caller could mistake for a
 /// child that merely exited nonzero.
-fn over_ceiling(
-    child: &mut std::process::Child,
-    cmd: &Cmd,
-    elapsed: Duration,
-    limit: Duration,
-) -> Run {
+/// SIGKILL the child and reap it, reporting only a kill that itself failed.
+/// Separate from [`over_ceiling`] so the log is read AFTER the process is gone
+/// and the same bytes serve the note and the ladder.
+fn kill_and_reap(child: &mut std::process::Child) -> String {
     let kill = match child.kill() {
         Ok(()) => String::new(),
         Err(e) => format!("  (SIGKILL itself failed: {e})\n"),
@@ -659,6 +685,23 @@ fn over_ceiling(
     // SIGKILL is not maskable, so this returns as soon as the kernel has torn
     // the process down.
     let _ = child.wait();
+    kill
+}
+
+fn over_ceiling(
+    cmd: &Cmd,
+    elapsed: Duration,
+    limit: Duration,
+    kill: &str,
+    logged: Option<&str>,
+) -> Run {
+    // NAME THE TEST. A killed `targo test` child's own log says which test
+    // binary never printed its `test result:` line and which test libtest had
+    // reported slow with no verdict after — the whole diagnosis of the 3-hour
+    // hang of 2026-09-16, which this block had left at the argv. The bytes come
+    // from the caller's ONE read of the log, so the note and the log the ladder
+    // shows describe each other.
+    let note = logged.and_then(crate::libtest::note).unwrap_or_default();
     let secs = elapsed.as_secs_f64();
     let limit_secs = limit.as_secs_f64();
     let argv = cmd.argv().join(" ");
@@ -668,6 +711,7 @@ fn over_ceiling(
             "aterm-verify: TIMEOUT — child killed after {secs:.1}s, over the {limit_secs:.1}s \
              wall-clock ceiling\n\
              \x20 child: {argv}\n\
+             {note}\
              {kill}\
              \x20 This stage decided NOTHING: a child that never exits is a FAIL, never a pass \
              and never a skip.\n\
@@ -1039,6 +1083,97 @@ mod tests {
         assert!(out.contains(CEILING_ENV), "{out}");
         assert!(out.contains("=off"), "{out}");
         assert!(out.contains("DIRECT child only"), "{out}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_timed_out_test_child_names_the_test_it_was_still_running() {
+        // The 3-hour hang of 2026-09-16: the ceiling ended it and the block
+        // named the argv, 4,874 tests wide. The child here writes what libtest
+        // writes — cargo's header, the count, one verdict, one slow notice —
+        // then hangs, and the block has to name the slow test, where its
+        // notice is, and how to re-run it alone.
+        let tmp = crate::mktemp_dir("atv-ceil-named").expect("mktemp");
+        let script = "printf '     Running unittests src/lib.rs (target/debug/deps/x-abc)\\n\\n\
+                      running 2 tests\\ntest a::b ... ok\\n\
+                      test a::hang has been running for over 60 seconds\\n'; exec sleep 600";
+        let hang = Cmd::new("/bin/sh").args(["-c", script]);
+
+        let t = Instant::now();
+        let r = run(&hang, ceiled(&tmp, Some(Duration::from_millis(300))));
+        let waited = t.elapsed();
+
+        // Everything the plain ceiling test holds, holds here too.
+        assert!(waited < Duration::from_secs(30), "waited {waited:?}");
+        assert!(waited >= Duration::from_millis(300), "and not end it early");
+        assert!(!r.ok, "a child that never finished is a FAILURE");
+        assert!(r.spawn_error.is_none());
+        assert_eq!(r.code, None, "killed by a signal, so there is no exit code");
+        let out = r.trimmed_output();
+        assert!(out.contains("  child: /bin/sh -c printf "), "{out}");
+        assert!(out.contains("child killed after "), "{out}");
+        assert!(out.contains("over the 0.3s wall-clock ceiling"), "{out}");
+        assert!(out.contains(CEILING_ENV), "{out}");
+        assert!(out.contains("=off"), "{out}");
+        assert!(out.contains("DIRECT child only"), "{out}");
+
+        // The order: the child's bytes, the TIMEOUT line, the name, the verdict
+        // sentence — the note sits inside the block, not in front of it.
+        let alive = out.find("running 2 tests").expect("the child's own output");
+        let verdict = out
+            .find("aterm-verify: TIMEOUT")
+            .expect("the ceiling diagnostic");
+        let named = out.find("still running when killed").expect("the name");
+        let nothing = out
+            .find("This stage decided NOTHING")
+            .expect("the verdict sentence");
+        assert!(
+            alive < verdict && verdict < named && named < nothing,
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "  test binary: unittests src/lib.rs (target/debug/deps/x-abc) — it never \
+                 printed its `test result:` line\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("    a::hang   (slow at child line 5; 0 lines followed)\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    re-run alone: target/debug/deps/x-abc --exact a::hang --nocapture\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  1 of that binary's 2 tests have a verdict in the log above.\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("    a::b "),
+            "a test with a verdict is not named:\n{out}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_timed_out_child_with_no_libtest_output_gets_the_diagnostic_it_gets_today() {
+        // A wedged compile, a hung script: no libtest lines, so the block adds
+        // no test-binary line — and no guess dressed up as one.
+        let tmp = crate::mktemp_dir("atv-ceil-plain").expect("mktemp");
+        let hang = Cmd::new("/bin/sh").args(["-c", "echo got-this-far; exec sleep 600"]);
+        let r = run(&hang, ceiled(&tmp, Some(Duration::from_millis(200))));
+        assert!(!r.ok);
+        let out = r.trimmed_output();
+        assert!(out.contains("aterm-verify: TIMEOUT"), "{out}");
+        assert!(!out.contains("still running"), "{out}");
+        assert!(!out.contains("test binary:"), "{out}");
+        // The `child:` line is followed directly by the verdict sentence.
+        assert!(
+            out.contains("exec sleep 600\n  This stage decided NOTHING"),
+            "{out}"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 

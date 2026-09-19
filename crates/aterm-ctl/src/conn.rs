@@ -154,14 +154,14 @@ fn conn_real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
         return print_usage();
     }
     let self_sid = env::var(super::SELF_SID_ENV).ok().filter(|s| !s.is_empty());
-    let path = super::resolve_path(
+    let (path, origin) = super::resolve_target(
         sock,
         pid,
         env::var(super::SOCK_ENV).ok(),
         env::var(super::NO_SOCK_ENV).ok(),
         self_sid.clone(),
     )?;
-    let wire = ConnWire { path };
+    let wire = ConnWire { path, origin };
     match rest.first().map(String::as_str) {
         None => cmd_status(&wire, self_sid.as_deref()),
         Some("ls") => cmd_ls(&wire, &rest[1..]),
@@ -190,6 +190,10 @@ fn print_usage() -> io::Result<ExitCode> {
 /// One resolved control-socket target the subverbs frame their requests on.
 struct ConnWire {
     path: String,
+    /// How `path` was chosen — `--sock`/`--pid`/an explicit
+    /// `$ATERM_CONTROL_SOCK` pin it — which decides what a connect failure on
+    /// it may offer instead (`super::connect_error`).
+    origin: super::TargetOrigin,
 }
 
 /// One reply: the trimmed status line, plus the body rows when the verb is
@@ -231,7 +235,7 @@ impl ConnWire {
         let mut request = parts.join(" ");
         request.push('\n');
         let path = aterm_uds::latest::resolve(&self.path);
-        let stream = super::connect_stream(&path)?;
+        let stream = super::connect_stream(&path, self.origin)?;
         stream.set_read_timeout(Some(CONN_DEADLINE))?;
         stream.set_write_timeout(Some(CONN_DEADLINE))?;
         super::send_request(&stream, super::read_token_for(&path).as_deref(), &request)?;

@@ -273,6 +273,43 @@ fn the_arch_gate_reads_the_elf_before_anything_leaves_the_machine() {
     );
 }
 
+/// "Nothing to build" is not "nothing to check". The branch that finds the tarball already
+/// on BOTH repos builds nothing and uploads nothing — so it skips the upload gate by
+/// design — and then still appends the `## Linux <arch>` notes section, which NAMES the
+/// target triple and republishes the sidecar digest as this lane's integrity anchor. That
+/// is an ARCHITECTURE CLAIM, and the two tests that branch does run cannot see one: `cmp`
+/// says the two repos agree (a mislabelled pair agrees with itself) and `sha256sum -c`
+/// says the digest covers the bytes (it always does — the whole lesson of this file). The
+/// bytes on that path are also the likeliest to be wrong: they were published by an
+/// earlier run, or hand-attached (the v0.44.0 tarball), and this is the only run that will
+/// ever look at them again. So the published ELF is read there too, on the copy the
+/// cross-repo compare already downloaded.
+#[test]
+fn the_idempotent_path_reads_the_elf_it_writes_an_arch_claim_about() {
+    let s = lane();
+    let branch = at(&s, r#"if [[ "$NEED_CH" == 0 && "$NEED_PR" == 0 ]]; then"#);
+    let converged = branch
+        + s[branch..]
+            .find(r#"TAR_PATH="""#)
+            .expect("the `already on both repos` branch still converges by clearing TAR_PATH");
+    let gate = r#"arch_gate_tarball "$WORK/ch/$TARBALL" "$ARCH""#;
+    assert!(
+        s[branch..converged].contains(gate),
+        "tools/linux-auto-release.sh's `already on both repos` branch does not call \
+         `{gate}` before clearing TAR_PATH. That branch uploads nothing, so the upload \
+         gate never runs — and it still appends the `## Linux <arch>` notes section, \
+         naming the triple and publishing the sidecar digest: an architecture claim over \
+         bytes nothing on that path ever read. `cmp` and `sha256sum -c` cannot see it."
+    );
+    // The claim really is downstream of the gate: the notes section is what makes this
+    // path a publisher rather than a no-op.
+    let notes = at(&s, r#"notes_heading "$ARCH""#);
+    assert!(
+        converged < notes,
+        "the `## Linux <arch>` notes section moved above the converge branch"
+    );
+}
+
 /// The behavioural half, where a shell exists: `tools/test-linux-auto-release.sh` sources
 /// the lane through its library seam and drives the arch table, the ELF reader and both
 /// gates against ELF headers it writes itself — so the aarch64 cases run on an x86_64 box

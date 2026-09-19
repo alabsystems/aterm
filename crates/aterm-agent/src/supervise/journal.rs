@@ -16,8 +16,10 @@
 //! review point, its TIMEOUT or the error it ends on, as an `EXIT` line) — as
 //!
 //! ```text
-//! {"t":<unix ms>,"sid":"<sid>"|null,"kind":"event|approved|dismissed|reconnect|timeout|exit|mail",
-//!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|-",
+//! {"t":<unix ms>,"sid":"<sid>"|null,
+//!  "kind":"event|approved|dismissed|reconnect|timeout|exit|mail|extend|escalated|cleared|probe",
+//!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|resumed|
+//!           still-limited|rebriefed|rebrief-failed|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
 //!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null}
 //! ```
@@ -27,7 +29,12 @@
 //! counted from (`watch --report`), else `null`; `report` is the inbox row id
 //! of the worker's report `watch --mail` folded into an `EVENT turn` line
 //! (its `rows=` is that body's row count), else `null`; a `MAIL …` line is
-//! `kind` `mail`, its words the summary. The file is opened
+//! `kind` `mail`, its words the summary. A limit episode's lines (round 17):
+//! `EXTEND until=<UTC> reset=<text>` is `extend`; the journal-only `ESCALATED
+//! seq=<n> …`, `CLEARED seq=<n> …` and `PROBE <sent|deferred> seq=<n> …` are
+//! `escalated`, `cleared` and `probe`, their `seq=` read like an EVENT's; the
+//! probe's outcome is an EVENT under `resumed`, `still-limited`, `rebriefed`
+//! or `rebrief-failed`. The file is opened
 //! append-only, created `0600` when missing; a failure to open or write it is
 //! said ONCE on stderr and never stops the loop — the journal is a record of
 //! the watch, not a condition of it.
@@ -45,8 +52,9 @@ pub struct JournalRecord {
     /// The session the loop watched (the `@sid` it was given, without the
     /// `@`), `None` when it was given none.
     pub sid: Option<String>,
-    /// `event`, `approved`, `dismissed`, `reconnect`, `timeout` or `exit`
-    /// (`other` for a line none of those start).
+    /// `event`, `approved`, `dismissed`, `reconnect`, `timeout`, `exit`,
+    /// `mail`, `extend`, `escalated`, `cleared` or `probe` (`other` for a
+    /// line none of those start).
     pub kind: String,
     /// The phase the line is about, `-` for none.
     pub phase: String,
@@ -88,7 +96,9 @@ impl JournalRecord {
     /// rows=<n>] <summary>`, `EVENT turn seq=<n> report=<id> rows=<n>
     /// <summary>`, `APPROVED seq=<n> <command>`, `DISMISSED survey seq=<n>`,
     /// `RECONNECT <reason>`, `RECONNECTED after <ms> ms`, `TIMEOUT`, `EXIT
-    /// <reason>`, `MAIL id=<n> …`).
+    /// <reason>`, `MAIL id=<n> …`, `EXTEND until=<UTC> …`, and the limit
+    /// episode's journal-only `ESCALATED seq=<n> …`, `CLEARED seq=<n> …`,
+    /// `PROBE <sent|deferred> seq=<n> …`).
     pub fn of_line(t: i64, sid: Option<&str>, line: &str, turn: Option<u64>) -> Self {
         let mut rec = JournalRecord {
             t,
@@ -146,6 +156,24 @@ impl JournalRecord {
             "RECONNECT" | "RECONNECTED" => rec.kind = "reconnect".to_string(),
             "TIMEOUT" => rec.kind = "timeout".to_string(),
             "EXIT" => rec.kind = "exit".to_string(),
+            "EXTEND" => rec.kind = "extend".to_string(),
+            "ESCALATED" | "CLEARED" => {
+                rec.kind = word.to_ascii_lowercase();
+                if let Some((seq, after)) = take_num(rest, "seq") {
+                    rec.seq = Some(seq);
+                    tail = after;
+                }
+            }
+            "PROBE" => {
+                rec.kind = "probe".to_string();
+                let (what, after) = split_word(rest);
+                rec.phase = what.to_string();
+                tail = after;
+                if let Some((seq, after)) = take_num(tail, "seq") {
+                    rec.seq = Some(seq);
+                    tail = after;
+                }
+            }
             _ => tail = line,
         }
         rec.summary = tail.to_string();
@@ -458,6 +486,53 @@ mod tests {
             (r.phase.as_str(), r.report, r.complete, r.rows),
             ("idle-no-report", None, Some(true), Some(689))
         );
+        // The limit episode's lines (round 17): printed and journal-only.
+        let r = rec("EXTEND until=2026-09-19T18:10:00Z reset=Sep 19 at 11am (America/Los_Angeles)");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            (
+                "extend",
+                "-",
+                None,
+                "until=2026-09-19T18:10:00Z reset=Sep 19 at 11am (America/Los_Angeles)"
+            )
+        );
+        let r = rec("ESCALATED seq=102 attention=OK mail=OK 7 off=91");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            ("escalated", "-", Some(102), "attention=OK mail=OK 7 off=91")
+        );
+        let r = rec("CLEARED seq=104 attention=OK resumed");
+        assert_eq!(
+            (r.kind.as_str(), r.seq, r.summary.as_str()),
+            ("cleared", Some(104), "attention=OK resumed")
+        );
+        let r = rec("PROBE sent seq=102");
+        assert_eq!(
+            (r.kind.as_str(), r.phase.as_str(), r.seq, r.summary.as_str()),
+            ("probe", "sent", Some(102), "")
+        );
+        let r = rec("PROBE deferred seq=102 text is typed in the composer");
+        assert_eq!(
+            (r.phase.as_str(), r.seq, r.summary.as_str()),
+            ("deferred", Some(102), "text is typed in the composer")
+        );
+        for (line, phase) in [
+            ("EVENT resumed seq=103 ⏺ Yes: the A/B is done.", "resumed"),
+            (
+                "EVENT still-limited seq=103 no answer within 120 s",
+                "still-limited",
+            ),
+            ("EVENT rebriefed seq=104", "rebriefed"),
+        ] {
+            let r = rec(line);
+            assert_eq!(
+                (r.kind.as_str(), r.phase.as_str()),
+                ("event", phase),
+                "{line}"
+            );
+            assert_eq!(r.seq, Some(if phase == "rebriefed" { 104 } else { 103 }));
+        }
     }
 
     /// The JSON round-trips, escapes what it must, and prints `null` for what

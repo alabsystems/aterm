@@ -1218,6 +1218,34 @@ mod macos {
     /// shape of the plant that walked through this file's old teeth.
     const PROBE_LIE: &str = "{_ATermAuditLie=qqqq}@:";
 
+    /// The register-class probe: a `CGPoint` — two doubles, which BOTH ABIs
+    /// return in float registers (`xmm0`/`xmm1` on x86_64, `d0`/`d1` on arm64)
+    /// and never through a hidden pointer.
+    const PROBE_POINT: aterm_objc::CGPoint = aterm_objc::CGPoint { x: 12.5, y: -3.25 };
+
+    /// The IMP behind part E's point rows: one compiled function returning
+    /// [`PROBE_POINT`] in registers, so a lying signature can only change which
+    /// registers NSInvocation READS — never anything this function writes.
+    extern "C" fn probe_point(_this: Id, _cmd: Sel) -> aterm_objc::CGPoint {
+        PROBE_POINT
+    }
+
+    /// The register-class lie: a 16-byte struct of two `long long`s. Same SIZE
+    /// as a `CGPoint`, but INTEGER class — `rax`:`rdx` on x86_64, `x0`:`x1` on
+    /// arm64 — while the IMP above answers in the float registers. This is the
+    /// lie x86_64 can detect: it returns EVERY 32-byte struct through a hidden
+    /// pointer, HFA or not, so [`PROBE_LIE`] is laid out exactly like the honest
+    /// rect there and NSInvocation agrees with a direct send (the gate proved
+    /// that on an Intel Mac, 2026-09-08). Register class is the distinction
+    /// x86_64 does have. The row is armed on both arches, but its verdict (the
+    /// lie DISAGREES) is measured only on x86_64: on an Intel Mac running macOS
+    /// 13.7.8, NSInvocation read `{12.5, -3.25}` back as `{-3.25, 0.0}`. On
+    /// arm64 the same verdict is the EXPECTATION, read from the ABI rather than
+    /// from a run: NSInvocation should read the lie from `x0`:`x1`, which still
+    /// hold `self` and `_cmd` after `probe_point` answers in `d0`:`d1`. This
+    /// row has not been run on arm64.
+    const PROBE_LIE_POINT: &str = "{_ATermAuditLie=qq}@:";
+
     /// The audit's whole state: the transcript it prints and the findings it
     /// exits on.
     #[derive(Default)]
@@ -2152,7 +2180,19 @@ mod macos {
         ///    through `NSInvocation` and through a direct send; the LYING one
         ///    must NOT — Foundation lays out an `x8` indirect return for an IMP
         ///    that answered in `d0`-`d3`. If those two ever agree, this file's
-        ///    part D has quietly become decoration and says so.
+        ///    part D has quietly become decoration and says so. That lie is
+        ///    arm64's: x86_64 returns EVERY 32-byte struct through a hidden
+        ///    pointer, HFA or not, so there the two rows are laid out alike and
+        ///    the rect tooth is inert by ABI. What x86_64 does distinguish is
+        ///    register CLASS, so a second pair — a `CGPoint` IMP registered
+        ///    honestly and as a 16-byte INTEGER-class `{qq}` — is armed on
+        ///    every arch and expects one verdict: honest agrees, lie disagrees.
+        ///    That verdict is MEASURED on x86_64 only. On arm64 it is the
+        ///    expectation, not a run: the honest `{dd}` row should be read from
+        ///    `d0`:`d1`, where `probe_point` answers, and the `{qq}` lie from
+        ///    `x0`:`x1`, which still hold `self`/`_cmd`. This pair has not been
+        ///    run on arm64; if arm64 answers otherwise, it is a FINDING there
+        ///    and the audit exits 1.
         /// 2. For a selector a CONFORMED-TO protocol declares, the protocol
         ///    wins and the registered string is not consulted. A class claiming
         ///    `NSTextInputClient` registers a 16-byte lie for
@@ -2201,12 +2241,72 @@ mod macos {
                 self.fail("the audit could not allocate its own probe object".to_owned());
                 return;
             }
+            // THE LIE IS PER ABI. arm64 returns a CGRect (an HFA) in d0-d3 and a
+            // 32-byte non-HFA through x8, so the {qqqq} row is the lie that bites
+            // there. x86_64 returns EVERY 32-byte struct through a hidden pointer,
+            // HFA or not: the honest and lying rows are laid out identically,
+            // NSInvocation agrees with the direct send, and the rect tooth is
+            // inert by ABI, not by defect (the gate failed exactly this row on an
+            // Intel Mac, 2026-09-08). The distinction x86_64 DOES draw is
+            // register CLASS — INTEGER (rax:rdx) against SSE (xmm0:xmm1) for a
+            // 16-byte struct — so the same experiment is run below on every arch
+            // with a CGPoint IMP against a {qq} lie.
+            let rect_tooth_live = cfg!(target_arch = "aarch64");
             let honest_ok = self.probe_row(obj, sel!(atermAuditHonestRect), &honest, true);
-            let lying_ok = self.probe_row(obj, sel!(atermAuditLyingRect), PROBE_LIE, false);
-            if honest_ok && lying_ok {
+            let lying_ok = if rect_tooth_live {
+                self.probe_row(obj, sel!(atermAuditLyingRect), PROBE_LIE, false)
+            } else {
+                println!(
+                    "  -atermAuditLyingRect: inert on x86_64 — a 32-byte struct returns through \
+                     a hidden pointer whatever its class, so a non-HFA lie is laid out exactly \
+                     like the honest row; the register-class tooth below is the live one here"
+                );
+                true
+            };
+            if honest_ok && lying_ok && rect_tooth_live {
                 println!(
                     "  the NSInvocation tooth is LIVE: it agrees with a direct send on an honest \
                      row and disagrees on a lying one"
+                );
+            }
+
+            // The register-class tooth, on every arch.
+            let honest_point = format!(
+                "{}@:",
+                <aterm_objc::CGPoint as aterm_objc::Encode>::ENCODING
+            );
+            let point_imp = probe_point as *const std::ffi::c_void;
+            let mut builder = aterm_objc::begin(c"NSObject", c"ATermAuditPointProbe");
+            builder.add_rust_ivar::<()>();
+            // SAFETY: `probe_point` is `extern "C"`, has the exact `(id, SEL)`
+            // prototype both encodings describe, returns a CGPoint in registers
+            // on both ABIs (it never writes through a hidden result pointer) and
+            // cannot unwind. The second registration is DELIBERATELY the wrong
+            // encoding for that prototype — a 16-byte INTEGER-class struct —
+            // which changes only which registers NSInvocation reads.
+            unsafe {
+                builder.add_method(sel!(atermAuditHonestPoint), point_imp, &honest_point);
+                builder.add_method(sel!(atermAuditLyingPoint), point_imp, PROBE_LIE_POINT);
+            }
+            let point_probe = builder.register();
+            // SAFETY: `+alloc`/`-init` on a freshly registered `NSObject`
+            // subclass whose only ivar is a zero-sized Rust payload.
+            let pobj = unsafe {
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+                send(send(point_probe.class().as_id(), sel!(alloc)), sel!(init))
+            };
+            if pobj.is_null() {
+                self.fail("the audit could not allocate its point probe object".to_owned());
+                return;
+            }
+            let honest_point_ok =
+                self.probe_point_row(pobj, sel!(atermAuditHonestPoint), &honest_point, true);
+            let lying_point_ok =
+                self.probe_point_row(pobj, sel!(atermAuditLyingPoint), PROBE_LIE_POINT, false);
+            if honest_point_ok && lying_point_ok {
+                println!(
+                    "  the register-class tooth is LIVE: NSInvocation agrees with a direct send \
+                     on an honest float pair and disagrees when the row claims an integer pair"
                 );
             }
 
@@ -2334,6 +2434,93 @@ mod macos {
                      part D's frameDidChange: check reads what the class registered"
                 );
             }
+        }
+
+        /// [`Self::probe_row`]'s twin for the 16-byte register-class rows: the
+        /// same experiment over a `CGPoint`, whose honest and lying encodings
+        /// differ in register CLASS rather than in indirection.
+        fn probe_point_row(
+            &mut self,
+            obj: Id,
+            sel: Sel,
+            encoding: &str,
+            expect_agreement: bool,
+        ) -> bool {
+            let name = sel.name().to_string_lossy().into_owned();
+            // SAFETY: `probe_point` really is `(id, SEL) -> CGPoint`; this is the
+            // COMPILER's view of the row, correct for both registrations because
+            // both are backed by that one function.
+            let direct: aterm_objc::CGPoint = unsafe {
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::CGPoint = msg();
+                send(obj, sel)
+            };
+            // SAFETY: `obj` is live; `-methodSignatureForSelector:` answers an
+            // autoreleased signature or nil.
+            let sig: Id = unsafe {
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
+                f(obj, sel!(methodSignatureForSelector:), sel)
+            };
+            if sig.is_null() {
+                self.fail(format!(
+                    "Foundation could not build a signature from {encoding}, which this audit \
+                     registered itself"
+                ));
+                return false;
+            }
+            // SAFETY: as in `probe_row`; `-getReturnValue:` writes exactly
+            // `methodReturnLength` bytes, 16 for both encodings, into a 16-byte
+            // `CGPoint`.
+            let through: aterm_objc::CGPoint = unsafe {
+                let new: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
+                let inv = new(
+                    class(c"NSInvocation").as_id(),
+                    sel!(invocationWithMethodSignature:),
+                    sig,
+                );
+                if inv.is_null() {
+                    self.fail(
+                        "NSInvocation refused a signature Foundation had just built".to_owned(),
+                    );
+                    return false;
+                }
+                let set_id: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
+                set_id(inv, sel!(setTarget:), obj);
+                let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
+                set_sel(inv, sel!(setSelector:), sel);
+                let go: unsafe extern "C-unwind" fn(Id, Sel) = msg();
+                go(inv, sel!(invoke));
+                let mut out = aterm_objc::CGPoint::default();
+                let get: unsafe extern "C-unwind" fn(Id, Sel, *mut std::ffi::c_void) = msg();
+                get(
+                    inv,
+                    sel!(getReturnValue:),
+                    std::ptr::from_mut(&mut out).cast(),
+                );
+                out
+            };
+            let agreed = direct == through;
+            println!(
+                "  -{name} registered {encoding}\n    direct = {direct:?}\n    NSInvocation = \
+                 {through:?}   agree={agreed}"
+            );
+            if agreed != expect_agreement {
+                self.fail(if expect_agreement {
+                    format!(
+                        "{name} is registered honestly and still answered differently through \
+                         NSInvocation — this audit cannot round-trip a correct 16-byte row, so \
+                         none of its verdicts about layout mean anything"
+                    )
+                } else {
+                    format!(
+                        "{name} is registered {encoding} — a 16-byte INTEGER-class lie against an \
+                         IMP that answers in the float registers — and NSInvocation still \
+                         answered what a direct send did. The register-class comparison this \
+                         file uses to detect a lying encoding no longer detects one"
+                    )
+                });
+                return false;
+            }
+            true
         }
 
         /// One probe row, sent directly and through `NSInvocation`.

@@ -30,13 +30,14 @@
 //! resolving on the other side of a `cfg`) for the same reason and on the same terms.
 //!
 //! WHY NOT ONLY IN `gate cells`. `cargo xtask gate cells` really cross-compiles, and it stays
-//! the authority — but its matrix is `aterm_forge::resolve::default_cells()`, which is
-//! `mac-arm`, `linux`, `win` and the two wasm rows: FOUR of the six shipped triples have no
-//! cell at all, `aarch64-pc-windows-msvc` among them, and the two that do are the x86_64
-//! Windows and x86_64 Linux ones. The gate is also opt-in, needs each triple's std installed
-//! and costs minutes. This file is the cheap standing guard that rides along with
-//! `cargo test -p atpkg` on whatever box the change is being written on: pure `std`, no
-//! subprocess, no network, no new dependency, reading only committed sources under
+//! the authority — but its matrix is `aterm_forge::resolve::default_cells()`, and when this
+//! file was written that matrix was `mac-arm`, `linux`, `win` and the two wasm rows: THREE of
+//! the six shipped triples had no cell at all, `aarch64-pc-windows-msvc` among them. All six
+//! are cells since 2026-09-18, and `shipped_triples_have_a_compile_cell.rs` beside this one is
+//! the law that keeps them there. The gate is still opt-in for the whole matrix, needs each
+//! triple's std installed and costs minutes. This file is the cheap standing guard that rides
+//! along with `cargo test -p atpkg` on whatever box the change is being written on: pure
+//! `std`, no subprocess, no network, no new dependency, reading only committed sources under
 //! `CARGO_MANIFEST_DIR`. It cannot replace a real cross-compile and does not claim to — what
 //! it proves is that the escape list does not REFUSE a shipped triple outright, which is the
 //! failure that was live.

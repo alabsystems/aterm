@@ -65,8 +65,12 @@ WHAT IT IS
   the bytes and the session keeps no grid and no scrollback. (The in-process VT model is
   demand-driven and OFF by default; ATERM_SESSION_MODEL=1 arms it for an in-process
   consumer of the engine, and 0/off/empty do not. It is not readable from outside either
-  way.) The shell runs through a protected spawn seam (capability-gated,
-  setrlimit-bounded, fail-closed, OS-sandbox-wrapped on demand), not raw forkpty/execvp.
+  way.) The shell runs through a protected spawn seam (capability-gated, fail-closed,
+  OS-sandbox-wrapped on demand, resource-bounded in the confinement modes only: user and
+  master install no caps, so on macOS and Linux the shell inherits your shell's limits;
+  safety/containment cap open files at a soft 8192 on macOS and Linux and address space
+  at a soft 16 GiB on Linux (hard limits untouched), and, on Windows, put 16 GiB / 512
+  active processes / UI restrictions on the child's Job Object), not raw forkpty/execvp.
   This passthrough CLI serves NO control socket of its own; the live, introspectable
   surface an AI reads and drives (via `aterm ctl`) is exposed by the WINDOW mode of the
   same binary — `aterm --window`, or `aterm --headless` (ATERM_HEADLESS=1).
@@ -84,6 +88,8 @@ KEY USAGE
                              `shell` move the code; `tty` and `privacy` never do.
   aterm show-config | validate-config | explain-config | list-fonts | list-themes
                              read-only diagnostics; print and exit, no shell spawned
+  aterm list-kitty-commands  the words the cursor cat obeys when typed, by language
+                             (what they do and when they fire: `aterm help kitty`)
   aterm --sandbox            run the shell under the macOS sandbox (deny net + secrets)
 
 WHEN TO REACH FOR IT
@@ -101,7 +107,8 @@ GOTCHAS
     pre-one-binary builds exited 127 when the sibling `atpkg` binary was missing.)
   * Containment precedence: explicit flag > $ATERM_CONTAINMENT_MODE > default `user`;
     a malformed mode fails CLOSED to `containment`. The OS sandbox is actuated on macOS
-    only; elsewhere it is rlimits + capability gate, and aterm says so on stderr.
+    only; elsewhere it is resource caps (rlimits on Linux, the Job Object on Windows) +
+    capability gate, and aterm says so on stderr.
   * macOS: `Operation not permitted` on a file macOS treats as private is privacy consent
     (TCC), not a broken tool — and it can arrive with NO dialog at all. `aterm doctor` has a
     `privacy:` row, `aterm ctl privacy` has the whole posture, and `aterm help permissions`
@@ -233,7 +240,10 @@ WHEN TO REACH FOR IT
   most once a minute, each time the window (or a --headless instance) opens
   a session — every DETECTED agent gets the current primer and skills, and nothing is
   written for an agent whose config dir does not exist (`agents_auto_prime = false` in
-  aterm.toml turns the pass off; `aterm agents status` names the knob). Run
+  aterm.toml turns the pass off; `aterm agents status` names the knob, and so does the
+  one line a pass that wrote anything leaves in aterm's log, ahead of the files it
+  wrote — a list long enough to pass the log's 512-byte record cap loses its tail, and
+  never the knob). Run
   `aterm agents install` to do the same on demand, `aterm agents` to check. A screen
   banner cannot do this job — an agent's context never sees the terminal's output, which
   is exactly why the primer rides in the agent's own files.
@@ -344,7 +354,22 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              installing. Only a pre-v0.63 seeded bundle fills the
                              store from its own bundled registry. The GUI
                              runs it once per launch; [packages].seed_install=false
-                             turns it from adopt-and-install into announce-only
+                             turns it from adopt-and-install into announce-only.
+                             The update pass announces the network install
+                             before a byte moves — the signed download and
+                             on-disk sizes and how to stop it — in aterm's log
+                             (the toolchain bar shows the sizes). Every such
+                             line names `uninstall --all`, usable once the pass
+                             ends. Only a pass completing a set this seed
+                             adopted also names that key, set BEFORE the first
+                             launch; the line of `install --default-set` (its
+                             own consent), of any later pass on a machine it
+                             adopted, and of a pass with auto_install on or the
+                             key already false names only the uninstall.
+                             `install.sh --no-toolchain` excludes the toolset,
+                             but the exclusion does not persist yet: it writes
+                             no config, so the app's first launch still adopts
+                             and installs unless that key is set first
 
 OCCASIONAL (recovery and preference)
   aterm pkg uninstall <program> | --all
@@ -483,8 +508,13 @@ GOTCHAS (in the order they bite)
     path_helper and a `~/.local/bin` line in ~/.zshrc otherwise leave /opt/homebrew/bin
     and ~/.local/bin ahead of it, and inside an aterm window tab the shell integration
     re-asserts it beside the reroute directory at every prompt and every command (a TTY
-    `aterm` session in another terminal has no integration and relies on the rc-sourced
-    hook alone). The hook is
+    `aterm` session in another terminal has no integration: it is spawned with
+    <prefix>/agents ahead of the inherited PATH — behind the reroute directory when that
+    is engaged — and $ATERM_AGENTS_DIR names it, handed on every launch that resolves a
+    store and can create the directory, with or without --no-reroute; when it cannot (no
+    $HOME, a system prefix without root, a file or link at agents/) one stderr line says
+    so and nothing is handed. The session relies on the rc-sourced hook to keep the
+    directory first past the login shell's path_helper). The hook is
     sourced inside every aterm session and from the
     marker block atpkg writes into an existing ~/.zshrc / ~/.bashrc / ~/.bash_profile /
     config.fish (see
@@ -524,9 +554,27 @@ GOTCHAS (in the order they bite)
     sources the hook itself when it appears or is rewritten (zsh, bash, fish measured), so a
     tab running the current integration needs nothing typed at all. The remedy line is in
     the dialect of the shell that typed `aterm pkg doctor` (its parent process, not
-    $SHELL): a fish tab on a zsh-login machine gets the fish line. Windows has no landing wait:
-    the .cmd twin runs the current build at once, and the next `claude` after the pass
-    runs the new one.
+    $SHELL): a fish tab on a zsh-login machine gets the fish line. On Windows the agents/
+    twin is a .cmd wrapper that carries the same wait (since 2026-09-17: while the landing
+    marker stands it hands over to the co-located atpkg, Ctrl-C during the wait runs the
+    current build, and the twin runs the current build when that atpkg is gone) — unless
+    the prelude could not be rendered safely, in which case the twin is laid as a plain
+    shim with NO wait, fail-closed, rather than one that might point anywhere. Two
+    caveats there, both unverified — the text is pinned by tests, but no Windows machine
+    has run it: a Ctrl-C typed inside the agent can raise cmd.exe's `Terminate batch job
+    (Y/N)?` prompt twice ON THE LANDING PATH, where the hand-over runs the bin shim
+    through cmd.exe and there are two batch levels (the ordinary path is one level and asks
+    once); and arming the console handler is best-effort, so a Ctrl-C can end the wait's
+    process instead of running the current build. A third — a twin or shim from before
+    2026-09-17 that is executing at the moment the next pass re-lays it could run the agent
+    a second time when it exits, cmd.exe resuming a rewritten batch file at a byte offset —
+    is closed by construction since 2026-09-18: every .cmd atpkg writes (shim, alias,
+    tombstone, pending stub and twin alike, one frame renderer) starts with
+    `@goto :main`, 4 KB of label-only padding and `@exit /b`, so that resume lands in the
+    padding and returns with the agent's own exit code (unverified on a Windows host, like
+    the rest). Every later re-lay is safe but for a residual microseconds-wide gap between
+    two consecutive line reads of the prelude, the twin ending its batch on the line that
+    runs the program.
   * bin/ NEVER carries a `cargo`, `rustc`, or `rustup` shim
     (those names are on the sensitive-shim deny-list): cargo reaches the compiler
     through rustup's `trust` toolchain link, which atpkg points at its view of
@@ -708,7 +756,11 @@ WHERE THE STUBS LIVE
   Only aterm's own sessions put the directory first on PATH — $ATERM_REROUTE_DIR names
   it, and the shell integration re-asserts it after your rc files ran (`. ~/.cargo/env`
   in a .zshrc prepends ~/.cargo/bin AFTER the environment was injected). Machine-wide,
-  shell.d still APPENDS bin/ and nothing points at the reroute directory.
+  shell.d still APPENDS bin/ and nothing points at the reroute directory. The managed
+  agents/ (claude, codex) is a SEPARATE handle, $ATERM_AGENTS_DIR, handed to a session
+  on every launch that resolves a store and can create the directory (else one stderr
+  line and nothing handed), whether or not the reroute is engaged: --no-reroute
+  restores the upstream Rust names and nothing else.
 
 GOTCHAS
   * `aterm pkg doctor` reports every row (laid / missing / foreign) and whether the
@@ -989,7 +1041,97 @@ const EXTRA_PAGES: &[&str] = &[
     "trust-backends",
     "permissions",
     "agent",
+    "kitty",
 ];
+
+/// `aterm help kitty` — the hand-written half of the kitty-commands page. The
+/// vocabulary itself is GENERATED below it ([`kitty_page`]) from the table the
+/// window's typed-line listener compiles, so the words printed are the words
+/// that fire; only the behaviour is prose, and every sentence of it describes
+/// `aterm_effects::typed_tricks` (when a word fires), `PetBrain::note_trick`
+/// (what the pet does) and the word engine's trick flash (the rainbow).
+const KITTY_PAGE_HEAD: &str = r#"kitty — talk to the cursor cat: the words it obeys when you TYPE them
+
+  aterm list-kitty-commands   every word, one row per trick and language
+  aterm help kitty            this page (also: help pet | cat | tricks)
+
+With the full-body pet on glass (`cursor_trail_style = "rainbow kitty pet"`, or
+"rainbow dog pet") type a command word at the terminal and two things happen:
+the word you typed flashes RAINBOW for about a second, and the pet pricks its
+ears and does it. sit, stay, down, sleep, nap, stretch, jump, play, roll, purr,
+meow, paw, hide, boo, treat — and the internet's cat-speak: pspsps, zoomies,
+loaf, sploot, boop, bap, mlem, biscuits.
+
+HOW TO SAY IT
+  sit<space>      a trailing SPACE completes a command. You do not need Enter, so
+                  nothing is submitted to your shell or your agent. Clear the line
+                  with Ctrl+U (or Ctrl+C) and say the next thing.
+  kitty jump      name the pet and the line is ADDRESSED: it fires at once.
+  good kitty      praise, scolding and everyday openers (good, nice, no, stop,
+                  come, look, run, fetch, wait) are ADDRESS words: they count only
+                  on a line that also names the pet.
+  sit!  sit.      sentence punctuation is fine; the space or Enter after it fires.
+  goooood kitty   a drawn-out word is still the word (purrrrr, nooo, staaay).
+  sit down        one phrase, one trick: the first command word of a phrase wins.
+                  Pause a moment and the next word is a new request.
+
+WHEN IT DOES NOT FIRE (on purpose)
+  * The line must be PURE — nothing on it but pet vocabulary. `npm run build`,
+    `git fetch` and `please do not sit there` never move the cat.
+  * A bare command word that STARTS a line fires TENTATIVELY: the word flashes and
+    the pet waits about a second. Keep typing prose (`roll back the last commit`,
+    `sleep 5`) and the flash fades and the pet never moves. Stop typing, or press
+    Enter on the still-pure line, and it performs.
+  * Only TYPED words count. Program output, a paste and `aterm ctl send` bytes
+    never fire; `aterm ctl key` does (a controller types exactly like a person).
+  * Code context never fires:  ./sit  --sit  sit.txt  sit=3  $sit  sit: 3
+  * After Tab, Esc, an arrow key or a paste, aterm no longer knows what the line
+    holds, so nothing fires until the line is reset with Enter, Ctrl+U or Ctrl+C.
+    Backspacing over a typo is fine: s-o-t, three backspaces, s-i-t, space fires.
+  * A no-echo prompt (a password) never moves the cat.
+  * A typed word never SUMMONS a pet: with no pet on glass only the word flashes.
+  * Reduced motion: no flash, and the pet honours only `sleep` (a still pose).
+
+AT A REAL SHELL
+  Pressing Enter on `sit` runs a command named sit, and the shell truthfully says
+  there is none. The pet does not sulk over that — a submitted line that was
+  nothing but pet talk is forgiven — but you never needed the Enter: the space
+  already said it.
+
+CONFIG (aterm.toml; these keys are not in the starter file)
+  [sparkle_words.tricks]
+  enabled      = true          # false: the words do nothing at all
+  ignore_words = ["play"]      # words that should never fire for you
+  [sparkle_words]
+  enabled      = true          # the master switch for every typed-word effect
+  languages    = ["en", "de"]  # loads the rows marked gated=1 below for those
+                               # languages ("all" loads every language's)
+  The flash is drawn by the sparkle-words engine, so it needs at least one sparkle
+  family switched on; the pet obeys either way.
+
+SEE IT WORK
+  aterm ctl trail status      pet_action= and pet_pose= say what the pet is doing
+  aterm ctl key s             type through the real input path, one key per call
+                              (s, i, t, then `key space`)
+
+THE WORDS
+  Generated from crates/aterm-lexicon/data/tricks.toml — the table the window
+  compiles. `words` fire bare; `address` words need the pet named; `does` is what
+  the pet performs; a gated=1 row loads only when `languages` lists its language.
+  `vocative` rows are names for the pet, `filler` rows are words a pet-directed
+  line may also hold (please, now, a, my).
+
+"#;
+
+/// The kitty-commands page: [`KITTY_PAGE_HEAD`] then one
+/// [`aterm_lexicon::tricks::row_line`] per vocabulary row — the same rows, from
+/// the same call, that `aterm list-kitty-commands` prints, so the page and the
+/// subcommand cannot disagree with each other or with what fires.
+fn kitty_page() -> String {
+    let mut page = String::from(KITTY_PAGE_HEAD);
+    page.push_str(&crate::list_kitty_commands_report());
+    page
+}
 
 /// Every `help <topic>` key, in display order — used by the completeness gate to
 /// prove each dispatchable topic is also listed on the front page.
@@ -1329,7 +1471,7 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      run (see --context-warn)
   watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
         [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT] [--journal FILE]
-        [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
+        [--mail [--inbox @sid] [--report-window S] [--idle-grace S]] [--resume [RULES]]
                      supervise's loop that never exits at a review point: it
                      prints ONE line — `EVENT <phase> seq=<n> <summary>` — and
                      keeps watching, looking again once the screen has moved past
@@ -1364,7 +1506,31 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      screen, every line is as before. With --mail the
                      worker's end-of-turn report comes by mail and its idle
                      point is ONE line, `EVENT turn seq=<n> report=<id>
-                     rows=<n> <summary>` (see --mail)
+                     rows=<n> <summary>` (see --mail). A usage limit is the
+                     loop's own decision point (measured 2026-09-15 → 09-17:
+                     one account's weekly limit stopped the manager and the
+                     worker at once and the watcher ran out its budget — two
+                     days lost). On `EVENT limited` it sets the worker's
+                     `attention` meta to the notice, posts it as
+                     `kind=control` mail to you (--inbox, else
+                     $ATERM_PARENT_SESSION_ID) and journals `ESCALATED …`,
+                     once an episode; it never exits on a limit — a --max-s
+                     that would end before the reset the notice names plus
+                     10 min is stretched to that, `EXTEND until=<UTC>
+                     reset=<text>` printed once a reset — and clears the
+                     attention when the worker answers again. With --resume
+                     it probes the worker at the reset, or as soon as the
+                     screen leaves the notice (a `/login`, a `/model` line):
+                     ONE turn (`Manager's watcher: the usage limit should
+                     have reset. …`), only at an idle composer with nothing
+                     typed; the answer prints `EVENT resumed seq=<n> <its
+                     line>` (a worker still busy on it after 120 s is waited
+                     for) and, with RULES, the file as ONE turn then `EVENT
+                     rebriefed seq=<n>`; no reaction within 120 s, or the
+                     notice again, prints `EVENT still-limited seq=<n>
+                     <why>` and the next probe waits 10 min, then 30. It
+                     invents no work: the last directive is yours to resend
+                     (see --resume)
   task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text...>
                      give the worker its work BY MAIL: `post to=@sid kind=task
                      [dl=<ms>] <text>` from your own session (@self, or
@@ -1518,6 +1684,14 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      or write it is said once on stderr and stops nothing.
                      `aterm drive ledger --journal FILE` replays it; --notes
                      stays what it was (one line per Bash-prompt decision)
+  --resume [RULES]   watch lives through a usage limit's reset and probes the
+                     worker after it (see watch); RULES names the file whose
+                     contents it restates to the worker as ONE turn once the
+                     worker answers — your standing rules, read when sent, so
+                     edit the file as they change; refused at the launch when
+                     it cannot be read or is empty. The next word is the file
+                     unless it is a flag or the worker's @sid. Without the
+                     flag every line is as before but for `EXTEND`
   --dismiss-surveys  supervise and watch dismiss Claude Code's session survey
                      instead of reporting it: when it appears, a GUARDED `0`
                      (`key if=^●.How.is.Claude.doing 0` — only `0`, never a
@@ -1639,8 +1813,9 @@ GOTCHAS
   * Per-folder state is `unknown` BY CONSTRUCTION: the only way to learn whether a folder
     is readable is to read it, which is the very act that raises the prompt. `unknown` is
     not `denied`, and neither is inferred from the Full Disk Access state.
-  * A dev build's grants do not persist: its code identity changes on every build, and
-    macOS keys the grant to that identity. `aterm doctor` says so when it applies.
+  * A dev build signed ad-hoc (no `tools/dev-sign-id.sh` identity) loses its grants on
+    every build: macOS keys the grant to the code identity, and an ad-hoc identity is the
+    exact bytes. `aterm doctor` says so when it applies.
   * This whole page is macOS. Elsewhere an EPERM is an ordinary permission error.
 "
     )
@@ -2395,8 +2570,9 @@ const EXEC_ROOTS_DIR: &str = "compat/trust";
 /// keeps a shim loop from spinning.
 const MAX_SHIM_HOPS: usize = 4;
 
-/// A shim is a few hundred bytes; atpkg reads its own shims under the same 64 KiB
-/// bound, and a larger file is not followed.
+/// A Unix shim is a few hundred bytes (a Windows `.cmd` shim carries a 4 KB resume-proof
+/// frame ahead of its body since 2026-09-18, so ~4.5 KB); atpkg reads its own shims under
+/// the same 64 KiB bound, and a larger file is not followed.
 const MAX_SHIM_BYTES: u64 = 64 * 1024;
 
 /// Where a bare command name typed in this shell really runs.
@@ -2994,7 +3170,10 @@ fn agent_page(sid: Option<&str>) -> String {
          ANTHROPIC_*, COPILOT_*, CODEX_*, CURSOR_*, AI_*, and _DEVTOOL_* var is removed before\n  \
          exec, so they never leak into your session. If an inner tool reports its context\n  \
          vars went missing, aterm sanitized them here by design (aterm_types::env_sanitize) —\n  \
-         re-export what it needs, or run it outside aterm to keep the originals.\n",
+         re-export what it needs, or run it outside aterm to keep the originals. The one\n  \
+         exception: a session spawned with `aterm ctl spawn identity=<name>` gets each agent's\n  \
+         home variable (CLAUDE_CONFIG_DIR, CODEX_HOME) pointed into <state>/identities/<name>/\n  \
+         — set AFTER the strip, so neither your login nor the identity's leaks into the other.\n",
     );
     s.push_str(
         "\nTHE TOOLS AT HAND (run `aterm help <name>` for how to use each)\n\
@@ -3127,7 +3306,12 @@ THE FIVE VERBS YOU NEED
   bus: a verdict given while the broker is down or the bridge is restarting is sent when
   they are back, once — you never need to say it again. Their `post --wait-ack` returns
   it, their `await inbox re=<off>` latches on it. A `note` earns none, and a session that
-  only `--peek`s acks nothing.
+  only `--peek`s acks nothing. A receipt counts only from the node (or principal) the ask
+  went to: an `ack re=<off>` from any other arrives as `kind=note demoted=ack`, and
+  neither it nor any other reply from elsewhere settles `post --wait-ack` or the `dl=`
+  deadline (the asking node remembers where its newest 1024 asks went, and where a
+  deadline's went; an older ask is judged as it always was). `await inbox re=<off>`
+  still latches on EVERY row that names the post, that note included: read its `from=`.
 
   A WAIT THAT DOES NOT LAND HAS FOUR ANSWERS, AND THREE OF THEM MEAN QUEUED:
     queued=1        a bridge exists and will publish it — `ERR fabric stalled id=<n>
@@ -3177,11 +3361,13 @@ THE HALT
 IS IT ON HERE?
   aterm fabric                  the whole answer on one screen, no arguments: where the
                                 [fabric] command came from, the broker reached for real
-                                (connect, attach, head query), the bridge of every aterm
-                                instance on this machine, every session's hold and inbox
-                                numbers, the last 10 bus records (metadata only), and
-                                WARNINGS for each thing that makes `connected` a lie or
-                                loses mail. Exit 0 healthy, 1 warned, 2 off.
+                                (connect, attach, head query), every node on the fleet
+                                (NODES: host=, state=, fabric=, `this` for this one), the
+                                bridge of every aterm instance on this machine, every
+                                session's hold and inbox numbers (and its node once the
+                                fleet has two), the last 10 bus records (metadata only),
+                                and WARNINGS for each thing that makes `connected` a lie
+                                or loses mail. Exit 0 healthy, 1 warned, 2 off.
                                 `aterm fabric tail` follows the bus live; `--bodies`
                                 adds the text.
   aterm ctl @self status        ... fabric=<connected|stalled|disconnected|absent>
@@ -3301,6 +3487,29 @@ TURNING IT ON (the operator does this once)
      are `ERR denied`.
   Off by default, deliberately: no bridge, no bus, no cross-host anything.
 
+A SECOND HOST (round 16) — over the sealed TCP wire
+  Needs the `sealed` cargo feature on BOTH hosts (`targo --unverified build --release -p
+  aterm --features sealed`); a default build refuses every command below by naming it.
+  On the first host:
+    aterm fabric on --tcp 0.0.0.0:<port> --allow-remote --key-file <k>
+        the broker on the sealed wire as well as the socket — always GUARDED with the
+        root's mint secret — and a 64-hex key minted into <k> (0600) if it is absent.
+        This host's own bridges stay on the socket; the port is for joining hosts
+    aterm fabric mint-for <node-id>|new --out <cap>
+        the joining node's 8 grants under THIS host's mint secret; its last lines are the
+        exact `join` to run on the other host
+  Copy the key and the cap — nothing else; the mint secret never leaves the first
+  host — `chmod 600` both, and open that ONE port. On the second host:
+    aterm fabric join --broker <host>:<port> --tcp --key-file <k> --cap-file <cap> \
+        --accept-from <first host's node>
+        checks both files, probes the broker (a wrong key or a foreign cap is refused
+        there, before anything is written), records the node id, installs the files in
+        its root, writes [fabric] command, arms the running aterm and proves it
+  `aterm fabric` then lists both nodes under NODES (`this`, `remote`) and every node's
+  sessions. The key is a TRANSPORT boundary, not a per-host identity: a copied key and
+  cap ARE that node, and there is no revoking one host short of re-keying. The whole
+  recipe, and what it does not protect: docs/FABRIC-SECOND-HOST.md in the source tree.
+
 BEING WOKEN — WHAT EXISTS, PER AGENT, HONESTLY
   Claude Code   `aterm link hook install claude --merge --settings <file>` merges four
                 hooks into that settings file (a backup at <file>.bak-<unix> first; bare,
@@ -3400,6 +3609,8 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         // reader of it needs, and `every_front_door_verb_resolves` requires
         // every front-door verb to land on a page rather than exit 2.
         "inbox" | "post" | "mail" | "link" => "fabric",
+        // What someone guesses when they want the cursor cat's words.
+        "pet" | "cat" | "tricks" | "kitty-commands" | "list-kitty-commands" => "kitty",
         other => other,
     });
     match topic {
@@ -3422,6 +3633,7 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("fleet") => (FLEET_PAGE.to_string(), 0),
         Some("fabric") => (FABRIC_PAGE.to_string(), 0),
         Some("trust-backends") => (TRUST_BACKENDS_PAGE.to_string(), 0),
+        Some("kitty") => (kitty_page(), 0),
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
             Some(t) => {
                 // `introspection` and `rust` have generated bodies; both are handled
@@ -4397,6 +4609,48 @@ mod tests {
         }
     }
 
+    /// `aterm help kitty` carries the GENERATED vocabulary — the very rows
+    /// `aterm list-kitty-commands` prints — so the page cannot list a word that
+    /// does not fire or miss one that does; and every word someone would guess
+    /// for the topic lands on it.
+    #[test]
+    fn the_kitty_page_is_the_prose_plus_the_generated_vocabulary() {
+        let (page, code) = render(Some("kitty"), None);
+        assert_eq!(code, 0);
+        let rows = crate::list_kitty_commands_report();
+        assert!(!rows.is_empty(), "the vocabulary is not empty");
+        assert!(
+            page.ends_with(&rows),
+            "the page ends with exactly the subcommand's rows"
+        );
+        for trick in aterm_lexicon::Trick::ALL {
+            let field = format!("command trick={} lang=en ", trick.code());
+            assert!(page.contains(&field), "no English row for {field:?}");
+        }
+        // The prose names the subcommand and the recovery gesture it teaches.
+        for needle in [
+            "aterm list-kitty-commands",
+            "Ctrl+U",
+            "ADDRESS",
+            "TENTATIVELY",
+        ] {
+            assert!(page.contains(needle), "the page never says {needle:?}");
+        }
+        for alias in [
+            "pet",
+            "cat",
+            "tricks",
+            "kitty-commands",
+            "list-kitty-commands",
+        ] {
+            assert_eq!(
+                render(Some(alias), None),
+                (page.clone(), 0),
+                "`aterm help {alias}` should be the kitty page"
+            );
+        }
+    }
+
     /// Every repo-rooted path the MANUAL names must exist.
     ///
     /// Ported from clean's help-truth C3, which caught two shipped defects
@@ -4726,6 +4980,29 @@ mod tests {
         );
     }
 
+    /// Session identities: the ENV HYGIENE paragraph names its ONE exception —
+    /// a `spawn identity=<name>` session gets the agents' home variables set
+    /// back, pointed into the identity, AFTER the strip — so an agent that
+    /// finds `CLAUDE_CONFIG_DIR` set under aterm can read here why.
+    #[test]
+    fn agent_brief_names_the_identity_exception_to_env_hygiene() {
+        let (agent, code) = render(None, Some("s-abc123"));
+        assert_eq!(code, 0);
+        let hygiene = agent
+            .split("ENV HYGIENE")
+            .nth(1)
+            .expect("the ENV HYGIENE paragraph");
+        for phrase in [
+            "The one",
+            "`aterm ctl spawn identity=<name>`",
+            "CLAUDE_CONFIG_DIR, CODEX_HOME",
+            "<state>/identities/<name>/",
+            "set AFTER the strip",
+        ] {
+            assert!(hygiene.contains(phrase), "ENV HYGIENE lacks {phrase:?}");
+        }
+    }
+
     #[test]
     fn agent_brief_documents_env_hygiene_and_ai_hint() {
         // FINDING #7: an inner agent that lost its context vars can learn why, and the
@@ -4994,9 +5271,13 @@ mod tests {
             );
         }
         // Length discipline: a few added lines, not a manual. `help introspection`
-        // and `help <verb>` are where the depth lives.
+        // and `help <verb>` are where the depth lives. RAISED FROM 90 lines on
+        // 2026-09-17: the ENV HYGIENE paragraph names its ONE exception (session
+        // identities — `spawn identity=<name>` sets the agents' home variables
+        // back after the strip), three lines the hygiene rule is incomplete
+        // without; the byte cap is untouched (6 610 B of 7 000 measured).
         assert!(
-            agent.lines().count() <= 90 && agent.len() <= 7_000,
+            agent.lines().count() <= 93 && agent.len() <= 7_000,
             "the brief grew into a manual: {} lines, {} bytes",
             agent.lines().count(),
             agent.len()

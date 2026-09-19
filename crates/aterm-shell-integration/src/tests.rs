@@ -3643,7 +3643,12 @@ fn test_fish_prompt_colors_are_sgr_indices_like_bash() {
     // rather than fail on the wrong shell; `$ATERM_TEST_BASH` can point at a newer
     // bash (Homebrew's) to run the parity for real.
     let probe = shell_command(bash)
-        .args(["--noprofile", "--norc", "-c", "x=ok; printf '%s' \"${x@P}\""])
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            "x=ok; printf '%s' \"${x@P}\"",
+        ])
         .output()
         .unwrap_or_else(|error| panic!("spawn bash for the @P probe: {error}"));
     if probe.stdout != b"ok" {
@@ -4239,8 +4244,17 @@ struct LiveShell {
     stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
+// `#[cfg(test)]` is redundant for the compiler — this file is `include!`d into
+// lib.rs's `#[cfg(test)] mod tests` — but it is what the wasm-process census
+// READS. That census walks `crates/**/*.rs`, so it sees this file on its own,
+// where the enclosing gate is nowhere in sight and the `thread::spawn` below
+// looks like a thread in the shipped wasm closure (OB-12). The marker states
+// here what the module states there.
+#[cfg(test)]
 #[cfg(unix)]
-fn pump(mut reader: impl std::io::Read + Send + 'static) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+fn pump(
+    mut reader: impl std::io::Read + Send + 'static,
+) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
     let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let out = std::sync::Arc::clone(&sink);
     std::thread::spawn(move || {
@@ -4318,7 +4332,13 @@ impl LiveShell {
         self.stdin
             .write_all(format!("{line}\n").as_bytes())
             .and_then(|()| self.stdin.flush())
-            .unwrap_or_else(|error| panic!("{}: write {line:?}: {error}\n{}", self.label, self.transcript()));
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: write {line:?}: {error}\n{}",
+                    self.label,
+                    self.transcript()
+                )
+            });
     }
 
     /// Wait until `marker` appears in stdout at or after byte offset `from`;
@@ -4379,7 +4399,11 @@ impl LiveShell {
             }
             if started.elapsed() > Self::TIMEOUT {
                 let _ = self.child.kill();
-                panic!("{}: did not exit after `exit`\n{}", self.label, self.transcript());
+                panic!(
+                    "{}: did not exit after `exit`\n{}",
+                    self.label,
+                    self.transcript()
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
@@ -4437,7 +4461,10 @@ impl LiveFixture {
 
     fn hook_body(&self, golden: &str) -> String {
         golden
-            .replace(ATPKG_HOOK_FIXTURE_AGENTS, self.agents.to_str().expect("UTF-8"))
+            .replace(
+                ATPKG_HOOK_FIXTURE_AGENTS,
+                self.agents.to_str().expect("UTF-8"),
+            )
             .replace(ATPKG_HOOK_FIXTURE_BIN, self.bin.to_str().expect("UTF-8"))
     }
 
@@ -4475,7 +4502,10 @@ impl LiveFixture {
     fn lay_reroute_stub(&self, name: &str, says: &str) {
         std::fs::create_dir_all(&self.reroute).expect("reroute");
         std::fs::write(self.reroute.join(REROUTE_DIR_MARKER), "").expect("marker");
-        write_executable(&self.reroute.join(name), &format!("#!/bin/sh\necho {says}\n"));
+        write_executable(
+            &self.reroute.join(name),
+            &format!("#!/bin/sh\necho {says}\n"),
+        );
     }
 
     fn write_hook(&self, ext: &str, body: &str) {
@@ -4508,7 +4538,8 @@ impl LiveFixture {
             );
         }
         assert!(
-            path.split(':').any(|e| e == self.foreign.to_str().expect("UTF-8")),
+            path.split(':')
+                .any(|e| e == self.foreign.to_str().expect("UTF-8")),
             "{label}: the foreign dir is demoted, not removed: {path:?}"
         );
     }
@@ -4530,10 +4561,18 @@ impl LiveFixture {
 /// fixture home's .zshrc — `rc_prelude` (a user's `setopt` lines, say) then the
 /// foreign prepend — exactly the real launch shape.
 #[cfg(unix)]
-fn spawn_live_zsh(zsh: &str, fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -> LiveShell {
+fn spawn_live_zsh(
+    zsh: &str,
+    fx: &LiveFixture,
+    rc_prelude: &str,
+    extra: &[(&str, &str)],
+) -> LiveShell {
     std::fs::write(
         fx.home.join(".zshrc"),
-        format!("{rc_prelude}export PATH=\"{}:$PATH\"\n", fx.foreign.display()),
+        format!(
+            "{rc_prelude}export PATH=\"{}:$PATH\"\n",
+            fx.foreign.display()
+        ),
     )
     .expect(".zshrc");
     let InjectionEnv { env_add, .. } = prepare_into(ShellType::Zsh, &fx.base)
@@ -4565,7 +4604,10 @@ fn spawn_live_zsh(zsh: &str, fx: &LiveFixture, rc_prelude: &str, extra: &[(&str,
 fn spawn_live_bash(fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -> LiveShell {
     std::fs::write(
         fx.home.join(".bashrc"),
-        format!("{rc_prelude}export PATH=\"{}:$PATH\"\n", fx.foreign.display()),
+        format!(
+            "{rc_prelude}export PATH=\"{}:$PATH\"\n",
+            fx.foreign.display()
+        ),
     )
     .expect(".bashrc");
     let InjectionEnv {
@@ -4619,7 +4661,10 @@ fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
     // The hook rewritten under the live shell (a later pass): re-sourced.
     fx.write_hook(
         "zsh",
-        &format!("{}export ATPKG_HOOK_GEN=2\n", fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)),
+        &format!(
+            "{}export ATPKG_HOOK_GEN=2\n",
+            fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)
+        ),
     );
     sh.send("echo \"GEN=$ATPKG_HOOK_GEN\"");
     let at = sh.wait_for_after("GEN=2", at);
@@ -4695,7 +4740,10 @@ fn bash_owner_scenario(sh: &mut LiveShell, fx: &LiveFixture) {
     let at = sh.wait_for_after("managed 2", at);
     fx.write_hook(
         "bash",
-        &format!("{}export ATPKG_HOOK_GEN=2\n", fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)),
+        &format!(
+            "{}export ATPKG_HOOK_GEN=2\n",
+            fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)
+        ),
     );
     sh.send("echo \"GEN=${ATPKG_HOOK_GEN:-unset}\"");
     let at = sh.wait_for_after("GEN=2", at);
@@ -4779,7 +4827,8 @@ fn live_reroute_survives_a_prepend_with_no_hook(
         "{label}: the reroute dir must lead PATH after the prepend: {path:?}"
     );
     assert!(
-        path.split(':').any(|e| e == fx.foreign.to_str().expect("UTF-8")),
+        path.split(':')
+            .any(|e| e == fx.foreign.to_str().expect("UTF-8")),
         "{label}: the prepended dir is demoted, not removed: {path:?}"
     );
 }
@@ -4795,7 +4844,10 @@ fn reroute_prepend_fixture() -> (LiveFixture, Vec<(String, String)>) {
             "ATERM_REROUTE_DIR".to_owned(),
             fx.reroute.to_str().expect("UTF-8").to_owned(),
         ),
-        ("PATH".to_owned(), format!("{}:/usr/bin:/bin", fx.reroute.display())),
+        (
+            "PATH".to_owned(),
+            format!("{}:/usr/bin:/bin", fx.reroute.display()),
+        ),
     ];
     (fx, env)
 }
@@ -5091,7 +5143,8 @@ fn fish_assert_path_and_reroute(sh: &mut LiveShell, fx: &LiveFixture, at: usize)
 
 #[cfg(unix)]
 fn script_can_allocate_a_pty() -> bool {
-    Command::new("script").arg("-V").output().is_ok() || Command::new("script").arg("--version").output().is_ok()
+    Command::new("script").arg("-V").output().is_ok()
+        || Command::new("script").arg("--version").output().is_ok()
 }
 
 /// The same three orders in fish, when installed: the owner's scenario — with
@@ -5128,7 +5181,10 @@ fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     // The hook rewritten under the live shell (a later pass): re-sourced.
     fx.write_hook(
         "fish",
-        &format!("{}set -gx ATPKG_HOOK_GEN 2\n", fx.hook_body(ATPKG_HOOK_FISH_GOLDEN)),
+        &format!(
+            "{}set -gx ATPKG_HOOK_GEN 2\n",
+            fx.hook_body(ATPKG_HOOK_FISH_GOLDEN)
+        ),
     );
     sh.send("echo \"GEN=$ATPKG_HOOK_GEN\"");
     let at = sh.wait_for_after("GEN=2", at);
@@ -5210,8 +5266,16 @@ fn test_live_hot_path_functions_fork_nothing() {
         "__aterm_managed_derive_reroute",
     ];
     for (label, script, extra) in [
-        ("zsh", scripts::ZSH, vec!["__aterm_atpkg_hook_stamp", "__aterm_managed_agents_listing"]),
-        ("bash", scripts::BASH, vec!["__aterm_path_front", "__aterm_atpkg_hook_read"]),
+        (
+            "zsh",
+            scripts::ZSH,
+            vec!["__aterm_atpkg_hook_stamp", "__aterm_managed_agents_listing"],
+        ),
+        (
+            "bash",
+            scripts::BASH,
+            vec!["__aterm_path_front", "__aterm_atpkg_hook_read"],
+        ),
     ] {
         for name in hot.iter().copied().chain(extra) {
             let body = shell_function_body(script, name, false);
@@ -5222,16 +5286,23 @@ fn test_live_hot_path_functions_fork_nothing() {
             // No external command as a line's first word (zsh's `zstat` is the
             // module builtin, hence the whole-word check).
             for line in body.lines() {
-                let first = line.trim_start().split_whitespace().next().unwrap_or("");
+                let first = line.split_whitespace().next().unwrap_or("");
                 assert!(
-                    !["stat", "dirname", "readlink", "basename", "sed", "awk", "grep", "cut", "command"]
-                        .contains(&first),
+                    ![
+                        "stat", "dirname", "readlink", "basename", "sed", "awk", "grep", "cut",
+                        "command"
+                    ]
+                    .contains(&first),
                     "{label}: {name} must not run an external {first:?}:\n{body}"
                 );
             }
         }
     }
-    for name in hot.iter().copied().chain(["__aterm_path_front", "__aterm_atpkg_hook_read"]) {
+    for name in hot
+        .iter()
+        .copied()
+        .chain(["__aterm_path_front", "__aterm_atpkg_hook_read"])
+    {
         let body = shell_function_body(scripts::FISH, name, true);
         assert!(
             !body.contains("$(") && !body.contains('`'),
@@ -5256,9 +5327,27 @@ fn test_live_hot_path_functions_fork_nothing() {
 #[test]
 fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_the_session() {
     for (label, script, precmd, preexec, fish) in [
-        ("zsh", scripts::ZSH, "__aterm_precmd", "__aterm_preexec", false),
-        ("bash", scripts::BASH, "__aterm_prompt_command", "__aterm_preexec", false),
-        ("fish", scripts::FISH, "fish_prompt", "__aterm_fish_preexec", true),
+        (
+            "zsh",
+            scripts::ZSH,
+            "__aterm_precmd",
+            "__aterm_preexec",
+            false,
+        ),
+        (
+            "bash",
+            scripts::BASH,
+            "__aterm_prompt_command",
+            "__aterm_preexec",
+            false,
+        ),
+        (
+            "fish",
+            scripts::FISH,
+            "fish_prompt",
+            "__aterm_fish_preexec",
+            true,
+        ),
     ] {
         for hook in [precmd, preexec] {
             let body = shell_function_body(script, hook, fish);
@@ -5267,7 +5356,8 @@ fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_t
                 "{label}: {hook} must call __aterm_managed_path_live:\n{body}"
             );
         }
-        let gate_zsh_bash = "if [[ -n \"${ATERM_CHILD:-}\" || -n \"${ATERM_SESSION_ID:-}\" ]]; then";
+        let gate_zsh_bash =
+            "if [[ -n \"${ATERM_CHILD:-}\" || -n \"${ATERM_SESSION_ID:-}\" ]]; then";
         let gate_fish = "if test -n \"$ATERM_CHILD\"; or test -n \"$ATERM_SESSION_ID\"";
         assert!(
             script.contains(if fish { gate_fish } else { gate_zsh_bash }),
@@ -5300,7 +5390,11 @@ fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_t
         // hook that CHANGED on disk — zsh by zstat, bash and fish by the text `read`
         // takes in — and an absent hook never returns early, so the order below is
         // still checked (review finding 2026-09-16).
-        let watch = if label == "zsh" { "__aterm_atpkg_hook_stamp" } else { "__aterm_atpkg_hook_read" };
+        let watch = if label == "zsh" {
+            "__aterm_atpkg_hook_stamp"
+        } else {
+            "__aterm_atpkg_hook_read"
+        };
         assert!(
             hot.contains(watch) && hot.contains("__aterm_atpkg_hook_seen"),
             "{label}: the hot path compares the hook on disk to the copy last sourced:\n{hot}"

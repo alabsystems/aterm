@@ -180,6 +180,18 @@ pub mod tone;
 pub mod trail_pack;
 pub mod trail_sound;
 pub mod trail_sweep;
+/// The KITTY-COMMAND word flash: the one word just typed to the pet turns
+/// rainbow for about a second and returns to its own colour. Crate-private
+/// state owned by [`word_decorations::WordDecorations`], which carries its
+/// whole public surface (`note_trick_typed`, `revoke_trick_flash`,
+/// `set_scan_base_y`, `trick_flash_phase`).
+mod trick_flash;
+/// The KITTY-COMMAND listener: the typed-LINE state machine that hears `sit`,
+/// `kitty jump`, `good kitty` at a word boundary on a line that is nothing but
+/// pet talk, and reports a fire / confirm / revoke for the host to act on. The
+/// vocabulary is `aterm_lexicon::tricks`; the pet's performance and the word's
+/// rainbow flash are other modules' business.
+pub mod typed_tricks;
 pub mod typing_momentum;
 pub mod word_decorations;
 

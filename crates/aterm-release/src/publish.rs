@@ -845,14 +845,974 @@ pub fn publisher_fence(git: &dyn GitRunner) -> Result<Option<PublisherFence>> {
     Ok(Some(PublisherFence { token, owner }))
 }
 
+// ---------------------------------------------------------------------------
+// publisher liveness: WHO holds the fence, and can this machine PROVE they are
+// gone?
+// ---------------------------------------------------------------------------
+//
+// The fence itself is correct and stays: two concurrent publishers would
+// corrupt a release, and Git fencing cannot cancel an already in-flight GitHub
+// REST request. What was wrong is that the fence recorded nothing about its
+// holder, so every refusal was identical and unactionable — an operator who
+// killed a resume had to hand-assemble
+// `ship recover vX.Y.Z <40-char-claim-sha> --old-publisher-stopped`, looking up
+// BOTH arguments, once per kill. On the v0.87.0 cut that produced a livelock:
+// a retry loop that retried without ever performing the remedy.
+//
+// The fix has two halves and only two:
+//   1. The fence RECORDS who wrote it (pid + host + boot session + executable +
+//      version), so a refusal can say whether that publisher is alive, dead, or
+//      unprovable, and can print the recover command already filled in.
+//   2. `--resume` may reclaim a fence ONLY under PROOF OF DEATH. A dead process
+//      cannot be racing. An unprovable one might be, so it is refused — see
+//      [`fence_liveness`], which is deliberately biased toward "alive".
+//
+// No time-based expiry exists and none is coming; the reasoning is recorded at
+// [`fence_liveness`].
+
+/// Version of the `fence-*` identity block written into the fence tag body.
+/// A fence carrying NO block (every binary before this one) parses to an empty
+/// [`FenceIdentity`], which is deliberately unprovable and never auto-stolen.
+///
+/// FORMAT 2 (2026-09-18) ADDS `fence-pgid`. Format 1 recorded the publisher's
+/// pid alone, and a refuter showed that is proof of death for the WRONG
+/// process: no GitHub mutation in this pipeline happens in the publisher
+/// itself — every one runs in a spawned `gh` or `curl` child (the draft-create
+/// POST, `--upload-file` streams of assets over a gigabyte), and a SIGKILL of
+/// the parent stops none of them. A format-1 fence whose pid is gone is
+/// therefore UNPROVABLE to this binary, never dead: the child may still be
+/// uploading. Proof of death is about the process GROUP, which the publisher
+/// and everything it spawned share.
+pub const FENCE_IDENTITY_FORMAT: u32 = 2;
+
+/// The version THIS process is publishing, recorded into any fence it creates
+/// so that a later refusal — on this machine or another — can print the recover
+/// command with the version already filled in.
+///
+/// Process-global because the rest of the recorded identity (pid, host, boot
+/// session, executable) is process-global by nature, and because it is set once
+/// at cut/resume entry, before any fence can be created. Threading it through
+/// the fence API instead would have changed a dozen call signatures to carry a
+/// value that never varies within a process.
+static FENCE_SELF_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record what this invocation publishes. Called once from `run_cut`, and again
+/// from `resume_cut`, whose journaled version is the authoritative one.
+pub fn set_publisher_fence_version(version: &str) {
+    if let Ok(mut slot) = FENCE_SELF_VERSION.lock() {
+        *slot = Some(version.trim().trim_start_matches('v').to_string());
+    }
+}
+
+fn publisher_fence_self_version() -> Option<String> {
+    FENCE_SELF_VERSION.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// One recorded `fence-*` field value: single-line and bounded, so no recorded
+/// value can forge another field or a whole extra line in the tag body.
+fn fence_field(value: &str) -> String {
+    let out: String = value
+        .chars()
+        .map(|c| if c.is_control() { '_' } else { c })
+        .take(200)
+        .collect();
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+/// The `fence-*` lines THIS process writes into a fence it creates: enough for
+/// any later reader, on any machine, to decide liveness and to print the
+/// recover command. A field the machine cannot answer is OMITTED rather than
+/// guessed — a missing field is unprovable, and unprovable refuses.
+fn fence_identity_block(probe: &dyn PublisherProbe) -> String {
+    let mut out = format!(
+        "fence-format: {FENCE_IDENTITY_FORMAT}\nfence-pid: {}\n",
+        std::process::id()
+    );
+    // The process GROUP is what proof of death is about (see `fence_liveness`):
+    // the publisher's spawned `gh`/`curl` children share it, and its emptiness
+    // is the only local fact that says none of them is still writing. Omitted
+    // when this machine cannot answer, which makes the fence unprovable to
+    // every reader — the honest outcome, since without it nobody can tell.
+    if let Some(pgid) = probe.pgid() {
+        out.push_str(&format!("fence-pgid: {pgid}\n"));
+    }
+    for (key, value) in [
+        ("host", probe.host()),
+        ("boot", probe.boot()),
+        ("exe", probe.exe()),
+        ("version", publisher_fence_self_version()),
+    ] {
+        if let Some(value) = value {
+            out.push_str(&format!("fence-{key}: {}\n", fence_field(&value)));
+        }
+    }
+    if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        out.push_str(&format!("fence-started: {}\n", now.as_secs()));
+    }
+    out
+}
+
+/// Who wrote a fence, as read back out of its annotated-tag body. EVERY field
+/// is optional: a fence written by an older binary carries none of them, and
+/// that case must refuse safely rather than panic or be auto-stolen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FenceIdentity {
+    pub format: Option<u32>,
+    pub pid: Option<u32>,
+    /// The publisher's process group — shared by every `gh`/`curl` it spawned,
+    /// which is why an empty group, not an absent pid, is proof of death.
+    /// Absent on format-1 fences, which are therefore unprovable once their
+    /// pid is gone.
+    pub pgid: Option<u32>,
+    pub host: Option<String>,
+    /// Boot-session identity. A pid is only meaningful WITHIN one boot, so this
+    /// is as load-bearing as the pid itself.
+    pub boot: Option<String>,
+    pub exe: Option<String>,
+    /// The release version that publisher was cutting, so a refusal can print
+    /// `ship recover v<version> <claim>` without an operator looking it up.
+    pub version: Option<String>,
+    pub started_unix: Option<u64>,
+    /// Set when the tag body could not be read AT ALL (no network, object
+    /// missing, malformed token). Distinct from "read, but carries no block".
+    pub unreadable: Option<String>,
+}
+
+impl FenceIdentity {
+    fn unreadable(reason: impl Into<String>) -> Self {
+        FenceIdentity {
+            unreadable: Some(reason.into()),
+            ..FenceIdentity::default()
+        }
+    }
+
+    /// Parse the `fence-*` lines out of a `git cat-file tag` body. Unknown
+    /// keys, the tag headers and the human first line are all ignored; a
+    /// malformed value leaves its field `None` — and therefore unprovable —
+    /// never an error, because a refusal must survive any bytes it is handed.
+    pub fn parse(body: &str) -> Self {
+        let mut identity = FenceIdentity::default();
+        for line in body.lines() {
+            let Some(rest) = line.trim().strip_prefix("fence-") else {
+                continue;
+            };
+            let Some((key, value)) = rest.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            match key.trim() {
+                "format" => identity.format = value.parse().ok(),
+                "pid" => identity.pid = value.parse().ok(),
+                "pgid" => identity.pgid = value.parse().ok(),
+                "host" => identity.host = Some(value.to_string()),
+                "boot" => identity.boot = Some(value.to_string()),
+                "exe" => identity.exe = Some(value.to_string()),
+                "version" => identity.version = Some(value.trim_start_matches('v').to_string()),
+                "started" => identity.started_unix = value.parse().ok(),
+                _ => {}
+            }
+        }
+        identity
+    }
+
+    /// One human line naming the recorded publisher, for the refusal.
+    pub fn describe(&self) -> String {
+        if let Some(reason) = &self.unreadable {
+            return format!("unreadable ({reason})");
+        }
+        if self.format.is_none() {
+            return "not recorded — this fence predates publisher-liveness recording".to_string();
+        }
+        let mut parts = vec![match self.pid {
+            Some(pid) => format!("pid {pid}"),
+            None => "pid not recorded".to_string(),
+        }];
+        if let Some(pgid) = self.pgid {
+            parts.push(format!("pgid {pgid}"));
+        }
+        if let Some(host) = &self.host {
+            parts.push(format!("host {host}"));
+        }
+        if let Some(boot) = &self.boot {
+            parts.push(format!("boot {boot}"));
+        }
+        if let Some(exe) = &self.exe {
+            parts.push(format!("exe {exe}"));
+        }
+        if let Some(version) = &self.version {
+            parts.push(format!("cutting v{version}"));
+        }
+        if let Some(started) = self.started_unix {
+            parts.push(format!("fenced at unix {started}"));
+        }
+        parts.join(", ")
+    }
+}
+
+/// What the local process table says about one recorded pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PidState {
+    Running {
+        exe: Option<String>,
+    },
+    NotRunning,
+    /// The probe itself failed. NEVER read as either answer.
+    Unknown(String),
+}
+
+/// What the process table says about one recorded process GROUP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupState {
+    /// No live process carries this pgid: the publisher AND everything it
+    /// spawned are gone. The only answer that can license a reclaim.
+    Empty,
+    /// Live members, `(pid, command)`. A spawned `gh`/`curl` that outlived the
+    /// publisher looks exactly like this — and so does a wrapper shell that is
+    /// still waiting, which is the conservative direction: refuse, name it.
+    Members(Vec<(u32, String)>),
+    /// The probe itself failed. NEVER read as either answer.
+    Unknown(String),
+}
+
+/// The machine facts liveness needs. A trait so the decision can be tested at
+/// every verdict without arranging a real reboot, a second host, or a race with
+/// the OS over pid reuse.
+pub trait PublisherProbe {
+    /// This machine's name.
+    fn host(&self) -> Option<String>;
+    /// This machine's CURRENT boot session. `None` ⇒ nothing is provable.
+    fn boot(&self) -> Option<String>;
+    /// This process's executable, for recording into a new fence.
+    fn exe(&self) -> Option<String>;
+    fn pid_state(&self, pid: u32) -> PidState;
+    /// This process's own process group: recorded into a new fence, and used
+    /// to refuse to judge a group this process is itself inside. `None` ⇒ the
+    /// fence records no group and is unprovable to every reader.
+    fn pgid(&self) -> Option<u32> {
+        None
+    }
+    /// Every live process in a recorded group. The default is fail-closed: a
+    /// probe that does not report groups cannot license a reclaim.
+    fn group_members(&self, pgid: u32) -> GroupState {
+        let _ = pgid;
+        GroupState::Unknown("this probe does not report process groups".to_string())
+    }
+}
+
+/// The real machine.
+pub struct LocalProbe;
+
+impl LocalProbe {
+    fn uname_n() -> Option<String> {
+        let out = Command::new("uname").arg("-n").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let host = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!host.is_empty()).then_some(host)
+    }
+
+    /// A pid is only meaningful within one boot. Linux publishes a random UUID
+    /// per boot; macOS/BSD publish the boot WALL CLOCK, whose seconds field is
+    /// stable for the life of the boot. Either is enough to tell "the pid I
+    /// recorded" from "a pid some later boot handed to someone else".
+    fn boot_session() -> Option<String> {
+        if let Ok(id) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+            let id = id.trim();
+            if !id.is_empty() {
+                return Some(format!("linux-boot-id:{id}"));
+            }
+        }
+        let out = Command::new("sysctl")
+            .args(["-n", "kern.boottime"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // `{ sec = 1757000000, usec = 123456 } Mon Sep …` — take the seconds
+        // field only; the trailing rendered date carries no extra identity and
+        // is locale-shaped.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let seconds: String = text
+            .split("sec")
+            .nth(1)?
+            .trim_start()
+            .trim_start_matches('=')
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (!seconds.is_empty()).then(|| format!("kern.boottime:{seconds}"))
+    }
+
+    /// Field 5 of a Linux `/proc/<pid>/stat` line is `pgrp`. The comm in
+    /// field 2 is parenthesised and may itself contain spaces and parentheses,
+    /// so the split is after the LAST `)`, never on whitespace from the start.
+    fn pgrp_from_stat(stat: &str) -> Option<u32> {
+        let (_, after) = stat.rsplit_once(')')?;
+        // after: " S ppid pgrp session tty …"
+        after.split_whitespace().nth(2)?.parse().ok()
+    }
+
+    fn own_pgid() -> Option<u32> {
+        if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
+            return Self::pgrp_from_stat(&stat);
+        }
+        let out = Command::new("ps")
+            .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+
+    /// Every live process in `pgid`. Linux reads `/proc` directly; macOS/BSD
+    /// reads the whole table once through `ps -A` and filters here. Either way
+    /// the listing must contain THIS process, or it is a truncated table and
+    /// not an answer — a cap on our own effort must never read as an empty
+    /// group.
+    fn members_of(pgid: u32) -> GroupState {
+        let me = std::process::id();
+        if Path::new("/proc/self/stat").exists() {
+            let entries = match fs::read_dir("/proc") {
+                Ok(entries) => entries,
+                Err(error) => return GroupState::Unknown(format!("could not read /proc: {error}")),
+            };
+            let mut members = Vec::new();
+            let mut saw_self = false;
+            for entry in entries.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                // Exited between readdir and read: not a member.
+                let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                    continue;
+                };
+                saw_self |= pid == me;
+                if Self::pgrp_from_stat(&stat) == Some(pgid) {
+                    let comm = fs::read_to_string(entry.path().join("comm"))
+                        .map(|c| c.trim().to_string())
+                        .unwrap_or_default();
+                    members.push((pid, comm));
+                }
+            }
+            if !saw_self {
+                return GroupState::Unknown("/proc did not list this process".to_string());
+            }
+            return if members.is_empty() {
+                GroupState::Empty
+            } else {
+                GroupState::Members(members)
+            };
+        }
+        let out = match Command::new("ps")
+            .args(["-A", "-o", "pid=,pgid=,comm="])
+            .output()
+        {
+            Ok(out) => out,
+            Err(error) => return GroupState::Unknown(format!("could not run ps: {error}")),
+        };
+        if !out.status.success() {
+            return GroupState::Unknown(format!(
+                "ps -A exited {}: {}",
+                out.status
+                    .code()
+                    .map_or_else(|| "by signal".to_string(), |code| code.to_string()),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut members = Vec::new();
+        let mut saw_self = false;
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(pid), Some(group)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            saw_self |= pid == me;
+            if group.parse::<u32>().ok() == Some(pgid) {
+                members.push((pid, fields.collect::<Vec<_>>().join(" ")));
+            }
+        }
+        if !saw_self {
+            return GroupState::Unknown("ps -A did not list this process".to_string());
+        }
+        if members.is_empty() {
+            GroupState::Empty
+        } else {
+            GroupState::Members(members)
+        }
+    }
+}
+
+impl PublisherProbe for LocalProbe {
+    fn pgid(&self) -> Option<u32> {
+        LocalProbe::own_pgid()
+    }
+
+    fn group_members(&self, pgid: u32) -> GroupState {
+        LocalProbe::members_of(pgid)
+    }
+
+    fn host(&self) -> Option<String> {
+        static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        HOST.get_or_init(LocalProbe::uname_n).clone()
+    }
+
+    fn boot(&self) -> Option<String> {
+        static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        BOOT.get_or_init(LocalProbe::boot_session).clone()
+    }
+
+    fn exe(&self) -> Option<String> {
+        std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string())
+    }
+
+    fn pid_state(&self, pid: u32) -> PidState {
+        // Neither of these can be a publisher, and both are exactly what a
+        // corrupt or truncated field parses to. Ambiguous ⇒ never an answer.
+        if pid == 0 {
+            return PidState::Unknown("pid 0 is not a real process id".to_string());
+        }
+        if pid == 1 {
+            return PidState::Unknown("pid 1 is init, never a publisher".to_string());
+        }
+        // Linux: /proc is authoritative and needs no subprocess.
+        if Path::new("/proc/self/stat").exists() {
+            let dir = PathBuf::from(format!("/proc/{pid}"));
+            if !dir.exists() {
+                return PidState::NotRunning;
+            }
+            let exe = fs::read_link(dir.join("exe"))
+                .ok()
+                .map(|path| path.display().to_string())
+                .or_else(|| {
+                    fs::read_to_string(dir.join("comm"))
+                        .ok()
+                        .map(|name| name.trim().to_string())
+                });
+            return PidState::Running { exe };
+        }
+        // macOS/BSD: `ps -p` exits 1 for "no such process" and 0 with the
+        // command when it exists. Any OTHER exit is a failure of the PROBE, not
+        // an answer about the process — a cap on our own effort must never be
+        // returned as a negative fact about the subject.
+        match Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        {
+            Err(error) => PidState::Unknown(format!("could not run ps: {error}")),
+            Ok(out) if out.status.success() => {
+                let exe = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if exe.is_empty() {
+                    PidState::NotRunning
+                } else {
+                    PidState::Running { exe: Some(exe) }
+                }
+            }
+            Ok(out) => {
+                let complaint = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                match (out.status.code(), complaint.is_empty()) {
+                    // The answer: `ps` ran, matched nothing, and said nothing.
+                    (Some(1), true) => PidState::NotRunning,
+                    // `ps` REJECTED the argument ("process id too large") or
+                    // failed some other way. That is a fact about the probe,
+                    // not about the process, and must never read as death.
+                    (code, _) => PidState::Unknown(format!(
+                        "ps -p {pid} exited {}: {complaint}",
+                        code.map_or_else(|| "by signal".to_string(), |code| code.to_string())
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// Do a recorded and an observed executable name describe the same program?
+///
+/// Conservative in ONE direction on purpose: every ambiguity answers `true`
+/// ("same program", therefore alive, therefore refuse). Only a confident
+/// mismatch answers `false`, and a `false` is what licenses an automatic
+/// reclaim, so it must never be produced by a truncation or an empty field.
+fn executables_agree(recorded: &str, observed: &str) -> bool {
+    let base = |path: &str| {
+        path.trim()
+            .trim_end_matches(" (deleted)")
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .trim()
+            .to_string()
+    };
+    let recorded = base(recorded);
+    let observed = base(observed);
+    if recorded.is_empty() || observed.is_empty() || recorded == observed {
+        return true;
+    }
+    // `/proc/<pid>/comm` truncates at 15 bytes and BSD `ps -o comm=` can be
+    // clipped too: a long-enough prefix is a MATCH, never a mismatch.
+    let (short, long) = if recorded.len() <= observed.len() {
+        (recorded.as_str(), observed.as_str())
+    } else {
+        (observed.as_str(), recorded.as_str())
+    };
+    short.len() >= 8 && long.starts_with(short)
+}
+
+/// Is the publisher that wrote this fence alive, dead, or unprovable?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceLiveness {
+    /// PROVED running. Refuse, always.
+    Alive(String),
+    /// PROVED gone: same host, same boot session, and the pid is either absent
+    /// from the process table or has been reused by a different program. A dead
+    /// process cannot be racing, so and only so may `--resume` reclaim.
+    Dead(String),
+    /// Not proved either way. Refuse — an unprovable publisher might be racing.
+    Unprovable(String),
+}
+
+impl FenceLiveness {
+    pub fn label(&self) -> &'static str {
+        match self {
+            FenceLiveness::Alive(_) => "ALIVE",
+            FenceLiveness::Dead(_) => "DEAD",
+            FenceLiveness::Unprovable(_) => "UNPROVABLE",
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            FenceLiveness::Alive(detail)
+            | FenceLiveness::Dead(detail)
+            | FenceLiveness::Unprovable(detail) => detail,
+        }
+    }
+}
+
+/// The liveness decision, pure over [`FenceIdentity`] + [`PublisherProbe`].
+///
+/// DELIBERATELY CONSERVATIVE. Only one path returns [`FenceLiveness::Dead`],
+/// and it requires ALL of: a readable liveness block of a format this binary
+/// understands, a recorded pid/host/boot, a host equal to this machine's, a
+/// boot session equal to this machine's CURRENT one, a process table that
+/// answers either "no such pid" or "that pid is a different program now" —
+/// AND a recorded process group that the table says is EMPTY. Everything else
+/// — an older fence, a newer format, another host, another boot session, a
+/// probe that failed, pid 0/1, a group this process is itself inside — is
+/// [`FenceLiveness::Unprovable`] and keeps refusing.
+///
+/// WHY THE GROUP, NOT THE PID. The publisher process performs no GitHub
+/// mutation itself: the draft-create POST, the release edits and every asset
+/// upload run in a spawned `gh` or `curl`, and a SIGKILL of the parent stops
+/// none of them — a `--upload-file` of a gigabyte carries on. So "the recorded
+/// pid is gone" proved death of the wrong process, and a resume that reclaimed
+/// on it could run beside a request still in flight. The children share the
+/// publisher's process group; an empty group is the local fact that says the
+/// whole tree is gone. A live member — a `curl`, or a wrapper shell still
+/// waiting — reads [`FenceLiveness::Alive`] and the refusal names it, which is
+/// the conservative direction and the actionable one.
+///
+/// On the differing-boot case specifically: a differing boot session under a
+/// matching hostname USUALLY means this machine rebooted, which would prove the
+/// old pid is gone. It is still refused, because a hostname is not a unique
+/// machine identity — two machines can present the same name — so "we rebooted"
+/// and "another machine with our name wrote this" are not separable here. The
+/// refusal says exactly that, and prints the recover command.
+///
+/// NO HEARTBEAT, NO EXPIRY — considered and rejected. An expiry would have to
+/// evict a fence whose holder is still RUNNING, and a running publisher can have
+/// a GitHub REST request in flight that no Git operation can cancel
+/// (`RECOVERY_STOPPED_PROCESS_REFUSAL` states exactly this). It would also have
+/// to separate "wedged" from "slow", which is not decidable from outside: a
+/// universal build, a notarization wait and a large asset upload all legitimately
+/// exceed any threshold that would have helped. The wedged-but-alive publisher is
+/// handled instead by making the refusal NAME THE PID: kill it, and the very next
+/// `--resume` reclaims on its own, because it has become provably dead.
+pub fn fence_liveness(identity: &FenceIdentity, probe: &dyn PublisherProbe) -> FenceLiveness {
+    if let Some(reason) = &identity.unreadable {
+        return FenceLiveness::Unprovable(format!(
+            "the fence tag body could not be read: {reason}"
+        ));
+    }
+    let Some(format) = identity.format else {
+        return FenceLiveness::Unprovable(
+            "the fence carries no liveness block — it was written by an aterm-release older \
+             than fence-format 1, which recorded no pid, host or boot session"
+                .to_string(),
+        );
+    };
+    if format > FENCE_IDENTITY_FORMAT {
+        return FenceLiveness::Unprovable(format!(
+            "the fence is fence-format {format}, newer than this binary's \
+             {FENCE_IDENTITY_FORMAT}; its fields may not mean what this binary would read"
+        ));
+    }
+    let (Some(pid), Some(host), Some(boot)) = (
+        identity.pid,
+        identity.host.as_deref(),
+        identity.boot.as_deref(),
+    ) else {
+        return FenceLiveness::Unprovable(
+            "the fence's liveness block is incomplete — pid, host and boot session are all \
+             required before a pid means anything"
+                .to_string(),
+        );
+    };
+    let Some(local_host) = probe.host() else {
+        return FenceLiveness::Unprovable(
+            "this machine could not determine its own hostname, so it cannot tell whether the \
+             recorded pid belongs to it"
+                .to_string(),
+        );
+    };
+    let Some(local_boot) = probe.boot() else {
+        return FenceLiveness::Unprovable(
+            "this machine could not determine its own boot session, and a pid is only \
+             meaningful within one boot"
+                .to_string(),
+        );
+    };
+    if !host.eq_ignore_ascii_case(&local_host) {
+        return FenceLiveness::Unprovable(format!(
+            "the fence was written on host {host}; this machine is {local_host}. A pid is only \
+             meaningful on the host that issued it, and this process cannot see that machine's \
+             process table"
+        ));
+    }
+    if boot != local_boot {
+        return FenceLiveness::Unprovable(format!(
+            "the fence was written in boot session {boot}; this machine is now in {local_boot}. \
+             The recorded pid cannot be that publisher any more, but a hostname is not a unique \
+             machine identity, so this cannot separate \"this machine rebooted\" from \"another \
+             machine with the same name wrote it\" — it is not proof of death"
+        ));
+    }
+    // THE PUBLISHER PROCESS: is IT gone? A running publisher is ALIVE on this
+    // alone. A gone one is not yet dead — the tree it spawned decides below.
+    let publisher_gone = match probe.pid_state(pid) {
+        PidState::NotRunning => format!(
+            "pid {pid} is not in the process table of {host}, in the same boot session that \
+             wrote the fence"
+        ),
+        PidState::Unknown(reason) => {
+            return FenceLiveness::Unprovable(format!("pid {pid} could not be probed: {reason}"));
+        }
+        PidState::Running { exe: observed } => match (identity.exe.as_deref(), observed.as_deref())
+        {
+            (Some(recorded), Some(seen)) if !executables_agree(recorded, seen) => format!(
+                "pid {pid} was reused — it now runs {seen}, not the recorded {recorded}, so \
+                 the publisher that wrote the fence has exited"
+            ),
+            (_, seen) => {
+                return FenceLiveness::Alive(format!(
+                    "pid {pid} is running on {host}{}",
+                    seen.map_or_else(String::new, |exe| format!(" as {exe}"))
+                ));
+            }
+        },
+    };
+    // THE PUBLISHER'S TREE: is ALL of it gone? The pid above never made a
+    // GitHub request. Its spawned `gh`/`curl` children did, they share its
+    // process group, and a killed parent stops none of them. Only an EMPTY
+    // group is proof that nothing is still writing.
+    let Some(pgid) = identity.pgid else {
+        return FenceLiveness::Unprovable(format!(
+            "{publisher_gone} — but the fence records no process group (fence-format {format}, \
+             written before groups were recorded), and every GitHub request that publisher \
+             made ran in a spawned gh or curl that a killed parent does not stop. Whether one \
+             is still running cannot be read from this fence"
+        ));
+    };
+    if probe.pgid() == Some(pgid) {
+        return FenceLiveness::Unprovable(format!(
+            "{publisher_gone} — but process group {pgid} is the one THIS process is in, and a \
+             process cannot judge its own group empty"
+        ));
+    }
+    match probe.group_members(pgid) {
+        GroupState::Empty => FenceLiveness::Dead(format!(
+            "{publisher_gone}, and process group {pgid} is empty: nothing it spawned is still \
+             running"
+        )),
+        GroupState::Unknown(reason) => FenceLiveness::Unprovable(format!(
+            "{publisher_gone}, but process group {pgid} could not be read: {reason}"
+        )),
+        GroupState::Members(members) => {
+            let shown: Vec<String> = members
+                .iter()
+                .take(4)
+                .map(|(member, command)| {
+                    if command.is_empty() {
+                        format!("pid {member}")
+                    } else {
+                        format!("pid {member} ({command})")
+                    }
+                })
+                .collect();
+            let more = members.len().saturating_sub(shown.len());
+            let plural = members.len() != 1;
+            FenceLiveness::Alive(format!(
+                "{publisher_gone}, but its process group {pgid} still has {} live member{}: {}{} \
+                 — a spawned GitHub request outlives the publisher that started it. Stop {} and \
+                 the next --resume reclaims on its own",
+                members.len(),
+                if plural { "s" } else { "" },
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                },
+                if plural { "them" } else { "it" },
+            ))
+        }
+    }
+}
+
+/// The EXACT command an operator must run, already filled in. Nothing about it
+/// is a template: version and claim sha are substituted HERE so that nobody
+/// assembles it by hand again.
+pub fn fence_recover_command(version: Option<&str>, owner: &str) -> String {
+    format!(
+        "targo --unverified ship recover v{} {owner} {RECOVERY_STOPPED_PROCESS_FLAG}",
+        version.unwrap_or("X.Y.Z")
+    )
+}
+
+/// The self-diagnosing refusal. It names the holder, states the liveness verdict
+/// and WHY, says what to do about that specific verdict, and ends with a
+/// runnable recover command.
+pub fn publisher_fence_refusal(
+    fence: &PublisherFence,
+    identity: &FenceIdentity,
+    liveness: &FenceLiveness,
+    fallback_version: Option<&str>,
+) -> String {
+    let (version, version_note) = match (identity.version.as_deref(), fallback_version) {
+        (Some(version), _) => (Some(version), String::new()),
+        (None, Some(version)) => (
+            Some(version),
+            format!(
+                "\n  NOTE: the fence records no version (it predates fence-format \
+                 {FENCE_IDENTITY_FORMAT}); v{version} is THIS invocation's version — confirm it \
+                 against the stuck machine's dist/cut-state.toml before running the command"
+            ),
+        ),
+        (None, None) => (
+            None,
+            "\n  NOTE: the fence records no version and this invocation has none; read \
+             `version` from the stuck machine's dist/cut-state.toml and substitute it for X.Y.Z"
+                .to_string(),
+        ),
+    };
+    let advice = match liveness {
+        FenceLiveness::Alive(_) => format!(
+            "that publisher is STILL RUNNING. Do not steal the fence: a Git ref rotation cannot \
+             cancel a GitHub REST request that is already in flight. Stop {} and rerun \
+             `--resume` — a resume RECLAIMS a fence whose publisher it can prove is dead, so \
+             once that process is gone no recovery command is needed at all.",
+            identity
+                .pid
+                .map_or_else(|| "it".to_string(), |pid| format!("pid {pid}"))
+        ),
+        FenceLiveness::Dead(_) => "that publisher is provably gone. `--resume` of THIS claim \
+             reclaims the fence automatically; this path refused because the caller is not such \
+             a resume — a fresh cut has no claim of its own to prove the fence is its own, and a \
+             fence peeling to another claim is never touched."
+            .to_string(),
+        FenceLiveness::Unprovable(_) => "this machine CANNOT PROVE the publisher is gone, and an \
+             unprovable publisher might still be racing, so the fence is kept. Establish by hand \
+             that the old process exited, then run the command below."
+            .to_string(),
+    };
+    format!(
+        "publisher fence {PUBLISHER_FENCE_REF} is active at token {} for claim {}\n  \
+         recorded publisher: {}\n  \
+         liveness: {} — {}\n  \
+         what to do: {advice}\n  \
+         recover command (only after the old publisher is provably stopped):\n    {}{version_note}",
+        fence.token,
+        fence.owner,
+        identity.describe(),
+        liveness.label(),
+        liveness.detail(),
+        fence_recover_command(version, &fence.owner),
+    )
+}
+
+/// Read the identity block out of the fence's annotated-tag object.
+///
+/// Never fails: a fence whose body cannot be fetched or parsed becomes an
+/// `unreadable` identity, which is unprovable, which refuses. The refusal path
+/// must survive a missing object, an offline remote and a malformed token.
+pub fn publisher_fence_identity(git: &dyn GitRunner, token: &str) -> FenceIdentity {
+    if !valid_lease_owner(token) {
+        return FenceIdentity::unreadable(format!("malformed fence token {token:?}"));
+    }
+    let local = git
+        .git(&["cat-file", "-t", token])
+        .map(|out| out.success() && out.stdout_utf8().trim() == "tag")
+        .unwrap_or(false);
+    if !local {
+        // A fence written on ANOTHER machine has to be fetched before its body
+        // can be read. `--no-tags` keeps the probe from writing local refs, and
+        // a failure here is not fatal: the object may be present already, and
+        // if it is not, the unreadable identity refuses safely below.
+        let _ = git.git(&[
+            "fetch",
+            "--no-tags",
+            "--quiet",
+            "origin",
+            PUBLISHER_FENCE_REF,
+        ]);
+    }
+    match git.git(&["cat-file", "tag", token]) {
+        Ok(out) if out.success() => FenceIdentity::parse(&out.stdout_utf8()),
+        Ok(out) => FenceIdentity::unreadable(format!(
+            "git cat-file tag {token} failed: {}",
+            out.stderr_utf8().trim()
+        )),
+        Err(error) => FenceIdentity::unreadable(format!("git cat-file tag {token}: {error}")),
+    }
+}
+
+/// Outcome of a resume's liveness probe against an ACTIVE fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceReclaim {
+    /// Nothing held the fence.
+    NoFence,
+    /// The holder was proved dead and its exact token was CAS-deleted.
+    Reclaimed { token: String, detail: String },
+    /// The fence stays. `refusal` is the full self-diagnosing message the
+    /// subsequent acquire will produce; callers print it as the reason.
+    Kept { refusal: String },
+}
+
+/// `--resume`'s automatic reclaim. THE ONLY automatic path that removes another
+/// process's fence, and it runs only under proof of death.
+///
+/// Every one of these must hold, or the fence is kept:
+///   * the fence peels to THIS resume's claim — another claim's fence is never
+///     touched, whatever its holder's liveness;
+///   * the persistent release lease agrees that the claim is ours — a fence and
+///     a lease that disagree are incoherent remote state, which is the recover
+///     lane's job to converge, not an automatic reclaim's;
+///   * [`fence_liveness`] returns [`FenceLiveness::Dead`].
+///
+/// The delete is an EXACT-token compare-and-swap, so two resumes that observed
+/// the same dead fence produce exactly one winner; the loser's create-only
+/// [`acquire_publisher_fence`] then loses to the winner's new fence, and its
+/// refusal names the winner's live pid. No force-delete, no time-based steal.
+pub fn reclaim_dead_publisher_fence(
+    git: &dyn GitRunner,
+    expected_owner: &str,
+    probe: &dyn PublisherProbe,
+) -> Result<FenceReclaim> {
+    let Some(fence) = publisher_fence(git)? else {
+        return Ok(FenceReclaim::NoFence);
+    };
+    let identity = publisher_fence_identity(git, &fence.token);
+    let liveness = fence_liveness(&identity, probe);
+    let refusal = |extra: Option<&str>| {
+        let base = publisher_fence_refusal(
+            &fence,
+            &identity,
+            &liveness,
+            publisher_fence_self_version().as_deref(),
+        );
+        match extra {
+            Some(extra) => format!("{base}\n  reclaim: {extra}"),
+            None => base,
+        }
+    };
+    let expected_owner = expected_owner.to_ascii_lowercase();
+    if !fence.owner.eq_ignore_ascii_case(&expected_owner) {
+        return Ok(FenceReclaim::Kept {
+            refusal: refusal(Some(
+                "not reclaimable: the fence peels to a different claim than this resume's",
+            )),
+        });
+    }
+    if release_lease_owner(git)?.as_deref() != Some(expected_owner.as_str()) {
+        return Ok(FenceReclaim::Kept {
+            refusal: refusal(Some(
+                "not reclaimable: the release lease does not name this claim, so the fence and \
+                 the lease disagree — converge them with the recover command, not automatically",
+            )),
+        });
+    }
+    let FenceLiveness::Dead(detail) = &liveness else {
+        return Ok(FenceReclaim::Kept {
+            refusal: refusal(None),
+        });
+    };
+    let lease_arg = format!("--force-with-lease={PUBLISHER_FENCE_REF}:{}", fence.token);
+    let delete = format!(":{PUBLISHER_FENCE_REF}");
+    let pushed = git.git(&["push", &lease_arg, "origin", &delete])?;
+    match publisher_fence(git)? {
+        None => Ok(FenceReclaim::Reclaimed {
+            token: fence.token.clone(),
+            detail: detail.clone(),
+        }),
+        // A rival resume won the same CAS and already holds its own fence. The
+        // dead holder we probed is gone either way, so the message must describe
+        // the CURRENT holder, not the one we set out to reclaim; the caller's
+        // create-only acquire then decides the rest.
+        Some(current) if current.token != fence.token => {
+            let identity = publisher_fence_identity(git, &current.token);
+            let liveness = fence_liveness(&identity, probe);
+            Ok(FenceReclaim::Kept {
+                refusal: format!(
+                    "{}\n  reclaim: not reclaimed: another session won the same \
+                     compare-and-swap and now holds the fence",
+                    publisher_fence_refusal(
+                        &current,
+                        &identity,
+                        &liveness,
+                        publisher_fence_self_version().as_deref(),
+                    )
+                ),
+            })
+        }
+        Some(_) => Ok(FenceReclaim::Kept {
+            refusal: refusal(Some(&format!(
+                "not reclaimed: the exact-token delete did not land: {}",
+                pushed.stderr_utf8().trim()
+            ))),
+        }),
+    }
+}
+
 fn ensure_no_publisher_fence(git: &dyn GitRunner) -> Result<()> {
     if let Some(fence) = publisher_fence(git)? {
-        return Err(Error::new(format!(
-            "publisher fence {PUBLISHER_FENCE_REF} is active at token {} for claim {}; \
-             another publisher or a killed process may still be in flight. Do not steal it: \
-             resume after that process exits, or run `cargo ship recover vX.Y.Z <full-claim-sha>` \
-             with `--old-publisher-stopped` only after proving the old process is stopped",
-            fence.token, fence.owner
+        let identity = publisher_fence_identity(git, &fence.token);
+        let liveness = fence_liveness(&identity, &LocalProbe);
+        return Err(Error::new(publisher_fence_refusal(
+            &fence,
+            &identity,
+            &liveness,
+            publisher_fence_self_version().as_deref(),
         )));
     }
     Ok(())
@@ -918,9 +1878,14 @@ fn new_publisher_fence_token(git: &dyn GitRunner, owner: &str) -> Result<String>
         "aterm-release-fence-candidate-{}-{nonce}-{sequence}",
         std::process::id(),
     );
+    // The human line is unchanged so that an older binary reading this tag sees
+    // exactly what it always did; the `fence-*` block below it is additive, and
+    // its absence (an older writer) is what makes an old fence UNPROVABLE
+    // rather than a crash or a free steal.
     let message = format!(
-        "aterm publisher fence for claim {owner}; pid {}; nonce {nonce}; sequence {sequence}",
-        std::process::id()
+        "aterm publisher fence for claim {owner}; pid {}; nonce {nonce}; sequence {sequence}\n\n{}",
+        std::process::id(),
+        fence_identity_block(&LocalProbe),
     );
     git_ok(git, &["tag", "-a", &local, "-m", &message, owner])?;
     let token_result = (|| {
@@ -2104,6 +3069,148 @@ fn http_status_from_curl_failure(stderr: &str) -> Option<u16> {
     let tail = stderr.rsplit_once("returned error: ")?.1;
     let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+/// GitHub's "I understood you and I refuse the CONTENT" — the code a release
+/// body over the limit comes back as, and the one a reader cannot decode from
+/// the number alone.
+const HTTP_UNPROCESSABLE_CONTENT: u16 = 422;
+
+/// GitHub's own refusal document, as it comes back on the failing POST's stdout
+/// (`--fail-with-body`): `{"message": "...", "errors": [{...}]}`. Only the
+/// fields that NAME the problem are read; everything else GitHub sends is
+/// ignored, and a response that is not this shape reads as "GitHub said
+/// nothing" rather than as an error of its own.
+#[derive(Deserialize, Default)]
+struct GithubRefusal {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    errors: Vec<GithubRefusalDetail>,
+}
+
+#[derive(Deserialize, Default)]
+struct GithubRefusalDetail {
+    #[serde(default)]
+    resource: String,
+    #[serde(default)]
+    field: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    message: String,
+}
+
+/// GitHub's refusal in its own words, or `None` when the response carried none.
+fn github_refusal_summary(response: &[u8]) -> Option<String> {
+    let refusal: GithubRefusal = aterm_json::from_slice(response).ok()?;
+    let fields: Vec<String> = refusal
+        .errors
+        .iter()
+        .map(|detail| {
+            let mut named = String::new();
+            if !detail.resource.is_empty() {
+                named.push_str(&detail.resource);
+            }
+            if !detail.field.is_empty() {
+                if !named.is_empty() {
+                    named.push('.');
+                }
+                named.push_str(&detail.field);
+            }
+            let said = if detail.message.is_empty() {
+                detail.code.clone()
+            } else {
+                detail.message.clone()
+            };
+            match (named.is_empty(), said.is_empty()) {
+                (true, true) => "unnamed error".to_string(),
+                (true, false) => said,
+                (false, true) => named,
+                (false, false) => format!("{named}: {said}"),
+            }
+        })
+        .collect();
+    match (refusal.message.is_empty(), fields.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(refusal.message),
+        (true, false) => Some(fields.join("; ")),
+        (false, false) => Some(format!("{} ({})", refusal.message, fields.join("; "))),
+    }
+}
+
+/// **WHAT THE FAILING RELEASE POST ACTUALLY SAID**, in place of the bare number.
+///
+/// `curl: (22) The requested URL returned error: 422` is the whole of what the
+/// v0.87.0 cut printed, for hours, while the cause sat in the request the
+/// caller still had in its hand: a 225,061-byte body against GitHub's
+/// 125,000-character limit. A 422 means the server UNDERSTOOD the request and
+/// refused its content, so the two things worth saying are the size of the body
+/// this process posted — measured against the limit, in BOTH directions, so the
+/// diagnosis cannot lie by only ever accusing the body — and whatever GitHub
+/// named in its own `errors[]`.
+///
+/// Every other failure is passed through as curl reported it: a timeout, a
+/// reset and a 5xx are not this, and dressing them up as this would be worse
+/// than the number.
+fn release_post_failure_detail(out: &RunOut, posted_body_len: usize) -> String {
+    let mut detail = out.stderr_utf8().trim().to_string();
+    if http_status_from_curl_failure(&out.stderr_utf8()) == Some(HTTP_UNPROCESSABLE_CONTENT) {
+        let limit = changelog::GITHUB_RELEASE_BODY_LIMIT;
+        detail.push_str(&format!(
+            " — {HTTP_UNPROCESSABLE_CONTENT} is GitHub understanding the request and refusing \
+             its CONTENT. The release body this POST carried was {posted_body_len} bytes against \
+             the {limit}-character release-body limit, which is "
+        ));
+        if posted_body_len > limit {
+            detail.push_str(
+                "OVER IT — that is this refusal, and nothing else needs investigating until \
+                 the body fits",
+            );
+        } else {
+            detail.push_str(
+                "WITHIN it — so the body's size is not the cause here; the tag, the target \
+                 commitish and GitHub's own words are what is left to read",
+            );
+        }
+    }
+    if let Some(said) = github_refusal_summary(&out.stdout) {
+        detail.push_str(&format!(" — GitHub said: {said}"));
+    }
+    detail
+}
+
+/// **THE RELEASE BODY, READ AND BOUNDED AT THE POST ITSELF.**
+///
+/// [`changelog::release_notes_document`] bounds what it writes, and that is not
+/// the guard this operation needs: the file read here can have been written by
+/// an older binary, carried into a `--resume` from a cut that ran before the
+/// bound existed, or hand-regenerated by an operator — which is exactly how
+/// v0.87.0's notes came to be on disk. Each of those still posts over the limit
+/// and still comes back as an opaque 422. Guard the OPERATION, not the call
+/// site that happens to precede it.
+///
+/// Idempotent by construction, which is what lets both guards stand: a body
+/// already within the limit is returned verbatim, so a file this binary wrote
+/// passes through untouched and is never cut twice.
+fn release_body_for_post(label: &str, path: &Path) -> Result<String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|error| Error::new(format!("read {label} release notes: {error}")))?;
+    let bounded = changelog::bound_release_body(&raw);
+    if bounded.len() != raw.len() {
+        step(
+            label,
+            &format!(
+                "{} is {} bytes, over the {} GitHub accepts in a release body; posting it cut \
+                 at a section boundary with a pointer to CHANGELOG.md for the rest (an \
+                 unbounded body is refused as an opaque 422)",
+                path.display(),
+                raw.len(),
+                changelog::GITHUB_RELEASE_BODY_LIMIT,
+            ),
+        );
+    }
+    Ok(bounded)
 }
 
 /// How curl is told to find the request body — the ONE decision that separates a
@@ -8064,6 +9171,11 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // is no longer a version lineage — its historical two-component lines are
     // retired-scheme accounting history.
     let release_version = release_version_from_workspace(&full)?;
+    // Recorded into any fence this process creates, and used as the fallback
+    // version when a refusal has to print the recover command for a fence that
+    // predates liveness recording. A resume overrides it with the journal's
+    // version, which is the authoritative one for the cut being finished.
+    set_publisher_fence_version(&release_version);
 
     let kind = if opts.dry_run {
         CutKind::DryRun
@@ -8072,7 +9184,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     } else {
         CutKind::Real
     };
-    let publish_slug = opts.rehearse.clone().unwrap_or_else(|| origin_slug.clone());
     if kind == CutKind::Real {
         assert_origin_repo_binding(&git, &origin_slug)?;
     }
@@ -8146,6 +9257,46 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         }
     }
 
+    // ---- align (before the tier, the version and the claim) ---------------
+    // ABSORB THE PEER'S PUSH. A real, fresh cut fast-forwards onto `origin/main`
+    // rather than refusing with "pull first" — the race that was lost by
+    // construction on a repository several machines push to, and the whole of
+    // `gates::align_to_origin`'s doc comment.
+    //
+    // WHERE IT SITS IS THE DESIGN. After the journal triage, because a cut that is
+    // already journaled must refuse without having moved anything first — a resume
+    // is bound to its claim commit. Before everything else, because a fast-forward
+    // moves `Cargo.toml`, the changelog and the ledger, and every decision below
+    // reads them. A resume never aligns; a dry run and a rehearsal never move the
+    // operator's branch at all.
+    let (full, origin_slug, mirror_slug, release_version) = if kind == CutKind::Real
+        && let Some(note) = gates::align_to_origin(&git)?
+    {
+        step("aligned", &note);
+        // RE-READ what the alignment moved. The four values above were derived
+        // from the pre-fast-forward tree; a peer whose push bumped the workspace
+        // version would otherwise have this cut publishing the old number from
+        // the new tree.
+        let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
+            .map_err(|e| Error::new(format!("read Cargo.toml after fast-forward: {e}")))?;
+        let full = workspace_version(&cargo_text)?;
+        let origin_slug = repo_slug(&cargo_text).ok_or_else(|| {
+            Error::new(
+                "Cargo.toml [workspace.package] repository is not an exact GitHub \
+                 OWNER/REPO URL",
+            )
+        })?;
+        let mirror_slug = mirror::update_channel_slug(&cargo_text)?;
+        let release_version = release_version_from_workspace(&full)?;
+        (full, origin_slug, mirror_slug, release_version)
+    } else {
+        (full, origin_slug, mirror_slug, release_version)
+    };
+
+    // Derived AFTER the alignment, from the slug the alignment may have re-read:
+    // a value captured before the fast-forward would name the pre-push tree.
+    let publish_slug = opts.rehearse.clone().unwrap_or_else(|| origin_slug.clone());
+
     // Tier APPLE, resolved HERE: after the resume delegation above (a resume
     // resolves its own tier, under its own rule — see `resume_apple_tier`) and
     // well before the gates, the lease and the claim. If the anchor is set, this
@@ -8209,6 +9360,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         // never readable from the environment.
         offline: !matches!(kind, CutKind::Real),
         allow_stale_cutter: matches!(kind, CutKind::DryRun),
+        paint_smoke: !opts.no_paint_smoke,
     };
     let gr = gates::run_all(&git, repo, &gate_opts)?;
     step(
@@ -8617,6 +9769,10 @@ fn resume_cut(
         ));
     };
     let git = GitCli::new(repo);
+    // The journal's version, not the workspace's, is the one this invocation is
+    // publishing — it is what any fence this resume creates records, and what a
+    // refusal falls back to when an older fence recorded none.
+    set_publisher_fence_version(&journal.version);
     println!(
         "aterm-release · cut v{} (build {}) — RESUME at step \"{next}\"",
         journal.version, journal.build_number
@@ -8627,6 +9783,44 @@ fn resume_cut(
     // and reject every unexplained worktree change before acquiring a remote
     // lease/fence.
     ordinary_resume_claim_preflight(repo, &git, &journal)?;
+
+    // THE INTERRUPTED-RESUME FIX. A killed resume leaves its fence behind, and
+    // before this every later resume refused with a message that named neither
+    // the holder nor the remedy — v0.87.0 spent hours, and 88 iterations of a
+    // retry loop, on a hand-assembled `ship recover`. A resume may now take a
+    // fence back, but ONLY when it can PROVE the recorded publisher is dead:
+    // same host, same boot session, and that pid either gone or reused by
+    // another program. Anything unprovable is kept and refused below, with a
+    // message that states which and prints the exact recover command.
+    //
+    // A recovery lane arrives with its session already rotated
+    // (`recovered_session`); it has its own explicit operator proof and must
+    // not be second-guessed here.
+    //
+    // AND ONLY WHEN THIS RESUME WILL ACQUIRE A FENCE AT ALL. The reclaim is an
+    // assist for the `acquire_publisher_fence` in `run_pipeline`, and that
+    // acquire is deliberately skipped for an unlock-only resume and for every
+    // post-unlock step (`site`): the lease was CAS-deleted by this cut's own
+    // `unlock`, and re-acquiring would mint state nothing later deletes. On
+    // exactly those resumes a fence on the remote belongs to a DIFFERENT claim
+    // — the successor cut's — so probing it here took the `Kept` arm and
+    // printed that cut's full refusal into this cut's transcript, for a fence
+    // this resume was never going to touch, before proceeding and exiting 0.
+    // The predicate is `run_pipeline`'s, spelled the same way on purpose.
+    if recovered_session.is_none() && next != "unlock" && !is_post_unlock_step(next) {
+        match reclaim_dead_publisher_fence(&git, &journal.commit, &LocalProbe) {
+            Ok(FenceReclaim::NoFence) => {}
+            Ok(FenceReclaim::Reclaimed { token, detail }) => {
+                println!("  fence: reclaimed {PUBLISHER_FENCE_REF} (token {token}) — {detail}")
+            }
+            Ok(FenceReclaim::Kept { refusal }) => {
+                println!("  fence: held by another publisher session\n{refusal}");
+            }
+            // The probe is an ASSIST, never an authority: if it cannot run, the
+            // acquire below still produces the authoritative refusal.
+            Err(error) => println!("  fence: liveness probe could not run: {error}"),
+        }
+    }
 
     // The provenance gate the fresh cut ran before its claim, re-run here — under the
     // one rule every rebuild-only check below shares — BEFORE any artifact is baked: a
@@ -9872,11 +11066,94 @@ pub const NO_PAINT_SMOKE_ACK_VALUE: &str = "this-cut-may-ship-dark";
 /// The recording fakes in tests/paint_smoke.rs drive the real decision code
 /// and assert what it DID, in what ORDER.
 pub trait PaintProbe {
-    /// `Ok(report)` = the effect painted (the probe's one-line measurement,
-    /// which the transcript prints so the claim carries its evidence).
-    /// `Err(why)` = it did not, or nothing could be proven — the CALLER owns
-    /// the verdict words; this is only the measurement.
-    fn paint(&self, bundle_binary: &Path) -> std::result::Result<String, String>;
+    /// `Ok(report)` = the effect painted AND the take is evidence (the probe's
+    /// one-line measurement, which the transcript prints so the claim carries
+    /// its evidence). `Err(refusal)` = it did not paint, or the take proves
+    /// nothing — two different claims, which is why the error is a
+    /// [`PaintRefusal`] and not a string. The CALLER owns the verdict words;
+    /// this is only the measurement and its standing.
+    fn paint(&self, bundle_binary: &Path) -> std::result::Result<String, PaintRefusal>;
+}
+
+/// The token `tools/paint-conformance/starvation.py` prints for a take whose
+/// own instrument can stand behind it — the ONLY reading this gate accepts.
+pub const PAINT_EVIDENCE_SOUND: &str = "evidence=sound";
+/// The probe's word for a take that ran and proves nothing.
+pub const PAINT_VERDICT_UNPROVED: &str = "verdict=UNPROVED";
+/// Exit 3 of `paint_probe.sh`: UNPROVED — the take ran and is not evidence.
+pub const PAINT_EXIT_UNPROVED: i32 = 3;
+/// The remedy a refusal must name, because a refusal nobody can act on gets
+/// switched off. MEASURED 2026-09-12: the sampler's worst tick reads 5.0 ms
+/// from an interactive shell or a `ProcessType=Interactive` LaunchAgent, and
+/// 75 ms under `launchctl submit` — whose QoS the launched SUBJECT inherits.
+pub const PAINT_EVIDENCE_REMEDY: &str = "re-run the cut from an interactive shell, or from a \
+     LaunchAgent with ProcessType=Interactive — a `launchctl submit` job runs this whole family \
+     at QoS utility and the bundle it launches inherits it. Repeating the take under the same \
+     tier cannot help: N starved takes are N takes of zero evidence";
+
+/// Why a paint smoke did not hand back a green take — and the two arms are
+/// NOT the same claim about the artifact.
+///
+/// THE DEFECT THIS TYPE EXISTS FOR (2026-09-17). The probe used to answer with
+/// one string, and the caller printed "the shipped artifact does not paint its
+/// flagship effect" over all of it. That was wrong in both directions: a take
+/// that could not run said the artifact was dark, and — far worse — a take
+/// that had already printed "This take is not evidence about paint" exited 0
+/// and was recorded by the cut as a SATISFIED paint obligation. A gate that
+/// cannot refute anything proves nothing by going green, so "not evidence" now
+/// has its own word here and its own refusal at the seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaintRefusal {
+    /// The instrument got its time, and the shape's expectation failed anyway.
+    /// This IS a claim about the artifact: it did not paint.
+    DidNotPaint(String),
+    /// The take proves nothing — it could not run, or it ran under conditions
+    /// its own instrument disowns. Neither a pass nor a paint failure, and it
+    /// may never satisfy the obligation: an unproven check that reads as green
+    /// is the exact vacuity docs/RELEASE-PROOF-DISCIPLINE.md was written about.
+    NotEvidence(String),
+}
+
+impl PaintRefusal {
+    /// The probe's own line, whatever the arm — so a refusal always carries
+    /// the measurement a reader needs.
+    #[must_use]
+    pub fn report(&self) -> &str {
+        match self {
+            PaintRefusal::DidNotPaint(report) | PaintRefusal::NotEvidence(report) => report,
+        }
+    }
+}
+
+/// Does this PAINT line stand behind itself? `Ok(())` iff the probe labelled
+/// the take `evidence=sound`.
+///
+/// FAIL-CLOSED, AND SEPARATELY FROM THE EXIT CODE, on purpose. `paint_probe.sh`
+/// already refuses a starved take with exit 3, so in the normal case this
+/// agrees with it twice. It exists for the case an exit code cannot cover: a
+/// probe script that predates the downgrade, or a future edit that loses it,
+/// hands this seam a `starved=yes … verdict=PASS` line and an exit of 0 —
+/// precisely the line every take of the v0.87.0 cut printed. The release
+/// obligation is owned HERE, so it is re-derived here from the words on the
+/// line, and a line with no evidence token at all is unproven, never sound.
+///
+/// # Errors
+/// The words for a take that may not satisfy the paint obligation.
+pub fn paint_take_is_evidence(report: &str) -> std::result::Result<(), String> {
+    if report.contains(PAINT_VERDICT_UNPROVED) {
+        return Err(format!(
+            "the paint probe exited 0 with an UNPROVED take — the take ran and is not evidence \
+             about paint; {PAINT_EVIDENCE_REMEDY}"
+        ));
+    }
+    if !report.contains(PAINT_EVIDENCE_SOUND) {
+        return Err(format!(
+            "the paint take does not stand behind itself: the probe did not label it \
+             `{PAINT_EVIDENCE_SOUND}`, so nothing was proven about paint in either direction; \
+             {PAINT_EVIDENCE_REMEDY}"
+        ));
+    }
+    Ok(())
 }
 
 /// The real probe: `tools/paint-conformance/paint_probe.sh` — the SAME driver
@@ -9888,13 +11165,13 @@ pub struct RealPaintProbe {
 }
 
 impl PaintProbe for RealPaintProbe {
-    fn paint(&self, bundle_binary: &Path) -> std::result::Result<String, String> {
+    fn paint(&self, bundle_binary: &Path) -> std::result::Result<String, PaintRefusal> {
         let script = self.repo.join("tools/paint-conformance/paint_probe.sh");
         if !script.is_file() {
-            return Err(format!(
+            return Err(PaintRefusal::NotEvidence(format!(
                 "paint probe missing ({}) — nothing was proven about paint",
                 script.display()
-            ));
+            )));
         }
         let out = Command::new(&script)
             .arg(bundle_binary)
@@ -9930,10 +11207,12 @@ impl PaintProbe for RealPaintProbe {
             // appears — so a bundle whose GPU backend could not initialize at
             // all produced a GREEN paint smoke drawn entirely on the CPU, and
             // the cut proceeded. The probe now makes that a COULD-NOT-RUN,
-            // which the `Some(1 | 2)` arm below already refuses.
+            // which `paint_probe_disposition` below already refuses.
             .args(["--backend", "gpu"])
             .output()
-            .map_err(|e| format!("could not spawn {}: {e}", script.display()))?;
+            .map_err(|e| {
+                PaintRefusal::NotEvidence(format!("could not spawn {}: {e}", script.display()))
+            })?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let report = stdout
             .lines()
@@ -9941,16 +11220,56 @@ impl PaintProbe for RealPaintProbe {
             .find(|l| l.starts_with("PAINT"))
             .unwrap_or("<no PAINT report line>")
             .to_string();
-        match out.status.code() {
-            Some(0) => Ok(report),
-            // 1 = the expectation failed, 2 = could not run; both refuse the
-            // cut (could-not-run is NOT a pass — the exact vacuity the audit
-            // found), under words the caller composes.
-            Some(1 | 2) => Err(report),
-            code => Err(format!(
-                "paint probe died abnormally (exit {code:?}; the protocol is 0/1/2): {report}"
-            )),
-        }
+        paint_probe_disposition(out.status.code(), report)
+    }
+}
+
+/// The probe's exit protocol, read as a DISPOSITION — pure, so every arm is
+/// testable without launching a GUI or recording a frame.
+///
+/// | exit | means | disposition |
+/// |---|---|---|
+/// | 0 | the shape's floors cleared | `Ok` — **iff the take is evidence** |
+/// | 1 | the expectation failed | [`PaintRefusal::DidNotPaint`] |
+/// | 2 | could not run | [`PaintRefusal::NotEvidence`] |
+/// | 3 | ran, and is not evidence | [`PaintRefusal::NotEvidence`] |
+/// | anything else | the protocol broke | [`PaintRefusal::NotEvidence`] |
+///
+/// A GREEN EXIT IS NOT ENOUGH, and 2026-09-17 is why. Exit 0 says the pixels
+/// cleared the shape's floors; it does not say the take was in a position to
+/// look. Every take of the v0.87.0 cut exited 0 while printing, on that same
+/// line, "This take is not evidence about paint". `paint_probe.sh` refuses such
+/// a take itself now (exit 3) — and this function ALSO re-derives it from the
+/// words on the line, so the release obligation never rests on an exit code
+/// alone.
+///
+/// NOTHING ACCUMULATES HERE, which is the answer to "just take it again": the
+/// disposition is a function of ONE take's exit code and ONE take's line, so
+/// repeating a starved take produces another refusal rather than a pass.
+///
+/// # Errors
+/// Every non-green disposition, in the words of its own arm.
+pub fn paint_probe_disposition(
+    code: Option<i32>,
+    report: String,
+) -> std::result::Result<String, PaintRefusal> {
+    match code {
+        Some(0) => match paint_take_is_evidence(&report) {
+            Ok(()) => Ok(report),
+            Err(why) => Err(PaintRefusal::NotEvidence(format!("{why} — {report}"))),
+        },
+        // 1 = the expectation failed: the instrument got its time and the
+        // glass was dark. That, and only that, is a claim about paint.
+        Some(1) => Err(PaintRefusal::DidNotPaint(report)),
+        // 2 = could not run, 3 = ran and proves nothing. Both refuse the cut
+        // (an unproven check that reads green is the exact vacuity the audit
+        // found) — but neither says the artifact is dark, and the caller's
+        // words must not say so either.
+        Some(2) => Err(PaintRefusal::NotEvidence(report)),
+        Some(PAINT_EXIT_UNPROVED) => Err(PaintRefusal::NotEvidence(report)),
+        code => Err(PaintRefusal::NotEvidence(format!(
+            "paint probe died abnormally (exit {code:?}; the protocol is 0/1/2/3): {report}"
+        ))),
     }
 }
 
@@ -10024,11 +11343,29 @@ pub fn selfcheck_paint_then_signing(
             // the SAME binary. This line is printed into the cut's own record,
             // so a stale count here is a false entry in the release ledger.
             Ok(report) => format!("29 keys, fake-Claude shape, ink asserted \u{2014} {report}"),
-            Err(why) => {
-                return Err(Error::new(format!(
-                    "self-check failed: the shipped artifact does not paint its flagship \
-                     effect \u{2014} see docs/RELEASE-PROOF-DISCIPLINE.md ({why})"
-                )));
+            // TWO REFUSALS, TWO SENTENCES. Both stop the cut; neither is a
+            // warning. But "it did not paint" is a claim about the artifact
+            // and "this take is not evidence" is a claim about the take, and
+            // printing the first over the second is how a starved instrument
+            // used to get away with being read as a verdict about paint.
+            Err(refusal) => {
+                let report = refusal.report();
+                return Err(Error::new(match &refusal {
+                    PaintRefusal::DidNotPaint(_) => format!(
+                        "self-check failed: the shipped artifact does not paint its flagship \
+                         effect \u{2014} see docs/RELEASE-PROOF-DISCIPLINE.md ({report})"
+                    ),
+                    PaintRefusal::NotEvidence(_) => format!(
+                        "self-check failed: NOTHING WAS PROVEN about the shipped artifact's \
+                         flagship effect \u{2014} this take is UNPROVED, which is neither a \
+                         pass nor a paint failure, and an unproven obligation is not a \
+                         satisfied one (docs/RELEASE-PROOF-DISCIPLINE.md). Remedy: \
+                         {PAINT_EVIDENCE_REMEDY}. If this cut truly must ship with no pixel \
+                         proof, say so out loud with {NO_PAINT_SMOKE_FLAG} + \
+                         {NO_PAINT_SMOKE_ACK_VAR}={NO_PAINT_SMOKE_ACK_VALUE} \u{2014} there is \
+                         no quiet way past this ({report})"
+                    ),
+                }));
             }
         },
     };
@@ -10606,8 +11943,8 @@ fn step_draft(ctx: &mut CutCtx) -> Result<()> {
 /// resolves). Durable intent is saved before the POST; this invocation then
 /// probes once, and a later resume may discover but never recreate it.
 fn create_draft(ctx: &mut CutCtx) -> Result<ReleaseObjectIdentity> {
-    let notes = fs::read_to_string(ctx.notes_path())
-        .map_err(|error| Error::new(format!("read draft release notes: {error}")))?;
+    let notes = release_body_for_post("draft", &ctx.notes_path())?;
+    let posted_body_len = notes.len();
     let title = format!("aterm {}", ctx.version);
     let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{}/releases", ctx.slug);
     let payload = aterm_json::to_vec(&aterm_json::json!({
@@ -10660,14 +11997,14 @@ fn create_draft(ctx: &mut CutCtx) -> Result<ReleaseObjectIdentity> {
              create intent has been released and `--resume` may post once more. If this keeps \
              happening the refusal itself is the thing to read, not the intent.",
             ctx.tag,
-            out.stderr_utf8().trim()
+            release_post_failure_detail(&out, posted_body_len)
         )));
     }
     Err(Error::new(format!(
         "draft create returned {} but no exact release object is visible for {}; refusing an ambiguous retry in this invocation (resume after GitHub converges): {}",
         if out.success() { "success" } else { "failure" },
         ctx.tag,
-        out.stderr_utf8().trim()
+        release_post_failure_detail(&out, posted_body_len)
     )))
 }
 
@@ -12190,8 +13527,8 @@ fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()>
 /// the authenticity of the bytes comes from the manifest digest + optional
 /// pinned signature + codesign, never from the release's target.
 fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIdentity> {
-    let notes = fs::read_to_string(ctx.notes_path())
-        .map_err(|error| Error::new(format!("read mirror release notes: {error}")))?;
+    let notes = release_body_for_post("mirror", &ctx.notes_path())?;
+    let posted_body_len = notes.len();
     let title = format!("aterm {}", ctx.version);
     let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{slug}/releases");
     let payload = aterm_json::to_vec(&aterm_json::json!({
@@ -12222,7 +13559,7 @@ fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIden
          on {slug}; refusing an ambiguous retry in this invocation (resume after GitHub \
          converges): {}",
         ctx.tag,
-        out.stderr_utf8().trim()
+        release_post_failure_detail(&out, posted_body_len)
     )))
 }
 
@@ -12477,6 +13814,196 @@ fn step_verify(ctx: &mut CutCtx) -> Result<()> {
             local_signature: Some(&signature),
         },
     )
+}
+
+#[cfg(test)]
+mod release_body_post_tests {
+    //! THE BODY THE POST ACTUALLY CARRIES, and what a refusal of it says.
+    //!
+    //! The v0.87.0 cut spent hours on `curl: (22) The requested URL returned
+    //! error: 422` because two facts never met: the body was 225,061 bytes, and
+    //! GitHub takes 125,000 characters. Both were in this process's hands at the
+    //! moment of the POST. Bounding where the notes are WRITTEN does not close
+    //! it — the file read here can come from an older binary, a resumed cut, or
+    //! an operator's hand-regeneration — so the bound is taken on the operation.
+
+    use super::*;
+
+    fn notes_file(label: &str, contents: &str) -> (PrivateTempDir, PathBuf) {
+        let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
+            "aterm-release-notes-{label}-{}-{sequence}",
+            std::process::id()
+        )))
+        .expect("create release-notes test directory");
+        let path = dir.path().join("notes-0.87.0.md");
+        fs::write(&path, contents).expect("write release-notes fixture");
+        (dir, path)
+    }
+
+    /// An over-limit file ON DISK — whatever wrote it — is posted BOUNDED.
+    ///
+    /// THE TWIN: read the file with `fs::read_to_string` (what shipped until
+    /// today) and the length assertion goes red on the very fixture that
+    /// reproduces the v0.87.0 refusal.
+    #[test]
+    fn an_oversized_notes_file_on_disk_is_bounded_at_the_post() {
+        let oversized = "### Section\n\n- an entry long enough to matter\n\n".repeat(6000);
+        assert!(
+            oversized.len() > changelog::GITHUB_RELEASE_BODY_LIMIT,
+            "fixture must actually overflow: {} bytes",
+            oversized.len()
+        );
+        let (_dir, path) = notes_file("oversized", &oversized);
+        let posted = release_body_for_post("draft", &path).expect("read notes");
+        assert!(
+            posted.len() <= changelog::GITHUB_RELEASE_BODY_LIMIT,
+            "the POST would carry {} bytes, over the {} GitHub takes",
+            posted.len(),
+            changelog::GITHUB_RELEASE_BODY_LIMIT
+        );
+        assert!(
+            posted.contains("longer than GitHub accepts"),
+            "a cut body must say it was cut, or it reads as corruption"
+        );
+        // The file itself is untouched: the bound is on what is SENT, not a
+        // rewrite of an artifact the operator may still be reading.
+        assert_eq!(
+            fs::read_to_string(&path).expect("re-read fixture").len(),
+            oversized.len()
+        );
+    }
+
+    /// **BOUNDING AT THE POST IS A NO-OP ON AN ALREADY-BOUNDED FILE**, byte for
+    /// byte — which is what lets the write-time bound and this one both stand.
+    #[test]
+    fn a_body_already_within_the_limit_is_posted_verbatim() {
+        let document = changelog::release_notes_document(
+            "0.87.0",
+            &"### Section\n\n- an entry\n\n".repeat(6000),
+        );
+        let (_dir, path) = notes_file("bounded", &document);
+        let posted = release_body_for_post("draft", &path).expect("read notes");
+        assert_eq!(posted, document, "a second bound must change nothing");
+        // And a third pass over what the POST would send is still a no-op.
+        let (_dir2, again) = notes_file("bounded-twice", &posted);
+        assert_eq!(
+            release_body_for_post("draft", &again).expect("read notes"),
+            posted
+        );
+    }
+
+    fn refusal(status: i32, stderr: &str, response: &str) -> RunOut {
+        RunOut {
+            status,
+            stdout: response.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    const CURL_422: &str = "curl: (22) The requested URL returned error: 422\n";
+    /// GitHub's actual refusal document for an over-length release body.
+    const TOO_LONG: &str = r#"{"message":"Validation Failed","errors":[{"resource":"Release","code":"custom","field":"body","message":"body is too long (maximum is 125000 characters)"}],"documentation_url":"https://docs.github.com/rest"}"#;
+
+    /// **A 422 NAMES THE SIZE**, in bytes, against the limit — the two numbers
+    /// whose absence cost the v0.87.0 cut its afternoon.
+    #[test]
+    fn a_422_on_a_release_create_names_the_size_and_githubs_own_words() {
+        let detail = release_post_failure_detail(&refusal(22, CURL_422, TOO_LONG), 225_061);
+        assert!(
+            detail.contains("225061"),
+            "the refusal must name the body it posted: {detail}"
+        );
+        assert!(
+            detail.contains(&changelog::GITHUB_RELEASE_BODY_LIMIT.to_string()),
+            "the refusal must name the limit it broke: {detail}"
+        );
+        assert!(
+            detail.contains("OVER IT"),
+            "the verdict must be stated, not left to the reader: {detail}"
+        );
+        assert!(
+            detail.contains("Validation Failed") && detail.contains("Release.body"),
+            "GitHub's own errors[] must survive into the message: {detail}"
+        );
+        assert!(
+            detail.contains("The requested URL returned error: 422"),
+            "curl's own line is still the evidence and must not be dropped: {detail}"
+        );
+    }
+
+    /// And it does NOT accuse the body when the body fits. A diagnosis that can
+    /// only ever say one thing is not a diagnosis.
+    #[test]
+    fn a_422_on_a_body_that_fits_says_the_size_is_not_the_cause() {
+        let mismatch = r#"{"message":"Validation Failed","errors":[{"resource":"Release","code":"invalid","field":"target_commitish"}]}"#;
+        let detail = release_post_failure_detail(&refusal(22, CURL_422, mismatch), 4_096);
+        assert!(detail.contains("WITHIN it"), "{detail}");
+        assert!(!detail.contains("OVER IT"), "{detail}");
+        assert!(detail.contains("Release.target_commitish"), "{detail}");
+    }
+
+    /// A timeout is not a content refusal and must not be dressed as one.
+    #[test]
+    fn a_transport_failure_is_reported_as_curl_reported_it() {
+        let out = refusal(28, "curl: (28) Operation timed out after 30001 ms\n", "");
+        let detail = release_post_failure_detail(&out, 225_061);
+        assert_eq!(detail, "curl: (28) Operation timed out after 30001 ms");
+    }
+
+    /// A 5xx carries GitHub's words if it sent any, and never the body verdict:
+    /// a server that fell over says nothing about our content.
+    #[test]
+    fn a_server_error_carries_githubs_words_but_no_size_verdict() {
+        let out = refusal(
+            22,
+            "curl: (22) The requested URL returned error: 502\n",
+            r#"{"message":"Server Error"}"#,
+        );
+        let detail = release_post_failure_detail(&out, 225_061);
+        assert!(
+            !detail.contains("OVER IT") && !detail.contains("WITHIN it"),
+            "{detail}"
+        );
+        assert!(detail.contains("GitHub said: Server Error"), "{detail}");
+    }
+
+    /// A response that is not GitHub's error shape adds nothing rather than
+    /// erroring — the transport line is still the evidence.
+    #[test]
+    fn a_response_that_is_not_an_error_document_adds_nothing() {
+        assert_eq!(
+            github_refusal_summary(b"<html>504 Gateway Time-out</html>"),
+            None
+        );
+        assert_eq!(github_refusal_summary(b"{}"), None);
+    }
+
+    /// **NO RELEASE-BODY POST MAY READ THE NOTES RAW AGAIN.** The hole this
+    /// closes was a second call site reading the same file without the bound;
+    /// asserted as source because the alternative is a live POST to GitHub.
+    #[test]
+    fn every_release_body_post_reads_through_the_bound() {
+        let src = include_str!("publish.rs");
+        // Split so this assertion does not match itself.
+        let raw_read = concat!("fs::read_to_string(ctx.", "notes_path())");
+        assert!(
+            !src.contains(raw_read),
+            "a release body is being read without the bound — post it through \
+             release_body_for_post"
+        );
+        for site in ["fn create_draft", "fn create_mirror_draft"] {
+            let body = &src[src.find(site).expect("function present")..];
+            let post = body.find("post.issue(permit)?").expect("the POST");
+            let bounded = body[..post]
+                .find("release_body_for_post(")
+                .expect("the bound must precede the POST");
+            assert!(
+                bounded < post,
+                "{site}: the body must be bounded before it is sent"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

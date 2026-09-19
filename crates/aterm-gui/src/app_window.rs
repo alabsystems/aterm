@@ -537,6 +537,12 @@ impl App {
     /// broken, session-less window behind). This is the fully-testable seam the
     /// multi-window conformance test drives; `create_window_internal` wraps it with
     /// the winit surface attach.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the window's birth facts — geometry, cwd, the seamless adoptee, the \
+                  connection lineage and the agent identity — are each a per-open datum; \
+                  a wrapper struct would relocate the list, not simplify it"
+    )]
     pub(crate) fn create_window_logical(
         &mut self,
         rows: u16,
@@ -551,6 +557,10 @@ impl App {
         // (`ATERM_OBSERVE_SESSION_ID`) into the newborn's shell.
         lineage_parent: Option<aterm_session::SessionId>,
         observe: Option<&aterm_session::SessionId>,
+        // The agent identity the first session spawns under (session
+        // identities; `spawn … place=window identity=<name>`), `None` for
+        // every ordinary open and every restore-created window.
+        identity: Option<&str>,
     ) -> Option<WindowId> {
         // Mint the window id FIRST so the spawned session's `Wake`s are stamped with
         // the window that will own them (Output/Exit/Bell route back to THIS window).
@@ -582,6 +592,7 @@ impl App {
             &proxy,
             cwd.as_deref(),
             observe,
+            identity,
             adopt, // SEAMLESS: `Some` re-adopts this window's handed-off first-leaf shell
         ) {
             Ok(s) => s,
@@ -735,7 +746,7 @@ impl App {
         cwd_override: Option<&str>,
         adopt: Option<crate::spawn::Adopted>,
     ) -> Option<WindowId> {
-        self.create_window_internal_connected(el, cwd_override, adopt, None, None)
+        self.create_window_internal_connected(el, cwd_override, adopt, None, None, None)
     }
 
     /// [`create_window_internal`] with the session-connection birth facts
@@ -771,10 +782,18 @@ impl App {
         adopt: Option<crate::spawn::Adopted>,
         lineage_parent: Option<aterm_session::SessionId>,
         observe: Option<&aterm_session::SessionId>,
+        identity: Option<&str>,
     ) -> Option<WindowId> {
         let (rows, cols) = self.front().map_or((80, 24), |ws| (ws.rows, ws.cols));
-        let wid =
-            self.create_window_logical(rows, cols, cwd_override, adopt, lineage_parent, observe)?;
+        let wid = self.create_window_logical(
+            rows,
+            cols,
+            cwd_override,
+            adopt,
+            lineage_parent,
+            observe,
+            identity,
+        )?;
         if !self.headless && !self.attach_os_window(el, wid) {
             // GPU surface failed: roll back the just-created window + its fresh
             // session rather than leave a present-less black window.

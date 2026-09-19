@@ -527,15 +527,37 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
         !stdout.iter().any(|l| l.contains(DECLINED_SENTENCE)),
         "the verb never ran: {stdout:?}"
     );
-    // …and once THIS holder lets go the lock is takeable at once: the orphan left
-    // nothing behind on it. (Asserting `Contended` while `guard` was still alive
-    // could never fail — a second flock from the holder's own process is always
-    // refused — so the guard is released first, and this is the assertion that can.)
+    // …and once THIS holder lets go the lock is takeable: the orphan left nothing
+    // behind on it. (Asserting `Contended` while `guard` was still alive could
+    // never fail — a second flock from the holder's own process is always refused
+    // — so the guard is released first, and this is the assertion that can.)
+    //
+    // POLLED, NOT SAMPLED ONCE (2026-09-17), for the mechanism `atpkg::lock`'s
+    // own unit test records at the identical shape: `flock` is released only when
+    // every descriptor on the open file description is closed, and a
+    // `fork`/`posix_spawn` anywhere else in this binary copies every descriptor
+    // into the child, which holds them until it `exec`s (`FD_CLOEXEC` closes at
+    // exec, never at fork). THIS binary is the worst case for that: every test in
+    // it spawns `sh` and a waiter, so a sibling's fork window is not hypothetical
+    // here, it is the file's subject matter.
+    //
+    // The CLAIM IS UNCHANGED — a released lock must become takeable, and a
+    // release that never takes effect still fails, loudly and inside the same
+    // 10 s the waiter tests already budget. Only the instant it must be visible
+    // is relaxed, by exactly the thing that delays it.
     drop(guard);
-    assert!(
-        atpkg::lock::try_lock_store(&fx.layout()).is_ok(),
-        "the lock is free once the holder releases it"
-    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let refusal = match atpkg::lock::try_lock_store(&fx.layout()) {
+            Ok(_) => break,
+            Err(e) => e,
+        };
+        assert!(
+            Instant::now() < deadline,
+            "the lock is still not free 10 s after the holder released it: {refusal:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// The window's shape: the spawner NAMES ITSELF (`ATPKG_SPAWNER_PID`, the `sh`'s

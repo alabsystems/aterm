@@ -231,6 +231,16 @@ pub const AUTO_PRIME_NOTE: &str = "\
 aterm installs/updates this primer for every detected agent each time it opens a
 session (set `agents_auto_prime = false` in ~/.config/aterm/aterm.toml to stop).";
 
+/// The off switch as ONE phrase — the parenthetical of [`AUTO_PRIME_NOTE`] (the
+/// footer `aterm agents status` and `aterm agents remove` print) and, on the pass
+/// summary the GUI logs on every write ([`auto_prime`], logged by aterm-gui
+/// `run_agent_prime`), the phrase between the outcome words and the file list, so
+/// the sentence a user is told when they ask and the one in aterm.log name the
+/// same key in the same file. Pinned equal by
+/// `the_summary_and_the_status_footer_name_one_off_switch`.
+pub const AUTO_PRIME_OFF_SWITCH: &str =
+    "set `agents_auto_prime = false` in ~/.config/aterm/aterm.toml to stop";
+
 /// The full managed block (markers + body + the agent's addendum, if any),
 /// newline-terminated — what an install writes and `aterm agents primer [<agent>]`
 /// prints for manual pasting. `None`, or a name the registry does not know, gives
@@ -629,6 +639,14 @@ struct AgentFile {
     /// for a runtime whose defaults defeat the generic brief. `None` for the
     /// generic block.
     addendum: Option<&'static str>,
+    /// The environment variable that MOVES this agent's config dir — the one
+    /// knob a session identity ([`agent_homes`]) sets so an agent under
+    /// `identity=<name>` keeps its login, settings and skills inside
+    /// `<identities>/<name>/<dir>` instead of `$HOME/<dir>`. `None` for an
+    /// agent whose variable has not been MEASURED on this machine (Gemini,
+    /// OpenCode): an identity gives such an agent nothing rather than a guess,
+    /// and the row is one measurement away from joining.
+    var: Option<&'static str>,
 }
 
 /// The registry of supported agents. Global-context-file conventions as of 2026:
@@ -643,6 +661,9 @@ const AGENT_FILES: &[AgentFile] = &[
         dir: ".claude",
         file: ".claude/CLAUDE.md",
         addendum: None,
+        // Measured 2026-09-17: the bun-compiled `claude` reads `CLAUDE_CONFIG_DIR`
+        // for its whole config tree (settings, skills, `.credentials.json`).
+        var: Some("CLAUDE_CONFIG_DIR"),
     },
     AgentFile {
         name: "codex",
@@ -650,6 +671,9 @@ const AGENT_FILES: &[AgentFile] = &[
         dir: ".codex",
         file: ".codex/AGENTS.md",
         addendum: Some(CODEX_ADDENDUM),
+        // Codex documents `CODEX_HOME` as the root of `config.toml`, `AGENTS.md`,
+        // `prompts/` and `auth.json`.
+        var: Some("CODEX_HOME"),
     },
     AgentFile {
         name: "gemini",
@@ -657,6 +681,7 @@ const AGENT_FILES: &[AgentFile] = &[
         dir: ".gemini",
         file: ".gemini/GEMINI.md",
         addendum: None,
+        var: None,
     },
     AgentFile {
         name: "opencode",
@@ -664,8 +689,43 @@ const AGENT_FILES: &[AgentFile] = &[
         dir: ".config/opencode",
         file: ".config/opencode/AGENTS.md",
         addendum: None,
+        var: None,
     },
 ];
+
+/// One row of the session-identity table: the agent whose config dir an
+/// identity relocates, the environment variable that relocates it, and the
+/// subdirectory of the identity it lands in — the agent's OWN conventional
+/// name (`.claude`, `.codex`), so [`auto_prime`] over the identity dir finds
+/// the agent "detected" there and the primer, the skills and the fabric hooks
+/// reach it unchanged. ONE roster: this is [`AGENT_FILES`] read through its
+/// `var` column, never a second table that could drift from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentHome {
+    /// The registry selector (`claude`, `codex`).
+    pub agent: &'static str,
+    /// The product name for human-readable listings.
+    pub product: &'static str,
+    /// The variable to set to `<identity dir>/<sub>`.
+    pub var: &'static str,
+    /// The agent's config dir, relative to the identity dir (`/`-separated,
+    /// one segment for every row that has a `var`).
+    pub sub: &'static str,
+}
+
+/// The agents an identity can carry: every [`AGENT_FILES`] row with a
+/// measured `var`, in registry order. An agent absent here gets NOTHING from
+/// an identity — not a guessed variable, not a directory.
+pub fn agent_homes() -> impl Iterator<Item = AgentHome> {
+    AGENT_FILES.iter().filter_map(|a| {
+        a.var.map(|var| AgentHome {
+            agent: a.name,
+            product: a.product,
+            var,
+            sub: a.dir,
+        })
+    })
+}
 
 /// The block this agent's file should carry.
 fn block_for(agent: &AgentFile) -> String {
@@ -951,6 +1011,17 @@ pub struct AgentOutcome {
     pub product: &'static str,
     /// What happened.
     pub outcome: Outcome,
+    /// Exactly the files THIS pass wrote for the agent (`~/`-relative, as `aterm
+    /// agents status` spells them), in write order: the primer file when it was
+    /// created, appended to, or replaced; each skill file installed or updated.
+    /// Decided from the write results themselves, not from `outcome` — an
+    /// [`Outcome::Error`] row can still have written (its skills are still
+    /// written after its primer file is refused: `upsert_primer_file` diagnoses
+    /// a corrupt block before it writes anything, and [`auto_prime`] does not
+    /// stop there; a created primer can precede a skill write that fails), and
+    /// an `Updated` row names the one stale skill it rewrote, not the primer it
+    /// left alone. What [`AutoPrime::changed`] and the summary's file list read.
+    pub wrote: Vec<String>,
 }
 
 /// The result of one [`auto_prime`] pass.
@@ -966,11 +1037,14 @@ pub struct AutoPrime {
 
 impl AutoPrime {
     /// Whether anything was written — the condition for an `info` log line.
+    /// Read from each row's [`AgentOutcome::wrote`], never from its outcome
+    /// word: an [`Outcome::Error`] row whose primer file was refused still
+    /// wrote its skills after that, under the user's home, and the line that
+    /// names them must be logged. (Until 2026-09-06 this asked for `Installed |
+    /// Updated`, so exactly that pass wrote and logged nothing.)
     #[must_use]
     pub fn changed(&self) -> bool {
-        self.agents
-            .iter()
-            .any(|a| matches!(a.outcome, Outcome::Installed | Outcome::Updated))
+        self.agents.iter().any(|a| !a.wrote.is_empty())
     }
 
     /// The rows that failed, for `warn` lines.
@@ -1034,9 +1108,38 @@ fn outcome_word(o: &Outcome) -> String {
 ///   [`Outcome::Error`] and the other agents still proceed. Every write is a
 ///   whole-file atomic replace ([`write_atomically`]), so nothing is ever left
 ///   half-edited — not even for the instant of the write.
+///
+/// Whenever anything was written, the summary follows the per-agent outcome
+/// words — exactly the short line an unchanged pass prints — with the off switch
+/// ([`AUTO_PRIME_OFF_SWITCH`]) and then EVERY FILE the pass wrote
+/// ([`AgentOutcome::wrote`] — `~/`-relative, as `aterm agents status` spells
+/// them). It is the one line a fresh session leaves in aterm.log — the GUI logs
+/// it exactly when [`AutoPrime::changed`], i.e. when any row wrote, an `Error`
+/// row included — and until 2026-09-06 it read only "agent primer: claude
+/// installed, codex installed" (measured on a first launch): files under
+/// `~/.claude` and `~/.codex`, unnamed, with the way to stop it stated only where
+/// a user who already knew to ask would find it (`aterm agents status`, `aterm
+/// help agents`, the README) and never on the line that reports the write. The
+/// file list goes LAST on purpose: aterm-log keeps one record body to 512 bytes
+/// and elides the tail, and a first pass over all four registry agents measures
+/// past that (`the_off_switch_survives_the_log_cap_on_a_four_agent_first_pass`),
+/// so the cap can clip only the list's tail — never the switch or a row's word.
 #[must_use]
 pub fn auto_prime(home: &Path) -> AutoPrime {
     auto_prime_with_xdg(home, xdg_config_home().as_deref())
+}
+
+/// [`auto_prime`] over a SESSION IDENTITY's directory ([`agent_homes`]): every
+/// agent path resolves under `dir` and nowhere else. `$XDG_CONFIG_HOME` is the
+/// HUMAN's redirection — it is not read here — so a `.config/`-rooted agent
+/// (OpenCode) that the human keeps under it is never detected, and never
+/// primed, while an identity is provisioned. Measured 2026-09-17 (review):
+/// with `XDG_CONFIG_HOME` set and an `opencode` directory under it,
+/// `auto_prime(&identity_dir)` detected the HUMAN's OpenCode and wrote aterm's
+/// `AGENTS.md` and command file into the human's tree.
+#[must_use]
+pub fn auto_prime_identity(dir: &Path) -> AutoPrime {
+    auto_prime_with_xdg(dir, None)
 }
 
 // Capture the environment at the public boundary. Every operation in one pass
@@ -1049,10 +1152,26 @@ fn auto_prime_with_xdg(home: &Path, xdg: Option<&Path>) -> AutoPrime {
             .iter()
             .map(|s| install_skill_file(&home_join(home, xdg, s.path), s.body))
             .collect();
+        // Exactly the paths THIS pass wrote — decided from the write results
+        // before they are folded into the row's one-word outcome (see
+        // `AgentOutcome::wrote`).
+        let mut wrote: Vec<String> = Vec::new();
+        if matches!(
+            primer,
+            Ok(PrimerWrite::Created | PrimerWrite::Appended | PrimerWrite::Replaced)
+        ) {
+            wrote.push(format!("~/{}", a.file));
+        }
+        for (skill, write) in skills_for(a.name).iter().zip(&skills) {
+            if matches!(write, Ok(SkillWrite::Installed | SkillWrite::Updated)) {
+                wrote.push(format!("~/{}", skill.path));
+            }
+        }
         agents.push(AgentOutcome {
             agent: a.name,
             product: a.product,
             outcome: fold_outcome(primer, &skills),
+            wrote,
         });
     }
     let summary = if agents.is_empty() {
@@ -1069,7 +1188,20 @@ fn auto_prime_with_xdg(home: &Path, xdg: Option<&Path>) -> AutoPrime {
             .iter()
             .map(|a| format!("{} {}", a.agent, outcome_word(&a.outcome)))
             .collect();
-        format!("agent primer: {}", rows.join(", "))
+        let mut s = format!("agent primer: {}", rows.join(", "));
+        // The switch, THEN the files — the log cap's order (see above): only the
+        // file list may lose its tail to aterm-log's 512-byte record cap.
+        let wrote: Vec<&str> = agents
+            .iter()
+            .flat_map(|a| a.wrote.iter().map(String::as_str))
+            .collect();
+        if !wrote.is_empty() {
+            s.push_str(" — ");
+            s.push_str(AUTO_PRIME_OFF_SWITCH);
+            s.push_str("; wrote ");
+            s.push_str(&wrote.join(", "));
+        }
+        s
     };
     AutoPrime { agents, summary }
 }
@@ -2292,6 +2424,25 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
 
     // ---- auto-prime ---------------------------------------------------------
 
+    /// aterm-log's cap on one record body (`aterm_log::MAX_RECORD_BYTES`): the GUI
+    /// logs the pass summary as ONE record, and past this many bytes the tail is
+    /// elided. This crate is dependency-free, so the figure is pinned here by
+    /// hand — change both or neither.
+    const MAX_RECORD_BYTES: usize = 512;
+
+    /// Every file a first pass writes for `agent`: its primer file, then each
+    /// bundled doc in registry order — the order [`AgentOutcome::wrote`] keeps.
+    /// DERIVED, so shipping another bundled doc updates the expectation.
+    fn first_pass_files(agent: &str) -> Vec<String> {
+        let a = AGENT_FILES
+            .iter()
+            .find(|a| a.name == agent)
+            .expect("a registry agent");
+        std::iter::once(format!("~/{}", a.file))
+            .chain(skills_for(agent).iter().map(|s| format!("~/{}", s.path)))
+            .collect()
+    }
+
     /// The GUI's pass: detected agents get primed (skills included), undetected
     /// agents get no directory, and the second pass changes nothing.
     #[test]
@@ -2309,9 +2460,33 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         );
         assert!(first.changed());
         assert_eq!(first.errors().count(), 0);
+        // The log line keeps the short outcome words, then names the way to stop
+        // it and every file it wrote.
+        assert_eq!(first.agents[0].wrote, first_pass_files("claude"));
+        assert_eq!(first.agents[1].wrote, first_pass_files("codex"));
+        let wrote = [first_pass_files("claude"), first_pass_files("codex")].concat();
         assert_eq!(
             first.summary,
-            "agent primer: claude installed, codex installed"
+            format!(
+                "agent primer: claude installed, codex installed — {AUTO_PRIME_OFF_SWITCH}; \
+                 wrote {}",
+                wrote.join(", ")
+            )
+        );
+        assert!(
+            first
+                .summary
+                .contains("; wrote ~/.claude/CLAUDE.md, ~/.claude/skills/drive-aterm/SKILL.md, "),
+            "{}",
+            first.summary
+        );
+        // Two agents — the common machine — fit ONE log record whole, every file
+        // named.
+        assert!(
+            first.summary.len() <= MAX_RECORD_BYTES,
+            "{} bytes: {}",
+            first.summary.len(),
+            first.summary
         );
 
         assert_eq!(
@@ -2340,9 +2515,34 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             second.agents
         );
         assert!(!second.changed());
+        // Nothing written ⇒ no file list and no off switch: the knob rides only
+        // on a line that reports a write, so the unchanged line stays short.
         assert_eq!(
             second.summary,
             "agent primer: claude unchanged, codex unchanged"
+        );
+    }
+
+    /// The off switch is ONE phrase in two places — the parenthetical of the
+    /// footer `aterm agents status` / `remove` print and the phrase the logged
+    /// summary carries ahead of its file list — so the sentence a user is told
+    /// when they ask and the one in aterm.log cannot drift apart. (The installed
+    /// block itself stays knob-free on purpose: it is the agent's brief, not the
+    /// user's notice.)
+    #[test]
+    fn the_summary_and_the_status_footer_name_one_off_switch() {
+        assert!(
+            AUTO_PRIME_NOTE.contains(AUTO_PRIME_OFF_SWITCH),
+            "{AUTO_PRIME_NOTE:?} must carry {AUTO_PRIME_OFF_SWITCH:?}"
+        );
+        let home = aterm_tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let (status, _) = agents_report(home.path(), &["status".to_string()]);
+        assert!(status.contains(AUTO_PRIME_OFF_SWITCH), "{status}");
+        let summary = auto_prime(home.path()).summary;
+        assert!(
+            summary.contains(&format!(" — {AUTO_PRIME_OFF_SWITCH}; wrote ~/")),
+            "a pass that wrote something names the switch ahead of its files: {summary}"
         );
     }
 
@@ -2358,6 +2558,16 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
 
         let pass = auto_prime(home.path());
         assert_eq!(pass.agents[0].outcome, Outcome::Updated, "{}", pass.summary);
+        // An update names the switch, then the primer it rewrote and each doc it
+        // laid beside it (the fabric prompt was absent, so it was installed).
+        assert_eq!(pass.agents[0].wrote, first_pass_files("codex"));
+        assert_eq!(
+            pass.summary,
+            format!(
+                "agent primer: codex updated — {AUTO_PRIME_OFF_SWITCH}; wrote {}",
+                first_pass_files("codex").join(", ")
+            )
+        );
         let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(content.starts_with(user));
         assert!(
@@ -2418,6 +2628,125 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         assert_eq!(
             std::fs::read_to_string(home.path().join(".gemini/GEMINI.md")).unwrap(),
             corrupt
+        );
+    }
+
+    /// An `Error` row can still have WRITTEN: `auto_prime` refuses the corrupt
+    /// primer file first (`upsert_primer_file` diagnoses the block before it
+    /// writes anything) and does not stop there, so the agent's skills are
+    /// still written after it (claude's skill files here). `changed()` is
+    /// "was anything written", not "does the row's word say installed/updated"
+    /// — so the GUI logs the line — and that line names the off switch and the
+    /// files, as any line that reports a write must. (The pre-fix `changed()`
+    /// matched only `Installed | Updated`, so exactly this pass wrote claude's
+    /// skill files under `~/.claude` and logged nothing.)
+    #[test]
+    fn an_error_row_that_wrote_its_skills_is_a_change_and_names_them() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let corrupt = "x\n<!-- aterm primer v1 -->\nno end marker\n";
+        std::fs::write(home.path().join(".claude/CLAUDE.md"), corrupt).unwrap();
+
+        let pass = auto_prime(home.path());
+        assert_eq!(pass.agents.len(), 1, "{}", pass.summary);
+        let row = &pass.agents[0];
+        assert!(matches!(row.outcome, Outcome::Error(_)), "{row:?}");
+        // Every claude doc, and not the primer file it refused to touch.
+        assert_eq!(row.wrote, first_pass_files("claude")[1..].to_vec());
+        assert!(
+            !row.wrote.iter().any(|f| f == "~/.claude/CLAUDE.md"),
+            "{row:?}"
+        );
+        assert!(
+            pass.changed(),
+            "an error row that wrote is a change: {}",
+            pass.summary
+        );
+        assert_eq!(pass.errors().count(), 1);
+        assert!(
+            pass.summary.starts_with("agent primer: claude ERROR: "),
+            "{}",
+            pass.summary
+        );
+        assert!(
+            pass.summary.ends_with(&format!(
+                " — {AUTO_PRIME_OFF_SWITCH}; wrote {}",
+                row.wrote.join(", ")
+            )),
+            "{}",
+            pass.summary
+        );
+        // The corrupt file is byte-for-byte untouched; the skills are on disk.
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".claude/CLAUDE.md")).unwrap(),
+            corrupt
+        );
+        for path in &row.wrote {
+            let rel = path.strip_prefix("~/").unwrap();
+            assert!(
+                home.path().join(rel).is_file(),
+                "{path} was named but not written"
+            );
+        }
+
+        // A second pass writes nothing — still an error, no longer a change, and
+        // the short line: no file list, no off switch.
+        let second = auto_prime(home.path());
+        assert!(matches!(second.agents[0].outcome, Outcome::Error(_)));
+        assert!(second.agents[0].wrote.is_empty(), "{:?}", second.agents[0]);
+        assert!(!second.changed(), "{}", second.summary);
+        assert!(!second.summary.contains("; wrote "), "{}", second.summary);
+        assert!(
+            !second.summary.contains(AUTO_PRIME_OFF_SWITCH),
+            "{}",
+            second.summary
+        );
+    }
+
+    /// The cap's order. aterm-log keeps one record body to [`MAX_RECORD_BYTES`]
+    /// and elides the tail; a first pass over ALL FOUR registry agents, every doc
+    /// written, is where the summary is longest — so the switch rides AHEAD of
+    /// the file list and every agent's word ahead of the switch, and whatever the
+    /// cap takes comes off the list's tail.
+    #[test]
+    fn the_off_switch_survives_the_log_cap_on_a_four_agent_first_pass() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        for a in AGENT_FILES {
+            std::fs::create_dir_all(home.path().join(a.dir)).unwrap();
+        }
+        let pass = auto_prime(home.path());
+        assert_eq!(pass.agents.len(), AGENT_FILES.len(), "{}", pass.summary);
+        assert!(
+            pass.agents.iter().all(|a| a.outcome == Outcome::Installed),
+            "{}",
+            pass.summary
+        );
+        let switch = pass
+            .summary
+            .find(AUTO_PRIME_OFF_SWITCH)
+            .expect("a pass that wrote names the switch");
+        let switch_end = switch + AUTO_PRIME_OFF_SWITCH.len();
+        assert!(
+            switch_end <= MAX_RECORD_BYTES,
+            "the switch ends at byte {switch_end}, past the {MAX_RECORD_BYTES}-byte cap: {}",
+            pass.summary
+        );
+        for a in AGENT_FILES {
+            let word = pass
+                .summary
+                .find(&format!("{} installed", a.name))
+                .expect("every agent's word");
+            assert!(word < switch, "{}", pass.summary);
+        }
+        let wrote: Vec<String> = AGENT_FILES
+            .iter()
+            .flat_map(|a| first_pass_files(a.name))
+            .collect();
+        assert!(
+            pass.summary
+                .ends_with(&format!("; wrote {}", wrote.join(", "))),
+            "{}",
+            pass.summary
         );
     }
 
@@ -2753,6 +3082,157 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
                 );
             }
         }
+    }
+
+    /// THE IDENTITY TABLE IS THE ROSTER (session identities, 2026-09-17). Every
+    /// row with a measured variable names the agent's OWN config dir as its
+    /// subdirectory — one segment, no `.config/` indirection — so
+    /// `CLAUDE_CONFIG_DIR=<idir>/.claude` is exactly where `auto_prime(&idir)`
+    /// writes the primer and the skills, and the fabric hooks the identity's
+    /// `settings.json` carries sit where the agent reads them. A `var` on an
+    /// agent whose dir is not a single top-level segment, or a second row
+    /// claiming the same variable, is the drift this pins against.
+    #[test]
+    fn the_identity_table_is_the_roster_read_through_its_var_column() {
+        let rows: Vec<AgentHome> = agent_homes().collect();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.agent, r.var, r.sub))
+                .collect::<Vec<_>>(),
+            vec![
+                ("claude", "CLAUDE_CONFIG_DIR", ".claude"),
+                ("codex", "CODEX_HOME", ".codex"),
+            ],
+            "the two measured agents, in registry order; Gemini/OpenCode wait for a measurement"
+        );
+        for r in &rows {
+            let a = AGENT_FILES
+                .iter()
+                .find(|a| a.name == r.agent)
+                .expect("a row of the roster");
+            assert_eq!(r.sub, a.dir, "{}: the sub IS the roster dir", r.agent);
+            assert_eq!(r.product, a.product);
+            assert!(
+                !r.sub.contains('/') && r.sub.starts_with('.'),
+                "{}: one dotted segment under the identity dir, got {}",
+                r.agent,
+                r.sub
+            );
+            assert!(
+                r.var.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "{}: an environment variable name, got {}",
+                r.agent,
+                r.var
+            );
+            assert!(
+                a.file.starts_with(a.dir)
+                    && skills_for(a.name).iter().all(|s| s.path.starts_with(a.dir)),
+                "{}: the primer and the skills land under the relocated dir",
+                r.agent
+            );
+        }
+        let mut vars: Vec<&str> = rows.iter().map(|r| r.var).collect();
+        vars.dedup();
+        assert_eq!(vars.len(), rows.len(), "no two agents share a variable");
+    }
+
+    /// An identity dir primed through the public entry point carries every
+    /// measured agent's primer file and skills — the agent subdirs aterm made
+    /// are what `auto_prime` detects, so nothing else in the tree is touched.
+    #[test]
+    fn a_primed_identity_dir_carries_the_docs_of_every_measured_agent() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-primer-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        for r in agent_homes() {
+            std::fs::create_dir_all(dir.join(r.sub)).unwrap();
+        }
+        let pass = auto_prime_with_xdg(&dir, None);
+        assert_eq!(
+            pass.agents.iter().map(|a| a.agent).collect::<Vec<_>>(),
+            agent_homes().map(|r| r.agent).collect::<Vec<_>>(),
+            "exactly the measured agents were detected: {}",
+            pass.summary
+        );
+        for r in agent_homes() {
+            let a = AGENT_FILES.iter().find(|a| a.name == r.agent).unwrap();
+            assert!(dir.join(a.file).is_file(), "{}: primer file", r.agent);
+            for s in skills_for(r.agent) {
+                assert!(dir.join(s.path).is_file(), "{}: {}", r.agent, s.path);
+            }
+        }
+        assert!(
+            !dir.join(".gemini").exists() && !dir.join(".config").exists(),
+            "an agent without a var is not detected, so nothing of it is created"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AN IDENTITY IS PRIMED UNDER ITSELF ALONE (review, 2026-09-17). With the
+    /// human's `$XDG_CONFIG_HOME` pointing at a tree that holds an `opencode`
+    /// directory, `auto_prime` over an identity dir follows that redirection
+    /// for the `.config/` row — the measured leak: the human's OpenCode tree
+    /// gains aterm's `AGENTS.md` while an identity is provisioned.
+    /// [`auto_prime_identity`] never reads the redirection: the same tree is
+    /// left untouched, and only the agents whose dirs sit under the identity
+    /// are primed.
+    #[test]
+    fn an_identity_is_primed_under_itself_and_never_through_the_humans_xdg_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-primer-identity-xdg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let xdg = root.join("xdg");
+        let humans_opencode = xdg.join("opencode");
+        std::fs::create_dir_all(&humans_opencode).unwrap();
+        let dir = root.join("identities").join("worker");
+        for r in agent_homes() {
+            std::fs::create_dir_all(dir.join(r.sub)).unwrap();
+        }
+        let names = |d: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        // The identity entry point: the two measured agents, nothing under XDG.
+        let pass = auto_prime_identity(&dir);
+        assert_eq!(
+            pass.agents.iter().map(|a| a.agent).collect::<Vec<_>>(),
+            agent_homes().map(|r| r.agent).collect::<Vec<_>>(),
+            "{}",
+            pass.summary
+        );
+        assert!(
+            names(&humans_opencode).is_empty(),
+            "the human's OpenCode tree is untouched: {:?}",
+            names(&humans_opencode)
+        );
+        assert!(!dir.join(".config").exists());
+        // The CONTRAST, the leak as measured: the same pass with the human's
+        // redirection honored detects the human's OpenCode and writes into it.
+        let leaked = auto_prime_with_xdg(&dir, Some(&xdg));
+        assert!(
+            leaked.agents.iter().any(|a| a.agent == "opencode"),
+            "{}",
+            leaked.summary
+        );
+        assert!(
+            humans_opencode.join("AGENTS.md").is_file(),
+            "this is what `auto_prime(&identity_dir)` did under a set XDG_CONFIG_HOME"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The fabric paragraph reaches EVERY agent, not only the one with a skills

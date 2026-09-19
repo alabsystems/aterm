@@ -12,8 +12,9 @@ description = "aterm — the transparent session: runs your shell unchanged, byt
 [dependencies]
 aterm-core = { workspace = true }
 # P0: the daily-driver CLI runs the shell through the PROTECTED spawn seam
-# (cap-gated + setrlimit-bounded + fail-closed fork/exec + OS-sandbox-wrapped when
-# the mode demands it), exactly like aterm-gui — not raw forkpty/execvp.
+# (cap-gated + fail-closed fork/exec + OS-sandbox-wrapped when the mode demands
+# it + resource-bounded in the confinement modes only, safety/containment — see
+# `session_limits` in lib.rs), exactly like aterm-gui — not raw forkpty/execvp.
 aterm-pty = { workspace = true }
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 aterm-sandbox = { workspace = true }
@@ -45,6 +46,12 @@ aterm-primer = { workspace = true }
 # by the print-and-exit path, never the shell hot path; the one binary links the
 # updater already.
 aterm-update = { workspace = true }
+# `aterm list-kitty-commands` and `aterm help kitty` print the kitty-command
+# vocabulary FROM the table the typed-line listener compiles (aterm-lexicon's
+# `tricks` module), so the listing cannot drift from the words that fire. Pure
+# data and a fold: reached only by those two print-and-exit paths, never the shell
+# hot path, and the one binary links the lexicon already (through the window).
+aterm-lexicon = { workspace = true }
 
 # The POSIX console driver (driver_unix.rs: termios raw mode + poll(2) loop);
 # the Windows driver is kernel32 console FFI with no libc.

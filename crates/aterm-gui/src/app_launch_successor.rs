@@ -389,7 +389,7 @@ pub(crate) fn launch_app_bundle(
     // mistake fails the same way (and is caught by the same tests) wherever it is
     // built — the non-macOS stub then refuses the platform, not the request.
     let request = validate_request(bundle, arguments, environment)?;
-    begin_launch_validated(&request)?.wait(budget)
+    begin_launch_validated(&request, false)?.wait(budget)
 }
 
 /// [`launch_app_bundle`] split at the instant the call is ISSUED (2026-09-14):
@@ -405,13 +405,24 @@ pub(crate) fn launch_app_bundle(
 /// backlog: every launched-lane handoff froze the terminal 5.3–5.8 s on this
 /// machine, against 272 ms on the fork lane. The answer was never the
 /// liveness signal; the dial is.
+///
+/// `activate` is whether LaunchServices should bring the successor to the
+/// front. TRUE ONLY WHEN AN ATERM WINDOW HAD FOCUS (2026-09-18): the successor
+/// takes over the user's windows, so when the user was looking at aterm it must
+/// be the frontmost app in the outgoing process's place — but the automatic lane
+/// prefers exactly the moments when no aterm window is focused (the user is in
+/// another app), and activating there stole their keyboard: an update landing
+/// while they typed in a browser popped aterm to the front. With `false` the
+/// successor's windows come up where the outgoing ones were, behind whatever
+/// the user is using.
 pub(crate) fn begin_launch(
     bundle: &Path,
     arguments: &[OsString],
     environment: &[(OsString, OsString)],
+    activate: bool,
 ) -> Result<LaunchInFlight, LaunchError> {
     let request = validate_request(bundle, arguments, environment)?;
-    begin_launch_validated(&request)
+    begin_launch_validated(&request, activate)
 }
 
 /// A launch LaunchServices has been asked for, whose answer may still be in
@@ -554,7 +565,10 @@ fn env_key_fault(key: &str) -> Option<TextFault> {
 /// the same thing a reader of the fork-lane log wants to know — instead of
 /// vanishing into a bare error value.
 #[cfg(not(target_os = "macos"))]
-fn begin_launch_validated(request: &LaunchRequest) -> Result<LaunchInFlight, LaunchError> {
+fn begin_launch_validated(
+    request: &LaunchRequest,
+    _activate: bool,
+) -> Result<LaunchInFlight, LaunchError> {
     aterm_log::warn!(
         "no LaunchServices on this platform: declining to launch {} as its own job \
          ({} argument(s), {} environment key(s)); the caller keeps its windows and \
@@ -568,7 +582,10 @@ fn begin_launch_validated(request: &LaunchRequest) -> Result<LaunchInFlight, Lau
 
 /// The AppKit half.
 #[cfg(target_os = "macos")]
-fn begin_launch_validated(request: &LaunchRequest) -> Result<LaunchInFlight, LaunchError> {
+fn begin_launch_validated(
+    request: &LaunchRequest,
+    activate: bool,
+) -> Result<LaunchInFlight, LaunchError> {
     use std::ffi::c_void;
 
     use aterm_objc::{Bool, Id, Obj, RcBlock, Sel, autoreleasepool, class, sel};
@@ -733,10 +750,13 @@ fn begin_launch_validated(request: &LaunchRequest) -> Result<LaunchInFlight, Lau
         // quarantine/consent dialog would burn the whole budget and strand the
         // user mid-update with the answer still pending.
         appkit::send_v_bool(configuration, sel!(setPromptsUserIfNeeded:), false);
-        // The successor takes over the user's windows, so it — not the outgoing
-        // process, which is about to exit — must be the frontmost app. Set
-        // explicitly because it is load-bearing, not incidental.
-        appkit::send_v_bool(configuration, sel!(setActivates:), true);
+        // The successor takes over the user's windows, so WHEN THE USER WAS
+        // LOOKING AT ATERM it — not the outgoing process, which is about to exit
+        // — must be the frontmost app. When no aterm window had focus the user is
+        // in another app and the update must not take their keyboard
+        // (2026-09-18): the successor comes up behind. Set explicitly either
+        // way because it is load-bearing, not incidental.
+        appkit::send_v_bool(configuration, sel!(setActivates:), activate);
         appkit::send_v_id(configuration, sel!(setArguments:), arguments);
         appkit::send_v_id(configuration, sel!(setEnvironment:), environment);
         let workspace = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));

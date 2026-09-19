@@ -8,7 +8,7 @@
 # lines (20 targo, 2 targo-tippy). This file is that multiset with exactly:
 #   * the lane columns of the stages that moved lane (target_design
 #     lanes_and_target_dirs): the regex lane -> <root>/target-regex and
-#     CARGO_BUILD_JOBS=4; the five xtask verbs -> <root>/target-xtask, 4; the
+#     CARGO_BUILD_JOBS=4; every xtask verb -> <root>/target-xtask, 4; the
 #     smoke, redraw and eight objc builds -> <root>/target-drivers, 8; the L0
 #     gate -> its explicit <root>/tools/freeze-safety-gate/target. Argv,
 #     RUSTDOC and ATERM_SEARCH_REGEX_LANE are unchanged on every one of them.
@@ -25,6 +25,10 @@
 #     same lane — `build -q -p atpkg`, the binary its end-to-end pack suite
 #     drives through $ATPKG. Until then the row was Lane::Pure at t0 and drove
 #     whatever `<root>/target/debug/atpkg` a PREVIOUS run had left.
+#   * exception 5 (2026-09-17): `gate citations` joined the xtask lane. It is a
+#     directory walk over the release + packaging surface, so it costs a second
+#     and rides the merge contract rather than living only in `gate all`, which
+#     nothing automatic invokes (crates/xtask/src/gate.rs' header says so).
 # `<inherited>` means the child got the test process's own value.
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build --workspace
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --doc --workspace --no-fail-fast
@@ -44,6 +48,7 @@ targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherit
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-objc --example objc_bound_drive
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-objc --example objc_swizzle_drive
 targo CARGO_TARGET_DIR=<root>/target-regex CARGO_BUILD_JOBS=4 RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=1 -- --unverified test -p aterm-search --features regex --no-fail-fast
+targo CARGO_TARGET_DIR=<root>/target-xtask CARGO_BUILD_JOBS=4 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified run -q -p xtask -- gate citations
 targo CARGO_TARGET_DIR=<root>/target-xtask CARGO_BUILD_JOBS=4 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified run -q -p xtask -- gate counts
 targo CARGO_TARGET_DIR=<root>/target-xtask CARGO_BUILD_JOBS=4 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified run -q -p xtask -- gate dormant
 targo CARGO_TARGET_DIR=<root>/target-xtask CARGO_BUILD_JOBS=4 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified run -q -p xtask -- gate drift

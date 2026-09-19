@@ -6737,8 +6737,8 @@ fn page(
             SettingsRoute::Home => top_settings_page(state, width, cx),
             SettingsRoute::Manual => manual_page(state, cx, width),
             SettingsRoute::Modified => settings_fields_page(state, true, cx, width, packages),
-            SettingsRoute::TabColor => tab_color_page(state, width),
-            SettingsRoute::Wallpaper => wallpaper_page(state, width),
+            SettingsRoute::TabColor => tab_color_page(state, width, cx.viewport),
+            SettingsRoute::Wallpaper => wallpaper_page(state, width, cx.viewport),
             SettingsRoute::SoftwareUpdate => update_page(
                 state,
                 update,
@@ -7441,6 +7441,181 @@ fn settings_page_content_width(viewport_width: f32, width: SettingsWidth, maximu
     };
     let insets = page_insets(viewport_width, width, maximum);
     (viewport_width - navigation - insets.left - insets.right).max(0.0)
+}
+
+/// The vertical measure a page's own children really get: the viewport less
+/// the chrome above and below it and the page's own insets.
+///
+/// `page` is a CLIPPED column, so a card that outgrows this does not push the
+/// page taller — it pushes its own last child under the clip, and on the
+/// Wallpaper page that last child is a button. A clipped hit target is a
+/// broken promise, which is why wrapped copy is bounded against this.
+fn settings_page_body_height(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    let insets = responsive_page_insets(
+        viewport.width,
+        viewport.height,
+        width,
+        page_maximum(state.route, width),
+    );
+    let chrome = if width == SettingsWidth::Compact {
+        compact_header_height(state, viewport)
+            + if compact_status_dock_required(state, viewport) {
+                0.0
+            } else {
+                settings_status_bars_height(state)
+            }
+    } else {
+        settings_status_bars_height(state)
+    };
+    (viewport.height - chrome - insets.top - insets.bottom).max(0.0)
+}
+
+/// The width a full-width settings CARD gives the text inside it: the page's
+/// content column less the 12pt padding pair every card wears
+/// ([`top_card`], [`smart_title_health_card`], the macOS access block).
+///
+/// Authoring copy without measuring against THIS is what the 2026-09 settings
+/// audit caught: the Wallpaper card's two sentences need 968.6 and 796.7
+/// points and never get more than 696, because [`page_insets`] caps the
+/// content column at [`page_maximum`]'s 720 at EVERY window size.
+fn settings_card_text_width(
+    viewport: LogicalRect,
+    width: SettingsWidth,
+    route: SettingsRoute,
+) -> f32 {
+    (settings_page_content_width(viewport.width, width, page_maximum(route, width)) - 24.0)
+        .max(48.0)
+}
+
+/// Exact visual lines for settings copy, measured at the size and face the
+/// painter will draw it and wrapped to `available_width`.
+///
+/// Trailing run-of-line whitespace is dropped: it paints nothing, and carrying
+/// it would leave a line measuring a space wider than the box it was wrapped
+/// for — which is the one thing [`crate::native_ui`]'s fit audit calls
+/// `overflow`.
+fn wrapped_copy_lines(text: &str, px: f32, available_width: f32) -> Vec<String> {
+    let available_width = available_width.max(48.0);
+    text.split('\n')
+        .flat_map(|paragraph| {
+            crate::tray_raster::ui_text_wrap_ranges(paragraph, px, available_width)
+                .into_iter()
+                .map(move |range| paragraph[range].trim_end().to_string())
+        })
+        .collect()
+}
+
+/// Trim `line` until it plus an ellipsis fits `max_width`.
+///
+/// Pushing the ellipsis onto a line the wrapper had already packed to the full
+/// measure puts it fractionally past its box — a real painted overflow the
+/// renderer audit measures. [`bound_outcome_lines`] was corrected for exactly
+/// that on the Update page in 2026-08; this is the same correction.
+fn elide_wrapped_copy_tail(
+    line: &str,
+    px: f32,
+    face: crate::widget::TextFace,
+    max_width: f32,
+) -> String {
+    let mut graphemes = line.graphemes().collect::<Vec<_>>();
+    loop {
+        let candidate = format!("{}\u{2026}", graphemes.concat().trim_end());
+        if crate::tray_raster::ui_text_width_for(face, &candidate, px) <= max_width
+            || graphemes.is_empty()
+        {
+            return candidate;
+        }
+        graphemes.pop();
+    }
+}
+
+/// A block of settings copy that WRAPS to its column instead of handing the
+/// painter one line to ellipsize.
+///
+/// [`group_footnote_lines`] already states this law for consequence notes —
+/// "Safety language must not disappear behind a semantic-only ellipsis" — and
+/// explanatory descriptions and consolidated status rows carry the same kind of
+/// load. The 2026-09 settings audit measured three of them dropping 108.7,
+/// 209.1 and 280.6 points of text at the SHIPPED DEFAULT 80x24 window: the
+/// sentence naming the Appearance page the wallpaper dim/tint controls live on,
+/// and the clause reporting whether the Smart Titles provider errored (and, in
+/// the error case, the error text itself, since it is composed last).
+///
+/// The complete string stays on the returned group's semantic label, so
+/// `semantic(key)` lookups and assistive technology still read it whole; the
+/// children are paint-only visual lines. The caller MUST charge the returned
+/// height to its page-capacity calculation, exactly as [`group_footnote_node`]'s
+/// caller does. Copy that already fits is unchanged — it wraps to one line.
+///
+/// `max_lines` bounds the wrap for a caller whose host cannot seat every line
+/// (the compact runtime-health card, which must still leave a whole control
+/// row on a 320-point landscape page). The bound marks itself the way the
+/// Update page's outcome card already does — see [`bound_outcome_lines`]:
+/// the last retained line ends in an ellipsis that FITS, so the reader is told
+/// the copy ran out of room instead of finding it silently ending early.
+fn wrapped_copy_node(
+    key: &str,
+    text: &str,
+    role: SemanticRole,
+    style: StyleRef,
+    available_width: f32,
+    line_height: f32,
+    max_lines: Option<usize>,
+) -> (UiNode, f32) {
+    let (px, face) = crate::native_ui::text_paint_metrics(role, style);
+    // `ui_text_wrap_ranges` charges the UI face's advances, so a role/style
+    // pair the painter draws in another face would wrap to the wrong measure.
+    // Every caller here is ordinary copy; this pins that.
+    debug_assert!(
+        face == crate::widget::TextFace::Ui,
+        "wrapped settings copy must be UI-face copy"
+    );
+    let mut lines = wrapped_copy_lines(text, px, available_width);
+    if let Some(max) = max_lines.filter(|max| *max >= 1 && lines.len() > *max) {
+        lines.truncate(max);
+        if let Some(last) = lines.pop() {
+            lines.push(elide_wrapped_copy_tail(&last, px, face, available_width));
+        }
+    }
+    let height = lines.len().max(1) as f32 * line_height;
+    let children = lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            UiNode::new(
+                format!("{key}/line-{index}"),
+                UiContent::Text(TextSpec {
+                    text: line,
+                    role,
+                    style,
+                }),
+            )
+            .layout(Layout::default().height(Length::Fixed(line_height)))
+            .paint_only()
+        })
+        .collect::<Vec<_>>();
+    (
+        UiNode::new(
+            key.to_string(),
+            UiContent::Group(GroupSpec {
+                label: Some(text.to_string()),
+                role,
+                style: StyleRef::Plain,
+            }),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(height))
+                .gap(0.0),
+        )
+        .children(children),
+        height,
+    )
 }
 
 fn choice_navigation_button_width() -> f32 {
@@ -8368,6 +8543,15 @@ fn top_setting_row(
     Some(row)
 }
 
+/// `text_width` is the width this card's own text really gets — normally
+/// [`settings_card_text_width`], and the half-column measure where the Home
+/// grid seats two cards side by side. The description WRAPS to it; authoring a
+/// sentence against an imagined column is what left the Wallpaper card painting
+/// an ellipsis at every window size (2026-09 settings audit).
+// Eight parameters: the card's identity, its two texts, the preview, the rows,
+// and the three measures the wrap needs — a struct for one caller would only
+// move the same eight names one level down.
+#[allow(clippy::too_many_arguments)]
 fn top_card(
     semantic_key: &str,
     title: &str,
@@ -8375,9 +8559,10 @@ fn top_card(
     preview: Option<UiNode>,
     rows: Vec<UiNode>,
     width: SettingsWidth,
+    text_width: f32,
+    description_lines: Option<usize>,
 ) -> (UiNode, f32) {
     let heading_height = group_heading_label_height();
-    let description_height = description.map_or(0.0, |_| page_subtitle_height());
     let mut children = vec![
         UiNode::new(
             format!("settings/top/{semantic_key}/heading"),
@@ -8398,15 +8583,16 @@ fn top_card(
     ];
     if let Some(description) = description {
         children.push(
-            UiNode::new(
-                format!("settings/top/{semantic_key}/description"),
-                UiContent::Text(TextSpec {
-                    text: description.to_string(),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Quiet,
-                }),
+            wrapped_copy_node(
+                &format!("settings/top/{semantic_key}/description"),
+                description,
+                SemanticRole::Text,
+                StyleRef::Quiet,
+                text_width,
+                page_subtitle_height(),
+                description_lines,
             )
-            .layout(Layout::default().height(Length::Fixed(description_height))),
+            .0,
         );
     }
     children.extend(preview);
@@ -8638,6 +8824,8 @@ fn top_section_card(
             regular
         })
     };
+    // One section card per virtual page: it spans the whole content column.
+    let text_width = settings_card_text_width(cx.viewport, width, SettingsRoute::Home);
     let card = match section {
         0 => top_card(
             "theme",
@@ -8655,6 +8843,8 @@ fn top_section_card(
             ),
             row(prefs::EDIT_THEME, None),
             width,
+            text_width,
+            None,
         ),
         1 => {
             let mut rows = row(prefs::EDIT_WINDOW_THEME, None);
@@ -8701,6 +8891,8 @@ fn top_section_card(
                 ),
                 rows,
                 width,
+                text_width,
+                None,
             )
         }
         2 => top_card(
@@ -8722,6 +8914,8 @@ fn top_section_card(
                 Some(top_projected_trail_value(state)),
             ),
             width,
+            text_width,
+            None,
         ),
         3 => {
             let mut rows = row(
@@ -8749,6 +8943,8 @@ fn top_section_card(
                 None,
                 rows,
                 width,
+                text_width,
+                None,
             )
         }
         4 => top_card(
@@ -8764,6 +8960,8 @@ fn top_section_card(
                 Some(top_projected_toy_value(state, SPARKLE_WORDS_KEY).to_string()),
             ),
             width,
+            text_width,
+            None,
         ),
         _ => top_card(
             "keyword-kitties",
@@ -8784,6 +8982,8 @@ fn top_section_card(
                 Some(top_projected_toy_value(state, KEYWORD_KITTIES_KEY).to_string()),
             ),
             width,
+            text_width,
+            None,
         ),
     };
     if let Some(limit) = height_limit {
@@ -8925,7 +9125,13 @@ fn display_font_ids(raw: Option<&str>) -> Vec<String> {
 /// Sits below the live preview on the Text & Fonts page (Medium/Wide);
 /// Compact keeps the registry popup row instead. Returns the node + its exact
 /// authored height for the page's budget math.
-fn display_faces_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNode, f32) {
+fn display_faces_card(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+    route: SettingsRoute,
+) -> (UiNode, f32) {
+    let text_width = settings_card_text_width(viewport, width, route);
     let current = state.raw_value(prefs::EDIT_DISPLAY_FONT);
     let active = display_font_ids(current.as_deref());
     let pending = state.config_key_pending(prefs::EDIT_DISPLAY_FONT);
@@ -9026,6 +9232,8 @@ fn display_faces_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNod
         None,
         rows,
         width,
+        text_width,
+        None,
     )
 }
 
@@ -9043,7 +9251,9 @@ fn cursor_kitty_card(
     state: &SettingsViewState,
     width: SettingsWidth,
     viewport: LogicalRect,
+    route: SettingsRoute,
 ) -> (UiNode, f32) {
+    let text_width = settings_card_text_width(viewport, width, route);
     let rows = top_setting_row(
         state,
         prefs::EDIT_CURSOR_TRAIL_STYLE,
@@ -9068,6 +9278,8 @@ fn cursor_kitty_card(
         None,
         rows,
         width,
+        text_width,
+        None,
     )
 }
 
@@ -9075,7 +9287,12 @@ fn cursor_kitty_card(
 /// `active_tab_color` key (click anywhere on the disk to pick that color for
 /// the selected tab), plus the "Transparent white" reset that restores the
 /// translucent system default.
-fn tab_color_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode> {
+fn tab_color_page(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> Vec<UiNode> {
+    let text_width = settings_card_text_width(viewport, width, SettingsRoute::TabColor);
     let mut out = page_heading(
         "Tab Color",
         "Click anywhere on the spectrum — your selected tab wears that color everywhere.",
@@ -9147,6 +9364,8 @@ fn tab_color_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode
         None,
         vec![wheel, status, reset],
         width,
+        text_width,
+        None,
     );
     out.push(card);
     out
@@ -9159,7 +9378,19 @@ fn tab_color_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode
 /// "Detach" clears the key so every terminal tab returns to the flat theme
 /// background. The legibility dim slider lives on the Appearance page with the
 /// other registered rows (this page points there).
-fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode> {
+fn wallpaper_page(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> Vec<UiNode> {
+    const DESCRIPTION: &str = "The picture is cover-scaled to the window and shows through \
+         every cell that carries the default background; selections and colored \
+         backgrounds still paint over it.";
+    const HINT: &str = "Appearance page extras: \"Wallpaper dim\" tones the image toward \
+         the theme background; \"Wallpaper text tint\" colors the text to match the \
+         picture behind it.";
+
+    let text_width = settings_card_text_width(viewport, width, SettingsRoute::Wallpaper);
     let mut out = page_heading(
         "Wallpaper",
         "Pick an image and every terminal tab wears it — settings tabs stay plain.",
@@ -9236,35 +9467,61 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode
             .width(Length::Fixed(220.0 * settings_text_scale().min(1.4)))
             .height(Length::Fixed(32.0)),
     );
-    let hint = UiNode::new(
-        "settings/wallpaper/hint",
-        UiContent::Text(TextSpec {
-            text: "Appearance page extras: \"Wallpaper dim\" tones the image toward the \
-                   theme background; \"Wallpaper text tint\" colors the text to match \
-                   the picture behind it."
-                .to_string(),
-            role: SemanticRole::Status,
-            style: StyleRef::Quiet,
-        }),
-    )
-    .layout(
-        Layout::default()
-            .width(Length::Fill)
-            .height(Length::Fixed(22.0)),
-    );
-    let (card, _height) = top_card(
-        "wallpaper",
-        "Terminal backdrop",
-        Some(
-            "The picture is cover-scaled to the window and shows through every cell \
-             that carries the default background; selections and colored backgrounds \
-             still paint over it.",
-        ),
-        None,
-        vec![status, choose, detach, hint],
-        width,
-    );
-    out.push(card);
+    // BOTH SENTENCES WRAP, not clamp. One fixed line cut the description at
+    // "…sele…" and the hint — the only pointer to where the dim and text-tint
+    // controls live — at "…to mat…", 280.6 and 108.7 points of them, at EVERY
+    // window size and with nothing to recover either (2026-09 settings audit).
+    //
+    // What the wrap may not do is push the Detach button under the page clip.
+    // `page` is a clipped column and this card's last child is a control, so
+    // the two sentences yield a line at a time — the explanatory description
+    // first, the actionable hint last, the same precedence `constrain_top_card`
+    // already applies — until the whole card fits the page's own body. At the
+    // shipped 744x420 default nothing yields (207 points of that page were
+    // empty under a row cut mid-word); only the 320-point landscape host, which
+    // could not seat both sentences whole on ANY build, spends the ladder.
+    let card = |description_lines: usize, hint_lines: usize| {
+        let (hint, _) = wrapped_copy_node(
+            "settings/wallpaper/hint",
+            HINT,
+            SemanticRole::Status,
+            StyleRef::Quiet,
+            text_width,
+            22.0,
+            Some(hint_lines),
+        );
+        top_card(
+            "wallpaper",
+            "Terminal backdrop",
+            Some(DESCRIPTION),
+            None,
+            vec![status.clone(), choose.clone(), detach.clone(), hint],
+            width,
+            text_width,
+            Some(description_lines),
+        )
+    };
+    let (description_px, _) =
+        crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
+    let (hint_px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    let mut description_lines = wrapped_copy_lines(DESCRIPTION, description_px, text_width)
+        .len()
+        .max(1);
+    let mut hint_lines = wrapped_copy_lines(HINT, hint_px, text_width).len().max(1);
+    let leading = page_heading_height()
+        + page_subtitle_height()
+        + 2.0 * settings_page_gap(state, width, viewport);
+    let body = settings_page_body_height(state, width, viewport);
+    let mut fitted = card(description_lines, hint_lines);
+    while leading + fitted.1 > body && (description_lines > 1 || hint_lines > 1) {
+        if description_lines > 1 {
+            description_lines -= 1;
+        } else {
+            hint_lines -= 1;
+        }
+        fitted = card(description_lines, hint_lines);
+    }
+    out.push(fitted.0);
     out
 }
 
@@ -9401,6 +9658,17 @@ fn top_settings_page(
         out.push(rainbow_banner_node());
     }
     let show_all = top_settings_shows_all(width, cx.viewport);
+    // `settings/top/grid` is a row of two Fill columns with a 12pt gap between
+    // them, so each card - and the text inside its 12pt padding pair - gets
+    // half of what a full-width card would.
+    let grid_text_width = ((settings_page_content_width(
+        cx.viewport.width,
+        width,
+        page_maximum(SettingsRoute::Home, width),
+    ) - 12.0)
+        / 2.0
+        - 24.0)
+        .max(48.0);
     if show_all {
         state.record_result_page_limit(0);
         let (theme, theme_height) = {
@@ -9451,6 +9719,8 @@ fn top_settings_page(
                 ),
                 rows,
                 width,
+                grid_text_width,
+                None,
             )
         };
         let (trail, trail_height) = top_section_card(state, 2, width, cx, true, None);
@@ -9486,6 +9756,8 @@ fn top_settings_page(
             None,
             playful_rows,
             width,
+            grid_text_width,
+            None,
         );
         let right_height = trail_height + 10.0 + playful_height;
         // Balance the grid: stretch the shorter side's terminal card so both
@@ -10546,8 +10818,8 @@ fn settings_fields_page(
         && (cx.viewport.height <= 420.0 || settings_text_scale() > 1.25);
     let show_machine_card_now =
         show_machine_card && (!compact_machine_card || state.page_scroll == 0);
-    let display_faces_showcase =
-        display_faces_showcase_eligible.then(|| display_faces_card(state, width));
+    let display_faces_showcase = display_faces_showcase_eligible
+        .then(|| display_faces_card(state, width, cx.viewport, state.route));
     // THE CURSOR KITTY CARD. Unlike the Display Faces showcase it can never be
     // shed outright: `cursor_trail_style` is a Top Setting, so the ordinary form
     // has no fallback row for it, and a "Cursor Kitty" page with no way to
@@ -10561,7 +10833,7 @@ fn settings_fields_page(
         && state.route == SettingsRoute::CursorKitty
         && state.choice_picker.is_none()
         && (width != SettingsWidth::Compact || state.page_scroll == 0))
-        .then(|| cursor_kitty_card(state, width, cx.viewport));
+        .then(|| cursor_kitty_card(state, width, cx.viewport, state.route));
     let title = if global_search {
         "Search Results"
     } else {
@@ -10694,9 +10966,11 @@ fn settings_fields_page(
         } - compact_header_height(state, cx.viewport)
             - 2.0 * compact_page_vertical_inset(cx.viewport.height))
         .max(0.0);
-        let floor_used =
-            smart_title_health_height(true) + gap + SettingsWidth::Compact.row_height();
-        let mut page = vec![smart_title_health_card(state, true)];
+        let health_fit = SmartTitleHealthFit::measure(state, width, cx.viewport);
+        let floor_used = smart_title_health_height(state, true, health_fit)
+            + gap
+            + SettingsWidth::Compact.row_height();
+        let mut page = vec![smart_title_health_card(state, true, health_fit)];
         if total > 1 && floor_used + gap + page_navigation_height() <= floor_body {
             page.push(page_navigation_node(
                 "settings/results-window",
@@ -10827,7 +11101,11 @@ fn settings_fields_page(
     let showcase_height = if show_renderer_preview_now {
         renderer_preview_height(width)
     } else if show_smart_title_health {
-        smart_title_health_height(compact_smart_title_health)
+        smart_title_health_height(
+            state,
+            compact_smart_title_health,
+            SmartTitleHealthFit::measure(state, width, cx.viewport),
+        )
     } else if let Some(access) = state
         .macos_access
         .as_ref()
@@ -11068,7 +11346,11 @@ fn settings_fields_page(
         out.push(preview);
     }
     if show_smart_title_health {
-        out.push(smart_title_health_card(state, compact_smart_title_health));
+        out.push(smart_title_health_card(
+            state,
+            compact_smart_title_health,
+            SmartTitleHealthFit::measure(state, width, cx.viewport),
+        ));
     }
     if let Some(access) = state
         .macos_access
@@ -12830,22 +13112,125 @@ fn visual_application_timing(key: &str) -> Option<&'static str> {
     })
 }
 
-fn smart_title_health_height(compact: bool) -> f32 {
+fn smart_title_health_line_height() -> f32 {
+    24.0_f32.max(20.0 * settings_text_scale())
+}
+
+/// How many visual lines the compact card's ONE consolidated diagnostic row
+/// takes in the column `fit` measured, never more lines than `fit` affords.
+///
+/// It is a join of four composed clauses, so its length is runtime state, not
+/// authored copy — and the widest of them, `detail`, is the slot carrying
+/// `last_error`. Clamping the join to a single fixed line dropped 209.1 points
+/// of it at the shipped default window and, in the error case, the error text
+/// itself (2026-09 settings audit). The row wraps now, and this is the count
+/// the card and its height allocation agree on.
+fn smart_title_health_summary_lines(state: &SettingsViewState, fit: SmartTitleHealthFit) -> usize {
+    let (px, _) = crate::native_ui::text_paint_metrics(
+        SemanticRole::Status,
+        smart_title_summary_style(state),
+    );
+    wrapped_copy_lines(
+        &smart_title_health_copy(state).compact_summary(),
+        px,
+        fit.text_width,
+    )
+    .len()
+    .clamp(1, fit.summary_line_budget.max(1))
+}
+
+/// What the runtime-health card is allowed to be: the column its text really
+/// gets, and how many lines the compact consolidated row may spend there.
+#[derive(Clone, Copy)]
+struct SmartTitleHealthFit {
+    text_width: f32,
+    summary_line_budget: usize,
+}
+
+impl SmartTitleHealthFit {
+    /// The compact card is a LEADING showcase on a page that must still seat
+    /// one whole native control — a clipped hit target is a broken promise —
+    /// so the consolidated row wraps into whatever the short host can spare
+    /// after that control, the page gap and the card's own headline and
+    /// padding. At the shipped default 80×24 window (744×420) the bound is
+    /// never what binds: 207 points of that page were empty underneath a row
+    /// cut mid-word. It bites only on the 320-point landscape hosts, and even
+    /// there the row paints whole words over several lines and puts the
+    /// ellipsis that admits it ran out of room at the end of the LAST of
+    /// them, instead of a quarter of the way through the first.
+    fn measure(state: &SettingsViewState, width: SettingsWidth, viewport: LogicalRect) -> Self {
+        let line_height = smart_title_health_line_height();
+        let body = (if compact_status_dock_required(state, viewport) {
+            viewport.height
+        } else {
+            viewport.height - settings_status_bars_height(state)
+        } - compact_header_height(state, viewport)
+            - 2.0 * compact_page_vertical_inset(viewport.height))
+        .max(0.0);
+        let spare = body
+            - settings_page_gap(state, width, viewport)
+            - SettingsWidth::Compact.row_height()
+            - line_height
+            - 24.0;
+        Self {
+            text_width: settings_card_text_width(viewport, width, state.route),
+            summary_line_budget: (spare / line_height).floor().max(1.0) as usize,
+        }
+    }
+}
+
+fn smart_title_health_height(
+    state: &SettingsViewState,
+    compact: bool,
+    fit: SmartTitleHealthFit,
+) -> f32 {
     let scale = settings_text_scale();
-    let line_height = 24.0_f32.max(20.0 * scale);
+    let line_height = smart_title_health_line_height();
     if compact {
-        // Short landscape keeps one truthful headline plus one complete
+        // Short landscape keeps one truthful headline plus one COMPLETE
         // consolidated diagnostic row. This leaves enough height for a whole
         // 2× Dynamic-Type control instead of clipping both the card and form.
-        2.0 * line_height + 24.0
+        (1 + smart_title_health_summary_lines(state, fit)) as f32 * line_height + 24.0
     } else {
         28.0_f32.max(22.0 * scale) + 6.0 * line_height + 24.0
     }
 }
 
-fn smart_title_health_card(state: &SettingsViewState, compact: bool) -> UiNode {
-    let line_height = 24.0_f32.max(20.0 * settings_text_scale());
-    let heading_height = 28.0_f32.max(22.0 * settings_text_scale());
+/// The composed runtime-health copy, in ONE place so the card and the height
+/// allocation can never disagree about how long it is.
+struct SmartTitleHealthCopy {
+    headline: String,
+    headline_style: StyleRef,
+    locality: String,
+    transport: String,
+    readiness: String,
+    detail: String,
+}
+
+impl SmartTitleHealthCopy {
+    fn compact_summary(&self) -> String {
+        format!(
+            "{}  ·  {}  ·  {}  ·  {}",
+            self.locality, self.transport, self.readiness, self.detail
+        )
+    }
+}
+
+/// Danger for the consolidated compact row exactly when the provider reported
+/// an error, since `detail` — the slot carrying it — is composed last.
+fn smart_title_summary_style(state: &SettingsViewState) -> StyleRef {
+    if state
+        .title_summary_health
+        .as_ref()
+        .is_some_and(|health| health.last_error.is_some())
+    {
+        StyleRef::Danger
+    } else {
+        StyleRef::Quiet
+    }
+}
+
+fn smart_title_health_copy(state: &SettingsViewState) -> SmartTitleHealthCopy {
     let (headline, headline_style, locality, transport, readiness, detail) = if let Some(health) =
         state.title_summary_health.as_ref()
     {
@@ -13003,6 +13388,40 @@ fn smart_title_health_card(state: &SettingsViewState, compact: bool) -> UiNode {
             "Manual connection testing is not available in this build.".to_string(),
         )
     };
+    SmartTitleHealthCopy {
+        headline,
+        headline_style,
+        locality,
+        transport,
+        readiness,
+        detail,
+    }
+}
+
+/// [`SmartTitleHealthFit`] is the column the card's own text gets and the line
+/// budget the host can spare. The compact consolidated row WRAPS to them, and
+/// [`smart_title_health_height`] charges the page for every line it takes.
+fn smart_title_health_card(
+    state: &SettingsViewState,
+    compact: bool,
+    fit: SmartTitleHealthFit,
+) -> UiNode {
+    let line_height = smart_title_health_line_height();
+    let heading_height = 28.0_f32.max(22.0 * settings_text_scale());
+    let copy = smart_title_health_copy(state);
+    // The ONE spelling of the consolidated row, shared with the line count
+    // `smart_title_health_height` charges the page for. A second `format!`
+    // here could drift from it, and the card would be allocated a height for
+    // a different string than the one it paints.
+    let summary = copy.compact_summary();
+    let SmartTitleHealthCopy {
+        headline,
+        headline_style,
+        locality,
+        transport,
+        readiness,
+        detail,
+    } = copy;
 
     let status_line = |key: &str, text: String, role: SemanticRole, style: StyleRef| {
         UiNode::new(
@@ -13014,20 +13433,16 @@ fn smart_title_health_card(state: &SettingsViewState, compact: bool) -> UiNode {
     let mut children = if compact {
         vec![
             status_line("state", headline, SemanticRole::Status, headline_style),
-            status_line(
-                "summary",
-                format!("{locality}  ·  {transport}  ·  {readiness}  ·  {detail}"),
+            wrapped_copy_node(
+                "settings/smart-titles/health/summary",
+                &summary,
                 SemanticRole::Status,
-                if state
-                    .title_summary_health
-                    .as_ref()
-                    .is_some_and(|health| health.last_error.is_some())
-                {
-                    StyleRef::Danger
-                } else {
-                    StyleRef::Quiet
-                },
-            ),
+                smart_title_summary_style(state),
+                fit.text_width,
+                line_height,
+                Some(smart_title_health_summary_lines(state, fit)),
+            )
+            .0,
         ]
     } else {
         vec![
@@ -13063,15 +13478,7 @@ fn smart_title_health_card(state: &SettingsViewState, compact: bool) -> UiNode {
                 "detail",
                 detail,
                 SemanticRole::Status,
-                if state
-                    .title_summary_health
-                    .as_ref()
-                    .is_some_and(|health| health.last_error.is_some())
-                {
-                    StyleRef::Danger
-                } else {
-                    StyleRef::Quiet
-                },
+                smart_title_summary_style(state),
             ),
         ]
     };
@@ -13089,7 +13496,9 @@ fn smart_title_health_card(state: &SettingsViewState, compact: bool) -> UiNode {
     )
     .layout(
         Layout::column()
-            .height(Length::Fixed(smart_title_health_height(compact)))
+            .height(Length::Fixed(smart_title_health_height(
+                state, compact, fit,
+            )))
             .padding(Insets::all(12.0))
             .gap(0.0)
             .clipped(),
@@ -14939,6 +15348,12 @@ fn normalize_slider_value(value: f64, range: prefs::Range) -> Option<String> {
     )
 }
 
+/// Where the About byline's fit ladder starts on a narrow large-type column:
+/// the author's own rungs, past `author · company · site` and `author ·
+/// company`. Named because the rule ("large type keeps the AUTHOR") is a
+/// decision, and a bare `2` in the middle of a layout function is not.
+const AUTHOR_RUNG: usize = 2;
+
 fn about_page(
     state: &SettingsViewState,
     width: SettingsWidth,
@@ -15126,19 +15541,34 @@ fn about_page(
     .layout(Layout::default().height(Length::Fixed(status_height)));
     // The byline says WHO and WHERE FROM: author · company · site
     // (`alab.systems`, the `site` row — owner, 2026-09-14) wherever that whole
-    // line fits, then author · company, then the author alone. The narrow
-    // large-type column keeps the author alone outright. Fit is MEASURED, never
-    // guessed from the width class: the line paints at the Body step (13pt ×
-    // text scale) in the UI face, in the hero column the renderer really gives
-    // it — About's page content at its own maximum, less the side pager beside
-    // a landscape compact section, less the hero's 24pt padding pair. A 286.5pt
-    // phone column at 1× is 206.5pt against the full line's ~223pt, which is
-    // exactly where the site used to clip. The site is never lost: it is the
-    // Project row, and one tap away on "Open Project Site".
+    // line fits, then author · company, then the author, then the author's short
+    // form. The narrow large-type column keeps the AUTHOR outright — it starts
+    // at that rung and never spends its measure on the company or the site, the
+    // same Dynamic-Type simplification that shortens this hero's own buttons.
+    // Fit is MEASURED, never guessed from the width class: the line paints at
+    // the Body step (13pt × text scale) in the UI face, in the hero column the
+    // renderer really gives it — About's page content at its own maximum, less
+    // the side pager beside a landscape compact section, less the hero's 24pt
+    // padding pair. A 286.5pt phone column at 1× is 206.5pt against the full
+    // line's ~223pt, which is exactly where the site used to clip. The site is
+    // never lost: it is the Project row, and one tap away on "Open Project
+    // Site".
+    //
+    // EVERY RUNG IS MEASURED, THE LAST ONE INCLUDED, AND A LINE THAT DOES NOT
+    // FIT IS NOT PAINTED (owner's decision, 2026-09-17). A ladder whose floor is
+    // asserted rather than measured is not a ladder: `Andrew Yates` is 164.6pt
+    // at 2× against the 164.0pt column a 240pt host gives, so the floor rung
+    // itself painted `Andrew Yat…`. The other half of the same defect was the
+    // column: it used to be clamped UP to 48pt so the arithmetic could not go
+    // degenerate, and a clamp is a guess — at a 100pt host the real box is 24pt
+    // while the clamp claimed 48, so every rung "fit" a column that was not
+    // there. A zero-width column is a true answer, and when no rung fits one the
+    // hero authors no byline at all: an elided name is a worse attribution than
+    // none, and none loses no fact — `author`, `company` and `site` are
+    // provenance rows, so this route's Copy Build Information block still says
+    // everything the line would have.
     let site = value("site", "");
-    let byline = if large_type_narrow {
-        "Andrew Yates".to_string()
-    } else {
+    let byline = {
         let beside_pager = compact_budget
             .filter(|budget| budget.side_by_side_pager)
             .map_or(0.0, |_| compact_side_pager_width() + 10.0);
@@ -15148,28 +15578,42 @@ fn about_page(
             page_maximum(SettingsRoute::About, width),
         ) - beside_pager
             - 48.0)
-            .max(48.0);
+            .max(0.0);
         let px = 13.0 * text_scale;
         let fits = |line: &str| crate::tray_raster::ui_text_width(line, px) <= identity_width;
         let author_company = crate::build_info::AUTHOR_COMPANY_BYLINE;
-        let full = format!("{author_company} \u{00b7} {site}");
-        if !site.is_empty() && fits(&full) {
-            full
-        } else if fits(author_company) {
-            author_company.to_string()
-        } else {
-            "Andrew Yates".to_string()
-        }
+        // A build with no `site` row authors no full rung, rather than a line
+        // ending in a dangling separator.
+        let full = (!site.is_empty()).then(|| format!("{author_company} \u{00b7} {site}"));
+        let ladder = [
+            full.as_deref().unwrap_or_default(),
+            author_company,
+            aterm_types::identity::AUTHOR,
+            crate::build_info::AUTHOR_SHORT,
+        ];
+        let first = if large_type_narrow { AUTHOR_RUNG } else { 0 };
+        ladder[first..]
+            .iter()
+            .copied()
+            .find(|form| !form.is_empty() && fits(form))
+            .map(str::to_string)
     };
-    let capabilities = UiNode::new(
-        "about/byline",
-        UiContent::Text(TextSpec {
-            text: byline,
-            role: SemanticRole::Text,
-            style: StyleRef::Success,
-        }),
-    )
-    .layout(Layout::default().height(Length::Fixed(capability_height)));
+    let capability_height = if byline.is_some() {
+        capability_height
+    } else {
+        0.0
+    };
+    let capabilities = byline.map(|text| {
+        UiNode::new(
+            "about/byline",
+            UiContent::Text(TextSpec {
+                text,
+                role: SemanticRole::Text,
+                style: StyleRef::Success,
+            }),
+        )
+        .layout(Layout::default().height(Length::Fixed(capability_height)))
+    });
     // A 320px-tall landscape host has room for a complete identity summary,
     // but not for decorative eyebrow/capability lines plus two touch actions.
     // Keep the essential wordmark, purpose, and exact version together; the
@@ -15196,7 +15640,10 @@ fn about_page(
         )
     } else {
         (
-            vec![eyebrow, wordmark, tagline, version_summary, capabilities],
+            [eyebrow, wordmark, tagline, version_summary]
+                .into_iter()
+                .chain(capabilities)
+                .collect(),
             eyebrow_height + wordmark_height + tagline_height + status_height + capability_height,
             false,
         )
@@ -18809,7 +19256,7 @@ mod tests {
     #[test]
     fn choose_image_is_enabled_exactly_when_a_picker_exists() {
         let state = SettingsViewState::new(&Config::default());
-        let page = wallpaper_page(&state, SettingsWidth::Wide);
+        let page = wallpaper_page(&state, SettingsWidth::Wide, view_cx().viewport);
         let choose =
             node_by_key(&page, "settings/wallpaper/choose").expect("the Wallpaper page offers it");
         let UiContent::Button(control) = &choose.content else {
@@ -18834,7 +19281,7 @@ mod tests {
     #[test]
     fn detach_stays_gated_on_an_attached_wallpaper_not_on_the_picker() {
         let state = SettingsViewState::new(&Config::default());
-        let page = wallpaper_page(&state, SettingsWidth::Wide);
+        let page = wallpaper_page(&state, SettingsWidth::Wide, view_cx().viewport);
         let detach =
             node_by_key(&page, "settings/wallpaper/detach").expect("the Wallpaper page offers it");
         let UiContent::Button(control) = &detach.content else {
@@ -39331,11 +39778,17 @@ enabled = true
     }
 
     /// The byline steps down a fixed ladder — author · company · site, then
-    /// author · company, then the author alone — to the longest form its hero
-    /// column really fits, so no width or text scale ever paints it elided. The
-    /// site joined the line on 2026-09-14 and clipped a 286.5pt phone column at
-    /// 1× ("…alab.sy…", 223.2pt required against 206.5pt available). Every
-    /// scale runs as its own child process: the text scale is process-global.
+    /// author · company, then the author, then the author's short form — to the
+    /// longest form its hero column really fits, so no width or text scale ever
+    /// paints it elided. The site joined the line on 2026-09-14 and clipped a
+    /// 286.5pt phone column at 1× ("…alab.sy…", 223.2pt required against 206.5pt
+    /// available). The LAST rung is measured like every other one: `Andrew
+    /// Yates` was the floor until 2026-09-17, when a 240pt host at 2× gave it a
+    /// 164.0pt column against its 164.6pt measure and the painter clipped the
+    /// name itself. Below the last rung the hero authors NO byline — asserted
+    /// here in both directions, so the omission can never hide a form that would
+    /// have fitted. Every scale runs as its own child process: the text scale is
+    /// process-global.
     #[test]
     fn native_about_byline_steps_down_to_the_longest_form_its_column_fits() {
         const CHILD: &str = "ATERM_ABOUT_BYLINE_FIT_CHILD";
@@ -39366,10 +39819,13 @@ enabled = true
             },
         );
         let author_company = crate::build_info::AUTHOR_COMPANY_BYLINE;
+        let author = aterm_types::identity::AUTHOR;
+        let author_short = crate::build_info::AUTHOR_SHORT;
         let full = format!("{author_company} \u{00b7} {}", aterm_types::identity::SITE);
-        let ladder = [full.as_str(), author_company, "Andrew Yates"];
+        let ladder = [full.as_str(), author_company, author, author_short];
         // The byline is Text/Success: the Body step, 13pt × scale, UI face.
         let px = 13.0 * scale;
+        let width_of = |line: &str| crate::tray_raster::ui_text_width(line, px);
         let (mut runtime, instance, view) = setup();
         runtime
             .dispatch(
@@ -39381,6 +39837,18 @@ enabled = true
                 }),
             )
             .unwrap();
+        struct HeroByline {
+            /// The painted line, its paint-audit row, and its semantic label —
+            /// `None` when the full hero authored no byline at all.
+            painted: Option<(String, String, Option<String>)>,
+            column: f32,
+            large_type_narrow: bool,
+        }
+        // `about/eyebrow` is a child of the SAME hero column and exists only in
+        // the full (non short-landscape) hero, so it measures the column even
+        // where no byline was authored — the one geometry a byline node cannot
+        // report on. Where both exist the two measures are asserted equal, which
+        // is what makes the eyebrow an honest proxy rather than a second guess.
         let byline_at = |width: f32, height: f32| {
             let cx = view_cx_at(width, height);
             let compiled = runtime
@@ -39388,72 +39856,115 @@ enabled = true
                 .unwrap()
                 .compile(cx.viewport)
                 .unwrap();
-            let node = compiled
+            let eyebrow = compiled
                 .paint
                 .iter()
-                .find(|node| node.key == UiKey::new("about/byline"))?;
-            let UiContent::Text(spec) = &node.content else {
-                panic!("{width}x{height} at {scale}×: the byline is a text node");
+                .find(|node| node.key == UiKey::new("about/eyebrow"))?;
+            let UiContent::Text(TextSpec {
+                text: eyebrow_text, ..
+            }) = &eyebrow.content
+            else {
+                panic!("{width}x{height} at {scale}×: the eyebrow is a text node");
             };
-            let audit = compiled
-                .paint_audit_lines()
-                .into_iter()
-                .find(|line| line.starts_with("paint-text key=\"about/byline\" "))
-                .expect("the renderer audits the byline's fit");
-            let large_type_narrow = compiled.paint.iter().any(|node| {
-                node.key == UiKey::new("about/eyebrow")
-                    && matches!(
-                        &node.content,
-                        UiContent::Text(TextSpec { text, .. }) if text == "NATIVE APP"
-                    )
-            });
-            let label = compiled
-                .semantic(&UiKey::new("about/byline"))
-                .map(|semantic| semantic.label.clone());
-            Some((
-                spec.text.clone(),
-                node.rect.width,
-                audit,
+            let large_type_narrow = eyebrow_text == "NATIVE APP";
+            let column = eyebrow.rect.width;
+            let painted = compiled
+                .paint
+                .iter()
+                .find(|node| node.key == UiKey::new("about/byline"))
+                .map(|node| {
+                    let UiContent::Text(spec) = &node.content else {
+                        panic!("{width}x{height} at {scale}×: the byline is a text node");
+                    };
+                    assert!(
+                        (node.rect.width - column).abs() < 0.05,
+                        "{width}x{height} at {scale}×: the byline's {}pt box and its eyebrow sibling's {column}pt box are the same hero column",
+                        node.rect.width
+                    );
+                    let audit = compiled
+                        .paint_audit_lines()
+                        .into_iter()
+                        .find(|line| line.starts_with("paint-text key=\"about/byline\" "))
+                        .expect("the renderer audits the byline's fit");
+                    let label = compiled
+                        .semantic(&UiKey::new("about/byline"))
+                        .map(|semantic| semantic.label.clone());
+                    (spec.text.clone(), audit, label)
+                });
+            Some(HeroByline {
+                painted,
+                column,
                 large_type_narrow,
-                label,
-            ))
+            })
         };
 
-        let mut rungs_seen = [0usize; 3];
+        let mut rungs_seen = [0usize; 4];
+        let mut omissions = 0usize;
+        // From 120pt: this product's own window floor is 164 LOGICAL points wide
+        // (`App::whole_cell_min_size`), so the narrow band below the old 240pt
+        // sweep start is shipping geometry, not a synthetic one.
         // 336pt tall puts a 480-760pt compact host in the landscape pager,
         // where the hero shares its row with the fixed-width side pager.
         for height in [558.0_f32, 336.0, 400.0, 820.0] {
-            let mut width = 240.0_f32;
+            let mut width = 120.0_f32;
             while width <= 1_320.0 {
-                if let Some((text, available, audit, large_type_narrow, _)) =
-                    byline_at(width, height)
-                {
+                if let Some(hero) = byline_at(width, height) {
+                    let HeroByline {
+                        painted,
+                        column,
+                        large_type_narrow,
+                        ..
+                    } = hero;
                     let context = format!("{width}x{height} at {scale}×");
-                    let rung = ladder
+                    // Large type on a narrow host starts at the author's rungs.
+                    // SPELLED AS A LITERAL, not read from production's own
+                    // constant: a sweep that indexes the ladder by the number
+                    // the page indexes it by would agree with any renumbering,
+                    // including a wrong one. 2 is the author rung's position in
+                    // the ladder this test builds, and if production moves it
+                    // the mismatch is the finding.
+                    let first = if large_type_narrow { 2 } else { 0 };
+                    let want = ladder[first..]
                         .iter()
-                        .position(|form| *form == text)
-                        .unwrap_or_else(|| panic!("{context}: {text:?} is not a byline form"));
-                    assert!(
-                        audit.contains(" overflow=false "),
-                        "{context}: the byline paints truncated: {audit}"
-                    );
-                    assert!(
-                        crate::tray_raster::ui_text_width(&text, px) <= available,
-                        "{context}: {text:?} is wider than its {available}pt column"
-                    );
-                    if large_type_narrow {
-                        assert_eq!(
-                            rung, 2,
-                            "{context}: large-type narrow keeps the author alone"
-                        );
-                    } else if rung > 0 {
-                        let longer = ladder[rung - 1];
+                        .position(|form| width_of(form) <= column)
+                        .map(|found| found + first);
+                    if let Some((text, audit, label)) = painted {
+                        let rung = ladder
+                            .iter()
+                            .position(|form| *form == text)
+                            .unwrap_or_else(|| panic!("{context}: {text:?} is not a byline form"));
                         assert!(
-                            crate::tray_raster::ui_text_width(longer, px) > available,
-                            "{context}: {longer:?} fits the {available}pt column, yet the byline painted {text:?}"
+                            audit.contains(" overflow=false "),
+                            "{context}: the byline paints truncated: {audit}"
                         );
+                        assert!(
+                            width_of(&text) <= column,
+                            "{context}: {text:?} is wider than its {column}pt column"
+                        );
+                        assert_eq!(
+                            Some(rung),
+                            want,
+                            "{context}: the byline painted rung {rung} ({text:?}), but the longest form its {column}pt column fits is rung {want:?}"
+                        );
+                        if large_type_narrow {
+                            assert!(
+                                rung >= 2,
+                                "{context}: large-type narrow keeps the author, never the company or the site: {text:?}"
+                            );
+                        }
+                        assert_eq!(
+                            label.as_deref(),
+                            Some(text.as_str()),
+                            "{context}: the byline reads out the line it paints"
+                        );
+                        rungs_seen[rung] += 1;
+                    } else {
+                        assert_eq!(
+                            want, None,
+                            "{context}: the hero authored no byline, yet rung {want:?} fits its {column}pt column"
+                        );
+                        omissions += 1;
                     }
-                    rungs_seen[rung] += 1;
                 }
                 width += 7.5;
             }
@@ -39462,24 +39973,155 @@ enabled = true
             rungs_seen[0] > 0,
             "the sweep paints the whole byline somewhere at {scale}×: {rungs_seen:?}"
         );
+        assert!(
+            rungs_seen[3] > 0,
+            "the sweep reaches the author's short form at {scale}×: {rungs_seen:?}"
+        );
+        assert!(
+            omissions > 0,
+            "the sweep reaches a column no rung fits at {scale}×, so the omission arm above is not vacuous"
+        );
 
         if scale == 1.0 {
-            let (text, available, audit, _, label) =
-                byline_at(286.5, 558.0).expect("the phone About hero paints its byline");
+            let hero = byline_at(286.5, 558.0).expect("the phone About hero paints its byline");
+            let (text, audit, label) = hero.painted.expect("the phone hero keeps a byline");
             assert_eq!(
                 text, author_company,
                 "the phone column keeps author and company"
             );
             assert_eq!(label.as_deref(), Some(author_company));
             assert!(
-                (available - 206.5).abs() < 0.05,
-                "phone byline column: {available}"
+                (hero.column - 206.5).abs() < 0.05,
+                "phone byline column: {}",
+                hero.column
             );
             assert!(audit.contains(" overflow=false "), "{audit}");
             assert!(
                 rungs_seen[1] > 0,
                 "the 1× sweep crosses from the whole byline to author and company: {rungs_seen:?}"
             );
+        }
+
+        if scale == 2.0 {
+            // THE RED THAT EXTENDED THIS LADDER (2026-09-17). A 240pt host at 2×
+            // gives the hero a 164.0pt column; `Andrew Yates` measured 164.6pt in
+            // the UI face of the x86_64 Linux host that left that red (3091ede3b),
+            // so the old floor rung painted "Andrew Yat…" there.
+            //
+            // THAT 0.6pt IS THE WHOLE MARGIN, and it is a font measurement, not
+            // a layout one: the column is arithmetic (164.0pt on every host, so
+            // it is asserted below), while the string's width is whatever this
+            // host's UI face makes it. Measured 2026-09-17 on a 2017 MacBook Pro
+            // (macOS 13.7.8, x86_64): the same name measures 156.884pt there and
+            // FITS, so asserting the overflow made the ladder's law unprovable on
+            // that host rather than wrong. The law is therefore READ from the
+            // measurement — the painted rung is the longest that fits, whichever
+            // that is — and the arm the host cannot exercise says so on stderr
+            // instead of passing quietly.
+            //
+            // MEASURED AGAIN 2026-09-18 on an Apple silicon Mac (Darwin 25.6,
+            // this repo's Trust toolchain), where main carried this test as red
+            // at 3091ede3b: the assertion that failed there was the premise
+            // `width_of(author) > hero.column` — "the full name really does not
+            // fit the 240pt column: 156.884 vs 164" — the very number the Intel
+            // Mac gave. Both Macs load the same UI face and measure it to the
+            // same 156.884pt, so the 164.6pt was the Linux host's face and not
+            // an x86_64-versus-arm64 or a headless-harness difference (the
+            // harness on this host finds the UI face; `ui_text_width` only
+            // falls back to 0.6 em per char when no face loads, which would
+            // measure the name at 12 × 15.6pt = 187.2pt and step it DOWN). The
+            // ladder code was right on every host; the test's premise was one
+            // host's font width, and a16b7707e/c507804d2 replaced it with the
+            // measurement below. Green here 5× alone and inside the full
+            // `targo --unverified test -p aterm-gui --lib` on 2026-09-18.
+            let hero = byline_at(240.0, 558.0).expect("a 240pt host paints the full About hero");
+            assert!(hero.large_type_narrow);
+            assert!(
+                (hero.column - 164.0).abs() < 0.05,
+                "the 240pt hero column: {}",
+                hero.column
+            );
+            // THE RUNG THIS HOST'S FACE LEAVES, read the whole ladder down rather
+            // than assumed one step in: the longest rung that fits is what must be
+            // painted, and if the face is wide enough that even the short form
+            // overflows, the honest answer is no byline at all — the same law the
+            // 150pt arm below asserts. Nothing here is a font premise.
+            let name_width = width_of(author);
+            let want = [author, author_short]
+                .into_iter()
+                .find(|rung| width_of(rung) <= hero.column);
+            match (want, hero.painted.as_ref()) {
+                (Some(rung), Some((text, audit, label))) => {
+                    let law = if rung == author {
+                        "a column the full name fits paints it whole and never steps below it"
+                    } else {
+                        "a column the full name overflows steps to the author's short form"
+                    };
+                    assert_eq!(text, rung, "{law} ({name_width}pt vs {}pt)", hero.column);
+                    assert_eq!(label.as_deref(), Some(rung), "{law}");
+                    assert!(audit.contains(" overflow=false "), "{audit}");
+                }
+                (None, painted) => assert!(
+                    painted.is_none(),
+                    "no rung fits this host's {}pt column ({author_short:?} needs {}pt), so the \
+                     hero authors NO byline rather than an elided name",
+                    hero.column,
+                    width_of(author_short)
+                ),
+                (Some(rung), None) => panic!(
+                    "{rung:?} fits the {}pt column, so the hero must paint it",
+                    hero.column
+                ),
+            }
+            if want == Some(author) {
+                // ONE comparison governs both the law above and this line: it is
+                // keyed off the rung that was chosen, never a second copy of the
+                // condition. Written to the stderr handle rather than `eprintln!`
+                // because this arm is also runnable by hand OUTSIDE the parent's
+                // `--nocapture` child (`ATERM_ABOUT_BYLINE_FIT_CHILD=1
+                // ATERM_ABOUT_BYLINE_FIT_SCALE=2.0 cargo test …`), and a waived
+                // measurement must show in that run too.
+                use std::io::Write as _;
+                let line = format!(
+                    "{EXACT}: the 240pt / 2× step-down is NOT exercised at this width on this \
+                     host: {author:?} measures {name_width}pt in this UI face against a {}pt \
+                     column, so the full name fits. It measured 164.6pt on the x86_64 Linux \
+                     host that extended this ladder (3091ede3b); the comment above this arm \
+                     records both. The longest rung that fits is asserted instead, and the \
+                     sweep above still reaches the short form at this scale, so the floor rung \
+                     is exercised here — just not at 240pt.\n",
+                    hero.column
+                );
+                let _ = std::io::stderr().write_all(line.as_bytes());
+            }
+
+            // And the decision below the last rung: a column too small for even
+            // the short form authors NO byline rather than an elided name.
+            let hero = byline_at(150.0, 558.0).expect("a 150pt host still paints the About hero");
+            assert!(
+                width_of(author_short) > hero.column,
+                "no rung fits the 150pt host's {}pt column",
+                hero.column
+            );
+            assert!(
+                hero.painted.is_none(),
+                "a column no rung fits paints no byline at all"
+            );
+            // What makes that omission survivable rather than a loss: author,
+            // company and site are PROVENANCE rows, so the route's own
+            // `Copy Build Information` block still carries every fact the
+            // byline would have said. That is why the hero may drop the line.
+            let provenance = crate::about::provenance_text();
+            for fact in [
+                crate::build_info::AUTHOR_ATTRIBUTION,
+                crate::build_info::COMPANY,
+                aterm_types::identity::SITE,
+            ] {
+                assert!(
+                    provenance.contains(fact),
+                    "the About provenance block still carries {fact:?}: {provenance}"
+                );
+            }
         }
     }
 
@@ -39601,6 +40243,173 @@ enabled = true
                 .iter()
                 .any(|node| node.key.as_str().starts_with("settings/row/")),
             "page 2 keeps its native rows"
+        );
+    }
+
+    /// Every visual line the painter is handed for one wrapped copy block, in
+    /// paint order.
+    fn painted_copy_lines(compiled: &crate::native_ui::CompiledUi, key: &str) -> Vec<String> {
+        let prefix = format!("{key}/line-");
+        compiled
+            .paint
+            .iter()
+            .filter(|node| node.key.as_str().starts_with(prefix.as_str()))
+            .map(|node| match &node.content {
+                UiContent::Text(spec) => spec.text.clone(),
+                other => panic!("{key} paints something other than text: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn settings_route_at(
+        state: &SettingsViewState,
+        cx: &ViewCx<'_>,
+    ) -> crate::native_ui::CompiledUi {
+        settings_tree(
+            state,
+            &UpdateState::from_status(1, "0.1.0", None, false).projection(),
+            &PackagesState::unobserved().projection(),
+            cx,
+        )
+        .compile(cx.viewport)
+        .expect("Settings compiles")
+    }
+
+    fn builtin_title_summary_health() -> TitleSummaryHealth {
+        TitleSummaryHealth {
+            state: TitleSummaryRuntimeState::Builtin,
+            provider: crate::app_config::TitleSummaryProvider::Builtin,
+            model: None,
+            endpoint: None,
+            locality: TitleSummaryLocality::NotApplicable,
+            managed_install_present: false,
+            model_ready: false,
+            last_error: None,
+            next_retry_after: None,
+            next_refresh_after: None,
+            timeout: None,
+            proxy_mode: None,
+            ca_file: None,
+        }
+    }
+
+    /// THE SHIPPED DEFAULT WINDOW CAN READ ITS OWN EXPLANATORY COPY.
+    ///
+    /// 80×24 is a 744×420 app viewport (`app_config.rs`), and three long
+    /// settings strings were authored as ONE fixed line there, so the painter
+    /// ellipsized them — 280.6, 108.7 and 209.1 points of text discarded with
+    /// no tooltip, wrap, scroll or selection to get any of it back (2026-09
+    /// settings audit):
+    ///
+    /// * `settings/top/wallpaper/description` — required 968.6 against 688.0
+    /// * `settings/wallpaper/hint` — the ONLY pointer to where the wallpaper
+    ///   dim and text-tint controls live, required 796.7
+    /// * `settings/smart-titles/health/summary` — required 897.1, losing the
+    ///   clause that reports whether the provider errored, and in the error
+    ///   case the error text itself, since `detail` is composed last
+    ///
+    /// The first two were never a compact-layout property: [`page_insets`]
+    /// caps the content column at [`page_maximum`]'s 720 in EVERY width class,
+    /// so they were unreadable at every window size. The renderer's own fit
+    /// audit is the judge — `overflow=true` is the painter reporting that it
+    /// elided — and the complete sentence has to survive on the semantic label
+    /// as well as on glass.
+    #[test]
+    fn long_settings_copy_wraps_instead_of_one_elided_line() {
+        // 80×24, the shipped default, and a roomy Wide host.
+        for (width, height) in [(744.0_f32, 420.0_f32), (1_464.0, 796.0)] {
+            let mut state = SettingsViewState::new(&Config::default());
+            state.navigate(SettingsRoute::Wallpaper);
+            let cx = view_cx_at(width, height);
+            let compiled = settings_route_at(&state, &cx);
+            let context = format!("Wallpaper at {width}×{height}");
+            assert_zero_top_paint(&compiled, &context);
+
+            for (key, tail) in [
+                (
+                    "settings/top/wallpaper/description",
+                    "selections and colored backgrounds still paint over it.",
+                ),
+                (
+                    "settings/wallpaper/hint",
+                    "colors the text to match the picture behind it.",
+                ),
+            ] {
+                let label = compiled
+                    .semantic(&UiKey::new(key))
+                    .unwrap_or_else(|| panic!("{context}: {key} is a semantic node"))
+                    .label
+                    .clone();
+                assert!(
+                    label.ends_with(tail),
+                    "{context}: {key} keeps its whole sentence: {label}"
+                );
+                let painted = painted_copy_lines(&compiled, key);
+                assert!(
+                    painted.len() > 1,
+                    "{context}: {key} does not fit one line and must wrap: {painted:?}"
+                );
+                assert!(
+                    painted.iter().all(|line| !line.contains('…')),
+                    "{context}: {key} paints no ellipsis: {painted:?}"
+                );
+                assert_eq!(
+                    painted
+                        .join(" ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    label.split_whitespace().collect::<Vec<_>>().join(" "),
+                    "{context}: {key} paints every word it claims"
+                );
+            }
+        }
+
+        // THE WINDOW PAGE'S CONSOLIDATED RUNTIME ROW. Compact joins the four
+        // composed clauses into one line; the wide layout already publishes
+        // them as six separate rows, so only the join was ever clipped.
+        const SUMMARY: &str = "settings/smart-titles/health/summary";
+        let mut state = SettingsViewState::new(&Config::default());
+        state.navigate(SettingsRoute::WindowTabs);
+        assert!(state.replace_title_summary_health(builtin_title_summary_health()));
+        let cx = view_cx_at(744.0, 420.0);
+        let compiled = settings_route_at(&state, &cx);
+        assert_zero_top_paint(&compiled, "Window at 744×420");
+        let painted = painted_copy_lines(&compiled, SUMMARY);
+        assert!(
+            painted.len() > 1,
+            "the consolidated row does not fit one line and must wrap: {painted:?}"
+        );
+        assert!(
+            painted
+                .last()
+                .is_some_and(|line| line.ends_with("No provider error reported.")),
+            "the clause saying whether anything is wrong reaches glass: {painted:?}"
+        );
+        assert!(
+            painted.iter().all(|line| !line.contains('…')),
+            "the consolidated row paints no ellipsis: {painted:?}"
+        );
+
+        // THE ERROR CASE is the one that mattered most: `detail` is composed
+        // LAST, so a single clamped line turned the row Danger-red while
+        // clipping off the error text that earned the colour.
+        let mut failing = builtin_title_summary_health();
+        failing.state = TitleSummaryRuntimeState::Error;
+        failing.provider = crate::app_config::TitleSummaryProvider::Ollama;
+        failing.locality = TitleSummaryLocality::UnattestedLoopback;
+        failing.endpoint = Some("http://127.0.0.1:11434/api/chat".to_string());
+        failing.timeout = Some(std::time::Duration::from_secs(42));
+        failing.proxy_mode = Some(crate::app_config::TitleSummaryProxyMode::Direct);
+        failing.last_error = Some("managed runtime is not installed".to_string());
+        assert!(state.replace_title_summary_health(failing));
+        let compiled = settings_route_at(&state, &cx);
+        let painted = painted_copy_lines(&compiled, SUMMARY);
+        assert!(
+            painted
+                .iter()
+                .any(|line| line.contains("managed runtime is not installed")),
+            "the error text the Danger colour is about reaches glass: {painted:?}"
         );
     }
 }

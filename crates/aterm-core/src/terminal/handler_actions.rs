@@ -1034,6 +1034,14 @@ impl TerminalHandler<'_> {
         };
         let cell_w = u32::from(self.iterm2.cell_px.0.max(1));
         let cell_h = u32::from(self.iterm2.cell_px.1.max(1));
+        // NATURAL SIZE vs a requested cell box. `c=`/`r=` are the client asking
+        // for the image scaled over that many cells, so the renderer fits it to
+        // the footprint. With NEITHER given the footprint is merely the raster's
+        // pixel size rounded UP to whole cells, and scaling back out to it would
+        // magnify by up to a cell — the same rounding noise the sixel path
+        // carries `pixel_exact` to avoid. Kitty's own reference terminal draws
+        // an un-sized transmission one image pixel to one device pixel.
+        let pixel_exact = cmd.columns.is_none() && cmd.rows.is_none();
         let cols = cmd.columns.unwrap_or_else(|| px_w.div_ceil(cell_w)).max(1);
         let rows = cmd.rows.unwrap_or_else(|| px_h.div_ceil(cell_h)).max(1);
         // Clamp the footprint to the grid so a huge image can't request an enormous
@@ -1054,6 +1062,7 @@ impl TerminalHandler<'_> {
             // Kitty z=: negative draws behind text. iTerm2/Sixel + z=0 default to 0.
             z_index: cmd.z_index.unwrap_or(0),
             band_lift_px: 0,
+            pixel_exact,
         })
     }
 }
@@ -2250,5 +2259,43 @@ mod kitty_display_tests {
         // We actually filled the store up to the global cap (not the count cap).
         assert!(stored >= 1 && stored < super::MAX_KITTY_IMAGES);
         assert_eq!(term.transient.kitty_images.len(), stored);
+    }
+
+    /// NATURAL SIZE IS PIXEL-EXACT. `c=`/`r=` are the client asking for the
+    /// image scaled over that many cells; with NEITHER given the footprint is
+    /// only the raster's pixel size rounded UP to whole cells, and scaling back
+    /// out to fill it magnifies the picture by up to a cell and interpolates
+    /// away its 1-px features — the same rounding noise the sixel path carries
+    /// `pixel_exact` to avoid. Kitty's own reference terminal draws an un-sized
+    /// transmission one image pixel to one device pixel.
+    #[test]
+    fn un_sized_transmit_is_pixel_exact_but_an_explicit_cell_box_is_fitted() {
+        // 15x25 px at a 10x20 cell: a 2x2-cell footprint that is NOT the raster,
+        // so the two policies differ on every pixel of it.
+        let raster = vec![0u8; 15 * 25 * 4];
+        let mut term = Terminal::new(24, 80);
+        term.set_cell_pixel_size(10, 20);
+        term.process(&apc_g("a=T,f=32,s=15,v=25", &raster));
+        let frame = term.cell_frame(24, 80);
+        let placed = frame.images[0].first().expect("a=T places an image");
+        assert_eq!((placed.1.image.cols, placed.1.image.rows), (2, 2));
+        assert!(
+            placed.1.image.pixel_exact,
+            "a transmission with neither c= nor r= is drawn at its natural size, \
+             1:1 from the top-left of the footprint"
+        );
+
+        // The SAME raster with an explicit cell box is the opposite: the client
+        // named cells, so the renderer fits the raster to them.
+        let mut term = Terminal::new(24, 80);
+        term.set_cell_pixel_size(10, 20);
+        term.process(&apc_g("a=T,f=32,s=15,v=25,c=4,r=3", &raster));
+        let frame = term.cell_frame(24, 80);
+        let placed = frame.images[0].first().expect("a=T places an image");
+        assert_eq!((placed.1.image.cols, placed.1.image.rows), (4, 3));
+        assert!(
+            !placed.1.image.pixel_exact,
+            "c=/r= asked for the image over that many cells: fit it to them"
+        );
     }
 }

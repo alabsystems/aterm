@@ -383,8 +383,25 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
         }
     }
 
-    // 3. Reclaim the store tree — but only after confirming it is inside the prefix.
+    // 3. Reclaim the store tree — but only after confirming it is inside the prefix, and
+    //    only after every build under it has been UNMARKED.
+    //
+    //    The unmark is not tidiness, it is the ordering that makes an interrupted uninstall
+    //    survivable. `remove_dir_all` over a program's whole store is the longest delete
+    //    this manager performs — gigabytes, tens of thousands of files, tens of seconds —
+    //    and `readdir` decides the order. ^C, a logout SIGTERM, an EACCES that aborts the
+    //    walk partway: whatever it had not reached stays, and that includes the `<n>.ready`
+    //    siblings vouching for build dirs it half-emptied. That is how m3 came to hold
+    //    `store/trust/8595/` with no `bin/`, 417 MB of orphaned `lib/`, and `8595.ready`
+    //    still saying `ok` — a build `list_installed` counted, `gc` would not sweep, and
+    //    `flow::rollback` would have switched to, removing every shim on the machine
+    //    because the "prior build" it re-points to holds no tool at all (2026-09-17).
+    //
+    //    With the markers down first, an interrupt here leaves INCOMPLETE trees: debris
+    //    `gc`'s partial arm reclaims under its claim guard, invisible to `list_installed`,
+    //    to `decide` and to `rollback`. Fail-closed in the direction that repairs itself.
     if prog_store.starts_with(&layout.prefix) && prog_store.exists() {
+        crate::store::unmark_program_builds(&prog_store);
         std::fs::remove_dir_all(&prog_store)?;
     }
 
@@ -437,6 +454,51 @@ mod tests {
         // A real install marks the build complete as its last step (verify_and_stage).
         crate::store::mark_build_ready(&dir).unwrap();
         dir
+    }
+
+    /// THE INTERRUPTED UNINSTALL, which is how the m3 corpse was made (2026-09-17):
+    /// `store/trust/8595/` with no `bin/`, 417 MB of orphaned `lib/`, and `8595.ready`
+    /// beside it still saying `ok`. `remove_dir_all` over a program's whole store runs for
+    /// tens of seconds across gigabytes; whatever ends it partway — ^C, a logout SIGTERM,
+    /// an EACCES inside the walk — leaves the builds it had not reached AND the `<n>.ready`
+    /// siblings it had not reached. Those trees then read as INSTALLED: `list_installed`
+    /// counts them, `gc` will not sweep them (it sweeps only marker-less trees) and
+    /// `flow::rollback` switches onto them.
+    ///
+    /// The interrupt is simulated the only way a test can — one subtree made unremovable,
+    /// which is one of the real ways that walk aborts. The uninstall fails, as it must; what
+    /// must NOT survive is a marker vouching for what is left.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_uninstall_leaves_no_build_still_vouched_for() {
+        let l = layout("uninstall-interrupted");
+        let keep = install(&l, "trust", 8590);
+        let doomed = install(&l, "trust", 8595);
+        assert!(crate::store::build_is_complete(&keep));
+        assert!(crate::store::build_is_complete(&doomed));
+        // Make one subtree unremovable so the walk aborts inside the program store.
+        std::fs::set_permissions(keep.join("bin"), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = uninstall(&l, "trust");
+        let aborted = keep.join("bin").join(tool("trust").exe_file()).is_file();
+        std::fs::set_permissions(keep.join("bin"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            aborted && outcome.is_err(),
+            "the fixture must make the removal abort partway, or it proves nothing: \
+             aborted={aborted} outcome={outcome:?}"
+        );
+        // NEITHER build may still read as installed. Before the unmark-first ordering, the
+        // marker of whichever build the walk had not reached survived untouched.
+        for (n, dir) in [(8590u64, &keep), (8595, &doomed)] {
+            assert!(
+                !crate::store::build_is_complete(dir),
+                "build {n} must not still be vouched for after an aborted uninstall"
+            );
+        }
+        assert!(
+            !list_installed(&l).iter().any(|(p, _)| p == "trust"),
+            "and nothing reports trust as installed — so rollback cannot select the wreck"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
     /// A build dir left WITHOUT the completeness marker — a crash mid-extract — must

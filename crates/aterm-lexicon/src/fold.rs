@@ -253,8 +253,14 @@ fn is_kept_mark(c: char) -> bool {
 /// ASCII punctuation that signals a *code / path / URL* context rather than
 /// prose. A whole-word match immediately adjacent to one of these is suppressed
 /// (`cat.txt`, `/api/cat`, `--cat`, `cat=1`, `$cat`).
+///
+/// Public for the same reason as [`is_token_char`]: the typed-line kitty-command
+/// listener judges the context of a TYPED token (`./sit`, `sit=3`, `$play`
+/// must never move the pet), and it has to draw the code/prose line exactly
+/// where the screen scanner draws it. A re-implemented look-alike set would
+/// drift, and the two would disagree about the same word on the same row.
 #[must_use]
-pub(crate) fn is_code_adjacent_punct(c: char) -> bool {
+pub fn is_code_adjacent_punct(c: char) -> bool {
     matches!(
         c,
         '/' | '\\'

@@ -47,10 +47,23 @@ Two ways in:
   ATERM_CONTROL_SOCK=$SOCK XDG_RUNTIME_DIR=$RUN ATERM_COLUMNS=120 ATERM_LINES=40 \
     aterm-gui --headless >"$RUN/gui.log" 2>&1 &
   for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
-  SID=$(aterm ctl --sock "$SOCK" ls | awk 'NR==1{print $3}')
+  SID=$(aterm ctl --sock "$SOCK" spawn identity=worker | cut -d' ' -f2)  # its OWN agent login
   aterm ctl --sock "$SOCK" "@$SID" turn 'cd <workdir> && exec claude'   # launch the worker
-  aterm ctl --sock "$SOCK" "@$SID" status                                # expect detail=claude
+  aterm ctl --sock "$SOCK" "@$SID" status                   # expect detail=claude, identity=worker last
   ```
+  `identity=worker` gives the worker its own agent identity: `CLAUDE_CONFIG_DIR`/`CODEX_HOME`
+  point into `<state>/identities/worker/` (created once, 0700, primed with these skills),
+  never at your `$HOME`, so the worker never shares an account with you — **a shared
+  account's usage limit stops the manager and the worker together**, and a worker on its own
+  login stops alone. Expect the first launch under a fresh identity to ask for a sign-in —
+  the human's keystrokes, in that window, never yours (a human-run measurement the docs
+  still record as a TODO); aterm never reads the login. `aterm ctl --sock "$SOCK"
+  identities` lists the identities and which live sessions carry each; `identities forget
+  worker confirm=worker` removes the directory once no session uses it (sign out in the
+  agent first — a macOS keychain login is not aterm's to remove). On an older build without
+  `identity=`, the spawn is `ERR usage`; fall back to the instance's first session
+  (`aterm ctl --sock "$SOCK" ls | awk 'NR==1{print $3}'`) and know the worker then shares
+  your login.
   On older builds that compound line reads `detail=cd` (the first word, not the segment
   that runs), so when `detail=` is a shell builtin confirm the worker is up with `text`.
   The worker is anything interactive or long-running — `claude` here, but
@@ -58,7 +71,8 @@ Two ways in:
   launch command. Use a **plain** session — NOT `spawn connected=controller`, which injects
   `ATERM_OBSERVE_SESSION_ID`, a marker the worker can read. Launched plainly, the
   worker sees only the generic in-aterm environment (`CLAUDE*`/`ANTHROPIC_*` are
-  stripped from every child), so it behaves exactly as if a human started it.
+  stripped from every child; under `identity=` only the agents' own home variables are
+  set back, pointed into the identity), so it behaves exactly as if a human started it.
 
 **Sandbox anything you run UNATTENDED.** Use a *disposable checkout* — a separate
 clone or a `git worktree` in a throwaway path — never the user's live tree. A
@@ -106,7 +120,7 @@ every human, so it must name YOUR sid, `s-…` — the node id the bridge's own
 delivered but never woken for), the whole loop is four commands:
 
 ```sh
-aterm drive watch "@$SID" --mail --auto-reads --journal "$JOURNAL"   # under ONE Monitor: one line per worker turn
+aterm drive watch "@$SID" --mail --auto-reads --journal "$JOURNAL" --resume "$RULES"   # under ONE Monitor: one line per worker turn
 aterm drive task "@$SID" --no-nudge 'run the suite and report'       # assign: the body goes by mail (the hook wakes it)
 aterm ctl @self inbox get <id>                                       # read the report the EVENT turn line names
 aterm drive ledger "@$SID" --journal "$JOURNAL"                      # replay the run
@@ -293,8 +307,8 @@ the drive budget below is still yours to count.
 ### Let the harness wake you: `aterm drive watch`
 
 ```sh
-aterm drive watch "@$SID" --mail --auto-reads --notes "$NOTES" --journal "$JOURNAL"   # under ONE background monitor
-aterm drive watch "@$SID" --auto-reads --notes "$NOTES" --report                      # no fabric: the screen alone
+aterm drive watch "@$SID" --mail --auto-reads --notes "$NOTES" --journal "$JOURNAL" --resume "$RULES"   # under ONE background monitor
+aterm drive watch "@$SID" --auto-reads --notes "$NOTES" --report --resume "$RULES"                      # no fabric: the screen alone
 ```
 
 When your harness can run a long-lived command in the background and wake you once per
@@ -378,8 +392,18 @@ except that a review point prints one line and the loop keeps going.
   request; a drop that keeps coming back is the same outage). Leave `--socket` unset, or
   name the `aterm.sock` alias: a per-instance `aterm-<pid>.sock` goes with the old
   instance, and every ride-out through it lapses.
-- **A `limited` EVENT means the worker cannot act** until its limit resets (`reset=` says
-  when, if the notice did) or its model is switched. Decide per the human's policy.
+- **A `limited` EVENT is the watcher's own decision point.** It has set the worker's
+  `attention` meta to the notice (aterm's menu bar badges it), mailed you the same text as
+  `kind=control` (a limited manager still reads its inbox later) and journaled `ESCALATED …`
+  — once an episode — and it does NOT exit: a `--max-s` that would end before the reset the
+  notice names is stretched to 10 min past it (`EXTEND until=<UTC> reset=<text>`, once).
+  With `--resume "$RULES"` it probes the worker at the reset (or as soon as the screen leaves
+  the notice: a `/login`, a `/model` line) with ONE fixed question, prints `EVENT resumed
+  seq=<n> <its line>` on the answer, restates `$RULES` as one turn and prints `EVENT
+  rebriefed seq=<n>`; `EVENT still-limited seq=<n> <why>` means it will try again in 10 min,
+  then 30. It never invents work: the LAST DIRECTIVE IS YOURS TO RESEND — the journal and
+  `aterm ctl "@$SID" history` show it. Without `--resume`, decide per the human's policy —
+  wait for `reset=`, switch with `/model`, or escalate — and never keep driving into the wall.
 - **A worker without Claude Code's composer** (a build, a REPL) gets an EVENT each time
   its output pauses for 2 s and its last rows changed — for a build you are only waiting
   on, `aterm drive await-turn` or `aterm ctl "@$SID" await block` is the better tool.
@@ -389,6 +413,34 @@ except that a review point prints one line and the loop keeps going.
   or — before the loop ran — one of its flags or the host (the error is on stderr too).
   Relaunch it or escalate. Like `supervise` it presses option 1 only and never types
   text.
+
+### A usage limit — the worker's, and your own
+
+Measured 2026-09-15 16:51 → 2026-09-17 08:55: the manager's and the worker's Claude Code
+drew on ONE account. Its weekly limit hit both at once — the worker stopped at an idle
+composer under `You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)`,
+the manager's workflow lost its last stage, the watcher printed `EVENT limited`, ran out its
+`--max-s` and exited — and nobody could act for two days, while a finished A/B sat unread.
+When the owner logged in under another account, a one-line probe answered in 23 s. Three
+things keep that from happening again:
+
+1. **Run the watcher as a plain process** under your harness's background monitor (Claude
+   Code's Monitor tool), never as a stage of a workflow that a limit can end: `aterm drive
+   watch "@$SID" --mail --auto-reads --journal "$JOURNAL" --resume "$RULES"`. It lives
+   through the reset on its own (above), and its `EXTEND` keeps it up past the reset, so the
+   line that wakes you comes when you can act on it.
+2. **Keep your standing rules in a file** (`$RULES`: the flag files, the ground-truth
+   command, what never to run) and hand it to `--resume`: after the reset the watcher
+   restates it to the worker as one turn (`Manager's watcher, standing rules restated after
+   a limit: …`, line breaks as spaces) so the rules survive a limit the way you re-send them
+   after `EVENT compacted`. Edit the file as the rules change; it is read when sent. What it
+   does NOT resend is the work: the last unfinished directive is yours, from the journal or
+   `history`.
+3. **Give the worker its own login** — spawn it under `identity=worker` (the recipe above),
+   so its `CLAUDE_CONFIG_DIR` and its login live apart from yours and one account's limit
+   never stops both of you. The sign-in itself is the owner's call, not yours: `/login` in
+   the WORKER's window is a human's keystrokes (never type an account switch for them), and
+   the watcher takes the screen leaving the notice as its cue to probe at once.
 
 ### Assign work by mail: `aterm drive task`
 

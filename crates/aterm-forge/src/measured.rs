@@ -821,9 +821,67 @@ pub const WASM_GPU: Baseline = Baseline {
     duplicate_names: 0,
 };
 
-/// The five cells, in [`crate::resolve::default_cells`] order, so a test that
-/// already holds a cell index can index this too.
-pub const CELLS: [Baseline; 5] = [MAC_ARM, LINUX, WIN, WASM_CPU, WASM_GPU];
+// ---------------------------------------------------------------------------
+// THE SECOND ARCHITECTURE OF EACH SHIPPED OS — measured 2026-09-18 on
+// m17-tower, the day these three triples became cells.
+//
+// EACH ONE READS EXACTLY LIKE ITS SIBLING, every field, and that is the fact
+// worth recording rather than a coincidence worth hiding: `cargo tree`'s
+// per-target resolve keys on `target_os` and `target_family` almost everywhere
+// in this graph, so the ARM Linux surface is the x86_64 Linux surface and the
+// Intel-Mac surface is the Apple-Silicon one. What the rows buy is the day that
+// STOPS being true — an `#[cfg(target_arch)]`-gated dependency, a vendored fork
+// with an arch-specific edge, an assembly crate pulled in on one arch only —
+// which under one ceiling per OS would have been invisible. `cargo forge survey
+// --cell mac-x64 --cell linux-arm --cell win-arm` prints all three.
+// ---------------------------------------------------------------------------
+
+/// The Intel-Mac slice of the universal release binary (`aterm-release`'s
+/// buildplan.rs builds it under upstream stable). Identical to [`MAC_ARM`] in
+/// every field.
+pub const MAC_X64: Baseline = Baseline {
+    cell: "mac-x64",
+    resolved: 122,
+    workspace: 75,
+    third_party: 47,
+    third_party_loc: 441_498,
+    build_scripts: 10,
+    proc_macros: 2,
+    duplicate_names: 1,
+};
+
+/// ARM Linux — the triple tools/linux-auto-atpkg.sh cross-packs beside x86_64.
+/// Identical to [`LINUX`] in every field.
+pub const LINUX_ARM: Baseline = Baseline {
+    cell: "linux-arm",
+    resolved: 272,
+    workspace: 77,
+    third_party: 195,
+    third_party_loc: 2_789_707,
+    build_scripts: 32,
+    proc_macros: 16,
+    duplicate_names: 6,
+};
+
+/// ARM Windows — the triple apps/aterm-win/build.ps1 selects for itself on an
+/// ARM64 host. Identical to [`WIN`] in every field.
+pub const WIN_ARM: Baseline = Baseline {
+    cell: "win-arm",
+    resolved: 162,
+    workspace: 71,
+    third_party: 91,
+    third_party_loc: 3_588_067,
+    build_scripts: 19,
+    proc_macros: 7,
+    duplicate_names: 1,
+};
+
+/// The eight cells, in [`crate::resolve::default_cells`] order, so a test that
+/// already holds a cell index can index this too. APPEND-ONLY for that reason:
+/// the three 2026-09-18 rows sit at the end rather than beside their siblings.
+pub const CELLS: [Baseline; 8] = [
+    MAC_ARM, LINUX, WIN, WASM_CPU, WASM_GPU, MAC_X64, LINUX_ARM, WIN_ARM,
+];
 
 /// The names duplicated in the mac-arm cell. Pinned as NAMES rather than a
 /// count because which crate is doubled is the actionable half of the fact.
@@ -1227,6 +1285,9 @@ mod ratchet_agreement {
             ("win", "shipped.x86_64-pc-windows-msvc"),
             ("wasm-cpu", "shipped.wasm32-unknown-unknown.wasm-cpu"),
             ("wasm-gpu", "shipped.wasm32-unknown-unknown.wasm-gpu"),
+            ("mac-x64", "shipped.x86_64-apple-darwin"),
+            ("linux-arm", "shipped.aarch64-unknown-linux-gnu"),
+            ("win-arm", "shipped.aarch64-pc-windows-msvc"),
         ];
         for (base, (cell, scope)) in CELLS.iter().zip(scopes) {
             assert_eq!(base.cell, cell, "CELLS order changed");

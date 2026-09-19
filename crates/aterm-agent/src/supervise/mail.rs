@@ -643,7 +643,7 @@ pub fn task<C: Ctl>(ctl: &mut C, opts: &TaskOpts, out: &mut dyn Write) -> Result
 
 /// A bound in seconds: whole when it is (`30`), else to the millisecond
 /// (`0.06`).
-fn secs(d: Duration) -> String {
+pub(super) fn secs(d: Duration) -> String {
     if d.subsec_millis() == 0 {
         d.as_secs().to_string()
     } else {

@@ -127,7 +127,9 @@ pub enum RuntimeLane {
 pub enum RecoverySlot {
     /// `Renderer::fallback_pick` — which broad-chain entry covered the char.
     FallbackPick,
-    /// `Renderer::symbol_fallback` — the single symbol slot.
+    /// `Renderer::symbol_chain_pick` — which symbol-chain entry covered the
+    /// char. RECOMPUTED rather than memoized (the pick is a pure function of the
+    /// code point and the loaded chain), so writer and reader cannot drift.
     SymbolSlot,
     /// `RuntimeFallback::parts_for` — EITHER decision map.
     RuntimeDecision,

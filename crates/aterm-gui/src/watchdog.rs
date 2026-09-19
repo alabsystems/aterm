@@ -23,6 +23,18 @@
 //! inside bounded event handling — it logs (and optionally aborts) with the last
 //! breadcrumb NAME.
 //!
+//! ## The second word: phases
+//!
+//! A root is a coarse address — `UserEvent` is every control verb, every
+//! config reload, every update step. Work that is known to be long, or that a
+//! stall was once traced to, announces itself with [`phase`] for the length of
+//! an RAII guard, and the stall line carries that [`Phase`] after the root
+//! (`while inside \`UserEvent\`, in the headless pixel-backend redemption …`).
+//! [`beat`] clears it, so a phase never outlives the root entry it was
+//! announced in. The 2026-09-06 first-launch stall is the case that named
+//! the first two phases; see [`Phase::PixelBackendRedeem`] for where that
+//! line's window fell and what it could not be traced to without the word.
+//!
 //! ## Why the park-point exemption matters
 //!
 //! Between events the winit loop parks in the OS event wait (after
@@ -142,6 +154,16 @@ static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 /// Initialised to [`Breadcrumb::Startup`] so the pre-event-loop launch window is
 /// treated as a park point (no false stall during heavy synchronous startup).
 static BREADCRUMB: AtomicU8 = AtomicU8::new(Breadcrumb::Startup as u8);
+
+/// The work the main thread last ANNOUNCED inside the current root, as a
+/// [`Phase`] `u8` — the second word of a stall line, where the root alone is
+/// not enough. [`beat`] clears it: a phase is scoped to the work inside ONE
+/// root entry and never carried into the next, and a guard restores its outer
+/// phase only over its OWN announcement (a compare-exchange on drop), so a
+/// stale announcement can never name the wrong work — not even a nested
+/// guard's outer phase, dropped after a beat cleared the cell for a root
+/// that never announced it. Written through [`phase`], read by the sampler.
+static PHASE: AtomicU8 = AtomicU8::new(Phase::None as u8);
 
 /// The main-loop roots the watchdog can pin a stall to. `#[repr(u8)]` so it round
 /// trips through the [`BREADCRUMB`] atomic with no allocation and no symbols — the
@@ -484,7 +506,8 @@ pub struct TurnCensus {
 /// to sit on the hot event path in every build, and the only place in the process
 /// that can price a park OUTSIDE the redraw (see the module header). The
 /// breadcrumb is stamped BEFORE the heartbeat bumps so the sampler never reads a
-/// fresh count against a stale location.
+/// fresh count against a stale location, and any announced [`Phase`] is cleared
+/// with it: the work a phase names belongs to the root that announced it.
 #[inline]
 pub fn beat(bc: Breadcrumb) {
     beat_at(bc, crate::metrics::now_ns());
@@ -494,17 +517,26 @@ pub fn beat(bc: Breadcrumb) {
 /// would make any assertion about a span a race.
 #[inline]
 fn beat_at(bc: Breadcrumb, now_ns: u64) -> Option<u64> {
-    beat_into(&TURNS, bc, now_ns)
+    beat_into(&TURNS, &PHASE, bc, now_ns)
 }
 
-/// The beat path with its LEDGER passed in too, on the [`Sampler`] precedent:
-/// factored out so the stamp-close-bump sequence is testable against a ledger no
-/// other test in this binary can write, and no `metrics reset` can clear
-/// mid-assertion.
+/// The beat path with its LEDGER and its PHASE cell passed in too, on the
+/// [`Sampler`] precedent: factored out so the stamp-close-clear-bump sequence is
+/// testable against cells no other test in this binary can write, and no
+/// `metrics reset` can clear mid-assertion. The phase cell needs that as much as
+/// the ledger does: every lib.rs test that arms a deferral before
+/// `ensure_pixel_backend` holds [`Phase::PixelBackendRedeem`] on [`PHASE`] for
+/// the length of a font seal, and none of them takes this module's beat lock.
 #[inline]
-fn beat_into(turns: &TurnLedger, bc: Breadcrumb, now_ns: u64) -> Option<u64> {
+fn beat_into(turns: &TurnLedger, phase: &AtomicU8, bc: Breadcrumb, now_ns: u64) -> Option<u64> {
     let previous = Breadcrumb::from_u8(BREADCRUMB.swap(bc as u8, Ordering::Relaxed));
     let booked = turns.close(previous, now_ns);
+    // A root entry starts with NO announced phase (see `PHASE`): one more
+    // relaxed store on the hot path, the only way a phase ever ends besides its
+    // guard dropping, and stamped BEFORE the heartbeat bumps for the same
+    // reason the breadcrumb is — the sampler must never read a fresh count
+    // against a stale word.
+    phase.store(Phase::None as u8, Ordering::Relaxed);
     HEARTBEAT.fetch_add(1, Ordering::Relaxed);
     booked
 }
@@ -601,6 +633,243 @@ impl Drop for ModalPark {
     }
 }
 
+/// The work a stall line can name INSIDE a root — the answer to "which of the
+/// many things `user_event` does was it doing?", which the root alone cannot
+/// give. `#[repr(u8)]` for the same reason [`Breadcrumb`] is: the NAME must
+/// survive into a stripped-release log line with no allocation and no symbols.
+///
+/// Added after the 2026-09-06 first-launch stall on an Intel MacBook Pro:
+/// `MAIN-THREAD STALL: no heartbeat for 5.045556453s while inside
+/// \`UserEvent\`` was recorded 14 s into the first headless launch on the
+/// machine, and `UserEvent` covers every control verb. Which verb had to be
+/// inferred from the instance's stderr and its socket-open time, and what
+/// that verb was doing on the main thread had to be re-measured with a
+/// probe afterwards — the one extra word this carries. A phase is announced
+/// with [`phase`] and lasts as long as its guard; the sampler prints the
+/// phase that is current when it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Phase {
+    /// Nothing announced: the root is all the line says.
+    None = 0,
+    /// `App::ensure_pixel_backend` — a headless run's FIRST pixel demand
+    /// redeeming, on the main thread, what the launch deferred: the font seal
+    /// (three font files read and parsed; Apple Color Emoji is 190 MB of it
+    /// on macOS), the CPU face fork, and `GpuRenderer::new_with_family`. That
+    /// last leg is NOT just the device: `new_with_family` spawns a font
+    /// thread (`Renderer::from_system_with_family` — font resolution, file
+    /// read, parse — then `prewarm_ascii`), builds the GPU context on the
+    /// calling thread, JOINS the font thread, and only then calls
+    /// `from_parts`, so the leg costs max(context, font thread) plus
+    /// `from_parts`. On the wgpu arms the context is the instance, the
+    /// adapter, the device and the context's tail (`GpuContextTail`), and
+    /// `from_parts`, after the join, compiles the shader and builds the
+    /// pipelines. On the macOS Metal arm `GpuContext::new` only NAMES the
+    /// preferred device and keeps nothing of it but the name — on the
+    /// system-default pick (`ATERM_GPU_POWER=high`, or no low-power GPU
+    /// listed) that naming IS `MTLCreateSystemDefaultDevice` — while
+    /// `MetalArmLive` mints the device (calling `Device::preferred` again:
+    /// on that pick, a second `MTLCreateSystemDefaultDevice`), its queue and
+    /// `cell.metal` at the first armed frame — inside [`Phase::ImageCapture`]
+    /// when the first pixel demand is an `image` capture (a `snapshot`'s or
+    /// `video`'s first frame mints under no phase) — and `from_parts`' shader
+    /// and pipeline legs are `cfg(wgpu_arm)`; so there the leg is max(device
+    /// name, font discovery + parse + prewarm) plus a struct-assembly tail.
+    /// The redemption's own log line splits the max (font thread, join wait).
+    ///
+    /// This is where the 2026-09-06 stall's reported window fell. The line
+    /// (`no heartbeat for 5.045556453s while inside \`UserEvent\``) was
+    /// written at 14:29:36.4, on a headless instance whose stderr did not
+    /// name its device ("GPU rendering on AMD Radeon Pro 560") until
+    /// 14:29:40.7 (the file's last write; that line is written AFTER
+    /// `new_with_family` returns) and whose capture PNG was created at
+    /// 14:29:41.7. So the last heartbeat (14:29:31.4) and the whole reported
+    /// window lie BEFORE that device line: in the seal, the fork and the
+    /// `new_with_family` legs, ~9 s in all, of a ~10 s capture. Which of the
+    /// three, and inside the third whether the device name or the font
+    /// thread, is what the log line's legs exist to say next time. That
+    /// instance predates `Device::preferred`: its `GpuContext::new` and its
+    /// `MetalArmLive::new` both took `MTLCreateSystemDefaultDevice`, the
+    /// call Apple documents as switching a dual-GPU Mac to the discrete GPU.
+    /// So aterm's first call that could set off a switch to the Radeon was
+    /// here, in the device leg; the first-frame mint made a second one, in
+    /// the 945 ms tail (see [`Phase::ImageCapture`]), after `GpuContext::new`
+    /// had released its reference to the device it named; nothing observed
+    /// the mux or timed either call. The aterm.log the line sits in
+    /// holds no other `UserEvent` stall line (checked 2026-09-10; every
+    /// other one is inside `NewEvents`). The surviving re-measurements
+    /// (that evening, debug build, on the Intel HD Graphics
+    /// 630, with a test build running alongside) put the redemption at
+    /// 509-533 ms: font seal 488-510 ms, fork 0, `new_with_family` 21-22 ms,
+    /// install 0.
+    PixelBackendRedeem = 1,
+    /// `App::render_image` — the `image` verb's capture on the main thread,
+    /// the control verb the 2026-09-06 stall was inside. Not the only verb
+    /// that does renderer work there — the offscreen present-real `video`
+    /// loop and the SIGUSR1 `snapshot` path render on the main thread too,
+    /// and announce nothing but the redemption they nest — but the one that
+    /// finding named. Headless, when a capture is the run's first pixel
+    /// demand, the redemption above is nested in it, and on macOS that
+    /// capture also mints the Metal device, its command queue and
+    /// `cell.metal`, then demand-builds the three pipelines the first frame
+    /// binds — the shader-cache-sensitive work. The device is
+    /// `Device::preferred`'s pick: the low-power GPU of a dual-GPU Mac,
+    /// unless `ATERM_GPU_POWER=high` asks for the system default, which on
+    /// such a Mac is the discrete GPU. On that pick the naming in
+    /// [`Phase::PixelBackendRedeem`]'s device leg is aterm's FIRST call that
+    /// can set off the switch — `MTLCreateSystemDefaultDevice`, the call
+    /// Apple documents as switching a dual-GPU Mac to the discrete GPU — and,
+    /// `GpuContext::new` keeping only the name, this mint makes a SECOND.
+    /// Whether that second call switches again, and in which of the two the
+    /// power-up's latency is paid, was not measured (nothing observed the
+    /// mux), so neither phase is ruled out for a mux stall.
+    ///
+    /// In the 2026-09-06 stall that mint was the TAIL, not the window: the
+    /// instance's stderr named its device (the Radeon Pro 560; the pick
+    /// predates `Device::preferred`) at 14:29:40.7, after the stall line had
+    /// been written, and its PNG was created at 14:29:41.7 — so the
+    /// first-frame mint on the discrete GPU (that build's second
+    /// `MTLCreateSystemDefaultDevice`) sits in the 945 ms between those
+    /// two file-system timestamps, with the install, the frame, the encode
+    /// and the write, after the redemption's ~9 s of a ~10 s capture. Nothing
+    /// timed the mint alone, and the stall line's wording cites no figure.
+    /// The surviving in-situ line from this phase is the debug watchdog's
+    /// 504 ms `in an \`image\` capture` on the Intel GPU that evening — a
+    /// 509 ms redemption (font seal 488 ms) with the capture around it,
+    /// under a concurrent test build, named as the capture because the
+    /// phase is read at the report and the redemption had logged its own
+    /// line 166 ms earlier. Nothing was building at 14:29 (the release
+    /// build's log last wrote 22 s before the instance's first log line; the
+    /// next test build's log was created 7 s after the stall line).
+    ImageCapture = 2,
+}
+
+impl Phase {
+    /// Reconstruct a phase from its stored `u8` (unknown values fold to
+    /// [`Phase::None`], which adds nothing to the line).
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Phase::PixelBackendRedeem,
+            2 => Phase::ImageCapture,
+            _ => Phase::None,
+        }
+    }
+
+    /// Stable, symbol-free wording for the log line.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Phase::None => "",
+            Phase::PixelBackendRedeem => {
+                "the headless pixel-backend redemption (the deferred font seal, the face \
+                 fork, and the GPU context with its font thread)"
+            }
+            Phase::ImageCapture => {
+                "an `image` capture (headless, the first one also mints the GPU device and \
+                 compiles its shaders)"
+            }
+        }
+    }
+
+    /// The clause the stall line carries after the root name: empty for
+    /// [`Phase::None`], `, in <description>` otherwise.
+    fn clause(self) -> String {
+        match self {
+            Phase::None => String::new(),
+            named => format!(", in {}", named.describe()),
+        }
+    }
+}
+
+/// Announce the work the main thread is about to do inside the current root.
+///
+/// Stamps `p` now and, on drop, restores the phase that was current when the
+/// guard was made — but only over `p` itself, so a phase nested inside
+/// another (the redemption inside a capture) reads correctly at every
+/// instant, the outer phase comes back when the inner one ends, and a guard
+/// a [`beat`] outlived (the beat cleared the cell for the next root) restores
+/// nothing: the inner guard of a nested pair must not re-announce the OUTER
+/// phase into a root that never announced it. Never a beat: the heartbeat is
+/// the root's, and a phase that beat would hide the very stall it exists to
+/// name.
+#[must_use = "the announcement lasts only as long as the guard lives"]
+pub fn phase(p: Phase) -> PhaseGuard {
+    announce(&PHASE, p)
+}
+
+/// The announcement itself, over an EXPLICIT cell — [`phase`] is this on the
+/// process-global [`PHASE`], and the phase test runs it on a cell of its own
+/// (see [`beat_into`] for why). The guard carries the cell it wrote so its
+/// drop restores the right one.
+fn announce(cell: &'static AtomicU8, p: Phase) -> PhaseGuard {
+    let previous = phase_in(cell);
+    cell.store(p as u8, Ordering::Relaxed);
+    PhaseGuard {
+        cell,
+        written: p,
+        previous,
+    }
+}
+
+/// The phase the main thread last announced (none between roots).
+pub fn current_phase() -> Phase {
+    phase_in(&PHASE)
+}
+
+/// The phase a cell holds.
+fn phase_in(cell: &AtomicU8) -> Phase {
+    Phase::from_u8(cell.load(Ordering::Relaxed))
+}
+
+/// The RAII half of [`phase`]: the cell it wrote, what it wrote there, and
+/// what stood before.
+pub struct PhaseGuard {
+    cell: &'static AtomicU8,
+    written: Phase,
+    previous: Phase,
+}
+
+impl Drop for PhaseGuard {
+    /// Restore `previous` only over this guard's own announcement. Anything
+    /// else in the cell means a [`beat`] cleared it for a new root (guards
+    /// are stack-scoped on one thread, so a later announcement is always
+    /// dropped before this one), and a stale guard leaves that clean slate
+    /// alone rather than naming work the new root is not doing. `Relaxed`
+    /// like every other access to the cell: one writer thread, and a sampler
+    /// that only reads.
+    fn drop(&mut self) {
+        let _ = self.cell.compare_exchange(
+            self.written as u8,
+            self.previous as u8,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// The stall line, assembled from the sampler's facts alone so its wording is
+/// testable without a thread or a logger: the FIRST report of a contiguous
+/// stall names the root and the announced phase and says what the class of
+/// hazard is; every later one says the same stall is still there.
+fn stall_message(reports: u32, frozen: Duration, bc: Breadcrumb, phase: Phase) -> String {
+    let phase = phase.clause();
+    if reports == 1 {
+        format!(
+            "MAIN-THREAD STALL: no heartbeat for {frozen:?} while inside `{}`{phase} — \
+             the UI is not responding. Either unbounded work under a contended lock \
+             (the L0 freeze hazard) or a park that will never end (a lock or lazy-init \
+             cycle). This line names the main-loop root without symbols; a hang report \
+             is not required to find it.",
+            bc.name()
+        )
+    } else {
+        format!(
+            "MAIN-THREAD STALL CONTINUES: still no heartbeat after {frozen:?} inside \
+             `{}`{phase} — this is a wedge, not a slow frame.",
+            bc.name()
+        )
+    }
+}
+
 /// Whether the watchdog sampler should run. EVERY build, unless explicitly
 /// switched off with `ATERM_WATCHDOG=off` — see the module header for why a
 /// release binary is the build that needs this most.
@@ -654,22 +923,16 @@ pub fn start() {
             let bc = Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed));
             if let Some(hit) = sampler.poll(now, cur, bc) {
                 let frozen = now.saturating_duration_since(sampler.last_advance);
-                if sampler.reports == 1 {
-                    aterm_log::error!(
-                        "MAIN-THREAD STALL: no heartbeat for {frozen:?} while inside \
-                         `{}` — the UI is not responding. Either unbounded work under a \
-                         contended lock (the L0 freeze hazard) or a park that will never \
-                         end (a lock or lazy-init cycle). This line names the main-loop \
-                         root without symbols; a hang report is not required to find it.",
-                        hit.name()
-                    );
-                } else {
-                    aterm_log::error!(
-                        "MAIN-THREAD STALL CONTINUES: still no heartbeat after {frozen:?} \
-                         inside `{}` — this is a wedge, not a slow frame.",
-                        hit.name()
-                    );
-                }
+                // The phase is read AT the report, just after the sample
+                // that decided it. If the main thread beat in that instant it
+                // reads none or the next root's; either way it was announced
+                // in the root the main thread is in now (a beat clears it).
+                // A nested phase that ended before the report reads as the
+                // phase around it.
+                aterm_log::error!(
+                    "{}",
+                    stall_message(sampler.reports, frozen, hit, current_phase())
+                );
                 if abort {
                     std::process::abort();
                 }
@@ -732,6 +995,171 @@ mod tests {
         assert!(HEARTBEAT.load(Ordering::Relaxed) >= before + 2);
         assert_eq!(Breadcrumb::from_u8(7), Breadcrumb::Modal);
         assert_eq!(Breadcrumb::Modal.name(), "Modal");
+    }
+
+    /// A phase is the SECOND word of a stall line: announced by a guard,
+    /// nested correctly, restored when the guard drops, and cleared by the
+    /// next root's beat — never carried into work it does not describe, not
+    /// even by a nested guard the beat outlived.
+    ///
+    /// The phase cell and the ledger are this test's OWN, on the same grounds
+    /// [`beat_into`] already states for the ledger: the default harness is
+    /// threaded, and the process-global [`PHASE`] has other writers — every
+    /// lib.rs test that arms `deferred_font_seal` or `deferred_gpu` before
+    /// `ensure_pixel_backend` HOLDS [`Phase::PixelBackendRedeem`] on it for the
+    /// whole of a font seal, and `spawn::park_reader`'s handoff spin CLEARS it
+    /// on every turn of a loop that takes no lock at all — so an assertion on
+    /// the shared cell would race them both ways. Every claim here is therefore
+    /// about this test's own cell; the lock is still taken because [`beat_into`]
+    /// writes the real [`BREADCRUMB`] and [`HEARTBEAT`], which locked siblings
+    /// do assert on, and the heartbeat is only ever read for ADVANCE (that same
+    /// unlocked spin makes any exact count a coin flip).
+    #[test]
+    fn a_phase_is_scoped_to_its_guard_and_cleared_by_the_next_root() {
+        static PH: AtomicU8 = AtomicU8::new(Phase::None as u8);
+        const T0: u64 = 11_000_000_000;
+        const MS: u64 = 1_000_000;
+
+        let _serial = beat_serial();
+        let turns = TurnLedger::new();
+        let before = HEARTBEAT.load(Ordering::Relaxed);
+
+        beat_into(&turns, &PH, Breadcrumb::UserEvent, T0);
+        assert!(
+            HEARTBEAT.load(Ordering::Relaxed) > before,
+            "a root entry beats"
+        );
+        assert_eq!(phase_in(&PH), Phase::None, "a root entry announces nothing");
+        {
+            let _capture = announce(&PH, Phase::ImageCapture);
+            assert_eq!(phase_in(&PH), Phase::ImageCapture);
+            {
+                let _redeem = announce(&PH, Phase::PixelBackendRedeem);
+                assert_eq!(
+                    phase_in(&PH),
+                    Phase::PixelBackendRedeem,
+                    "the inner phase reads while it lasts"
+                );
+            }
+            assert_eq!(
+                phase_in(&PH),
+                Phase::ImageCapture,
+                "the outer phase comes back when the inner one ends"
+            );
+        }
+        assert_eq!(phase_in(&PH), Phase::None);
+        let held = announce(&PH, Phase::PixelBackendRedeem);
+        beat_into(&turns, &PH, Breadcrumb::AboutToWait, T0 + MS);
+        assert_eq!(
+            phase_in(&PH),
+            Phase::None,
+            "the next root's beat clears a phase whose guard is still alive"
+        );
+        // The stale guard finds its announcement gone and restores nothing.
+        // (That it does not BEAT either is structural rather than asserted:
+        // `announce` and `PhaseGuard::drop` are handed the phase cell and
+        // nothing else, so neither can reach the heartbeat — the property a
+        // phase needs, since a phase that beat would hide the very stall it
+        // exists to name.)
+        drop(held);
+        assert_eq!(phase_in(&PH), Phase::None);
+        // The wrong-work case the `PHASE` doc rules out: a beat between a
+        // NESTED guard's creation and its drop. The inner guard sampled the
+        // outer phase, and a plain store on drop would re-announce that outer
+        // phase into the new root — work the new root is not doing. The
+        // compare-exchange leaves the beat's clean slate alone, and so does
+        // the outer guard's drop after it. Unreachable today (neither
+        // `render_image` nor `ensure_pixel_backend` beats or parks); pinned
+        // so it stays a non-event if either ever does.
+        beat_into(&turns, &PH, Breadcrumb::UserEvent, T0 + 2 * MS);
+        let outer = announce(&PH, Phase::ImageCapture);
+        let inner = announce(&PH, Phase::PixelBackendRedeem);
+        beat_into(&turns, &PH, Breadcrumb::AboutToWait, T0 + 3 * MS);
+        assert_eq!(phase_in(&PH), Phase::None);
+        drop(inner);
+        assert_eq!(
+            phase_in(&PH),
+            Phase::None,
+            "a stale inner guard must not re-announce the outer phase"
+        );
+        drop(outer);
+        assert_eq!(phase_in(&PH), Phase::None);
+        // …and a fresh announcement in the new root, made while the stale
+        // pair is still alive, keeps its own restore chain intact.
+        let outer = announce(&PH, Phase::ImageCapture);
+        let inner = announce(&PH, Phase::PixelBackendRedeem);
+        beat_into(&turns, &PH, Breadcrumb::UserEvent, T0 + 4 * MS);
+        let fresh = announce(&PH, Phase::ImageCapture);
+        assert_eq!(phase_in(&PH), Phase::ImageCapture);
+        drop(fresh);
+        assert_eq!(
+            phase_in(&PH),
+            Phase::None,
+            "the fresh guard sampled the beat's None and puts it back"
+        );
+        drop(inner);
+        drop(outer);
+        assert_eq!(phase_in(&PH), Phase::None);
+
+        // Leave the global breadcrumb where the rest of the suite expects it.
+        beat(Breadcrumb::AboutToWait);
+    }
+
+    /// The line a stripped-release log gets, root AND phase — the 2026-09-06
+    /// line as it would have read with the phase in it, the bare form when
+    /// nothing was announced, and the repeat.
+    #[test]
+    fn the_stall_line_names_the_root_and_the_announced_phase() {
+        for p in [Phase::None, Phase::PixelBackendRedeem, Phase::ImageCapture] {
+            assert_eq!(Phase::from_u8(p as u8), p);
+        }
+        assert_eq!(Phase::from_u8(200), Phase::None, "unknown folds to nothing");
+        let line = stall_message(
+            1,
+            Duration::from_millis(5045),
+            Breadcrumb::UserEvent,
+            Phase::PixelBackendRedeem,
+        );
+        assert!(
+            line.starts_with(
+                "MAIN-THREAD STALL: no heartbeat for 5.045s while inside `UserEvent`, in \
+                 the headless pixel-backend redemption"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains("the GPU context with its font thread)"),
+            "{line}"
+        );
+        let bare = stall_message(
+            1,
+            Duration::from_secs(1),
+            Breadcrumb::ResizeSettle,
+            Phase::None,
+        );
+        assert!(
+            bare.contains("inside `ResizeSettle` — the UI is not responding"),
+            "no phase, no clause: {bare}"
+        );
+        let again = stall_message(
+            2,
+            Duration::from_secs(103),
+            Breadcrumb::NewEvents,
+            Phase::ImageCapture,
+        );
+        assert!(
+            again.starts_with(
+                "MAIN-THREAD STALL CONTINUES: still no heartbeat after 103s inside \
+                 `NewEvents`, in an `image` capture (headless, the first one also mints \
+                 the GPU device"
+            ),
+            "{again}"
+        );
+        assert!(
+            again.ends_with("compiles its shaders) — this is a wedge, not a slow frame."),
+            "the mechanism, and no figure: {again}"
+        );
+        assert!(!again.contains("up to a second"), "{again}");
     }
 
     /// LIVE end-to-end proof that the REAL background sampler thread wakes, sees a
@@ -940,24 +1368,26 @@ mod tests {
     /// that the turn it closes is booked to the root that OWNED it — the
     /// `user_event` park, not the `about_to_wait` that ended it.
     ///
-    /// The ledger is local and the beat path is serialized, so nothing here
-    /// depends on test order. What is left uncovered is the one-line binding of
-    /// `beat` to the global ledger and the process clock.
+    /// The ledger and the phase cell are local and the beat path is serialized,
+    /// so nothing here depends on test order. What is left uncovered is the
+    /// one-line binding of `beat` to the global ledger, the global phase cell
+    /// and the process clock.
     #[test]
     fn a_beat_books_the_turn_it_closes_to_the_root_that_owned_it() {
         let _serial = beat_serial();
         const T0: u64 = 7_000_000_000;
         const PARKED: u64 = 250_000_000;
         let turns = TurnLedger::new();
+        let phase = AtomicU8::new(Phase::None as u8);
 
         // Enter the Output arm's root; nothing is closed yet.
-        assert_eq!(beat_into(&turns, Breadcrumb::UserEvent, T0), None);
+        assert_eq!(beat_into(&turns, &phase, Breadcrumb::UserEvent, T0), None);
         assert_eq!(current(), Breadcrumb::UserEvent);
 
         // 250 ms of bookkeeping later the loop reaches its park point, and the
         // beat that gets there prices what just happened.
         assert_eq!(
-            beat_into(&turns, Breadcrumb::AboutToWait, T0 + PARKED),
+            beat_into(&turns, &phase, Breadcrumb::AboutToWait, T0 + PARKED),
             Some(PARKED),
             "the beat that ends a 250 ms `user_event` turn must book it"
         );
@@ -973,7 +1403,12 @@ mod tests {
 
         // The idle park that follows books nothing, however long the user is away.
         assert_eq!(
-            beat_into(&turns, Breadcrumb::NewEvents, T0 + PARKED + 600_000_000_000),
+            beat_into(
+                &turns,
+                &phase,
+                Breadcrumb::NewEvents,
+                T0 + PARKED + 600_000_000_000
+            ),
             None
         );
         assert_eq!(turns.snapshot().turns, 1);

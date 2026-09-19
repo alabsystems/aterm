@@ -174,8 +174,28 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         // the way it did when they queued behind it in `target/`. The sealed
         // fabric rung is one of the driver lane's stages, so it is waited for
         // through `DriverTarget`.
+        //
+        // AND FOR TIPPY (2026-09-18). The test run MEASURES: the paint
+        // conformance takes run in its first minutes and carry a scheduling
+        // sampler beside the probe's driver. Tippy is a full-workspace
+        // `--all-targets` compile at t0 in its own lane, and on a cached build
+        // it is the only heavy work on the box when those takes run. Measured
+        // on m3, third v0.88.0 gate: `alt_screen_fake_claude_typing_paints_trail_ink`
+        // read `sched_late_max_us=49894` against the 25 ms floor
+        // (`sched_qos=user-interactive`, capture hole 18.6 ms — the cadence was
+        // fine, the DRIVER was descheduled) with tippy's rustc jobs running
+        // beside it; the same take had passed the two previous runs, where a
+        // longer build stage had let tippy get further first. A take its own
+        // sampler disowns is a red the tree did not earn, so the test run waits
+        // for the lint's compile the way it waits for the other side lanes,
+        // and the lint keeps starting at t0.
         StageSpec {
-            after_lanes: vec![Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget],
+            after_lanes: vec![
+                Lane::RegexTarget,
+                Lane::XtaskTarget,
+                Lane::DriverTarget,
+                Lane::TippyTarget,
+            ],
             ..spec(StageId::Test, format!("test ({label})"), Lane::MainTarget)
         },
         spec(
@@ -204,8 +224,8 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // on two measured runs.
     //
     // WHY THE CONTRACT NOW CHECKS FORMATTING. It did not until 2026-08-31, and
-    // the limit was stated rather than hidden — but `.githooks/pre-push` has
-    // been advisory since 2026-08-24, so nothing whatsoever ran the formatter
+    // the limit was stated rather than hidden — but `.githooks/pre-push` was
+    // advisory from 2026-08-24, so nothing whatsoever ran the formatter
     // unless a human chose to. MEASURED consequence: three consecutive rebases
     // of `main` arrived with drift (5 files, 2 files, 1 file), and one of those
     // files sat in a crate `targo-fmt --all` structurally cannot see. A rule the
@@ -718,8 +738,10 @@ mod tests {
     /// The test run measures, and until 2026-09-13 the regex lane, the xtask
     /// verbs and every driver build queued behind it in `target/`. Now they
     /// have lanes of their own and start at t0, so the test run must wait for
-    /// all three — and for every stage of theirs that is not behind an
-    /// exclusive barrier (those cannot overlap it by the barrier rule).
+    /// all three — and, since 2026-09-18, for tippy's compile, which
+    /// descheduled a paint take's driver for 50 ms in the v0.88.0 gate — and
+    /// for every stage of theirs that is not behind an exclusive barrier
+    /// (those cannot overlap it by the barrier rule).
     #[test]
     fn the_test_run_waits_for_every_new_side_lane() {
         for mode in [Mode::Fast, Mode::Full] {
@@ -727,13 +749,19 @@ mod tests {
             let test = p.iter().position(|s| s.id == StageId::Test).expect("test");
             assert_eq!(
                 p[test].after_lanes,
-                [Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget]
+                [
+                    Lane::RegexTarget,
+                    Lane::XtaskTarget,
+                    Lane::DriverTarget,
+                    Lane::TippyTarget
+                ]
             );
             let awaited: Vec<StageId> = crate::sched::awaited(&p, test).map(|j| p[j].id).collect();
             assert_eq!(
                 awaited,
                 [
                     StageId::RegexLane,
+                    StageId::Tippy,
                     StageId::Formatting,
                     StageId::FeatureGates,
                     StageId::ProofInventory,

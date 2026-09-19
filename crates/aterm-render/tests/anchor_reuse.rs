@@ -272,6 +272,7 @@ fn image_lane_change_dirties_its_row_under_anchor_shift() {
                 rows: 1,
                 z_index: 0,
                 band_lift_px: 0,
+                pixel_exact: false,
             }),
             cell_row: 0,
             cell_col: 0,

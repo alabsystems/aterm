@@ -63,6 +63,11 @@ use crate::spec::{
     BurstKind, BurstSpec, Collection, Colorway, GraphicSpec, InkSpec, SpecTable, WordEffectSpec,
 };
 use crate::supernova::{self, SuperEnv};
+use crate::trick_flash::TrickFlash;
+// The flash's lifecycle observable is part of THIS module's public surface
+// (the state lives on `WordDecorations`); the module that defines it is
+// crate-private.
+pub use crate::trick_flash::TrickFlashPhase;
 
 /// Hard cap on occurrences tracked per frame (deterministic truncation keeps the
 /// hot path bounded on a screen full of matches). Truncation prefers the
@@ -77,17 +82,17 @@ const MAX_DECORATIONS: usize = 256;
 /// NO ink at all (partial-word ink would sweep a torn gradient).
 const MAX_INK_CELLS: usize = 512;
 /// Specular sweep ramp-in (ms) — §4.2 `env(t)`.
-const INK_RAMP_IN_MS: u64 = 130;
+pub(crate) const INK_RAMP_IN_MS: u64 = 130;
 /// Specular sweep ramp-out after `sweep_ms` (ms) — §4.2: after `sweep_ms + 250`
 /// the emitted color is exactly the static gradient, constant bytes forever.
-const INK_FADE_MS: u64 = 250;
+pub(crate) const INK_FADE_MS: u64 = 250;
 /// §4.3 legibility bound: the word's mid-gradient ink must hold at least this
 /// WCAG contrast against the word's cell background, else the mix is pulled
 /// toward the captured base fg (the theme's own legible color) until it does.
 /// At 2.5:1 the pastel feline / emphasis anchors settle as washed-out salmon on
 /// light themes, visibly weaker than the surrounding theme text; 3.5:1 keeps the
 /// tint while still reading as INK. Dark themes never bind at either value.
-const MIN_INK_CONTRAST: f32 = 3.5;
+pub(crate) const MIN_INK_CONTRAST: f32 = 3.5;
 /// FELINE words are not tinted pink. Their whole ink effect is a subtle
 /// self-terminating GLOW pulse in the word's OWN fg color — total window ms.
 const FELINE_GLOW_MS: u64 = 1400;
@@ -818,7 +823,7 @@ fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
 /// §3.1 rainbow base hue, degrees — a salted decode of the frozen genome so
 /// similar contexts start at similar (not identical) hues.
 const RAINBOW_HUE_SALT: u64 = 0x5A1A_D0FF_BEAD_5EED;
-fn rainbow_base_hue(gkey: u64) -> f32 {
+pub(crate) fn rainbow_base_hue(gkey: u64) -> f32 {
     (mix(gkey ^ RAINBOW_HUE_SALT) % 360) as f32
 }
 
@@ -1163,7 +1168,7 @@ const MAX_PEEK_CUES: usize = 8;
 /// with margin while being far shorter than the "a repaint happens to park the
 /// caret here" horizon the owner actually complained about (which was
 /// unbounded).
-const TYPED_EDIT_WITNESS_MS: u64 = 750;
+pub(crate) const TYPED_EDIT_WITNESS_MS: u64 = 750;
 
 /// How far from a token the recorded edit caret may sit and still count as an
 /// edit OF that token, in columns.
@@ -1187,7 +1192,7 @@ const TYPED_EDIT_WITNESS_MS: u64 = 750;
 /// between the keystroke and its echo lose their cat for that one appearance —
 /// silence is the safe direction for a "once per word" contract, a spurious
 /// replay is not.
-const TYPED_EDIT_REACH_COLS: u16 = 2;
+pub(crate) const TYPED_EDIT_REACH_COLS: u16 = 2;
 
 /// The last committed EDIT keystroke — the causal witness the feline/profanity
 /// re-arm demands on top of the caret's position.
@@ -2466,6 +2471,25 @@ pub struct WordDecorations {
     /// [`TYPED_EDIT_WITNESS_MS`], so there is no state here for a reset to
     /// leave stale.
     typed_edit: Option<TypedEdit>,
+    /// THE TRICK FLASH ([`crate::trick_flash`]): the one word the person just
+    /// typed TO THE PET (`sit`, the `good` of `good kitty`), flashing rainbow
+    /// for about a second — noted by the input path
+    /// ([`Self::note_trick_typed`]), found on the glass by the rescan, painted
+    /// by `tick`.
+    ///
+    /// WINDOW-SCOPED, not parked, ONE slot per engine — the `typed_edit`
+    /// reasoning verbatim: a keyboard has one owner, so this is a claim about
+    /// the person typing, not about one pane's text. The pane the word was
+    /// typed in is recorded IN the value and every hook compares it to
+    /// [`Self::scan_scope`], which is what keeps pane B from painting pane A's
+    /// flash at the same cell (the split host ticks this one engine once per
+    /// pane and translates each pane's ink separately). Parking it per pane
+    /// would turn "one flash at a time" into one per pane.
+    ///
+    /// UNLIKE `typed_edit`, a reset DOES clear it
+    /// ([`Self::reset_word_transient_state`]): it holds grid-derived cells and
+    /// captured colours, and paint state must not outlive the grid it names.
+    trick_flash: TrickFlash,
     /// Per-tick resident scratch (§6.5): `(occurrence index, nova index)`
     /// pairs — each live nova's ≤ MAX_COUPLING_WORDS nearest ink-bearing
     /// occurrences, recomputed per presented frame (stateless coupling).
@@ -3012,6 +3036,33 @@ impl WordDecorations {
         self.bound.or(self.scan_session)
     }
 
+    /// Declare the ABSOLUTE ROW of the top visible line (`RenderInput::base_y`,
+    /// captured under the same lock as the cells) for the rescan the host is
+    /// about to run in the CURRENT scan scope. Call it beside
+    /// [`Self::set_scan_session`] / [`Self::bind_pane`], before the rescan.
+    ///
+    /// It exists for the trick flash. `sit⏎` on the bottom row scrolls before
+    /// its echo is ever scanned, and what the scan then finds nearest the old
+    /// caret is the shell's own `command not found: sit`. The snapshot's
+    /// `base_y` is the EXACT scroll delta, so the engine tests one row —
+    /// `caret.row − (base_y_now − base_y_then)` — instead of guessing upward.
+    /// A setter rather than a rescan parameter because the rescan entry points
+    /// have some thirty callers and exactly three of them know a `base_y`.
+    ///
+    /// A host that never calls it (or passes `None`) is still correct: every
+    /// scroll delta reads as zero, and the flash falls back to its bounded,
+    /// exact-anchor upward search. The declaration is keyed to the scope it
+    /// was made in, so one pane's value can never stand in for another pane's
+    /// rescan, and it is SPENT by the next rescan, so a rescan the host did
+    /// not declare for reads as "no row origin" rather than as a stale one —
+    /// declare before EVERY rescan of a pane whose keys can reach
+    /// [`Self::note_trick_typed`]. Free on the frames that repeat themselves
+    /// (a declaration nobody rescans under is simply overwritten).
+    pub fn set_scan_base_y(&mut self, base_y: Option<i64>) {
+        let scope = self.scan_scope();
+        self.trick_flash.declare_base_y(scope, base_y);
+    }
+
     /// Open a host FRAME, before any pane's [`tick`](Self::tick).
     ///
     /// The `MAX_BAKES_PER_FRAME` budget and the baker's LRU clock are per
@@ -3044,6 +3095,10 @@ impl WordDecorations {
     /// keep their cats across a visit to a split tab should name every session
     /// it still holds open.
     pub fn retain_panes(&mut self, keep: impl Fn(u64) -> bool) {
+        // The trick flash is not parked, so it prunes itself: a departed
+        // pane's base-y memo, and a flash that names a pane nobody will ever
+        // rescan again.
+        self.trick_flash.retain_panes(&keep);
         self.parked.retain(|k, _| keep(*k));
         if let Some(cur) = self.bound
             && !keep(cur)
@@ -3055,8 +3110,14 @@ impl WordDecorations {
             self.pane_px = (0, 0);
             // ONLY the departed pane's state (it is the one in the live fields).
             // Its still-visible siblings are parked and keep their episodes —
-            // closing one pane must not blank the cats in the rest.
+            // closing one pane must not blank the cats in the rest. Nor a
+            // sibling's trick flash: that state is not parked, it already
+            // pruned itself by pane above, and whatever it still holds does
+            // not name the pane that left — so it rides through this one
+            // pane's reset (and its next rescan re-verifies it as always).
+            let flash = std::mem::take(&mut self.trick_flash);
             self.reset_bound();
+            self.trick_flash = flash;
         }
     }
 
@@ -3176,6 +3237,11 @@ impl WordDecorations {
         // heat IS transient — surviving a hard_reset would force escalated
         // rolls across rebirths and break the decorrelation pin).
         self.combo_births.clear();
+        // The trick flash holds cells and colours captured from the grid that
+        // just died, and a config reload may have turned tricks or ink off
+        // mid-flash. Window-scoped, so under the per-pane reset fold this runs
+        // once per pane — which is why `clear` is idempotent.
+        self.trick_flash.clear();
     }
 
     /// v3 §1.1 fix #3: suspend the engine's clocks (perf_reduced latch,
@@ -3246,6 +3312,12 @@ impl WordDecorations {
         // 2026-08-07). Heat just decays in engine-clock time, frozen or not —
         // a streak is about the last 30 seconds of the person at the
         // keyboard, not about how long a pane spent suspended.
+        //
+        // The TRICK FLASH is not thaw-shifted either, for the same reason: it
+        // is window-scoped state about the keyboard, and one pane's freeze
+        // must not stretch a flash that belongs to a sibling. A frozen pane
+        // neither finds nor paints it (both hooks sit behind the frozen
+        // returns); its second simply runs out on the engine clock.
     }
 
     /// §3.2b F-BOMB COMBO level at `now`: prune entries older than
@@ -4984,6 +5056,58 @@ impl WordDecorations {
         });
     }
 
+    /// Record that `word` was just TYPED TO THE PET in `pane` — the typed-line
+    /// listener ([`crate::typed_tricks`]) fired on it — so the word flashes
+    /// rainbow once the rescan finds it (the crate-private `trick_flash`
+    /// module holds the whole mechanism and its laws).
+    ///
+    /// `word` is the raw typed trick token (never the pet's name) and
+    /// `back_chars` is how many typed characters lie between it and the caret
+    /// as the press arrived: 0 for `sit␣`, 6 for the `good` of `good kitty␣`,
+    /// the commit's leading characters for a word inside one IME commit.
+    ///
+    /// The `note_typed_edit` seam's twin, and under the same provenance law:
+    /// fed from the host's INPUT path only, so program output, a paste and a
+    /// controller's raw bytes can never mint a flash — with no note there is
+    /// no slot, and `echo sit` stays plain text. The place comes from the
+    /// NAMED pane's pre-echo caret (`caret_of_pane`, the edit witness's own
+    /// source) and the base-y that pane's last cursor-bearing rescan recorded.
+    ///
+    /// FAIL-SILENT by design: a pane with no caret observation stores nothing
+    /// (a paint decision must not abstain the way the edit witness does), and
+    /// a flash still in its opening third of a second is not cut off by a new
+    /// one. O(`word` length) into fixed inline buffers — constant work on the
+    /// input path, no allocation. A host that never calls this (the web
+    /// pipeline) pays one `Option` test per rescan and per tick.
+    pub fn note_trick_typed(
+        &mut self,
+        now: Instant,
+        pane: Option<u64>,
+        word: &str,
+        back_chars: u16,
+    ) {
+        let caret = self.caret_of_pane(pane);
+        let scope = self.scan_scope();
+        self.trick_flash
+            .note(now, pane, scope, caret, word, back_chars);
+    }
+
+    /// The line the word was typed on turned out NOT to be pet talk (`sit
+    /// tight`): a flash on the glass leaves over a tenth of a second instead
+    /// of finishing, and one the rescan has not found yet is dropped unseen.
+    /// Idempotent — the listener can revoke with nothing pending here.
+    pub fn revoke_trick_flash(&mut self, now: Instant) {
+        self.trick_flash.revoke(now);
+    }
+
+    /// Where the trick flash stands at `now` — pending, live, revoked or
+    /// idle. Observability for tests, the lifecycle model's conformance bind
+    /// and driven validation; nothing in the engine reads it back.
+    #[must_use]
+    pub fn trick_flash_phase(&self, now: Instant) -> TrickFlashPhase {
+        self.trick_flash.phase(now)
+    }
+
     /// The last scanned caret belonging to `pane`, wherever that pane's state
     /// currently lives — the live fields when they are that pane's (or when
     /// nothing is bound at all), its parked slot otherwise.
@@ -5212,6 +5336,13 @@ impl WordDecorations {
             }
             break;
         }
+        // THE TRICK FLASH's rescan half (see [`Self::locate_trick_flash`]),
+        // after the scan pass and before `rescan_end` — in BOTH twins, so the
+        // cold path the test batteries drive and the snapshot path the
+        // renderer drives cannot drift. The row buffer is still ours to lend.
+        self.locate_trick_flash(rows, cols, cursor, now, cfg, &mut row_cells, |r, buf| {
+            term.render_row_into(r, buf);
+        });
         self.scan_cells = row_cells;
         self.rescan_end(out, cols, epoch, now, None, None);
     }
@@ -5375,6 +5506,17 @@ impl WordDecorations {
             }
             break;
         }
+        // THE TRICK FLASH's rescan half — the term-walk twin's call verbatim,
+        // outside row sourcing. This path scans the snapshot's rows in place
+        // and never touches the resident row buffer, so it is free to lend.
+        let mut row_cells = std::mem::take(&mut self.scan_cells);
+        self.locate_trick_flash(rows, cols, cursor, now, cfg, &mut row_cells, |r, buf| {
+            buf.clear();
+            if let Some(row) = cells.get(r) {
+                buf.extend_from_slice(row);
+            }
+        });
+        self.scan_cells = row_cells;
         self.rescan_end(
             out,
             cols,
@@ -5386,6 +5528,47 @@ impl WordDecorations {
                 feline_magic: cfg.feline_magic,
             }),
             cursor,
+        );
+    }
+
+    /// THE TRICK FLASH's rescan half, ONE routine over both row sources (the
+    /// `dense_scan_cutoff` idiom: `load_row` fills `row_buf` with one viewport
+    /// row). With no flash noted it is one `Option` test (plus, on a
+    /// cursor-bearing rescan of a host that declares `base_y`, a probe of the
+    /// flash's short per-pane memo).
+    ///
+    /// With one noted IN THIS SCAN SCOPE it finds the typed word on the row
+    /// the caret stood on — moved by exactly the scroll `set_scan_base_y`
+    /// reported — or re-verifies and follows a word it already found, and ends
+    /// the flash when the text is gone, the grid changed width, or this pane
+    /// is being scanned without a cursor (a scrollback view, whose rows are
+    /// not live rows). It creates no occurrence and no episode, so identity,
+    /// the done marks, the occurrence cap, the ink-cell cap and the flash
+    /// limiter never see it. `cursor` is the one the twin handed `scan_row`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "threads the rescan's geometry, caret, clock, config and row source to the flash; the dense_scan_cutoff shape"
+    )]
+    fn locate_trick_flash(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        cursor: Option<(u16, u16)>,
+        now: Instant,
+        cfg: &DecoConfig,
+        row_buf: &mut Vec<RenderCell>,
+        load_row: impl FnMut(usize, &mut Vec<RenderCell>),
+    ) {
+        let scope = self.scan_scope();
+        self.trick_flash.on_rescan(
+            scope,
+            now,
+            rows,
+            cols,
+            cursor,
+            trick_flash_paintable(cfg),
+            row_buf,
+            load_row,
         );
     }
 
@@ -6538,7 +6721,9 @@ impl WordDecorations {
     /// Advance the animation one frame and emit this frame's decorations into
     /// `out`, this frame's animated-ink fg overrides into `ink` (sorted
     /// `(row, col)` unique — the renderer's [`InkCell`] invariant; emission is
-    /// row-major over non-overlapping matches, so sortedness is structural),
+    /// row-major over non-overlapping matches, so sortedness is structural, and
+    /// the trick flash's few cells are merged IN ORDER, replacing on an equal
+    /// cell),
     /// this frame's peeking cats into `free` (overlay Phase 4: ONE
     /// [`FreeSprite`] per cat plus its gaze-light dots, paired with
     /// [`WordDecorations::free_atlas`]), and this frame's supernova additive
@@ -6678,6 +6863,31 @@ impl WordDecorations {
             return 0;
         }
         if self.occ.is_empty() {
+            // THE TRICK FLASH ON A WORDLESS SCREEN — the COMMON case: `sit` at
+            // a clean prompt is a screen with no lexicon word on it. This arm
+            // returns before `frame` advances and disarms the scheduler, so a
+            // flash that painted here without arming would freeze mid-ramp
+            // until the next keypress — exactly the tint residue the flash
+            // promises cannot happen. It therefore arms THIS pane's own
+            // deadline (never a term in `is_active`) and folds its own clock
+            // into the fingerprint, there being no frame counter on this path.
+            // With no flash to paint, the three lines below run verbatim.
+            let mut fp: u64 = 0xcbf2_9ce4_8422_2325;
+            let scope = self.scan_scope();
+            if let Some(until) =
+                self.trick_flash
+                    .emit(scope, now, trick_flash_paintable(cfg), ink, &mut fp)
+            {
+                self.active_until = Some(until);
+                self.novas.clear();
+                self.coupling.clear();
+                debug_assert!(
+                    ink.windows(2)
+                        .all(|w| (w[0].row, w[0].col) < (w[1].row, w[1].col)),
+                    "ink must be sorted by (row, col) with unique cells"
+                );
+                return fp;
+            }
             self.active_until = None;
             self.novas.clear();
             self.coupling.clear();
@@ -7260,6 +7470,20 @@ impl WordDecorations {
         // stable version, so the settled fp stays stable.
         if !free.is_empty() {
             fp = fold_u64(fp, self.cat_baker.version());
+        }
+        // THE TRICK FLASH, merged LAST so it can see what the occurrences
+        // inked: at most 32 cells, inserted in `(row, col)` order, and where an
+        // occurrence already inked the cell (a custom spec on the trick word,
+        // a feline self-glow on `meow`) THAT colour is the mix base — so the
+        // fade lands on exactly what shows without the flash. It folds into
+        // `fp` only while it emits (always animating, then zero cells
+        // forever) and arms the tick-local deadline like every other ink.
+        let scope = self.scan_scope();
+        if let Some(until) =
+            self.trick_flash
+                .emit(scope, now, trick_flash_paintable(cfg), ink, &mut fp)
+        {
+            arm_until(&mut active_until, until);
         }
         // The renderers' merge-walk is correct ONLY under sorted-unique (row, col);
         // structural here (row-major occurrences, non-overlapping matches, ascending
@@ -9110,6 +9334,13 @@ fn caret_on_span(cell: (u16, u16), row: u16, start_col: u16, end_col: u16) -> bo
     caret_row == row && caret_col >= start_col && caret_col <= end_col.saturating_add(1)
 }
 
+/// Whether the trick flash may paint under `cfg` — the SelfGlow law. Ink off
+/// means zero [`InkCell`]s for everyone; and reduced motion never arms the
+/// scheduler, so it could never take a TRANSIENT tint off again: no flash.
+fn trick_flash_paintable(cfg: &DecoConfig) -> bool {
+    cfg.ink_enabled && !cfg.reduced_motion
+}
+
 /// Arm (or extend) the shared animation deadline to at least `until`, keeping
 /// the repaint scheduler awake through the latest live window.
 fn arm_until(active_until: &mut Option<Instant>, until: Instant) {
@@ -10300,7 +10531,7 @@ fn emit_rainbow_sparkles(
 
 /// Fold an ink cell's visible fields into the frame fingerprint (FNV-1a chain,
 /// the `fold_deco` sibling).
-fn fold_ink(mut h: u64, c: &InkCell) -> u64 {
+pub(crate) fn fold_ink(mut h: u64, c: &InkCell) -> u64 {
     for x in [
         u64::from(c.row),
         u64::from(c.col),
@@ -10321,7 +10552,7 @@ fn dim_rgb(c: u32, f: f32) -> u32 {
     (m(16) << 16) | (m(8) << 8) | m(0)
 }
 
-fn rgb3_to_u32(c: [u8; 3]) -> u32 {
+pub(crate) fn rgb3_to_u32(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
 }
 
@@ -10648,7 +10879,7 @@ fn cat_peek_plan(
     }
 }
 
-fn u32_to_rgb3(c: u32) -> [u8; 3] {
+pub(crate) fn u32_to_rgb3(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
@@ -10764,7 +10995,7 @@ fn fold_glow(mut h: u64, q: &GlowQuad) -> u64 {
 }
 
 /// Fold one scalar into the FNV-1a fingerprint chain.
-fn fold_u64(mut h: u64, x: u64) -> u64 {
+pub(crate) fn fold_u64(mut h: u64, x: u64) -> u64 {
     h ^= x;
     h.wrapping_mul(0x0000_0100_0000_01B3)
 }
@@ -25149,5 +25380,199 @@ mod dog_cameo_emission_tests {
             s.w
         );
         assert!(s.w > 0 && s.h > 0);
+    }
+}
+
+/// The TRICK FLASH's hooks, pinned against the engine's PRIVATE state (the
+/// flash's own battery, which drives the public surface on both rescan twins,
+/// lives with the flash in `trick_flash.rs`): what `tick` arms and what it
+/// leaves verbatim, and what a reset leaves behind.
+#[cfg(test)]
+mod trick_flash_hook_tests {
+    use super::*;
+    use crate::trick_flash::FLASH_MS;
+
+    fn tick(wd: &mut WordDecorations, now: Instant, ink: &mut Vec<InkCell>) -> u64 {
+        let (mut out, mut free, mut nova) = (Vec::new(), Vec::new(), Vec::new());
+        wd.tick(
+            now,
+            &DecoConfig::default(),
+            EffectGeom::default(),
+            None,
+            None,
+            true,
+            &mut out,
+            ink,
+            &mut free,
+            &mut nova,
+        )
+    }
+
+    /// Type `typed`, note `word` as typed to the pet, echo the Space, rescan.
+    fn flash(term: &mut Terminal, wd: &mut WordDecorations, typed: &str, word: &str, t0: Instant) {
+        let (lex, c) = (Lexicon::with_languages(&["en"]), DecoConfig::default());
+        term.process(typed.as_bytes());
+        wd.rescan(term, 4, 40, &lex, &c, 1, t0);
+        wd.note_trick_typed(t0, None, word, 0);
+        term.process(b" ");
+        wd.rescan(term, 4, 40, &lex, &c, 2, t0);
+    }
+
+    /// The wordless arm with NO flash is the pre-feature path, verbatim: a
+    /// stale scratch comes back empty, the fingerprint is the literal 0, and
+    /// the deadline is `None` — not merely in the past. A PENDING flash (noted,
+    /// not yet found) changes none of that.
+    #[test]
+    fn a_wordless_screen_with_no_flash_still_returns_fp_zero_and_disarms() {
+        let t0 = Instant::now();
+        let (lex, c) = (Lexicon::with_languages(&["en"]), DecoConfig::default());
+        let mut term = Terminal::new(4, 40);
+        term.process(b"$ sit");
+        let mut wd = WordDecorations::default();
+        wd.rescan(&term, 4, 40, &lex, &c, 1, t0);
+        assert!(wd.occ.is_empty(), "`sit` is nobody's lexicon word");
+        let stale = InkCell {
+            row: 0,
+            col: 0,
+            color: [1, 2, 3],
+        };
+        for pending in [false, true] {
+            if pending {
+                wd.note_trick_typed(t0, None, "sit", 0);
+            }
+            wd.active_until = Some(t0 + Duration::from_secs(5));
+            let mut ink = vec![stale];
+            assert_eq!(tick(&mut wd, t0, &mut ink), 0, "pending = {pending}");
+            assert!(ink.is_empty(), "pending = {pending}");
+            assert_eq!(wd.active_until, None, "pending = {pending}");
+        }
+    }
+
+    /// A LIVE flash on a wordless screen arms THIS pane's own deadline at
+    /// exactly the flash's end — the wake `is_active` already reads, never a
+    /// new term — and the first tick past it puts the verbatim path back.
+    #[test]
+    fn a_live_flash_on_a_wordless_screen_arms_exactly_its_own_window() {
+        let t0 = Instant::now();
+        let mut term = Terminal::new(4, 40);
+        let mut wd = WordDecorations::default();
+        flash(&mut term, &mut wd, "$ sit", "sit", t0);
+        let end = t0 + Duration::from_millis(u64::from(FLASH_MS));
+        let mut ink = Vec::new();
+        let frame_before = wd.frame;
+        assert_ne!(tick(&mut wd, t0 + Duration::from_millis(200), &mut ink), 0);
+        assert_eq!(ink.len(), 3);
+        assert_eq!(wd.active_until, Some(end));
+        assert_eq!(
+            wd.frame, frame_before,
+            "the wordless arm still advances no frame counter"
+        );
+        assert_eq!(tick(&mut wd, end, &mut ink), 0);
+        assert!(ink.is_empty());
+        assert_eq!(wd.active_until, None);
+    }
+
+    /// At the TAIL the flash only ever EXTENDS the tick-local deadline: a
+    /// feline word's longer glow keeps its own end, and once that word has
+    /// settled a new flash is the only thing armed.
+    #[test]
+    fn beside_other_ink_the_flash_extends_the_deadline_and_never_shortens_it() {
+        let t0 = Instant::now();
+        let mut term = Terminal::new(4, 40);
+        let mut wd = WordDecorations::default();
+        flash(&mut term, &mut wd, "$ kitty sit", "sit", t0);
+        assert!(
+            !wd.occ.is_empty(),
+            "`kitty` is an occurrence: the tail hook"
+        );
+        let mut ink = Vec::new();
+        tick(&mut wd, t0 + Duration::from_millis(300), &mut ink);
+        let glow_end = t0 + Duration::from_millis(FELINE_GLOW_MS);
+        assert!(FELINE_GLOW_MS > u64::from(FLASH_MS));
+        assert_eq!(wd.active_until, Some(glow_end), "the longer window stands");
+        assert!(ink.iter().any(|cell| (8..=10).contains(&cell.col)));
+        // After both (and inside the identity grace, so `kitty` stays the
+        // same spent episode): a settled feline word arms nothing…
+        let later = t0 + Duration::from_secs(2);
+        tick(&mut wd, later, &mut ink);
+        assert_eq!(wd.active_until, None);
+        // …so a second command on the same line is the flash's deadline alone.
+        let (lex, c) = (Lexicon::with_languages(&["en"]), DecoConfig::default());
+        term.process(b"jump");
+        wd.rescan(&term, 4, 40, &lex, &c, 3, later);
+        wd.note_trick_typed(later, None, "jump", 0);
+        term.process(b" ");
+        wd.rescan(&term, 4, 40, &lex, &c, 4, later);
+        tick(&mut wd, later + Duration::from_millis(16), &mut ink);
+        assert_eq!(
+            wd.active_until,
+            Some(later + Duration::from_millis(u64::from(FLASH_MS)))
+        );
+        let flashed: Vec<u16> = ink.iter().map(|cell| cell.col).collect();
+        assert_eq!(flashed, [12, 13, 14, 15]);
+    }
+
+    /// The flash twin of `reset_clears_stale_ink_on_next_tick`: the
+    /// suppressed-alt-screen / master-off arms call `reset()` and tick with
+    /// the same scratch. The flash holds cells captured from the grid that
+    /// just died, so it must go with it — and stay gone when the very same
+    /// text is scanned again.
+    #[test]
+    fn reset_clears_a_live_trick_flash_on_the_next_tick() {
+        let t0 = Instant::now();
+        for hard in [false, true] {
+            let mut term = Terminal::new(4, 40);
+            let mut wd = WordDecorations::default();
+            flash(&mut term, &mut wd, "$ sit", "sit", t0);
+            let mut ink = Vec::new();
+            tick(&mut wd, t0 + Duration::from_millis(200), &mut ink);
+            assert_eq!(ink.len(), 3);
+            assert!(wd.is_active(t0 + Duration::from_millis(200)));
+            if hard {
+                wd.hard_reset_words();
+            } else {
+                wd.reset();
+            }
+            let now = t0 + Duration::from_millis(216);
+            assert_eq!(tick(&mut wd, now, &mut ink), 0, "hard = {hard}");
+            assert!(
+                ink.is_empty(),
+                "stale flash ink must clear on the next tick"
+            );
+            assert!(!wd.is_active(now));
+            assert_eq!(wd.trick_flash_phase(now), TrickFlashPhase::Idle);
+            let (lex, c) = (Lexicon::with_languages(&["en"]), DecoConfig::default());
+            wd.rescan(&term, 4, 40, &lex, &c, 3, now);
+            assert_eq!(tick(&mut wd, now, &mut ink), 0, "a reset is not a re-arm");
+            assert!(ink.is_empty());
+        }
+    }
+
+    /// A FROZEN engine neither locates nor paints: both hooks sit behind the
+    /// frozen returns, and the thaw finds the flash exactly where the clock
+    /// left it (its window is a claim about the keyboard, not about one
+    /// pane's suspended grid, so it is not thaw-shifted).
+    #[test]
+    fn a_frozen_engine_neither_finds_nor_paints_the_flash() {
+        let t0 = Instant::now();
+        let (lex, c) = (Lexicon::with_languages(&["en"]), DecoConfig::default());
+        let mut term = Terminal::new(4, 40);
+        term.process(b"$ sit");
+        let mut wd = WordDecorations::default();
+        wd.rescan(&term, 4, 40, &lex, &c, 1, t0);
+        wd.note_trick_typed(t0, None, "sit", 0);
+        term.process(b" ");
+        wd.freeze(t0);
+        wd.rescan(&term, 4, 40, &lex, &c, 2, t0);
+        assert_eq!(wd.trick_flash_phase(t0), TrickFlashPhase::Pending);
+        let mut ink = Vec::new();
+        assert_eq!(tick(&mut wd, t0, &mut ink), 0);
+        assert!(ink.is_empty());
+        let thawed = t0 + Duration::from_millis(100);
+        wd.thaw(thawed);
+        wd.rescan(&term, 4, 40, &lex, &c, 2, thawed);
+        assert_eq!(wd.trick_flash_phase(thawed), TrickFlashPhase::Live);
+        tick(&mut wd, thawed + Duration::from_millis(200), &mut ink);
+        assert_eq!(ink.len(), 3);
     }
 }

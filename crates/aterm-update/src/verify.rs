@@ -3,9 +3,12 @@
 
 //! Authenticity verification of a candidate `.app`, run both at stage time and
 //! again at apply time (TOCTOU defence — the staged copy sits on disk between the
-//! two). Mirrors the checks `apps/aterm-mac/notarize.sh` performs, in order of
-//! cheapest/most-local first, and fails CLOSED: any error, non-zero exit, or
-//! unparseable output is a rejection.
+//! two). It asks the same questions the CUTTER asks at notarize time —
+//! `crates/aterm-release/src/sign.rs` (codesign verification, `stapler
+//! validate`, `spctl` assessment) — in order of cheapest/most-local first, and
+//! fails CLOSED: any error, non-zero exit, or unparseable output is a
+//! rejection. Both sides were ported from the retired `apps/aterm-mac/notarize.sh`,
+//! which no longer exists in this tree; cite the Rust, not the shell.
 
 use std::path::Path;
 use std::process::Command;

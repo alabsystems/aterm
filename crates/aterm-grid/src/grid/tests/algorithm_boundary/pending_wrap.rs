@@ -7,7 +7,9 @@
 //! Verifies that operations which should clear the `pending_wrap` flag
 //! (xterm's `do_wrap`) actually do so, and that the ones xterm leaves alone keep
 //! it. Per xterm (`util.c` / `charproc.c`), these cancel the deferred wrap:
-//! insert/delete character/line (ICH/DCH/IL/DL), erase-character (ECH), the
+//! insert/delete character/line (ICH/DCH/IL/DL — but IL and DL only once
+//! their row/column margin tests PASS, since xterm returns above its
+//! `ResetWrap`), erase-character (ECH), the
 //! ED 0/1/2 and EL 0/1/2 erases (`ClearRight`, `ClearInLine2` and
 //! `ClearScreen` all call `ResetWrap`), the selective DECSEL/DECSED erases
 //! (DECSEL 0 always; DECSED 0 except at the origin, reachable only on a line one
@@ -16,7 +18,7 @@
 //! because `ClearInLine2` returns before `ResetWrap` when its span holds no
 //! unprotected cell), DECALN, and
 //! entering the alternate screen with CSI ?1049 h (its `ClearScreen` runs
-//! last). Scrolls (SU/SD), TAB, ED 3 and the rectangle ops keep it.
+//! last). Scrolls (SU/SD), TAB and CBT, ED 3 and the rectangle ops keep it.
 //!
 //! Part of #5351 (deferred wrapping conformance).
 
@@ -92,6 +94,124 @@ fn insert_lines_clears_pending_wrap() {
     assert!(
         !grid.pending_wrap(),
         "IL must clear pending_wrap (xterm: ResetWrap in InsertLine)"
+    );
+}
+
+/// AN IL/DL THE CURSOR POSITION REJECTS KEEPS THE PARKED WRAP.
+///
+/// xterm's `InsertLine` and `DeleteLine` (util.c) test the margins and RETURN
+/// before they reach `ResetWrap(screen)`:
+///
+/// ```c
+/// if (!ScrnIsRowInMargins(screen, screen->cur_row)
+///     || screen->cur_col < left || screen->cur_col > right)
+///     return;                       /* <-- before ResetWrap */
+/// ...
+/// ResetWrap(screen);
+/// ```
+///
+/// So the deferred wrap dies with the INSERT, not with the request. aterm reset
+/// it as the first statement of all four entry points, which cancelled a wrap
+/// xterm keeps: the next printable then landed on this row instead of wrapping
+/// to the next one, because `do_wrap` is consumed by the next printable
+/// wherever the cursor sits (charproc.c: `if (screen->do_wrap) { WrapLine(xw); }`).
+///
+/// Each refusal is pinned beside the in-range case that must STILL clear, so a
+/// blanket "never resets" cannot pass this.
+#[test]
+fn insert_lines_outside_the_scroll_region_keeps_pending_wrap() {
+    let mut grid = grid_with_pending_wrap(5, 5);
+    // The cursor is parked on row 0; put the scroll region strictly below it.
+    grid.set_scroll_region(1, 4);
+    assert!(
+        grid.pending_wrap(),
+        "precondition: setting the region must not disturb the parked wrap"
+    );
+
+    grid.insert_lines(1);
+
+    assert!(
+        grid.pending_wrap(),
+        "an IL the region test rejects must leave the wrap armed (xterm returns before ResetWrap)"
+    );
+
+    // POSITIVE CONTROL: the same IL with the cursor INSIDE the region still resets.
+    grid.set_scroll_region(0, 4);
+    grid.insert_lines(1);
+    assert!(
+        !grid.pending_wrap(),
+        "an IL that actually inserts must still reset the wrap"
+    );
+}
+
+/// DL outside the scroll region keeps the wrap — see the IL twin above.
+#[test]
+fn delete_lines_outside_the_scroll_region_keeps_pending_wrap() {
+    let mut grid = grid_with_pending_wrap(5, 5);
+    grid.set_scroll_region(1, 4);
+
+    grid.delete_lines(1);
+
+    assert!(
+        grid.pending_wrap(),
+        "a DL the region test rejects must leave the wrap armed"
+    );
+
+    // POSITIVE CONTROL.
+    grid.set_scroll_region(0, 4);
+    grid.delete_lines(1);
+    assert!(
+        !grid.pending_wrap(),
+        "a DL that actually deletes must still reset the wrap"
+    );
+}
+
+/// IL outside the DECLRMM horizontal margins keeps the wrap.
+///
+/// The column test is xterm's too (`screen->cur_col < left || > right`), and it
+/// sits in the same `return` that precedes `ResetWrap`.
+#[test]
+fn insert_lines_outside_the_horizontal_margins_keeps_pending_wrap() {
+    let mut grid = grid_with_pending_wrap(5, 5);
+    // The wrap parks the cursor on the last column; these margins exclude it.
+    grid.set_horizontal_margins(0, 2);
+    assert_eq!(grid.cursor_col(), 4, "precondition: cursor outside [0, 2]");
+
+    grid.insert_lines_margined(1, true);
+
+    assert!(
+        grid.pending_wrap(),
+        "an IL the column-margin test rejects must leave the wrap armed"
+    );
+
+    // POSITIVE CONTROL: margins that CONTAIN the parked column still reset it.
+    grid.set_horizontal_margins(2, 4);
+    grid.insert_lines_margined(1, true);
+    assert!(
+        !grid.pending_wrap(),
+        "an IL inside the margins must still reset the wrap"
+    );
+}
+
+/// DL outside the DECLRMM horizontal margins keeps the wrap — see the IL twin.
+#[test]
+fn delete_lines_outside_the_horizontal_margins_keeps_pending_wrap() {
+    let mut grid = grid_with_pending_wrap(5, 5);
+    grid.set_horizontal_margins(0, 2);
+
+    grid.delete_lines_margined(1, true);
+
+    assert!(
+        grid.pending_wrap(),
+        "a DL the column-margin test rejects must leave the wrap armed"
+    );
+
+    // POSITIVE CONTROL.
+    grid.set_horizontal_margins(2, 4);
+    grid.delete_lines_margined(1, true);
+    assert!(
+        !grid.pending_wrap(),
+        "a DL inside the margins must still reset the wrap"
     );
 }
 
@@ -355,18 +475,43 @@ fn tab_preserves_pending_wrap() {
     assert_eq!(grid.cursor_col(), 19, "cursor stays at the last column");
 }
 
-/// CBT (Back Tab) must clear pending_wrap.
+/// CBT (Back Tab) must PRESERVE pending_wrap, exactly like its forward twin.
 ///
-/// xterm: Back tab repositions the cursor, cancelling the deferred wrap state.
+/// xterm's `TabToPrevStop` (tabs.c) never calls `ResetWrap`, and the
+/// `set_cur_col` it does call is a plain assignment — `#define
+/// set_cur_col(screen, value) screen->cur_col = value` (xterm.h) — so a back
+/// tab leaves `do_wrap` armed just as HT does. The rule recorded here before
+/// ("Back tab repositions the cursor, cancelling the deferred wrap state") was
+/// not xterm's: moving the cursor is not what resets the wrap, an explicit
+/// `ResetWrap` is, and CBT has none.
 #[test]
-fn back_tab_clears_pending_wrap() {
+fn back_tab_preserves_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 20);
 
     grid.back_tab();
 
     assert!(
-        !grid.pending_wrap(),
-        "CBT (back tab) must clear pending_wrap"
+        grid.pending_wrap(),
+        "CBT must preserve pending_wrap (xterm: TabToPrevStop never touches do_wrap)"
+    );
+    assert_eq!(
+        grid.cursor_col(),
+        16,
+        "the cursor still moves to the previous tab stop"
+    );
+}
+
+/// The DECLRMM-aware back tab preserves it too — same function, same reason.
+#[test]
+fn back_tab_margin_preserves_pending_wrap() {
+    let mut grid = grid_with_pending_wrap(3, 20);
+    grid.set_horizontal_margins(4, 19);
+
+    grid.back_tab_margin(true);
+
+    assert!(
+        grid.pending_wrap(),
+        "margin-aware CBT must preserve pending_wrap as well"
     );
 }
 

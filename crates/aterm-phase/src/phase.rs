@@ -405,6 +405,12 @@ pub fn has_composer_frame(rows: &[String]) -> bool {
     composer_frame(rows).is_some()
 }
 
+/// The index of the composer's top rule, when the frame is on the screen —
+/// for the prompt parser, which must know where the live zone begins.
+pub(crate) fn composer_top(rows: &[String]) -> Option<usize> {
+    composer_frame(rows).map(|f| f.top)
+}
+
 /// A full-width composer rule: `─` from column 0 to the last column, with at
 /// most a label inside it (`──── sandboxed ─`) and none of a table's joints.
 fn is_rule(row: &str) -> bool {
@@ -456,7 +462,7 @@ pub fn is_glyph_row(row: &str) -> bool {
 /// A row only the transcript has: the worker's message or tool call in column
 /// 0 (`⏺`; `●` where the platform draws that — never the session survey), or
 /// output under the `⎿` gutter that is not a tip or a todo item.
-fn is_transcript_row(row: &str) -> bool {
+pub(crate) fn is_transcript_row(row: &str) -> bool {
     if is_survey(row) {
         return false;
     }
@@ -664,7 +670,7 @@ fn is_status_row(row: &str) -> bool {
 /// at 0, 2, 4 or 5, and Claude Code parks its hints against the right edge.
 const HINT_COLUMN: usize = 20;
 
-fn leading_spaces(row: &str) -> usize {
+pub(crate) fn leading_spaces(row: &str) -> usize {
     row.chars().take_while(|c| c.is_whitespace()).count()
 }
 
@@ -2093,6 +2099,257 @@ mod tests {
             "  ⏵⏵ auto mode on",
         );
         assert_eq!(worker_phase(&shell), Phase::Busy);
+    }
+
+    // ---- a manager's screen (round 16 addendum) ----------------------------
+
+    /// The footer a MANAGER session showed on 0.86.0 (2026-09-15, rows
+    /// constructed here, never copied): bypass permissions, one persistent
+    /// Monitor (the manager's mail watcher), and under the footer the
+    /// artifact bar, `⧉` and the pages' names.
+    const MANAGER_FOOTER: &str = "  ⏵⏵ bypass permissions on · 1 monitor";
+    const MANAGER_FOOTER_QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+    const ARTIFACT_BAR: &str = "  ⧉  name · name";
+    const WORKFLOW_LINE: &str =
+        "  ◯ fan-out  collect the standings  1/4 agents done · 3m 2s · ↓ 12.4k tokens";
+
+    /// The three ways the rows under the footer were laid out: the bar right
+    /// under it, a blank row between, and a workflow's line between (the
+    /// measured order: footer, blank, `◯` line, bar, blank).
+    const UNDER: [&[&str]; 3] = [
+        &[ARTIFACT_BAR],
+        &["", ARTIFACT_BAR],
+        &["", WORKFLOW_LINE, ARTIFACT_BAR, ""],
+    ];
+
+    /// A manager's screen: `body` over the composer, the footer, then `under`.
+    fn manager(body: &[&str], footer: &str, under: &[&str]) -> Vec<String> {
+        let mut r = screen(body, footer);
+        r.extend(rows(under));
+        r
+    }
+
+    /// **THE MANAGER'S FOOTER IS NOT A BOX.** `bypass permissions on · 1
+    /// monitor` over the artifact bar reads what the live zone says: a
+    /// spinner or a `Waiting for` row is busy, a workflow's line under the
+    /// footer is busy, a finished turn with the monitor counted is busy on the
+    /// soft rule (the monitor, [`Busy::soft`]) and loses to a question, and
+    /// without the monitor it is idle — never `prompt`, in any of the three
+    /// layouts under the footer.
+    #[test]
+    fn a_manager_footer_with_a_monitor_and_the_artifact_bar_reads_busy_or_idle() {
+        let working = [
+            "⏺ Dispatching the next item.",
+            "",
+            "✻ Orchestrating… (2m 3s · ↓ 12.1k tokens)",
+            "",
+        ];
+        let waiting = [
+            "⏺ Launched the workflow.",
+            "",
+            "✻ Waiting for 1 dynamic workflow…",
+            "",
+        ];
+        let done = [
+            "⏺ Merged and reported.",
+            "",
+            "✻ Worked for 3m 21s · done 8:50 PM",
+            "",
+        ];
+        let asked = [
+            "⏺ Two items left. Should I start the next one?",
+            "",
+            "✻ Worked for 9s · done 8:51 PM",
+            "",
+        ];
+        for under in UNDER {
+            let has_workflow = under.contains(&WORKFLOW_LINE);
+            let r = manager(&working, MANAGER_FOOTER, under);
+            assert_eq!(worker_phase(&r), Phase::Busy, "{under:?}");
+            assert_eq!(
+                signal(&r).as_deref(),
+                Some("status row: spinner"),
+                "{under:?}"
+            );
+
+            let r = manager(&waiting, MANAGER_FOOTER, under);
+            assert_eq!(worker_phase(&r), Phase::Busy, "{under:?}");
+            assert_eq!(busy_signal(&r).map(|b| b.soft), Some(false), "{under:?}");
+
+            let r = manager(&done, MANAGER_FOOTER, under);
+            assert_eq!(worker_phase(&r), Phase::Busy, "{under:?}");
+            let expect = if has_workflow {
+                "footer: a workflow running"
+            } else {
+                "footer: a monitor running"
+            };
+            assert_eq!(signal(&r).as_deref(), Some(expect), "{under:?}");
+            assert_eq!(
+                busy_signal(&r).map(|b| b.soft),
+                Some(!has_workflow),
+                "{under:?}"
+            );
+
+            let r = manager(&asked, MANAGER_FOOTER, under);
+            let expect = if has_workflow {
+                Phase::Busy
+            } else {
+                Phase::Question
+            };
+            assert_eq!(worker_phase(&r), expect, "{under:?}");
+
+            let r = manager(&done, MANAGER_FOOTER_QUIET, under);
+            let expect = if has_workflow {
+                Phase::Busy
+            } else {
+                Phase::Idle
+            };
+            assert_eq!(worker_phase(&r), expect, "{under:?}");
+
+            for body in [&working[..], &waiting, &done, &asked] {
+                for footer in [MANAGER_FOOTER, MANAGER_FOOTER_QUIET] {
+                    let r = manager(body, footer, under);
+                    assert_eq!(parse_prompt(&r), None, "{body:?} {footer} {under:?}");
+                    assert_ne!(
+                        worker_phase(&r),
+                        Phase::Prompt,
+                        "{body:?} {footer} {under:?}"
+                    );
+                    assert!(!survey_open(&r) && limit_notice(&r).is_none(), "{under:?}");
+                }
+            }
+        }
+    }
+
+    /// A worker's approval box as a manager's transcript shows it: a Monitor
+    /// event (or a tool's output) that printed the worker's screen, under the
+    /// `⎿` gutter, indented past it.
+    const BOX_UNDER_GUTTER: [&str; 12] = [
+        "⏺ Monitor event: \"worker watch\"",
+        "  ⎿  EVENT prompt seq=41",
+        "      Bash command",
+        "",
+        "        git push origin main",
+        "        Push the branch",
+        "",
+        "      Do you want to proceed?",
+        "      ❯ 1. Yes",
+        "        2. No",
+        "",
+        "      Esc to cancel · Tab to amend",
+    ];
+
+    /// The same box quoted in the manager's own words (a `⏺` message's rows,
+    /// indented as a code block is) — not under a gutter.
+    const BOX_IN_PROSE: [&str; 9] = [
+        "⏺ The worker is blocked on its box:",
+        "",
+        "   Bash command",
+        "     git push origin main",
+        "   Do you want to proceed?",
+        "   ❯ 1. Yes",
+        "     2. No",
+        "   Esc to cancel · Tab to amend",
+        "",
+    ];
+
+    /// **A WORKER'S BOX IN A MANAGER'S TRANSCRIPT IS NOT THE MANAGER'S
+    /// PROMPT.** The one way a manager's screen reads `prompt` (the footer
+    /// test above shows its live zone never does): an `Esc to cancel` row
+    /// anywhere on it used to be a box, and a manager's transcript carries
+    /// its workers' boxes. Under the
+    /// `⎿` gutter it is output, whatever is under it — the manager idle (the
+    /// soft monitor), the manager busy. Quoted in prose, it is history once
+    /// the manager's later words or a done row stand between it and the
+    /// composer. With only a spinner under it the parser still errs towards
+    /// `prompt` (the module header of `prompt.rs` says why), and a REAL box
+    /// over the manager's composer is a prompt with this footer as with any.
+    #[test]
+    fn a_workers_box_in_a_managers_transcript_is_not_a_prompt() {
+        let done_row = "✻ Worked for 12s · done 9:01 PM";
+        let spinner = "✻ Orchestrating… (4s · ↓ 310 tokens)";
+        for under in UNDER {
+            let has_workflow = under.contains(&WORKFLOW_LINE);
+            let with = |rest: &[&str], footer: &str, quoted: &[&str]| {
+                let mut body: Vec<&str> = quoted.to_vec();
+                body.extend_from_slice(rest);
+                manager(&body, footer, under)
+            };
+
+            // Under the gutter: never a box — idle, soft-busy or busy.
+            let r = with(&["", done_row, ""], MANAGER_FOOTER, &BOX_UNDER_GUTTER);
+            assert_eq!(parse_prompt(&r), None, "{under:?}");
+            assert_eq!(crate::prompt::prompt_box_span(&r), None, "{under:?}");
+            assert_eq!(worker_phase(&r), Phase::Busy, "{under:?}");
+            assert_eq!(
+                busy_signal(&r).map(|b| b.soft),
+                Some(!has_workflow),
+                "{under:?}"
+            );
+            let r = with(&["", done_row, ""], MANAGER_FOOTER_QUIET, &BOX_UNDER_GUTTER);
+            let expect = if has_workflow {
+                Phase::Busy
+            } else {
+                Phase::Idle
+            };
+            assert_eq!(worker_phase(&r), expect, "{under:?}");
+            let r = with(&["", spinner, ""], MANAGER_FOOTER, &BOX_UNDER_GUTTER);
+            assert_eq!(parse_prompt(&r), None, "{under:?}");
+            assert_eq!(worker_phase(&r), Phase::Busy, "{under:?}");
+            assert_eq!(
+                signal(&r).as_deref(),
+                Some("status row: spinner"),
+                "{under:?}"
+            );
+            // The gutter block as the LAST thing on the screen above the rule.
+            let r = with(&[""], MANAGER_FOOTER_QUIET, &BOX_UNDER_GUTTER);
+            assert_eq!(parse_prompt(&r), None, "{under:?}");
+            assert_eq!(worker_phase(&r), expect, "{under:?}");
+
+            // In prose: history under the manager's later words or a done row.
+            let later = ["⏺ Approved it; the push went through.", "", done_row, ""];
+            let r = with(&later, MANAGER_FOOTER_QUIET, &BOX_IN_PROSE);
+            assert_eq!(parse_prompt(&r), None, "{under:?}");
+            assert_eq!(worker_phase(&r), expect, "{under:?}");
+            let r = with(&[done_row, ""], MANAGER_FOOTER, &BOX_IN_PROSE);
+            assert_eq!(parse_prompt(&r), None, "{under:?}");
+            assert_ne!(worker_phase(&r), Phase::Prompt, "{under:?}");
+
+            // Only a spinner under the prose copy: still read as a box.
+            let r = with(&[spinner, ""], MANAGER_FOOTER, &BOX_IN_PROSE);
+            assert!(parse_prompt(&r).is_some(), "{under:?}");
+
+            // A real box over the manager's composer: a prompt.
+            let mut live = rows(&["⏺ Pushing the branch.", ""]);
+            live.extend(rows(&[
+                " Bash command",
+                "",
+                "   git push origin main",
+                "   Push the branch",
+                "",
+                " Do you want to proceed?",
+                " ❯ 1. Yes",
+                "   2. No",
+                "",
+                " Esc to cancel · Tab to amend",
+            ]));
+            live.extend(composer(MANAGER_FOOTER));
+            live.extend(rows(under));
+            assert_eq!(worker_phase(&live), Phase::Prompt, "{under:?}");
+            let p = parse_prompt(&live).expect("the live box");
+            assert_eq!(p.kind, crate::prompt::PromptKind::Bash);
+            assert_eq!(p.command, "git push origin main");
+            // And the same live box with a copy of another box in the
+            // transcript above it: the live one is read.
+            let mut both = rows(&BOX_UNDER_GUTTER);
+            both.push(String::new());
+            both.extend(live);
+            assert_eq!(worker_phase(&both), Phase::Prompt, "{under:?}");
+            assert_eq!(
+                parse_prompt(&both).map(|p| p.command),
+                Some("git push origin main".into())
+            );
+        }
     }
 
     // ---- the usage-limit wall ---------------------------------------------

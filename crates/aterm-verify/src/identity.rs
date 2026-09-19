@@ -44,12 +44,120 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The gate's own state directory inside a checkout it runs in (the snapshot
 /// lock, the lane trash). Never part of a source identity, and never cleaned.
 pub const GATE_STATE_DIR: &str = ".aterm-verify";
+
+/// The regular files this process's own stdout and stderr are open on, as
+/// `(dev, ino)` — see [`claim_own_output`]. Empty (or unset) means "exclude
+/// nothing", which is exactly how the gate behaved before.
+static OWN_OUTPUT: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+
+/// Record where this run's own output is going, so a gate log written INSIDE
+/// the checkout cannot read as the tree moving under the run.
+///
+/// WHY (2026-09-17), and it cost a whole `--fast` run. `bash tools/verify.sh
+/// --fast > gate.log` inside the worktree makes `gate.log` an untracked,
+/// non-ignored file — which is part of a [`TreeState`] by design, because an
+/// untracked `.rs` file IS something a compiler reads. It then GROWS, one
+/// ladder line at a time, for the length of the run. In place, every
+/// [`Tripwire::check`] after the first therefore reports `source: moved paths:
+/// gate.log` and every stage that would build something answers `not run` — a
+/// run that prints thirty stage lines and decides nothing. Through the
+/// snapshot the same file churns between the sync's capture and its copy, so
+/// the sync exhausts its attempts and the run is COULD NOT RUN. Both failures
+/// are caused by the gate's own output, and neither says so.
+///
+/// The gate can tell its own output from the tree's source exactly: it holds
+/// the descriptors. `fstat` on stdout and stderr names the FILE behind a
+/// redirect, and an untracked path with that `(dev, ino)` is this run's log,
+/// not a source change. Only
+/// UNTRACKED paths are ever excluded — a redirect that lands on a tracked file
+/// is a real edit to a real source file and stays visible.
+///
+/// It cannot see through a `| tee gate.log`: there fd 1 is a pipe and the file
+/// belongs to another process. That case is caught the other way round, by
+/// [`tripped_label`], which names the remedy when everything that moved is
+/// untracked.
+///
+/// Called once, from `main`, before anything reads the tree. Not calling it
+/// leaves every path visible, which is the old behaviour.
+pub fn claim_own_output() {
+    let _ = OWN_OUTPUT.set(own_output_ids());
+}
+
+#[cfg(unix)]
+fn own_output_ids() -> Vec<(u64, u64)> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+
+    // `fstat` OF THE DESCRIPTOR, and not `stat("/dev/fd/<n>")`, which was the
+    // first spelling and is WRONG on macOS: measured 2026-09-17, the fdesc
+    // filesystem answers with its OWN `st_dev` (413786866) while the file's is
+    // 16777232, so every comparison missed and the exclusion did nothing. The
+    // inode alone matched — a pair of numbers that agrees by half is exactly
+    // the kind of identity that reads as working.
+    //
+    // No `unsafe`: `try_clone_to_owned` DUPs the descriptor, the `File` owns
+    // only the duplicate, and dropping it leaves the gate's own stdout open.
+    let stat = |fd: std::os::fd::BorrowedFd<'_>| -> Option<(u64, u64)> {
+        let owned = fd.try_clone_to_owned().ok()?;
+        let m = std::fs::File::from(owned).metadata().ok()?;
+        m.is_file().then(|| (m.dev(), m.ino()))
+    };
+    let mut ids = Vec::new();
+    for id in [
+        stat(std::io::stdout().as_fd()),
+        stat(std::io::stderr().as_fd()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+#[cfg(not(unix))]
+fn own_output_ids() -> Vec<(u64, u64)> {
+    Vec::new()
+}
+
+/// Is `full` a file this run's own output is being written to?
+#[cfg(unix)]
+fn is_own_output(full: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(ids) = OWN_OUTPUT.get().filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    std::fs::metadata(full).is_ok_and(|m| ids.contains(&(m.dev(), m.ino())))
+}
+
+#[cfg(not(unix))]
+fn is_own_output(_full: &Path) -> bool {
+    false
+}
+
+/// The `verify:` note for output the gate excluded from the source identity —
+/// printed only when there was some, so a run that redirects nowhere near the
+/// checkout reads exactly as it always did.
+#[must_use]
+pub fn own_output_note(paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "verify: this run's own output is being written to {} inside the checkout — \
+         excluded from the source identity, which a growing log would otherwise read as \
+         the tree moving",
+        name_some(&paths.iter().map(String::as_str).collect::<Vec<_>>())
+    ))
+}
 
 /// Git's own environment, which would redirect every call below at a
 /// different repository: a gate started from inside a git hook inherits
@@ -220,19 +328,27 @@ impl TreeState {
         if self.head != now.head {
             parts.push(format!("HEAD {} -> {}", self.head, now.head));
         }
-        let moved: Vec<&str> = self
-            .dirty
-            .keys()
-            .chain(now.dirty.keys())
-            .filter(|p| self.dirty.get(*p) != now.dirty.get(*p))
-            .map(String::as_str)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let moved = self.moved_paths(now);
         if !moved.is_empty() {
+            let moved: Vec<&str> = moved.iter().map(String::as_str).collect();
             parts.push(format!("moved paths: {}", name_some(&moved)));
         }
         Some(parts.join("; "))
+    }
+
+    /// Every path whose state differs between `self` and `now`, sorted. The
+    /// names behind [`Self::moved_to`]'s `moved paths:` clause — which shows at
+    /// most eight of them, and is a sentence rather than a list.
+    #[must_use]
+    pub fn moved_paths(&self, now: &Self) -> Vec<String> {
+        self.dirty
+            .keys()
+            .chain(now.dirty.keys())
+            .filter(|p| self.dirty.get(*p) != now.dirty.get(*p))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 }
 
@@ -329,21 +445,38 @@ fn matches_index_entry(
     }
 }
 
-/// Untracked, non-ignored files under `root` (never the gate's own state).
+/// Untracked, non-ignored files under `root` (never the gate's own state, and
+/// never the file this run's own output is going to — see [`claim_own_output`]).
 #[must_use]
 pub fn untracked_paths(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
+    Some(untracked_split(root, path_env)?.0)
+}
+
+/// `(the tree's untracked files, the ones that are this run's own output)`.
+///
+/// One `git ls-files --others` for both, because every caller needs the first
+/// and the ladder needs to be able to SAY the second.
+#[must_use]
+pub fn untracked_split(root: &Path, path_env: &OsStr) -> Option<(Vec<String>, Vec<String>)> {
     let out = stdout_bytes(git(root, path_env).args([
         "ls-files",
         "--others",
         "--exclude-standard",
         "-z",
     ]))?;
-    Some(
-        split_z(&out)
-            .into_iter()
-            .filter(|p| !is_gate_state(p))
-            .collect(),
-    )
+    let mut tree = Vec::new();
+    let mut own = Vec::new();
+    for p in split_z(&out) {
+        if is_gate_state(&p) {
+            continue;
+        }
+        if is_own_output(&root.join(&p)) {
+            own.push(p);
+        } else {
+            tree.push(p);
+        }
+    }
+    Some((tree, own))
 }
 
 /// Each path's [`PathState`], hashing the regular files in one `git
@@ -698,7 +831,13 @@ impl Tripwire {
         let mut why = Vec::new();
         if let SourceIdentity::Git(then) = &self.source {
             match TreeState::capture(&self.root, &self.path_env) {
-                Some(now) => why.extend(then.moved_to(&now).map(|m| format!("source: {m}"))),
+                Some(now) => {
+                    if let Some(m) = then.moved_to(&now) {
+                        let mut m = format!("source: {m}");
+                        m.push_str(&self.own_log_hint(&then.moved_paths(&now)));
+                        why.push(m);
+                    }
+                }
                 None => why.push("source: git could no longer read the tree".to_string()),
             }
         }
@@ -711,6 +850,37 @@ impl Tripwire {
             st.tripped = Some(why.clone());
             Some(why)
         }
+    }
+
+    /// The remedy sentence for the one cause of a trip the operator can fix in
+    /// one move: THE RUN'S OWN LOG, written inside the checkout.
+    ///
+    /// [`claim_own_output`] already excludes a plain `> gate.log` redirect,
+    /// because fd 1 is then the file itself. It cannot see a `| tee gate.log`:
+    /// fd 1 is a pipe and the file belongs to `tee`. So when everything that
+    /// moved is UNTRACKED — a state no `git pull`, rebase or edit of a source
+    /// file produces on its own — the tool says what to do instead of leaving
+    /// the reader to guess which of their files is churning.
+    ///
+    /// Empty when a tracked path moved too: that is a real edit, and the
+    /// remedy would be a lie.
+    fn own_log_hint(&self, moved: &[String]) -> String {
+        if moved.is_empty() {
+            return String::new();
+        }
+        let Some((untracked, _)) = untracked_split(&self.root, &self.path_env) else {
+            return String::new();
+        };
+        if !moved.iter().all(|p| untracked.contains(p)) {
+            return String::new();
+        }
+        format!(
+            " — every one of those is UNTRACKED. If one is this run's own log (a \
+             `| tee` or an editor scratch file inside {}), write it outside the checkout or \
+             under {GATE_STATE_DIR}/, which the gate never reads as source; the gate already \
+             keeps its own copy of this ladder (see the `verify: log` line on stderr).",
+            self.root.display()
+        )
     }
 
     /// A stage finished: whatever it did happened after any cached check.

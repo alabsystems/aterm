@@ -10,6 +10,11 @@ use crate::pet_world::{PetAnchor, PetPane, PetRect, PetWorld, PetWorldFacts, Pet
 use aterm_core::terminal::BlockState;
 
 const INPUT_HOLD: f32 = 0.65;
+// A typed kitty command is heard only once this hold has lapsed: inside it
+// every tick wipes the verdict latches and the frame wears the typing pose,
+// so a trick consumed there would be half-erased as it began. Structural,
+// because the two constants live in different files.
+const _: () = assert!(TRICK_SETTLE > INPUT_HOLD);
 const EDIT_HOLD: f32 = 1.10;
 const CONTACT_HOLD: f32 = 0.40;
 const RESULT_HOLD: f32 = 1.20;
@@ -424,6 +429,22 @@ impl PetBrain {
             target: self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c))),
         });
         self.console.edit = None;
+        // THE KITTY COMMAND'S ONE RE-STAMP. A latched trick waits out the
+        // user's OWN typing — text, a delete, the submit — and this note is
+        // exactly one per admitted press, so it is the only signal that
+        // means "the hand is still busy". The move sensor must never do
+        // this: program output moves the caret too, and a build log
+        // re-stamping the latch would hold it, the frame lane and the
+        // console resident's perch for the whole absolute cap. Navigation, a
+        // paste and the kill chords re-stamp nothing: the listener has
+        // already poisoned or reset the line they touch.
+        if matches!(
+            kind,
+            PetInputKind::Text | PetInputKind::Delete | PetInputKind::Submit
+        ) && let Some(trick) = self.pending_trick.as_mut()
+        {
+            trick.stamped = now;
+        }
     }
 
     #[must_use]
@@ -826,6 +847,15 @@ impl PetBrain {
             self.pending_vigil_pounce = false;
             self.vigil_cheer = None;
             self.quiet = 0.0;
+            // A COMMANDED SEAT stands down with the quiet clock it was
+            // written on, and a "heard you" beat the hand typed over owes
+            // its verb no longer (work outranks a trick) — a key that does
+            // not move the caret is still the hand going back to work. The
+            // trick LATCH is deliberately not cleared here: the word's own
+            // Enter is a fresh input, and the verb is owed to the prompt
+            // that follows it.
+            self.clear_trick_settle();
+            self.drop_trick_go();
             // Intent is enough for attention even if the caret stays still.
             if self.alpha > 0.0 && self.action == PetAction::Sleep && sense.caret.is_some() {
                 self.set_action(PetAction::Waking);
@@ -975,7 +1005,17 @@ impl PetBrain {
 
         // Eligible direct affection outranks program watching. The ordinary
         // petting owner consumes the contact and its finite hold unchanged.
-        if self.pending_pet > 0 || self.pet_hold_t > 0.0 {
+        //
+        // A TYPED KITTY COMMAND IS THE SAME KIND OF ADDRESS, for as long as
+        // it has the cat's attention or its body ([`PetBrain::trick_engaged`]):
+        // the latch, its opening beat, a one-shot still playing, a commanded
+        // seat still held. Keyed on the latch alone, a running command
+        // reseated the cat as `Sit` one tick after `sleep` was performed —
+        // the nap lasted a frame — and cut a roll to its first pose. Every
+        // term is finite or interruptible by its own law, and none of them
+        // is in `console_frames`: a resident that owns the tick (a held
+        // selection, a hidden caret) still parks exactly as it did.
+        if self.pending_pet > 0 || self.pet_hold_t > 0.0 || self.trick_engaged() {
             self.console.resident = false;
             self.console.trip = None;
             self.console.pose = None;
@@ -1272,6 +1312,22 @@ impl PetBrain {
         self.pet_hold_t = 0.0;
         self.pending_pet = 0;
         self.pet_at = None;
+        // THE KITTY COMMAND goes the same way, whole — a held selection or a
+        // hidden caret must not replay a stale verb, or resume a commanded
+        // seat, minutes later when it lets go. ONE EXCEPTION, and only for
+        // the latch: while a REPAIR is live. Fixing a typo is still typing
+        // the word — `sot`, two backspaces, `it`, Space fires with the
+        // repair's hold still standing, and that hold seats a resident (this
+        // one) on a body that may stand. It is [`EDIT_HOLD`] from the last
+        // key, well inside the latch's own TTL, with its end already offered
+        // by `console_deadline`; dropping the latch under it would make the
+        // commonest recovery gesture a silent non-answer. Keyed on the
+        // repair's own clock, not on the attention it was dealt — advancing
+        // ink re-labels a repair as `Contact` for its first beats.
+        let repairing = self.console.repair_until.is_some_and(|end| sense.now < end);
+        let latched = self.pending_trick.filter(|_| repairing);
+        self.drop_tricks();
+        self.pending_trick = latched;
         let body = self.console_body(sense);
         let world = self.console.world.as_ref()?;
         let home = self.console_caret_home(sense, width);
@@ -3070,5 +3126,452 @@ mod tests {
             frames + 2 >= want,
             "the ghost ran its whole ramp ({frames} frames, want ≥ {want})"
         );
+    }
+
+    // ── the typed kitty commands, WITH an observed world ─────────────────
+    //
+    // The brain's own trick tests run with no console world, where
+    // `begin_console_tick` returns before it can wipe a latch or seat a
+    // resident — so every interaction below is invisible to them. These
+    // drive the real terminal, the real input notes and the real OSC 133
+    // block states.
+
+    impl Scene {
+        /// Type `text` the way the host does: one input note per key, then
+        /// the echo, a frame every 50 ms.
+        fn type_text(&mut self, text: &str) {
+            for ch in text.bytes() {
+                self.input(PetInputKind::Text);
+                self.term.process(&[ch]);
+                self.frame(0.05);
+            }
+        }
+
+        /// A command that is still running: prompt, command line, the `C`
+        /// mark and a line of output, the caret left on the output row.
+        fn executing(&mut self) {
+            self.term
+                .process(b"\x1b[8;1H\x1b]133;A\x07> \x1b]133;B\x07build\r\n\x1b]133;C\x07working");
+            for _ in 0..90 {
+                self.frame(0.016);
+                if self.pet.console.resident && !self.pet.console.moving && !self.pet.needs_frames()
+                {
+                    break;
+                }
+            }
+            assert_eq!(self.pet.console_attention(), PetAttention::Output);
+            assert!(
+                self.pet.console.resident,
+                "fixture: the running command owns the cat"
+            );
+        }
+
+        /// Frames at 60 fps for `secs`, collected.
+        fn watch(&mut self, secs: f32) -> Vec<PetFrame> {
+            (0..(secs / 0.016).ceil() as usize)
+                .map(|_| self.frame(0.016))
+                .collect()
+        }
+    }
+
+    /// TREAT FROLICS ON GLASS. Routed through `pending_cheer` it never did:
+    /// the console layer wipes that latch on every tick the last key is
+    /// younger than [`INPUT_HOLD`], the cheer needs two ticks, and a settle
+    /// gate inside the hold meant the very next tick erased it. Performed
+    /// directly, past the hold, it plays — motes and all, in its own poses.
+    #[test]
+    fn a_typed_treat_frolics_with_the_console_layer_watching() {
+        let mut s = Scene::new();
+        s.type_text("treat ");
+        assert!(
+            matches!(
+                s.pet.console_attention(),
+                PetAttention::Typing | PetAttention::Contact
+            ),
+            "fixture: the last key is live — the window the cheer latch is wiped in"
+        );
+        s.pet.note_trick(s.now, Trick::Treat, true);
+        let frames = s.watch(2.0);
+        let frolic = frames
+            .iter()
+            .position(|f| f.action == PetAction::Frolic)
+            .expect("the treat frolics");
+        assert!(
+            frames[..frolic].iter().any(|f| f.action == PetAction::Perk),
+            "heard first"
+        );
+        assert!(
+            matches!(
+                frames[frolic].pose,
+                PetGlyphId::PetPlaybow | PetGlyphId::PetBat
+            ),
+            "in the frolic's own frames, not a console pose: {:?}",
+            frames[frolic].pose
+        );
+        assert!(
+            frames[frolic..].iter().any(|f| f
+                .motes
+                .iter()
+                .flatten()
+                .any(|m| m.kind == PetMoteKind::Note)),
+            "with its motes on glass"
+        );
+        assert!(
+            s.pet.pending_cheer.is_none(),
+            "and never through the cheer latch"
+        );
+    }
+
+    /// A COMMANDED SLEEP SURVIVES A RUNNING COMMAND. The resident that a
+    /// `C..D` block seats owns the tick and forces `Sit`; keyed on the latch
+    /// alone, the affection arm handed the cat back to it one tick after the
+    /// verb was performed and the nap lasted a frame. The level
+    /// (`trick_settle`) is what the arm reads now.
+    #[test]
+    fn a_commanded_sleep_survives_an_executing_block() {
+        let mut s = Scene::new();
+        s.executing();
+        s.pet.note_trick(s.now, Trick::Sleep, true);
+        // The latch is deliberately NOT a term of `console_frames`: a parked
+        // resident answers the cadence question first, and the handoff
+        // model's quiet-resident laws stay untouched. The host asks for the
+        // frame that reads the latch (the petting precedent) — and that one
+        // tick is what takes the cat off the resident and arms the lane.
+        assert!(
+            !s.pet.needs_frames(),
+            "a parked resident still answers first"
+        );
+        s.frame(0.016);
+        assert!(!s.pet.console.resident && s.pet.needs_frames());
+        let frames = s.watch(3.0);
+        assert!(frames.iter().any(|f| f.action == PetAction::Perk), "heard");
+        let last = frames.last().expect("frames");
+        assert_eq!(
+            last.action,
+            PetAction::Sleep,
+            "asleep a second later, and still"
+        );
+        assert!(
+            matches!(last.pose, PetGlyphId::PetSleep0 | PetGlyphId::PetSleep1),
+            "in the sleeper's own frame, not the resident's: {:?}",
+            last.pose
+        );
+        assert!(
+            !s.pet.console.resident,
+            "the running command does not reseat it"
+        );
+        assert!(!s.pet.needs_frames(), "and a sleeping cat rides the offer");
+        // Output that moves the caret is a caret move: the cat wakes, the
+        // level stands down, and the command has its watcher back.
+        s.term.process(b"\r\nmore output");
+        s.frame(0.016);
+        assert!(s.pet.trick_settle.is_none());
+        let _ = s.watch(2.5);
+        assert!(s.pet.console.resident, "the resident gets the cat back");
+        assert_eq!(s.pet.console_attention(), PetAttention::Output);
+    }
+
+    /// …and so does a ONE-SHOT: a roll asked for during a build plays out
+    /// instead of being cut to its first pose by the resident's forced seat.
+    #[test]
+    fn a_roll_plays_through_an_executing_block() {
+        let mut s = Scene::new();
+        s.executing();
+        s.pet.note_trick(s.now, Trick::Roll, true);
+        let frames = s.watch(4.5);
+        let rolled = frames
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.pose,
+                    PetGlyphId::PetRoll0 | PetGlyphId::PetRoll1 | PetGlyphId::PetRoll2
+                )
+            })
+            .count();
+        assert!(
+            rolled as f32 * 0.016 > WRIGGLE_DUR - 0.2,
+            "the whole roll, not a frame of it: {rolled} frames"
+        );
+        assert!(
+            !s.pet.trick_act,
+            "and the flag comes down with the performance"
+        );
+        assert!(
+            s.pet.console.resident,
+            "after which the command has its watcher back"
+        );
+    }
+
+    /// A HELD SELECTION DROPS THE LATCH (surface protection outranks
+    /// everything): nothing plays over a selection, and nothing replays when
+    /// it is released minutes later.
+    #[test]
+    fn a_held_selection_drops_a_trick_and_never_replays_it() {
+        let mut s = Scene::new();
+        s.term.process(b"\x1b[3;3Hread this");
+        s.term.text_selection_mut().start_selection(
+            2,
+            2,
+            SelectionSide::Left,
+            SelectionType::Simple,
+        );
+        s.term
+            .text_selection_mut()
+            .update_selection(2, 10, SelectionSide::Right);
+        for _ in 0..240 {
+            s.frame(0.016);
+            if !s.pet.needs_frames() {
+                break;
+            }
+        }
+        assert_eq!(s.pet.console_attention(), PetAttention::Reading);
+        assert!(
+            !s.pet.needs_frames(),
+            "fixture: the reading resident is parked"
+        );
+        s.pet.note_trick(s.now, Trick::Roll, true);
+        s.frame(0.016);
+        assert_eq!(
+            s.pet.pending_trick(),
+            None,
+            "dropped by the resident that owns the tick"
+        );
+        assert!(!s.pet.needs_frames(), "and a held selection still parks");
+        s.term.text_selection_mut().clear();
+        let frames = s.watch(3.0);
+        assert!(
+            frames.iter().all(|f| f.pose != PetGlyphId::PetRoll1),
+            "released, it replays nothing"
+        );
+    }
+
+    /// PROGRAM OUTPUT NEVER RE-STAMPS THE LATCH. `sleep 1 && make`: the
+    /// trick fires, then a build streams for ten seconds with nobody typing.
+    /// Every printed line is a caret move, so the settle gate never opens —
+    /// and the latch must not ride those moves to its twenty-second cap,
+    /// evicting the running command's parked resident (and holding the lane)
+    /// the whole way. Gone by [`TRICK_TTL`]; the resident has its perch back.
+    #[test]
+    fn streamed_output_lets_a_trick_expire_and_the_resident_takes_its_perch_back() {
+        let mut s = Scene::new();
+        s.executing();
+        s.pet.note_trick(s.now, Trick::Roll, true);
+        let t0 = s.now;
+        let mut gone = None;
+        let mut rolled = false;
+        for step in 0..625u32 {
+            if step % 6 == 0 {
+                // Lines of two lengths: at the bottom row the pane scrolls
+                // instead of the caret stepping down, and only the column
+                // still says that something was printed.
+                s.term.process(if step % 12 == 0 {
+                    b"\r\ncompiling another crate".as_slice()
+                } else {
+                    b"\r\ncompiling".as_slice()
+                });
+            }
+            let f = s.frame(0.016);
+            rolled |= f.pose == PetGlyphId::PetRoll1;
+            if gone.is_none() && s.pet.pending_trick().is_none() {
+                gone = Some((s.now - t0).as_secs_f32());
+            }
+        }
+        let gone = gone.expect("the latch is finite");
+        assert!(
+            (TRICK_TTL..TRICK_TTL + 0.1).contains(&gone),
+            "gone at +{gone} s: output re-stamps nothing, want {TRICK_TTL}"
+        );
+        assert!(!rolled, "and an expired trick is never performed");
+        assert!(
+            s.pet.console.resident,
+            "the running command has its watcher back"
+        );
+        assert_eq!(s.pet.console_attention(), PetAttention::Output);
+    }
+
+    /// FIXING A TYPO IS STILL TYPING THE WORD. `sot`, two backspaces, `it`,
+    /// Space: the fire lands with the repair's hold still standing — a
+    /// RESIDENT, whose clear list drops every other suppressed latch. The
+    /// trick latch rides it out and plays when the hold lapses.
+    #[test]
+    fn a_trick_typed_through_a_repair_is_still_performed() {
+        let mut s = Scene::new();
+        s.type_text("rot");
+        for _ in 0..2 {
+            s.input(PetInputKind::Delete);
+            s.term.process(b"\x08 \x08");
+            s.frame(0.05);
+        }
+        s.type_text("oll ");
+        s.pet.note_trick(s.now, Trick::Roll, true);
+        s.frame(0.016);
+        assert_eq!(
+            s.pet.pending_trick(),
+            Some(Trick::Roll),
+            "the repair's resident does not eat the word it was repairing"
+        );
+        let frames = s.watch(3.5);
+        assert!(
+            frames.iter().any(|f| f.pose == PetGlyphId::PetRoll1),
+            "and the roll plays once the hand has stopped"
+        );
+    }
+
+    /// …AND SO IS A SEAT. The same repair, asking for `sit`: the latch rides
+    /// the repair's resident out, the cat looks up when the hand has stopped
+    /// — and then HOLDS the look-up seat it was asked for, with the console
+    /// layer watching: no resident reseats it, no typing pose overrides it.
+    #[test]
+    fn a_seat_typed_through_a_repair_is_taken_and_held() {
+        let mut s = Scene::new();
+        s.type_text("sot");
+        for _ in 0..2 {
+            s.input(PetInputKind::Delete);
+            s.term.process(b"\x08 \x08");
+            s.frame(0.05);
+        }
+        s.type_text("it ");
+        s.pet.note_trick(s.now, Trick::Sit, true);
+        let frames = s.watch(3.0);
+        let heard = frames
+            .iter()
+            .position(|f| f.action == PetAction::Perk)
+            .expect("heard");
+        let seated = frames[heard..]
+            .iter()
+            .filter(|f| f.pose == PetGlyphId::PetSitLookup)
+            .count();
+        assert!(
+            seated as f32 * 0.016 > 1.0,
+            "the commanded seat is on glass and held: {seated} frames"
+        );
+        assert_eq!(s.pet.trick_settle, Some(Trick::Sit), "and still is");
+    }
+
+    /// THE FRESH-INPUT CLEAR AND THE TRICK. A key wipes the verdict latches
+    /// (a cheer, a sulk) and stands a COMMANDED SEAT down — a key is the
+    /// hand going back to work even when it moves no caret — but it never
+    /// takes an owed trick: the word's own Enter is a fresh input, and the
+    /// verb is owed to the prompt that follows it.
+    #[test]
+    fn fresh_input_stands_a_commanded_seat_down_but_keeps_an_owed_latch() {
+        let mut s = Scene::new();
+        s.pet.note_trick(s.now, Trick::Sit, true);
+        let frames = s.watch(1.0);
+        assert!(
+            frames.iter().any(|f| f.pose == PetGlyphId::PetSitLookup),
+            "fixture: the commanded seat is on glass"
+        );
+        assert_eq!(s.pet.trick_settle, Some(Trick::Sit));
+        // A key the program swallowed: an input note, and no echo.
+        s.input(PetInputKind::Text);
+        let f = s.frame(0.016);
+        assert!(
+            s.pet.trick_settle.is_none(),
+            "the seat stands down with the key"
+        );
+        assert_ne!(f.pose, PetGlyphId::PetSitLookup);
+
+        s.pet.note_trick(s.now, Trick::Roll, true);
+        s.pet.pending_cheer = Some(false);
+        s.input(PetInputKind::Submit);
+        s.term.process(b"\r\n> ");
+        s.frame(0.016);
+        assert_eq!(s.pet.pending_cheer, None, "fixture: the clear ran");
+        assert_eq!(
+            s.pet.pending_trick(),
+            Some(Trick::Roll),
+            "the latch is owed to the prompt after the Enter"
+        );
+        let frames = s.watch(3.5);
+        assert!(
+            frames.iter().any(|f| f.pose == PetGlyphId::PetRoll1),
+            "and it plays there"
+        );
+    }
+
+    /// THE EXIT-127 FORGIVENESS reaches the console layer too: no failed
+    /// result pose, no failure hush — where an ordinary fast failure gets
+    /// both.
+    #[test]
+    fn a_forgiven_pet_only_submit_leaves_no_failed_result_on_the_console() {
+        let failed_result = |pet_talk: bool| -> (bool, bool) {
+            let mut s = Scene::new();
+            s.type_text("sit");
+            s.input(PetInputKind::Submit);
+            if pet_talk {
+                s.pet.note_trick_submit(s.now);
+            }
+            s.term.process(b"\r\nzsh: command not found: sit\r\n> ");
+            s.frame(0.03);
+            s.pet.note_command_done(s.now, true, Some(3));
+            let hushed = s.pet.grieving();
+            let mut inspected = false;
+            for _ in 0..150 {
+                s.frame(0.016);
+                inspected |= s.pet.console_attention() == PetAttention::Result;
+            }
+            (hushed, inspected)
+        };
+        assert_eq!(
+            failed_result(true),
+            (false, false),
+            "pet talk: no hush, no failed-result inspection"
+        );
+        let (hushed, _) = failed_result(false);
+        assert!(hushed, "control: an ordinary fast failure is hushed");
+    }
+
+    /// ENTER INSIDE THE HEARD-YOU BEAT, in the key handler's own order: the
+    /// input note and the listener's confirmation FIRST, the echo and the
+    /// tick after. `roll`, a thinking pause, the cat looks up — and Enter
+    /// lands a tenth of a second into the look. Absorbed as "already
+    /// answered", the confirmation was lost and the Enter then took the
+    /// beat's verb with it: heard, confirmed, never performed. A look is
+    /// not an answer: the confirmation latches and plays at the new prompt,
+    /// once.
+    #[test]
+    fn an_enter_inside_the_heard_you_beat_still_gets_its_trick() {
+        let rolling = |f: &PetFrame| {
+            matches!(
+                f.pose,
+                PetGlyphId::PetRoll0 | PetGlyphId::PetRoll1 | PetGlyphId::PetRoll2
+            )
+        };
+        let mut s = Scene::new();
+        s.type_text("roll ");
+        s.pet.note_trick(s.now, Trick::Roll, false);
+        for _ in 0..120 {
+            s.frame(0.016);
+            if s.pet.trick_go.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            s.pet.trick_go,
+            Some(Trick::Roll),
+            "fixture: heard, verb owed"
+        );
+        let _ = s.watch(0.1);
+        assert!(s.pet.trick_go.is_some(), "fixture: still inside the beat");
+        s.input(PetInputKind::Submit);
+        s.pet.note_trick(s.now, Trick::Roll, true);
+        s.term.process(b"\r\n> ");
+        let f = s.frame(0.016);
+        assert!(
+            s.pet.trick_go.is_none() && !rolling(&f),
+            "the Enter took the beat"
+        );
+        assert_eq!(
+            s.pet.pending_trick(),
+            Some(Trick::Roll),
+            "…and the confirmation still owes the roll"
+        );
+        let frames = s.watch(4.5);
+        let rolls = frames
+            .windows(2)
+            .filter(|w| !rolling(&w[0]) && rolling(&w[1]))
+            .count();
+        assert_eq!(rolls, 1, "performed at the new prompt, once");
     }
 }

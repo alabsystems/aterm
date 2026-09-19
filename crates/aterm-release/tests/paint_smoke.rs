@@ -99,17 +99,37 @@ fn record(log: &Log, what: &str, target: &Path) {
 }
 
 /// Records the paint probe call and answers a scripted verdict.
+///
+/// The error side is a [`publish::PaintRefusal`] and not a string because the
+/// two refusals are different claims: "it did not paint" is about the ARTIFACT,
+/// "this take is not evidence" is about the TAKE. Conflating them is what let a
+/// starved instrument be read as a verdict about paint from the day the
+/// label was added (2026-09-10) to the v0.87.0 cut.
 struct FakePaintProbe {
     log: Log,
-    verdict: Result<&'static str, &'static str>,
+    verdict: Result<&'static str, publish::PaintRefusal>,
 }
 
 impl publish::PaintProbe for FakePaintProbe {
-    fn paint(&self, bundle_binary: &Path) -> Result<String, String> {
+    fn paint(&self, bundle_binary: &Path) -> Result<String, publish::PaintRefusal> {
         record(&self.log, "paint", bundle_binary);
-        self.verdict.map(str::to_string).map_err(str::to_string)
+        self.verdict.clone().map(str::to_string)
     }
 }
+
+/// The line every take of the v0.87.0 cut printed: the disqualification and the
+/// green on the SAME LINE. Verbatim from that cut's transcript, trimmed to the
+/// fields that decide.
+const STARVED_GREEN_TAKE: &str = "PAINT shape=fake-claude total_ink=1553 union_hues=9 \
+     sched_late_max_us=88046 sched_qos=utility starved=yes evidence=unproved \
+     reason=\"the probe's own driver was descheduled for 88046us (>= 25000us) and this process \
+     family runs at QoS utility ... This take is not evidence about paint; run the smoke from an \
+     interactive shell or a LaunchAgent with ProcessType=Interactive\" verdict=PASS";
+
+/// The same shape on a sound instrument — a take that may be believed.
+const SOUND_GREEN_TAKE: &str = "PAINT shape=fake-claude total_ink=1553 union_hues=9 \
+     sched_late_max_us=3012 sched_qos=default starved=no evidence=sound \
+     reason=\"the DRIVER kept its cadence\" verdict=PASS";
 
 /// A healthy Apple-side machine that records every spawn. With an EMPTY team — a fork's
 /// tier, and this tree's before `APPLE_TEAM_ID` was armed on 2026-08-15, which is what
@@ -215,7 +235,9 @@ fn a_dark_bundle_refuses_the_cut_before_any_apple_tool_runs() {
         None,
         &FakePaintProbe {
             log: Rc::clone(&log),
-            verdict: Err("PAINT shape=fake-claude total_ink=0 verdict=FAIL"),
+            verdict: Err(publish::PaintRefusal::DidNotPaint(
+                "PAINT shape=fake-claude total_ink=0 verdict=FAIL".to_string(),
+            )),
         },
         &RecordingTools {
             log: Rc::clone(&log),
@@ -240,9 +262,11 @@ fn a_dark_bundle_refuses_the_cut_before_any_apple_tool_runs() {
 }
 
 /// A probe that COULD NOT RUN is not a pass — "we could not tell" refuses the
-/// cut exactly like "it did not paint", under the same failure-class words.
-/// This is the vacuity the audit found (proofs that measured nothing reading
-/// as green), pinned shut at the cut.
+/// cut exactly as hard as "it did not paint". This is the vacuity the audit
+/// found (proofs that measured nothing reading as green), pinned shut at the
+/// cut. Since 2026-09-17 it refuses in its OWN words: a take that never ran is
+/// not evidence that the artifact is dark, and the transcript may not say it
+/// is.
 #[test]
 fn a_probe_that_could_not_run_is_not_a_pass() {
     let log = log();
@@ -255,17 +279,199 @@ fn a_probe_that_could_not_run_is_not_a_pass() {
         None,
         &FakePaintProbe {
             log: Rc::clone(&log),
-            verdict: Err("PAINT-COULD-NOT-RUN control socket never appeared"),
+            verdict: Err(publish::PaintRefusal::NotEvidence(
+                "PAINT-COULD-NOT-RUN control socket never appeared".to_string(),
+            )),
         },
         &RecordingTools {
             log: Rc::clone(&log),
         },
     )
     .expect_err("an unproven bundle must refuse the cut");
+    let msg = err.to_string();
     assert!(
-        err.to_string()
-            .contains("does not paint its flagship effect"),
-        "could-not-run refuses under the same fail-closed class: {err}"
+        msg.contains("NOTHING WAS PROVEN"),
+        "could-not-run refuses as UNPROVEN, not as a paint failure: {msg}"
+    );
+    assert!(
+        !msg.contains("does not paint its flagship effect"),
+        "a take that never ran may not be reported as a dark artifact: {msg}"
+    );
+}
+
+// --- a take that is not evidence --------------------------------------------
+
+/// THE DEFECT, AT THE SEAM THAT RECORDED IT AS SATISFIED. Every paint take of
+/// the v0.87.0 cut printed `starved=yes ... "This take is not evidence about
+/// paint" ... verdict=PASS` and exited 0, and the cut wrote each one into its
+/// transcript as a passed obligation.
+///
+/// KILLS: reading the probe's exit code alone. A green exit whose own line
+/// disowns the take is UNPROVED here, whatever the script said.
+#[test]
+fn a_starved_take_is_not_a_pass_even_when_the_probe_exits_green() {
+    let refusal = publish::paint_probe_disposition(Some(0), STARVED_GREEN_TAKE.to_string())
+        .expect_err("a take that disowns itself must never satisfy the paint obligation");
+    assert!(
+        matches!(refusal, publish::PaintRefusal::NotEvidence(_)),
+        "a starved take is UNPROVED, not a paint failure: {refusal:?}"
+    );
+    assert!(
+        refusal.report().contains("ProcessType=Interactive"),
+        "the refusal must name the remedy: {refusal:?}"
+    );
+    assert!(
+        refusal.report().contains("88046"),
+        "the refusal must carry the take's own measurement: {refusal:?}"
+    );
+}
+
+/// N STARVED TAKES ARE N TAKES OF ZERO EVIDENCE. The disposition is a function
+/// of one take's own exit code and line, so nothing accumulates across takes —
+/// re-running the smoke under the same starved tier (which is the tier the job
+/// runs in, not a matter of luck) can never promote it to a pass.
+///
+/// KILLS: a best-of-N retry, a "seen it pass once" memo, or any caller that
+/// hopes a flake will clear.
+#[test]
+fn repeating_a_starved_take_never_launders_it_into_a_pass() {
+    for attempt in 1..=8 {
+        let outcome = publish::paint_probe_disposition(Some(0), STARVED_GREEN_TAKE.to_string());
+        assert!(
+            matches!(outcome, Err(publish::PaintRefusal::NotEvidence(_))),
+            "attempt {attempt} must refuse, not pass: {outcome:?}"
+        );
+    }
+}
+
+/// The exit protocol, arm by arm — including exit 3, the disposition
+/// `paint_probe.sh` gained for "the take ran and is not evidence".
+///
+/// KILLS: mapping 3 to the abnormal-death arm (which would still refuse, but
+/// would blame the protocol instead of the tier), and mapping 1 to
+/// `NotEvidence` (which would let a REAL blackout be reported as "we could not
+/// tell" — starvation may only ever take a green away, never rescue a red).
+#[test]
+fn the_exit_protocol_maps_each_code_to_its_own_disposition() {
+    assert_eq!(
+        publish::paint_probe_disposition(Some(0), SOUND_GREEN_TAKE.to_string()),
+        Ok(SOUND_GREEN_TAKE.to_string()),
+        "a sound green take passes, exactly as before"
+    );
+    assert!(
+        matches!(
+            publish::paint_probe_disposition(Some(1), "PAINT total_ink=0 verdict=FAIL".to_string()),
+            Err(publish::PaintRefusal::DidNotPaint(_))
+        ),
+        "exit 1 is a claim about PAINT"
+    );
+    for code in [Some(2), Some(publish::PAINT_EXIT_UNPROVED), Some(7), None] {
+        assert!(
+            matches!(
+                publish::paint_probe_disposition(code, "PAINT verdict=UNPROVED".to_string()),
+                Err(publish::PaintRefusal::NotEvidence(_))
+            ),
+            "exit {code:?} proves nothing about paint"
+        );
+    }
+}
+
+/// THE OTHER HALF OF THE RULE: a sound take behaves EXACTLY as it did before
+/// this lane. The gate must still be passable — a check nothing can satisfy is
+/// no more honest than one nothing can refute.
+#[test]
+fn a_sound_take_still_passes_and_still_carries_its_measurement() {
+    let log = log();
+    let (paint_note, _) = publish::selfcheck_paint_then_signing(
+        CutKind::Real,
+        "",
+        &app(),
+        &dmg_path(),
+        false,
+        None,
+        &FakePaintProbe {
+            log: Rc::clone(&log),
+            verdict: Ok(SOUND_GREEN_TAKE),
+        },
+        &RecordingTools {
+            log: Rc::clone(&log),
+        },
+    )
+    .expect("a sound green take must self-check clean");
+    assert!(
+        paint_note.contains("ink asserted") && paint_note.contains("evidence=sound"),
+        "the transcript keeps the take's own line: {paint_note:?}"
+    );
+    publish::paint_take_is_evidence(SOUND_GREEN_TAKE)
+        .expect("a take labelled evidence=sound is evidence");
+}
+
+/// A line with NO evidence token at all is unproven, never sound — the
+/// fail-closed direction. This is the older-probe / edited-probe case: the
+/// release obligation is owned at this seam, so it is re-derived here rather
+/// than trusted from an exit code.
+#[test]
+fn a_line_that_says_nothing_about_its_own_standing_is_not_evidence() {
+    for line in [
+        "PAINT shape=fake-claude total_ink=1553 verdict=PASS",
+        "<no PAINT report line>",
+        "PAINT starved=unknown evidence=unproved verdict=PASS",
+        "PAINT evidence=sound verdict=UNPROVED",
+    ] {
+        let why = publish::paint_take_is_evidence(line)
+            .expect_err("a take that does not stand behind itself may not satisfy the gate");
+        assert!(
+            why.contains("ProcessType=Interactive"),
+            "every refusal names the remedy: {why}"
+        );
+    }
+}
+
+/// THE CUT REFUSES, IN THE RIGHT WORDS, AND SPENDS NO APPLE TOOL. The operator
+/// is told what to do (the tier) and told that the only way past is the loud
+/// acknowledged escape — there is no quiet one.
+#[test]
+fn an_unproven_take_refuses_the_cut_and_names_the_remedy() {
+    let log = log();
+    let err = publish::selfcheck_paint_then_signing(
+        CutKind::Real,
+        "",
+        &app(),
+        &dmg_path(),
+        false,
+        None,
+        &FakePaintProbe {
+            log: Rc::clone(&log),
+            verdict: Err(publish::PaintRefusal::NotEvidence(
+                STARVED_GREEN_TAKE.to_string(),
+            )),
+        },
+        &RecordingTools {
+            log: Rc::clone(&log),
+        },
+    )
+    .expect_err("an unproven take must refuse the cut");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("NOTHING WAS PROVEN") && msg.contains("UNPROVED"),
+        "the refusal must say the obligation was not met, not that the artifact is dark: {msg}"
+    );
+    assert!(
+        !msg.contains("does not paint its flagship effect"),
+        "an unproven take is not a claim that the artifact is dark: {msg}"
+    );
+    assert!(
+        msg.contains("ProcessType=Interactive") && msg.contains("interactive shell"),
+        "the refusal must name the remedy, or it will be switched off: {msg}"
+    );
+    assert!(
+        msg.contains(publish::NO_PAINT_SMOKE_ACK_VALUE),
+        "the only way past must be the loud, acknowledged one: {msg}"
+    );
+    assert_eq!(
+        entries(&log),
+        vec!["paint:aterm".to_string()],
+        "an unproven take must abort before any Apple tool runs"
     );
 }
 

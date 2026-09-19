@@ -117,6 +117,60 @@ mod macos {
     // written out here, and each was checked against clang's own
     // `@encode`-derived signature for its selector.
 
+    /// `+[NSMenu popUpContextMenu:withEvent:forView:]` — the strip's ONE pop
+    /// site (toolbar.rs), as the class method it is: `(cls, _cmd, menu, event,
+    /// view)`, void.
+    type PopUpContextMenu = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id);
+
+    /// The site that replaces it for the life of the drive process.
+    ///
+    /// NO MENU EVER TRACKS IN THIS PROCESS. The module header promised that
+    /// by entering the strip's IMPs directly, and it held on macOS 14+, where
+    /// `[NSApp sendEvent:]` does not route a synthesized ctrl-left or right
+    /// mouse into the titlebar's view tree. On macOS 13 it does route them
+    /// (measured 2026-09-08 on an Intel Mac running 13.7.8): the real
+    /// `rightMouseDown:` ran, `popUpContextMenu:` opened a real menu, its
+    /// synchronous tracking loop never read the ESC the drive had queued, and
+    /// the watchdog fired — exit 3, at the same line, every run. The pop site
+    /// is therefore replaced before stage 5 with a stub that RECORDS the pop
+    /// (count and item count) and returns; the stage's checks read the strip's
+    /// own `TabContextMenuOpening` wake and this record, and the tracking loop
+    /// that no drive can survive is never entered, on any macOS.
+    static POP_UP_CONTEXT_MENU: aterm_objc::swizzle::SwizzleSite<PopUpContextMenu> =
+        aterm_objc::swizzle::SwizzleSite::new();
+    /// Pops the stub swallowed, and the item count of the last one.
+    static MENUS_SWALLOWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static LAST_MENU_ITEMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// The stub. Entered by the runtime exactly as the class method it
+    /// replaces; nothing here can unwind (two atomic stores and one
+    /// `-numberOfItems` send on a live menu).
+    unsafe extern "C-unwind" fn swallow_pop_up(
+        _cls: Id,
+        _cmd: Sel,
+        menu: Id,
+        _event: Id,
+        _view: Id,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for the
+        // duration of this call); `-numberOfItems` is `-(NSInteger)` on it,
+        // sent as exactly that. A nil menu (and a negative answer, which no
+        // menu gives) is recorded as zero items.
+        let items = if menu.is_null() {
+            0
+        } else {
+            usize::try_from(unsafe { s_isize(menu, sel!(numberOfItems)) }).unwrap_or(0)
+        };
+        LAST_MENU_ITEMS.store(items, Relaxed);
+        MENUS_SWALLOWED.fetch_add(1, Relaxed);
+    }
+
+    /// How many menus the stub has swallowed so far.
+    fn pops() -> usize {
+        MENUS_SWALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     unsafe fn s_v_id(r: Id, s: Sel, a: Id) {
         // SAFETY: as above, for `void (id, SEL, id)`.
         unsafe {
@@ -229,13 +283,6 @@ mod macos {
         // SAFETY: as above, for `void (id, SEL, NSRect, BOOL)`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Bool) = msg();
-            f(r, s, a, Bool::new(b));
-        }
-    }
-    unsafe fn s_v_id_bool(r: Id, s: Sel, a: Id, b: bool) {
-        // SAFETY: as above, for `void (id, SEL, id, BOOL)`.
-        unsafe {
-            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) = msg();
             f(r, s, a, Bool::new(b));
         }
     }
@@ -1145,177 +1192,235 @@ mod macos {
 
         // ---------------------------------------------------------- stage 5
         println!("\n-- stage 5: the context menu, two ways in");
+        // The pop site goes first — see `POP_UP_CONTEXT_MENU`. A class method
+        // is an instance method of the METACLASS, so the row is claimed there;
+        // `install` refuses unless the registered encoding is the stub's.
+        // SAFETY: `NSMenu` is a live, immortal class object; `class_of` on it
+        // answers its metaclass.
+        let meta = unsafe { aterm_objc::class_of(class(c"NSMenu").as_id()) };
+        // SAFETY: the stub has exactly the row's prototype and cannot unwind;
+        // NSMenu's metaclass is live and the selector is interned.
+        let pop_site_replaced = match unsafe {
+            POP_UP_CONTEXT_MENU.install(
+                meta,
+                sel!(popUpContextMenu:withEvent:forView:),
+                swallow_pop_up,
+            )
+        } {
+            Ok(_) => {
+                println!(
+                    "  --  +[NSMenu popUpContextMenu:withEvent:forView:] replaced for this \
+                     process: pops are recorded, never tracked"
+                );
+                true
+            }
+            Err(e) => {
+                cx.check(
+                    false,
+                    format!(
+                        "the pop site could not be replaced ({e:?}); no menu path is safe to drive"
+                    ),
+                );
+                false
+            }
+        };
         let menus = toolbar::read_tab_menus(&handle);
         println!("  --  read_tab_menus: {} line(s)", menus.len());
         for l in &menus {
             println!("      {l}");
         }
-        // SAFETY: live views, NSApp and NSWindow throughout this block; every
-        // synthesized event is +0 autoreleased.
-        unsafe {
-            let b = s_rect(cs[1], sel!(bounds));
-            let mid = CGPoint {
-                x: b.size.width * 0.35,
-                y: b.size.height * 0.5,
-            };
-            let wp = s_point_point_id(cs[1], sel!(convertPoint:toView:), mid, Id::NIL);
-            let lp = s_point_point_id(cs[1], sel!(convertPoint:toView:), mid, strip);
-            let ctrl_ev = mouse_event(LEFT_DOWN, wp, CTRL, win_no, 1);
-            let right_ev = mouse_event(RIGHT_DOWN, wp, 0, win_no, 1);
-            println!(
-                "  --  hitTest at the press point -> {}",
-                name_of(s_id_point(strip, sel!(hitTest:), lp))
-            );
-
-            // The app is made ACTIVE and the window KEY first: titlebar event
-            // routing depends on both, and a probe that skips them measures its
-            // own setup rather than the strip.
-            s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
-            s_v_id(ns_window, sel!(makeKeyAndOrderFront:), Id::NIL);
-            pump(&mut d, &mut el, 250);
-            println!(
-                "  --  app active={} window key={} main={}",
-                s_bool(app, sel!(isActive)),
-                s_bool(ns_window, sel!(isKeyWindow)),
-                s_bool(ns_window, sel!(isMainWindow))
-            );
-
-            // THE CONTROL, and it is the reason the two `[]` lines below are
-            // an observation and not a failure: a plain left click through the
-            // SAME routing does arrive. `[NSApp sendEvent:]` does not deliver a
-            // synthesized ctrl-left or right-mouse into the titlebar's view
-            // tree — measured, on both this branch and origin/main — so the
-            // menu is entered at its IMP instead.
-            d.wakes.clear();
-            s_v_id(
-                app,
-                sel!(sendEvent:),
-                mouse_event(LEFT_DOWN, wp, 0, win_no, 1),
-            );
-            s_v_id(
-                app,
-                sel!(sendEvent:),
-                mouse_event(LEFT_UP, wp, 0, win_no, 1),
-            );
-            pump(&mut d, &mut el, 200);
-            let control_arrived = d.wakes.iter().any(|w| w == "SelectTab(1)");
-            println!("  --  [NSApp sendEvent:] plain left   -> {:?}", d.wakes);
-            cx.check(
-                control_arrived,
-                "the CONTROL arrived: NSApp routes a plain left click into the strip".to_owned(),
-            );
-
-            d.wakes.clear();
-            s_v_id(app, sel!(sendEvent:), ctrl_ev);
-            s_v_id(
-                app,
-                sel!(sendEvent:),
-                mouse_event(LEFT_UP, wp, CTRL, win_no, 1),
-            );
-            pump(&mut d, &mut el, 250);
-            println!("  --  [NSApp sendEvent:] ctrl-left    -> {:?}", d.wakes);
-
-            d.wakes.clear();
-            s_v_id(app, sel!(sendEvent:), right_ev);
-            s_v_id(
-                app,
-                sel!(sendEvent:),
-                mouse_event(RIGHT_UP, wp, 0, win_no, 1),
-            );
-            pump(&mut d, &mut el, 250);
-            println!("  --  [NSApp sendEvent:] rightMouse   -> {:?}", d.wakes);
-
-            let frame_view = s_id(s_id(ns_window, sel!(contentView)), sel!(superview));
-            println!(
-                "  --  theme frame={} hitTest(window pt) -> {}",
-                name_of(frame_view),
-                name_of(s_id_point(frame_view, sel!(hitTest:), wp))
-            );
-
-            // STRAIGHT INTO THE REGISTERED IMP, which is what AppKit calls once
-            // its routing has picked the view. An ESC is queued first so the
-            // menu that pops has something to dismiss it — without it the
-            // modal tracking loop is what the watchdog exists for.
-            for (label, recv, s, ev) in [
-                (
-                    "chip rightMouseDown:",
-                    cs[1],
-                    sel!(rightMouseDown:),
-                    right_ev,
-                ),
-                ("chip mouseDown: ctrl", cs[1], sel!(mouseDown:), ctrl_ev),
-            ] {
-                d.wakes.clear();
-                s_v_id_bool(
-                    app,
-                    sel!(postEvent:atStart:),
-                    key_event(KEY_DOWN, win_no, nsstr("\u{1b}"), 53),
-                    true,
-                );
-                s_v_id(recv, s, ev);
-                pump(&mut d, &mut el, 300);
-                println!("  --  [{label}] -> {:?}", d.wakes);
-                cx.check(
-                    d.wakes.iter().any(|w| w == "TabContextMenuOpening"),
-                    format!("[{label}] pops the tab context menu"),
-                );
-            }
-
-            // WHERE a click lands, across the chip. Free (no pumping), and it
-            // is the layout evidence a chip-geometry regression shows up in
-            // first: the label owns the middle, the chip owns the edges.
-            let bb = s_rect(cs[1], sel!(bounds));
-            let map: Vec<String> = (0..20)
-                .map(|k| {
-                    let fx = (f64::from(k) + 0.5) / 20.0;
-                    let p = s_point_point_id(
-                        cs[1],
-                        sel!(convertPoint:toView:),
-                        CGPoint {
-                            x: bb.size.width * fx,
-                            y: bb.size.height * 0.5,
-                        },
-                        strip,
-                    );
-                    name_of(s_id_point(strip, sel!(hitTest:), p))
-                })
-                .collect();
-            println!("  --  hit map across chip1: {}", map.join(" "));
-
-            // AND THE LABEL, which is what a user's pointer is actually over:
-            // `NSTextField` is not a chip, so both menu routes have to survive
-            // the responder walk from the label up to the chip.
-            let label = subviews(cs[1])
-                .into_iter()
-                .find(|v| name_of(*v) == "NSTextField");
-            if let Some(lab) = label {
+        // The block below enters the strip's menu, through AppKit's routing
+        // and straight at the IMPs, so it runs only over the stub. Over the
+        // REAL pop site any of those entries can start the tracking loop the
+        // watchdog exists for, and the drive would end HUNG (exit 3) instead of
+        // failing with the reason recorded above. Its free observations (the
+        // control click, the hit map) are skipped with it; that FAIL already
+        // decides the drive.
+        if pop_site_replaced {
+            // SAFETY: live views, NSApp and NSWindow throughout this block; every
+            // synthesized event is +0 autoreleased.
+            unsafe {
+                let b = s_rect(cs[1], sel!(bounds));
+                let mid = CGPoint {
+                    x: b.size.width * 0.35,
+                    y: b.size.height * 0.5,
+                };
+                let wp = s_point_point_id(cs[1], sel!(convertPoint:toView:), mid, Id::NIL);
+                let lp = s_point_point_id(cs[1], sel!(convertPoint:toView:), mid, strip);
+                let ctrl_ev = mouse_event(LEFT_DOWN, wp, CTRL, win_no, 1);
+                let right_ev = mouse_event(RIGHT_DOWN, wp, 0, win_no, 1);
                 println!(
-                    "  --  label frame={} menuForEvent -> {}",
-                    show_rect(s_rect(lab, sel!(frame))),
-                    name_of(s_id_id(lab, sel!(menuForEvent:), right_ev))
+                    "  --  hitTest at the press point -> {}",
+                    name_of(s_id_point(strip, sel!(hitTest:), lp))
                 );
-                for (label_txt, s, ev) in [
-                    ("label rightMouseDown:", sel!(rightMouseDown:), right_ev),
-                    ("label mouseDown: ctrl", sel!(mouseDown:), ctrl_ev),
+
+                // The app is made ACTIVE and the window KEY first: titlebar event
+                // routing depends on both, and a probe that skips them measures its
+                // own setup rather than the strip.
+                s_v_bool(app, sel!(activateIgnoringOtherApps:), true);
+                s_v_id(ns_window, sel!(makeKeyAndOrderFront:), Id::NIL);
+                pump(&mut d, &mut el, 250);
+                println!(
+                    "  --  app active={} window key={} main={}",
+                    s_bool(app, sel!(isActive)),
+                    s_bool(ns_window, sel!(isKeyWindow)),
+                    s_bool(ns_window, sel!(isMainWindow))
+                );
+
+                // THE CONTROL, and it is the reason the two lines below are an
+                // observation and not a failure: a plain left click through the
+                // SAME routing does arrive. On macOS 14+ `[NSApp sendEvent:]` does
+                // not deliver a synthesized ctrl-left or right-mouse into the
+                // titlebar's view tree — measured, on both this branch and
+                // origin/main — so the menu is entered at its IMP instead. On
+                // macOS 13 it DOES deliver them (measured 2026-09-08 on an Intel
+                // Mac running 13.7.8), which is why the pop site above is a stub:
+                // whichever way the routing goes, the pop is recorded and the
+                // drive continues. The swallow count after each send says whether
+                // this OS routed it.
+                d.wakes.clear();
+                s_v_id(
+                    app,
+                    sel!(sendEvent:),
+                    mouse_event(LEFT_DOWN, wp, 0, win_no, 1),
+                );
+                s_v_id(
+                    app,
+                    sel!(sendEvent:),
+                    mouse_event(LEFT_UP, wp, 0, win_no, 1),
+                );
+                pump(&mut d, &mut el, 200);
+                let control_arrived = d.wakes.iter().any(|w| w == "SelectTab(1)");
+                println!("  --  [NSApp sendEvent:] plain left   -> {:?}", d.wakes);
+                cx.check(
+                    control_arrived,
+                    "the CONTROL arrived: NSApp routes a plain left click into the strip"
+                        .to_owned(),
+                );
+
+                d.wakes.clear();
+                let before = pops();
+                s_v_id(app, sel!(sendEvent:), ctrl_ev);
+                s_v_id(
+                    app,
+                    sel!(sendEvent:),
+                    mouse_event(LEFT_UP, wp, CTRL, win_no, 1),
+                );
+                pump(&mut d, &mut el, 250);
+                println!(
+                    "  --  [NSApp sendEvent:] ctrl-left    -> {:?}  (pops routed: {})",
+                    d.wakes,
+                    pops() - before
+                );
+
+                d.wakes.clear();
+                let before = pops();
+                s_v_id(app, sel!(sendEvent:), right_ev);
+                s_v_id(
+                    app,
+                    sel!(sendEvent:),
+                    mouse_event(RIGHT_UP, wp, 0, win_no, 1),
+                );
+                pump(&mut d, &mut el, 250);
+                println!(
+                    "  --  [NSApp sendEvent:] rightMouse   -> {:?}  (pops routed: {})",
+                    d.wakes,
+                    pops() - before
+                );
+
+                let frame_view = s_id(s_id(ns_window, sel!(contentView)), sel!(superview));
+                println!(
+                    "  --  theme frame={} hitTest(window pt) -> {}",
+                    name_of(frame_view),
+                    name_of(s_id_point(frame_view, sel!(hitTest:), wp))
+                );
+
+                // STRAIGHT INTO THE REGISTERED IMP, which is what AppKit calls once
+                // its routing has picked the view. Nothing is queued to dismiss the
+                // menu: the pop lands in the stub, so there is no tracking loop to
+                // end, and an ESC posted anyway would reach the key window as a
+                // stray Escape keyDown, on every macOS.
+                for (label, recv, s, ev) in [
+                    (
+                        "chip rightMouseDown:",
+                        cs[1],
+                        sel!(rightMouseDown:),
+                        right_ev,
+                    ),
+                    ("chip mouseDown: ctrl", cs[1], sel!(mouseDown:), ctrl_ev),
                 ] {
                     d.wakes.clear();
-                    s_v_id_bool(
-                        app,
-                        sel!(postEvent:atStart:),
-                        key_event(KEY_DOWN, win_no, nsstr("\u{1b}"), 53),
-                        true,
-                    );
-                    s_v_id(lab, s, ev);
+                    let before = pops();
+                    s_v_id(recv, s, ev);
                     pump(&mut d, &mut el, 300);
-                    println!("  --  [{label_txt}] -> {:?}", d.wakes);
+                    println!(
+                        "  --  [{label}] -> {:?}  (pops: {}, items in the last: {})",
+                        d.wakes,
+                        pops() - before,
+                        LAST_MENU_ITEMS.load(std::sync::atomic::Ordering::Relaxed)
+                    );
                     cx.check(
                         d.wakes.iter().any(|w| w == "TabContextMenuOpening"),
-                        format!("[{label_txt}] reaches the tab's menu"),
+                        format!("[{label}] pops the tab context menu"),
+                    );
+                    cx.check(
+                        pops() > before,
+                        format!("[{label}] reached +[NSMenu popUpContextMenu:withEvent:forView:]"),
                     );
                 }
-            } else {
-                cx.check(false, "chip1 has an NSTextField label".to_owned());
+
+                // WHERE a click lands, across the chip. Free (no pumping), and it
+                // is the layout evidence a chip-geometry regression shows up in
+                // first: the label owns the middle, the chip owns the edges.
+                let bb = s_rect(cs[1], sel!(bounds));
+                let map: Vec<String> = (0..20)
+                    .map(|k| {
+                        let fx = (f64::from(k) + 0.5) / 20.0;
+                        let p = s_point_point_id(
+                            cs[1],
+                            sel!(convertPoint:toView:),
+                            CGPoint {
+                                x: bb.size.width * fx,
+                                y: bb.size.height * 0.5,
+                            },
+                            strip,
+                        );
+                        name_of(s_id_point(strip, sel!(hitTest:), p))
+                    })
+                    .collect();
+                println!("  --  hit map across chip1: {}", map.join(" "));
+
+                // AND THE LABEL, which is what a user's pointer is actually over:
+                // `NSTextField` is not a chip, so both menu routes have to survive
+                // the responder walk from the label up to the chip.
+                let label = subviews(cs[1])
+                    .into_iter()
+                    .find(|v| name_of(*v) == "NSTextField");
+                if let Some(lab) = label {
+                    println!(
+                        "  --  label frame={} menuForEvent -> {}",
+                        show_rect(s_rect(lab, sel!(frame))),
+                        name_of(s_id_id(lab, sel!(menuForEvent:), right_ev))
+                    );
+                    for (label_txt, s, ev) in [
+                        ("label rightMouseDown:", sel!(rightMouseDown:), right_ev),
+                        ("label mouseDown: ctrl", sel!(mouseDown:), ctrl_ev),
+                    ] {
+                        d.wakes.clear();
+                        s_v_id(lab, s, ev);
+                        pump(&mut d, &mut el, 300);
+                        println!("  --  [{label_txt}] -> {:?}", d.wakes);
+                        cx.check(
+                            d.wakes.iter().any(|w| w == "TabContextMenuOpening"),
+                            format!("[{label_txt}] reaches the tab's menu"),
+                        );
+                    }
+                } else {
+                    cx.check(false, "chip1 has an NSTextField label".to_owned());
+                }
             }
+        } else {
+            println!("  --  stage 5's menu entries NOT driven: the pop site is still AppKit's");
         }
 
         // ---------------------------------------------------------- stage 6

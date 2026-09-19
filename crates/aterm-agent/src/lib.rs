@@ -648,6 +648,7 @@ USAGE
               | watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
                       [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT]
                       [--journal FILE] [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
+                      [--resume [RULES]]
               | task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text...>
               | report [@sid] [--since ORIGIN:I] [--max-rows N] [--final | --messages]
               | ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
@@ -819,6 +820,7 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        two runs is not seen).
     watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
           [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT]
+          [--journal FILE] [--mail …] [--resume [RULES]]
                        supervise's loop for a harness that wakes its agent once per
                        stdout line (a background monitor, a supervisor process).
                        Approvals are supervise's, and each prints `APPROVED
@@ -887,6 +889,68 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        point prints as ONE line, `EVENT turn seq=<n>
                        report=<id> rows=<n> <summary>`; without the flag every
                        line is as above, byte for byte.
+                       A usage limit is a decision point the loop handles
+                       ALONE (measured 2026-09-15 16:51 → 09-17 08:55: one
+                       account's weekly limit stopped the manager and the
+                       worker at once, the loop printed `EVENT limited`, ran
+                       out its --max-s and exited; nobody could act for two
+                       days). On `EVENT limited` it sets the worker's
+                       attention (`meta set attention limited: <message>
+                       reset=<when>`, cut at 256 bytes — the typed escalation
+                       aterm's menu bar badges), posts the same text as
+                       `kind=control` mail from the worker's session to yours
+                       (--inbox, else $ATERM_PARENT_SESSION_ID; with neither,
+                       skipped) and journals one `ESCALATED seq=<n>
+                       attention=<reply> mail=<reply>` line — once a limit
+                       episode: a retry's notice prints its EVENT and
+                       escalates nothing again. It never exits on a limit: a
+                       --max-s that would run out before the reset the notice
+                       names (`resets Sep 19 at 11am (America/Los_Angeles)`,
+                       `resets 7:30pm`, `resets in 3h`; the zone's offset as
+                       `date` reads it today, the local zone with none; a span
+                       counts from the notice's print, so a watcher started
+                       onto a notice that sat reads it late — the probe's
+                       backoff covers that; a reset read as more than 8 days
+                       off is misread and extends nothing) plus 10 min is
+                       stretched to that, `EXTEND until=<UTC> reset=<text>`
+                       printed once a reset. The episode ends when the worker
+                       answers again — a point after it was read busy (your
+                       turn after the reset), or a box — the attention cleared
+                       (`meta unset attention`; on the wire `meta set
+                       attention ''` is a usage error) and `CLEARED seq=<n> …`
+                       journaled; its point prints as ever. With --resume the
+                       loop PROBES the worker itself: at the reset — or
+                       sooner, when the screen leaves the notice with no busy
+                       spell (the `/login` of another account, the `/model`
+                       output) — ONE turn (`turn idle=600 timeout=2500
+                       Manager's watcher: the usage limit should have reset.
+                       Answer with one line: can you work now, and what was
+                       the last thing you completed?`), only at an idle
+                       composer with nothing typed (a draft, or no composer on
+                       the screen — the `/login` dialog's code field — defers
+                       it a step, a question leaves it to you; journaled
+                       `PROBE sent|deferred seq=<n> …`). Its answer — a new
+                       done row, or a box; a worker still busy on it when 120
+                       s are up is waited for, as any turn is — prints `EVENT
+                       resumed seq=<n> <its line>` (the point is not reported
+                       again as idle) and, with RULES named, the file's
+                       contents are sent as ONE turn (`Manager's watcher,
+                       standing rules restated after a limit: <the file, line
+                       breaks as spaces>`; read at the launch and again then)
+                       and `EVENT rebriefed seq=<n>` follows — `EVENT
+                       rebrief-failed seq=<n> <why>` when it cannot be read or
+                       the turn was not submitted; a worker that answers on
+                       someone else's turn is rebriefed at that idle point the
+                       same way. The notice again, a turn not submitted, or no
+                       reaction within 120 s prints `EVENT still-limited
+                       seq=<n> <why>` and the next probe waits 10 min, then 30
+                       (never before a later reset a new notice names; the
+                       notice again with the same text — a retry's, an
+                       outage's re-report — moves no reset and brings no probe
+                       forward). The last unfinished directive is yours to
+                       resend — the journal and `history` show it; the loop
+                       invents no work. Without --resume every line is as
+                       above but for the one EXTEND.
     task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text...>
                        Give the worker its work BY MAIL: `post to=@sid
                        kind=task [dl=<S*1000>] <text>` from your own session
@@ -1219,9 +1283,12 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        approvals, its review point, its TIMEOUT, or `EXIT
                        <reason>` for the error it ends on.
                          {\"t\":<unix ms>,\"sid\":\"<sid>\"|null,\"kind\":\"event|
-                          approved|dismissed|reconnect|timeout|exit\",\"phase\":
+                          approved|dismissed|reconnect|timeout|exit|mail|extend|
+                          escalated|cleared|probe\",\"phase\":
                           \"idle|question|prompt|limited|survey|context|
-                          compacted|-\",\"seq\":<n>|null,\"complete\":0|1|null,
+                          compacted|turn|idle-no-report|resumed|still-limited|
+                          rebriefed|rebrief-failed|-\",\"seq\":<n>|null,
+                          \"complete\":0|1|null,
                           \"rows\":<n>|null,\"summary\":\"<the line's free-text
                           tail>\",\"line\":\"<the exact line>\",\"turn\":<id>|null}
                        Every field is read from the line itself, so the record
@@ -1233,6 +1300,15 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        never stops the loop. `aterm drive ledger --journal
                        FILE` replays it. --notes is still what it was: one line
                        per Bash-prompt decision, and nothing else.
+    --resume [RULES]   (watch) Live through a usage limit's reset and probe
+                       the worker after it (see watch); RULES, when named, is
+                       the file whose contents are restated to the worker as
+                       ONE turn once it answers — keep your standing rules
+                       there (run nothing heavy while a flag file exists, …),
+                       and edit it as they change: it is read when sent.
+                       Refused at the launch when it cannot be read or is
+                       empty. The next word is the file unless it is a flag
+                       or the worker's @sid.
 
 OPTIONS
     --socket PATH   The target aterm's control socket. Defaults to
