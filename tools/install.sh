@@ -79,10 +79,14 @@
 #         the bundle: no cargo, works from a piped script, and the link tracks
 #         in-place app updates. Fallback: the toolset is built from THIS
 #         checkout's source (run `git pull --ff-only` first for the latest
-#         main; needs a checkout + cargo + the pinned CUSTOM `trust` toolchain
-#         — rust-toolchain.toml; rustup cannot download it, so its absence is
-#         a loud pre-flight skip naming the acquisition path, never a
-#         mid-build abort) into a private store
+#         main; needs a checkout + the pinned CUSTOM `trust` toolchain —
+#         rust-toolchain.toml — which arrives EITHER the product's way, `aterm
+#         pkg install trust` (the atpkg store's targo, taken FIRST, no rustup
+#         needed), OR as rustup's `trust` link, built through rustup's proxy,
+#         the one cargo that honours the pin; rustup cannot download it, so
+#         with neither in reach the lane is a loud pre-flight skip naming
+#         both remedies, never a mid-build abort — see find_cargo_and_rustup)
+#         into a private store
 #         (~/.local/lib/aterm/bin, override ATERM_STORE_DIR) with the one
 #         `aterm` symlink in ~/.local/bin — non-macOS, older bundles, or no
 #         installed app. A PATH hint prints if ~/.local/bin isn't on PATH.
@@ -130,9 +134,13 @@
 #   tools/install.sh --token                          # DO provision the update token
 #                                                     # (default: skipped — see `token`)
 #   tools/install.sh --no-token                       # hard off for the token half
-#   tools/install.sh --no-toolchain                   # lean zip, packages disabled — no
-#                                                     # toolset half at all (`aterm pkg
-#                                                     # install --default-set` later)
+#   tools/install.sh --no-toolchain                   # lean zip, toolset excluded — but the
+#                                                     # exclusion does not persist yet: no
+#                                                     # config is written, so the app's first
+#                                                     # launch still installs the ALab toolset
+#                                                     # unless `[packages].seed_install = false`
+#                                                     # is in ~/.config/aterm/aterm.toml first
+#                                                     # (`aterm help pkg`)
 #   tools/install.sh --no-path                        # don't touch the shell profile
 #   tools/install.sh --token --no-app --no-cli --no-toolchain --no-path
 #                                                     # ONLY provision the token — for a
@@ -1053,8 +1061,12 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 		ASSET_NAME="$zip_name"
 		ASSET_SHA="$zip_sha"
 		if [[ "$toolchain" -eq 0 ]]; then
-			# --no-toolchain keeps its meaning: lean zip, packages disabled —
-			# this run defers nothing, because the user excluded the toolset.
+			# --no-toolchain excludes the toolset: lean zip, and this run
+			# defers nothing — this script's own toolset step is skipped.
+			# The exclusion does not persist yet: no config is written
+			# (docs/DESIGN-cli-toolchain-seed-2026-08-31.md, "Review
+			# corrections" 1), so the app's first launch still adopts and
+			# installs unless [packages].seed_install = false is set first.
 			LEAN_REASON=no-toolchain
 		else
 			LEAN_REASON=default
@@ -1069,6 +1081,557 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 	# exactly as before the flip. (Such a release may still name the retired
 	# Intel pair in its manifest; those keys are no longer read.)
 	return 0
+}
+
+# --- the cargo that honours the pin (source-build lane) ----------------------
+#
+# TWO LANES, the aterm-managed one FIRST (2026-09-18, owner: "you must be using
+# the aterm toolchain. why would you need rust toolchain at all?"). A machine
+# provisioned the product's own way — `aterm pkg install trust` — has NO rustup:
+# the atpkg store holds the Trust toolchain at <prefix>/store/trust/<build>/bin/
+# (targo, trustc, siblings) and <prefix>/bin/targo is the shim on PATH. That
+# targo IS channel `trust`, the one thing rust-toolchain.toml pins here, so it
+# honours the pin by construction, and the gate takes it first: resolved
+# through `aterm pkg which targo`, the shim's exec target, or PATH's targo,
+# proved to lie in the store, and built on targo's explicit `--unverified`
+# lane (find_managed_targo; measured on the owner's Mac, store build 9192, no
+# rustup, no cargo on PATH — the gate below used to refuse it, demanding
+# rustup's proxy, which was false for that shape). A stock pin (the PUBLIC
+# snapshot's) never takes that lane. When no managed store applies, rustup's
+# lane below runs exactly as it did, proved as it was.
+#
+# THE RUSTUP LANE. rust-toolchain.toml pins the toolchain, and of the cargos
+# rustup knows ONLY its proxy honours it: a
+# plain cargo — Homebrew's `rust` formula, a distro package — compiles with
+# PATH's rustc. On the trust-pinned dev tree that build does not get far.
+# crates/aterm depends on crates/trust-gate, whose build script refuses any
+# non-Trust rustc among the build's first units. Its refusal names this very
+# case ("a cargo that is not rustup's (Homebrew's ignores the pin)") and the
+# fix ("build through rustup's cargo, ~/.cargo/bin/cargo"), and it stays the
+# backstop. What this pre-flight adds beyond it:
+#   * it FINDS the proxy when ~/.cargo/bin is not on PATH at all, where the
+#     `command -v cargo` pre-flight skipped the lane as "needs cargo";
+#   * it refuses BEFORE any compile. trust-gate's refusal is a mid-build
+#     abort, and FAILSAFE POLICY (the header) makes a condition a pre-flight
+#     can detect a skip, never that;
+#   * the PUBLIC snapshot ships this script with a stock pin
+#     (publish/public-rust-toolchain.toml). There trust-gate stands down
+#     (gate::tree_pins_trust) and a Homebrew cargo DOES build silently, with
+#     whatever rustc PATH holds.
+# On a Mac the proxy is the one that loses:
+# path_helper puts the system dirs FIRST in every login shell's INHERITED PATH,
+# so a terminal spawned from a terminal finds /usr/local/bin/cargo before
+# ~/.cargo/bin/cargo. Measured 2026-09-06 on an Intel Ventura Mac: a Homebrew
+# cargo 1.95.0 shadowed the pinned 1.97.1 in nested shells, and a shell with no
+# ~/.cargo/bin on PATH at all had no cargo — so this lane's pre-flight said
+# "needs cargo" (and recommended `brew install rust`, the very toolchain that
+# ignores the pin) with rustup and the pinned toolchain both installed.
+#
+# So rustup is found first ($CARGO_HOME/bin — rustup-init's layout — then
+# PATH) and the cargo is taken from BESIDE it: rustup lays its proxies beside
+# its own binary wherever that is (rustup-init's ~/.cargo/bin or a custom
+# $CARGO_HOME/bin, Homebrew's keg-only `rustup` formula dir, a distro's
+# /usr/bin), so the shadow-first, custom-CARGO_HOME and Homebrew-rustup layouts
+# all resolve to the proxy without any PATH surgery. Then the result is PROVED
+# to dispatch to the pin, by measurements rather than a "(Homebrew)" sniff:
+#
+#   * rustup must resolve this root to the FILE's pin: `show active-toolchain`
+#     names the file it read, and that file must BE this checkout's
+#     rust-toolchain.toml, compared by inode (-ef), never by string. rustup
+#     spells the path as getcwd() does, physical and in the letter case on
+#     disk. Bash's builtin `pwd -P` resolves symlinks but keeps the case as
+#     typed, and on a case-insensitive volume (macOS's default APFS) any
+#     spelling reaches the checkout: from `cd /users/<user>/aterm/...` the
+#     builtin printed /users/... while rustup printed
+#     `trust (overridden by '/Users//<user>/aterm/.../rust-toolchain.toml')`
+#     (measured 2026-09-10, bash 3.2.57, rustup 1.29.1). An ambient
+#     RUSTUP_TOOLCHAIN steers rustup and the proxy alike, so an unscrubbed
+#     gate proves, and builds under, whatever it names — measured on the
+#     `trust` pin 2026-09-10: RUSTUP_TOOLCHAIN=1.97.1 gives
+#     `1.97.1-x86_64-apple-darwin (overridden by environment variable
+#     RUSTUP_TOOLCHAIN)`, and `rustup which cargo` names that toolchain's
+#     cargo. So it is scrubbed (env -u) from every probe AND from the build.
+#     What survives the scrub is a `rustup override` on this very directory,
+#     `<name> (directory override for '<dir>')`, refused by name; a parent
+#     directory's override never wins, rustup reading the checkout's own
+#     rust-toolchain.toml first (both measured, rustup 1.29.1, in a scratch
+#     RUSTUP_HOME);
+#   * the cargo's `--version` must equal that of the toolchain cargo rustup
+#     names for this root (the proxy execs exactly that binary — measured
+#     `cargo 1.99.0-dev (3d7768caf 2026-08-21)` both ways for the linked
+#     `trust`, `cargo 1.97.1 (c980f4866 2026-06-30)` for a stock pin — so a
+#     cargo of a DIFFERENT build cannot match; a plain cargo of the SAME
+#     release can, and would then build with PATH's rustc);
+#   * it must refuse RUSTUP_TOOLCHAIN=<absent name>, which only the proxy
+#     reads (measured, rustup 1.29.1: exit 1 for the proxy, exit 0 for the
+#     plain toolchain cargo);
+#   * the rustc the build will run must be rustup's proxy too. cargo (RUSTC
+#     and build.rustc unset) runs PATH's `rustc`, and rustup adds its
+#     $CARGO_HOME/bin to the front of the PATH it hands the toolchain's cargo
+#     only when that PATH lacks it, and never adds the dir the proxy was
+#     invoked from. Measured 2026-09-10 with rustup 1.29.1 and a fake
+#     toolchain, linked into a scratch RUSTUP_HOME, whose cargo reports
+#     `command -v rustc`. With PATH=<shadow>:$CARGO_HOME/bin:/usr/bin:/bin
+#     (a Homebrew-style rustc in <shadow>, the nested-shell order above), that
+#     cargo saw PATH unchanged and resolved <shadow>/rustc. With
+#     $CARGO_HOME/bin off PATH, rustup put it first. With rustup and its
+#     proxies in a keg dir behind <shadow> and $CARGO_HOME/bin empty, it
+#     resolved <shadow>/rustc again. So the build itself puts $CARGO_HOME/bin
+#     and then the proved cargo's own dir first on PATH, and the first rustc
+#     in those dirs must refuse an absent RUSTUP_TOOLCHAIN as the cargo did.
+#     rustup exports RUSTUP_TOOLCHAIN=<pin> to the cargo it runs (measured),
+#     so that proxy resolves to the pin.
+#
+# FAILSAFE POLICY applies: every outcome here is a pre-flight skip reason,
+# never a mid-build abort. The functions between the markers are
+# byte-identical in tools/dev-app.sh (duplicated, not sourced: this script
+# stays self-contained for the piped lane); tools/test-cargo-pin.sh compares
+# the two copies and pins their behaviour.
+#
+# RUSTUP_AUTO_INSTALL=0 on every probe: rustup 1.29.0 otherwise treats a
+# pinned-but-absent toolchain as an order to DOWNLOAD it (`rustup which cargo`
+# began "syncing channel updates", measured 2026-09-06), and a pre-flight —
+# read-only under --dry-run by contract — must never start a multi-hundred-MB
+# fetch.
+#
+# Read-only: no file is created, so the --dry-run zero-mutation contract holds.
+# >>> cargo-pin gate: byte-identical in tools/dev-app.sh and tools/install.sh
+# One file's PHYSICAL path: symlinks followed hop by hop with readlink (the
+# installer's floor is macOS's stock bash 3.2, and `realpath` is not on every
+# Mac), the directory spelled as getcwd() spells it. Empty, exit 1, when the
+# file does not exist.
+gate_physical_path() { # <path>
+	local p="$1" t
+	while [[ -L "$p" ]]; do
+		t="$(readlink "$p")" || return 1
+		case "$t" in
+		/*) p="$t" ;;
+		*) p="$(dirname "$p")/$t" ;;
+		esac
+	done
+	[[ -e "$p" ]] || return 1
+	printf '%s/%s\n' "$(cd "$(dirname "$p")" && env pwd -P)" "$(basename "$p")"
+}
+
+# The channel rust-toolchain.toml pins: its first uncommented `channel = "…"`.
+# Read from the file, never from rustup — the managed lane below has no rustup
+# to ask, and the stock pin the PUBLIC snapshot ships must never take that
+# lane.
+gate_pinned_channel() { # <root>
+	sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1/rust-toolchain.toml" 2>/dev/null | head -n 1
+}
+
+# THE MANAGED-STORE LANE, first in precedence. A machine provisioned the
+# product's own way — `aterm pkg install trust` — has NO rustup: atpkg holds the
+# Trust toolchain at <prefix>/store/trust/<build>/bin/ (targo, trustc, and their
+# siblings), <prefix>/store/trust/current selects the build, and
+# <prefix>/bin/targo is the shim on PATH (its body is
+# `exec '<prefix>/store/trust/<build>/bin/targo' "$@"`), with `alab-targo`
+# beside it — atpkg's ALIAS shim, the same body, laid so the managed copy can
+# be typed when a foreign `targo` sits ahead of the managed bin/ on PATH
+# (crates/atpkg/src/store.rs ALIAS_PREFIX). That targo IS channel `trust` —
+# the one thing rust-toolchain.toml can pin here — so it honours the pin by
+# construction, with nothing for a rustup proxy to prove. Measured 2026-09-18
+# on the owner's Mac (store build 9192, `targo 1.99.0-dev (321aaeda7
+# 2026-09-17)`, no rustup, no cargo on PATH): `aterm pkg which targo` prints
+# `targo → <prefix>/bin/targo → <prefix>/store/trust/9192/bin/targo — managed
+# 9192 — pinned by index 39`, and a verbose build under that targo runs
+# `<prefix>/store/trust/9192/bin/trustc` by ABSOLUTE path — with a shadow rustc
+# first on PATH it still ran the store's trustc — so PATH cannot steer the
+# compiler (an ambient RUSTC or CARGO_BUILD_RUSTC can, and cargo_build_pinned
+# scrubs both). The store is resolved three ways, in order:
+#   1. `aterm pkg which targo` when `aterm` is in reach: its last `→` arm, up
+#      to the ` — ` note. The managed bin/ is appended LAST to PATH inside an
+#      aterm session, so any other targo ahead of it (a `cargo install`ed one
+#      in ~/.cargo/bin, a scratch script) makes atpkg answer the SHADOWED
+#      shape instead — measured 2026-09-18 with a stray targo first on PATH:
+#      `targo → <stray> — managed 9192 — SHADOWED by <stray> — type alab-targo
+#      for the managed one` (exit 0), while `aterm pkg which alab-targo` still
+#      printed `alab-targo → <prefix>/bin/alab-targo → <prefix>/store/trust/
+#      9192/bin/targo — managed 9192 — pinned by index 39`. The gate used to
+#      take the SHADOWED answer's last arm, decline the stray, and refuse a
+#      Mac that HAD the store, naming `aterm pkg install trust` as if it were
+#      not done. So a SHADOWED answer is re-asked as `alab-targo` — the
+#      un-shadowable name atpkg lays for exactly this — and its store path is
+#      taken; an alias that is not laid (nothing printed) falls through.
+#   2. PATH, scanned dir by dir for a `targo` or `alab-targo` — a shim followed
+#      to its exec target — taking the FIRST that is the store's: a stray ahead
+#      of the managed shim does not hide it (the alias exists for that), and
+#      the shape proof below is what admits a candidate, never its PATH rank.
+#      When none is the store's, the first targo seen is what the decline
+#      names.
+#   3. (the same scan) PATH's `targo` itself, symlinks resolved — a store bin
+#      dir on PATH, or one reached through `current`.
+# Whatever answered, the PHYSICAL path must lie at
+# <prefix>/store/trust/<build>/bin/targo — a Homebrew targo, or any PATH-order
+# stranger, is not the store's and never takes this lane. The lane needs the
+# checkout root (its pin proof reads the file); the pin must name `trust`.
+# Anything short of that is "no managed store": the reason is kept in
+# MANAGED_DECLINE for the refusal, and the rustup lane runs unchanged.
+
+# The exec target of an atpkg shim — a script whose body is `exec '<path>'
+# "$@"` (the `alab-<tool>` alias has the same body) — else the file itself. A
+# Mach-O targo on PATH is not read past its magic (`head -c 2`).
+gate_shim_target() { # <file>
+	local line="" cand=""
+	if [[ "$(head -c 2 "$1" 2>/dev/null)" == '#!' ]]; then
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			case "$line" in
+			"exec '"*"' \"\$@\"")
+				cand="${line#exec \'}"
+				cand="${cand%\' \"\$@\"}"
+				break
+				;;
+			esac
+		done < <(head -n 8 "$1" 2>/dev/null)
+	fi
+	printf '%s\n' "${cand:-$1}"
+}
+
+# The shape proof: <candidate> resolves, physically, to
+# <prefix>/store/trust/<build>/bin/targo and is executable. Sets
+# MANAGED_TARGO/MANAGED_PREFIX/MANAGED_BUILD, or MANAGED_DECLINE with the reason.
+gate_store_targo() { # <candidate>
+	local p="" prefix="" build=""
+	MANAGED_DECLINE=""
+	if ! p="$(gate_physical_path "$1")" || [[ -z "$p" ]]; then
+		MANAGED_DECLINE="the targo in reach, $1, does not exist"
+		return 1
+	fi
+	case "$p" in
+	*/store/trust/*/bin/targo)
+		prefix="${p%/store/trust/*}"
+		build="${p#"$prefix"/store/trust/}"
+		build="${build%/bin/targo}"
+		;;
+	esac
+	if [[ -z "$prefix" || -z "$build" || "$build" == */* ]]; then
+		MANAGED_DECLINE="the targo in reach, $p, is not in an aterm-managed store (<prefix>/store/trust/<build>/bin/targo), so it is not the toolchain \`aterm pkg install trust\` lays"
+		return 1
+	fi
+	if [[ ! -x "$p" ]]; then
+		MANAGED_DECLINE="the store's targo at $p is not executable (aterm pkg doctor)"
+		return 1
+	fi
+	MANAGED_TARGO="$p"
+	MANAGED_PREFIX="$prefix"
+	MANAGED_BUILD="$build"
+	return 0
+}
+
+find_managed_targo() { # <root>
+	local root="$1" aterm="" out="" cand="" first="" pin="" d="" name="" f="" c="" dirs
+	MANAGED_TARGO=""
+	MANAGED_PREFIX=""
+	MANAGED_BUILD=""
+	MANAGED_DECLINE=""
+	MANAGED_SEEN=""
+	pin="$(gate_pinned_channel "$root")"
+	if [[ "$pin" != trust ]]; then
+		MANAGED_DECLINE="rust-toolchain.toml pins '${pin:-nothing}', not 'trust', so the aterm-managed Trust store is not this checkout's toolchain"
+		return 1
+	fi
+	if aterm="$(command -v aterm 2>/dev/null)" && [[ -n "$aterm" ]]; then
+		out="$("$aterm" pkg which targo 2>/dev/null | head -n 1 || true)"
+		case "$out" in
+		*" — SHADOWED by "*)
+			# A foreign targo ahead of the managed bin/ on PATH: the alias
+			# names the managed copy (route 1, measured shape above).
+			out="$("$aterm" pkg which alab-targo 2>/dev/null | head -n 1 || true)"
+			;;
+		esac
+		case "$out" in
+		*" → "*)
+			cand="${out##* → }"
+			cand="${cand%% — *}"
+			;;
+		esac
+	fi
+	if [[ -z "$cand" ]]; then
+		# Routes 2 and 3: PATH, dir by dir, the first targo (or alias) that
+		# proves to be the store's; else the first seen, for the decline.
+		IFS=: read -ra dirs <<<"${PATH:-}"
+		for d in ${dirs[@]+"${dirs[@]}"}; do
+			[[ -n "$d" ]] || continue
+			for name in targo alab-targo; do
+				f="$d/$name"
+				[[ -f "$f" && -x "$f" ]] || continue
+				c="$(gate_shim_target "$f")"
+				if gate_store_targo "$c"; then
+					cand="$c"
+					break 2
+				fi
+				[[ -n "$first" ]] || first="$c"
+			done
+		done
+		[[ -n "$cand" ]] || cand="$first"
+	fi
+	if [[ -z "$cand" ]]; then
+		MANAGED_DECLINE="no aterm-managed Trust store is in reach (no \`aterm\` to ask, no \`targo\` on PATH)"
+		return 1
+	fi
+	MANAGED_SEEN=1
+	gate_store_targo "$cand"
+}
+
+# Which cargo, and which lane. With a <root>, the managed store is tried first
+# (CARGO_LANE=store: CARGO_BIN is the store's targo and RUSTUP_BIN is empty —
+# there is none to consult); without one, or when no managed store applies,
+# rustup's lane runs exactly as before (CARGO_LANE=rustup). The refusals name
+# the product's remedy first, then rustup's — except under a stock pin, which
+# the store cannot serve.
+find_cargo_and_rustup() { # [root]
+	local root="${1:-}" home="${CARGO_HOME:-$HOME/.cargo}" beside="" seen managed=1 declined=""
+	CARGO_BIN=""
+	RUSTUP_BIN=""
+	CARGO_LANE=""
+	CARGO_RESOLVE_REASON=""
+	MANAGED_DECLINE=""
+	MANAGED_SEEN=""
+	if [[ -n "$root" ]]; then
+		if find_managed_targo "$root"; then
+			CARGO_LANE=store
+			CARGO_BIN="$MANAGED_TARGO"
+			return 0
+		fi
+		[[ "$(gate_pinned_channel "$root")" == trust ]] || managed=0
+	fi
+	# A targo that was in reach but is not the store's is worth naming in a
+	# refusal: it is the hijack this lane refuses to build under.
+	[[ -z "$MANAGED_SEEN" ]] || declined="; the targo in reach was declined: $MANAGED_DECLINE"
+	CARGO_LANE=rustup
+	# rustup first: its proxies sit beside it.
+	if [[ -x "$home/bin/rustup" ]]; then
+		RUSTUP_BIN="$home/bin/rustup"
+	elif ! RUSTUP_BIN="$(command -v rustup 2>/dev/null)" || [[ -z "$RUSTUP_BIN" ]]; then
+		RUSTUP_BIN=""
+	fi
+	if [[ -n "$RUSTUP_BIN" ]]; then
+		beside="$(dirname "$RUSTUP_BIN")/cargo"
+	fi
+	if [[ -n "$beside" && -x "$beside" ]]; then
+		CARGO_BIN="$beside"
+	elif [[ -x "$home/bin/cargo" ]]; then
+		CARGO_BIN="$home/bin/cargo"
+	elif ! CARGO_BIN="$(command -v cargo 2>/dev/null)" || [[ -z "$CARGO_BIN" ]]; then
+		CARGO_BIN=""
+		if [[ -n "$RUSTUP_BIN" && "$managed" -eq 1 ]]; then
+			CARGO_RESOLVE_REASON="building from source needs a toolchain that honours rust-toolchain.toml, and none is in reach: no aterm-managed Trust store (aterm pkg install trust lays one), and no cargo — no proxy beside $RUSTUP_BIN (at $beside), none at $home/bin/cargo, none on PATH — reinstall rustup (https://rustup.rs), which lays its proxies beside its own binary$declined"
+		elif [[ -n "$RUSTUP_BIN" ]]; then
+			CARGO_RESOLVE_REASON="building from source needs cargo, and none is in reach: no proxy beside $RUSTUP_BIN (at $beside), none at $home/bin/cargo, none on PATH — reinstall rustup (https://rustup.rs), which lays its proxies beside its own binary$declined"
+		elif [[ "$managed" -eq 1 ]]; then
+			CARGO_RESOLVE_REASON="building from source needs a toolchain that honours rust-toolchain.toml, and none is in reach — aterm pkg install trust (the aterm-managed Trust store, whose targo honours the \`trust\` pin by construction), or install rustup (https://rustup.rs), whose proxy at $home/bin/cargo is the one cargo that honours the pin$declined"
+		else
+			CARGO_RESOLVE_REASON="building from source needs cargo — install rustup (https://rustup.rs), whose proxy at $home/bin/cargo is the one cargo that honours rust-toolchain.toml$declined"
+		fi
+		return 1
+	fi
+	if [[ -z "$RUSTUP_BIN" ]]; then
+		seen="$(env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$CARGO_BIN" --version 2>/dev/null | head -n 1 || true)"
+		if [[ "$managed" -eq 1 ]]; then
+			CARGO_RESOLVE_REASON="$CARGO_BIN (${seen:-no version}) is not rustup's proxy and no rustup is installed, so rust-toolchain.toml's pin cannot be honoured — aterm pkg install trust (the aterm-managed Trust store, whose targo honours the \`trust\` pin by construction), or install rustup (https://rustup.rs); a Homebrew rust never honours a pin (brew uninstall rust)$declined"
+		else
+			CARGO_RESOLVE_REASON="$CARGO_BIN (${seen:-no version}) is not rustup's proxy and no rustup is installed, so rust-toolchain.toml's pin cannot be honoured — install rustup (https://rustup.rs); a Homebrew rust never honours a pin (brew uninstall rust)$declined"
+		fi
+		return 1
+	fi
+	return 0
+}
+
+cargo_honours_pin() {
+	local root="$1" pinned here pinfile named proxies remedy theirs why d pin trustc
+	CARGO_VERSION=""
+	CARGO_TOOLCHAIN=""
+	CARGO_RUSTC=""
+	CARGO_RESOLVE_REASON=""
+	here="$(cd "$root" && env pwd -P 2>/dev/null)" || here="$root"
+	pinfile="$here/rust-toolchain.toml"
+	if [[ "${CARGO_LANE:-}" == store ]]; then
+		# The managed lane's proof: the FILE pins `trust` (read again here —
+		# find_managed_targo read it, and this is the proof step), the store's
+		# targo reports itself as targo, and the compiler it runs — trustc
+		# beside it, by absolute path (measured 2026-09-18, see above) — is
+		# there. A store that fails these is damaged, not absent: the remedy
+		# is the product's, never rustup's.
+		pin="$(gate_pinned_channel "$root")"
+		if [[ "$pin" != trust ]]; then
+			CARGO_RESOLVE_REASON="$pinfile pins '${pin:-nothing}', not 'trust' — the aterm-managed store at $MANAGED_PREFIX holds only the Trust toolchain, so this checkout builds under rustup's proxy (https://rustup.rs)"
+			return 1
+		fi
+		CARGO_VERSION="$(env -u RUSTUP_TOOLCHAIN "$CARGO_BIN" --version 2>/dev/null | head -n 1 || true)"
+		case "$CARGO_VERSION" in
+		"targo "*) ;;
+		*)
+			CARGO_RESOLVE_REASON="$CARGO_BIN (${CARGO_VERSION:-no version}) sits in the aterm-managed store but does not report itself as targo — store build $MANAGED_BUILD under $MANAGED_PREFIX is damaged: aterm pkg doctor, then aterm pkg install trust"
+			return 1
+			;;
+		esac
+		trustc="$(dirname "$CARGO_BIN")/trustc"
+		if [[ ! -x "$trustc" ]]; then
+			CARGO_RESOLVE_REASON="$CARGO_BIN ($CARGO_VERSION) has no trustc beside it at $trustc — targo runs the compiler beside itself, so store build $MANAGED_BUILD under $MANAGED_PREFIX is incomplete: aterm pkg doctor, then aterm pkg install trust"
+			return 1
+		fi
+		CARGO_RUSTC="$trustc"
+		CARGO_TOOLCHAIN="trust (pinned by '$pinfile'; aterm-managed store build $MANAGED_BUILD under $MANAGED_PREFIX)"
+		return 0
+	fi
+	if ! pinned="$(cd "$root" && env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$RUSTUP_BIN" which cargo 2>/dev/null)" || [[ -z "$pinned" ]]; then
+		why="$(cd "$root" && env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$RUSTUP_BIN" which cargo 2>&1 >/dev/null | head -n 1 || true)"
+		CARGO_RESOLVE_REASON="rustup cannot resolve this checkout's pinned toolchain (rust-toolchain.toml): ${why:-$RUSTUP_BIN which cargo failed}"
+		# A `trust` pin rustup cannot serve, with no aterm-managed store in
+		# reach either: the product's remedy comes first — `aterm pkg install
+		# trust` lays the store (its targo builds this checkout with no
+		# rustup at all) and, where rustup is installed, the
+		# ~/.rustup/toolchains/trust seam rustup resolves the pin through
+		# (crates/atpkg/src/seam.rs) — and the hand-linked tarballs second.
+		if [[ "$(gate_pinned_channel "$root")" == trust && -z "${MANAGED_SEEN:-}" ]]; then
+			CARGO_RESOLVE_REASON="$CARGO_RESOLVE_REASON — aterm pkg install trust (lays the aterm-managed Trust store, whose targo builds this checkout without rustup, and the ~/.rustup/toolchains/trust seam rustup resolves the pin through); or unpack the Trust toolchain tarballs (https://github.com/alabsystems/trust/releases) into one prefix, then: rustup toolchain link trust <prefix>"
+		fi
+		return 1
+	fi
+	# What rustup resolved must be the FILE's pin: `show active-toolchain`
+	# prints `<name> (overridden by '<file>')`, and <file> must BE this
+	# checkout's rust-toolchain.toml. rustup spells it as getcwd() does,
+	# physical and in the letter case on disk, while bash's builtin `pwd -P`
+	# resolves symlinks but keeps the case as typed, and a case-insensitive
+	# volume (macOS's default) lets any spelling reach the checkout. So the
+	# file is compared by inode (-ef), never by string. The messages spell the
+	# root as the getcwd-backed external pwd does (`env pwd -P`, not the
+	# builtin), which is rustup's spelling and the path a `rustup override`
+	# on it is keyed by. With RUSTUP_TOOLCHAIN scrubbed from every probe (and
+	# from the build), the one steer left is a `rustup override` on this very
+	# directory, which rustup prints `<name> (directory override for '<dir>')`.
+	CARGO_TOOLCHAIN="$(cd "$root" && env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$RUSTUP_BIN" show active-toolchain 2>/dev/null | head -n 1 || true)"
+	named="${CARGO_TOOLCHAIN#*"(overridden by '"}"
+	named="${named%"')"*}"
+	if [[ "$named" == "$CARGO_TOOLCHAIN" || ! "$named" -ef "$root/rust-toolchain.toml" ]]; then
+		case "$CARGO_TOOLCHAIN" in
+		*"directory override"*)
+			CARGO_RESOLVE_REASON="rustup resolves this checkout to $CARGO_TOOLCHAIN, not to the pin in $pinfile — a \`rustup override\` on the checkout directory outranks its rust-toolchain.toml: rustup override unset --path $here"
+			;;
+		*)
+			CARGO_RESOLVE_REASON="rustup resolves this checkout to ${CARGO_TOOLCHAIN:-nothing it can name}, not to the pin in $pinfile (\`rustup show active-toolchain\` run there must name that file)"
+			;;
+		esac
+		return 1
+	fi
+	CARGO_VERSION="$(cd "$root" && env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$CARGO_BIN" --version 2>/dev/null | head -n 1 || true)"
+	theirs="$(env -u RUSTUP_TOOLCHAIN "$pinned" --version 2>/dev/null | head -n 1 || true)"
+	# The remedy for a cargo that is not the proxy. find_cargo_and_rustup took
+	# the cargo BESIDE rustup first, so a refusal below means either that
+	# cargo is not rustup's proxy (a rustup linked in beside another
+	# toolchain's cargo), or nothing sits beside rustup and a stranger was
+	# taken — and until a proxy is back beside rustup, no PATH order supplies
+	# one, so the remedy names that dir, never a $CARGO_HOME/bin holding none.
+	proxies="$(dirname "$RUSTUP_BIN")"
+	if [[ "$CARGO_BIN" == "$proxies/cargo" ]]; then
+		remedy="the cargo beside $RUSTUP_BIN is not its proxy (a rustup symlinked in beside another toolchain's cargo?) — rustup lays its proxies beside its own binary: reinstall it (https://rustup.rs), or remove the shadowing toolchain (Homebrew: brew uninstall rust)"
+	else
+		remedy="$proxies (beside $RUSTUP_BIN) holds no cargo proxy — reinstall rustup (https://rustup.rs), which lays one there, and put that dir first: export PATH=\"$proxies:\$PATH\" as a hard prepend in your shell rc (macOS path_helper reorders an inherited PATH, and \`. ~/.cargo/env\` skips a dir already present); or remove the shadowing toolchain (Homebrew: brew uninstall rust)"
+	fi
+	if [[ -z "$CARGO_VERSION" || "$CARGO_VERSION" != "$theirs" ]]; then
+		CARGO_RESOLVE_REASON="$CARGO_BIN (${CARGO_VERSION:-no version}) ignores rust-toolchain.toml, whose pin is $pinned ($theirs) — $remedy"
+		return 1
+	fi
+	# The same line proves only the same release: a plain cargo built from the
+	# pin's commit prints it too. The proxy alone reads RUSTUP_TOOLCHAIN — named
+	# a toolchain that is not installed it refuses (measured, rustup 1.29.1:
+	# `error: toolchain 'aterm-pin-probe-absent' is not installed`, exit 1, no
+	# fetch under RUSTUP_AUTO_INSTALL=0) where a plain cargo prints its version
+	# and exits 0. The exit status is the discriminator, never the wording.
+	if (cd "$root" && RUSTUP_AUTO_INSTALL=0 RUSTUP_TOOLCHAIN=aterm-pin-probe-absent "$CARGO_BIN" --version >/dev/null 2>&1); then
+		CARGO_RESOLVE_REASON="$CARGO_BIN ($CARGO_VERSION) prints the pin's version line but is not rustup's proxy (it ignores RUSTUP_TOOLCHAIN): a build under it takes PATH's rustc, not the pinned toolchain at ${pinned%/bin/cargo} — $remedy"
+		return 1
+	fi
+	# The rustc the build runs. rustup execs the toolchain's cargo with
+	# RUSTUP_TOOLCHAIN=<pin> exported, and adds its $CARGO_HOME/bin to the
+	# front of PATH only when PATH lacks that dir; it never adds the dir the
+	# proxy was invoked from. cargo, with RUSTC and build.rustc unset
+	# (.cargo/config.toml sets neither), then runs PATH's `rustc`. Measured
+	# 2026-09-10 with rustup 1.29.1 and a fake toolchain, linked into a scratch
+	# RUSTUP_HOME, whose cargo reports `command -v rustc` (nothing compiled;
+	# on the trust-pinned tree trust-gate would refuse that compile): with a
+	# Homebrew-style rustc in a dir ahead of $CARGO_HOME/bin on PATH, the
+	# toolchain's cargo saw PATH unchanged and resolved that rustc. So
+	# cargo_build_pinned itself puts $CARGO_HOME/bin and then this cargo's own
+	# dir first on PATH, whatever rustup does, and the first rustc in those
+	# two dirs, in that order, is the one the build resolves. It must be
+	# rustup's proxy too: present, and refusing an absent RUSTUP_TOOLCHAIN as
+	# the cargo did.
+	for d in "${CARGO_HOME:-$HOME/.cargo}/bin" "$(dirname "$CARGO_BIN")"; do
+		if [[ -x "$d/rustc" ]]; then
+			CARGO_RUSTC="$d/rustc"
+			break
+		fi
+	done
+	if [[ -z "$CARGO_RUSTC" ]]; then
+		why="no rustc sits beside it (nor in ${CARGO_HOME:-$HOME/.cargo}/bin), so the build would take PATH's"
+	elif (cd "$root" && RUSTUP_AUTO_INSTALL=0 RUSTUP_TOOLCHAIN=aterm-pin-probe-absent "$CARGO_RUSTC" --version >/dev/null 2>&1); then
+		why="the rustc the build would take first, $CARGO_RUSTC, is not rustup's proxy (it ignores RUSTUP_TOOLCHAIN), so the build would compile with it"
+		CARGO_RUSTC=""
+	else
+		return 0
+	fi
+	CARGO_RESOLVE_REASON="$CARGO_BIN is rustup's proxy, but $why, not the pinned toolchain's ${pinned%/cargo}/rustc — reinstall rustup (https://rustup.rs), which lays its proxies (cargo and rustc among them) side by side"
+	return 1
+}
+
+# The build, under exactly what cargo_honours_pin proved.
+#
+# The managed lane: the store's targo, on the EXPLICIT lane it requires —
+# targo has exactly two lanes and neither is silent: `targo build` refuses to
+# create an implicitly unverified artifact (measured 2026-09-18: "Targo has
+# exactly two lanes … `targo --unverified build` UNVERIFIED: runs with the
+# proof pipeline off"), and this tree's .cargo/config.toml sets
+# -Ztrust-verify=off workspace-wide, so `--unverified` is the lane every build
+# here runs (tools/agent-drill.sh, the verify stages) and targo prints
+# `warning: UNVERIFIED: … explicitly authorized`. The store's bin dir goes
+# first on PATH — never rustup's — so a build script that runs a bare `rustc`
+# finds the store's sibling; the compiler targo itself runs is trustc beside it
+# by absolute path, PATH or no PATH (measured, see find_managed_targo). What
+# CAN steer it is an ambient RUSTC or CARGO_BUILD_RUSTC (measured 2026-09-18,
+# store build 9192, a scratch crate: `RUSTC=/usr/bin/false targo --unverified
+# build` → `error: process didn't exit successfully: \`/usr/bin/false -vV\``,
+# and CARGO_BUILD_RUSTC=/usr/bin/false the same; with RUSTC scrubbed the build
+# finished), so both are scrubbed here: the compiler the `rustc:` line
+# announced ($CARGO_RUSTC, trustc beside targo) is the one that runs.
+#
+# rustup's lane: the same cargo from the same root, with RUSTUP_TOOLCHAIN
+# scrubbed as it was from every probe (an ambient one would otherwise steer
+# the proxy off the pin at build time), and $CARGO_HOME/bin then the cargo's
+# own dir first on PATH: the two dirs the rustc proof searched, in its order.
+# This prepend, not rustup, is what puts the proved rustc ($CARGO_RUSTC)
+# first. rustup adds its $CARGO_HOME/bin to the front only when PATH lacks it
+# (measured, rustup 1.29.1), so a PATH that holds Homebrew's dir ahead of
+# ~/.cargo/bin reaches the toolchain's cargo unchanged, Homebrew's rustc
+# first; and rustup never adds the dir it was invoked from, so a proxy set
+# outside $CARGO_HOME (a keg) is not added either.
+#
+# Both lanes: no --target triple, and CARGO_BUILD_TARGET unset — an explicit
+# target makes cargo withhold .cargo/config.toml's [target.*] rustflags from
+# host units.
+cargo_build_pinned() { # <root>
+	if [[ "${CARGO_LANE:-}" == store ]]; then
+		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN -u RUSTC -u CARGO_BUILD_RUSTC PATH="$(dirname "$CARGO_BIN"):$PATH" "$CARGO_BIN" --unverified build --release -p aterm --target-dir "$1/target")
+	else
+		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$(dirname "$CARGO_BIN"):$PATH" "$CARGO_BIN" build --release -p aterm --target-dir "$1/target")
+	fi
+}
+# <<< cargo-pin gate
+
+# Does <name> parse as a rustup DIST toolchain, one `rustup toolchain install`
+# can fetch? rustup's grammar (`rustup help toolchain`, 1.29.1):
+#   <channel>[-<date>][-<host>]
+#   <channel>    = stable|beta|nightly|<versioned>[-<prerelease>]
+#   <versioned>  = <major.minor>|<major.minor.patch>
+#   <prerelease> = beta[.<number>]
+#   <date>       = YYYY-MM-DD
+# Anything else (the dev tree's `trust`) is a CUSTOM name, which only
+# `rustup toolchain link` makes. The source lane's absent-pin skip names the
+# remedy by this test.
+rustup_dist_channel() { # <name>
+	local re='^(stable|beta|nightly|[0-9]+\.[0-9]+(\.[0-9]+)?(-beta(\.[0-9]+)?)?)(-[0-9]{4}-[0-9]{2}-[0-9]{2})?(-[A-Za-z0-9_.]+)*$'
+	[[ "$1" =~ $re ]]
 }
 
 # Internal test seam: source this file to exercise the pure functions without
@@ -1503,6 +2066,16 @@ print_install_plan() {
 		echo "install.sh: cli: would be SKIPPED: $CLI_SKIP"
 	else
 		echo "install.sh: cli: ONE command on PATH — the $BIN_DIR/aterm symlink (bundle-backed when the installed app ships the toolset; otherwise a source build into $STORE_DIR), plus man pages/completions where writable"
+		# The skip FIRST: every refusal found after a cargo was (no rustup
+		# behind it, the pinned toolchain absent, a cargo that ignores the
+		# pin, a rustc beside it that is not the proxy, an unwritable store)
+		# leaves CARGO_BIN set to the very cargo this line must not announce
+		# as the build's.
+		if [[ -n "$CLI_CARGO_SKIP" ]]; then
+			echo "  cargo:    the source build would be SKIPPED: $CLI_CARGO_SKIP"
+		elif [[ -n "$CARGO_BIN" ]]; then
+			echo "  cargo:    $CARGO_BIN ($CARGO_VERSION) — toolchain $CARGO_TOOLCHAIN — rustc $CARGO_RUSTC"
+		fi
 	fi
 
 	if [[ "$DO_TOOLCHAIN" -eq 0 ]]; then
@@ -1609,9 +2182,16 @@ DO_TOOLCHAIN="${DO_TOOLCHAIN:-1}"
 # every release is the lean app, so there is no second container to elect.
 # The flag stays PARSED (below) so an old command line fails loudly with its
 # next act, exit 2, instead of "unknown argument".
-# PATH wiring for the user's OWN shell. `shell.d` is generated correctly but is
-# auto-sourced only by an aterm session, so every other terminal (iTerm, VS
-# Code, ssh) saw none of the toolset. Opt out with ATERM_NO_PATH=1.
+# PATH wiring for the user's OWN shell. `shell.d` is sourced by aterm's own
+# integration inside an aterm session, and by atpkg's marker block
+# (`# >>> atpkg shell integration >>>`), which atpkg's install/update pass
+# appends only to an EXISTING ~/.zshrc, ~/.bashrc, ~/.bash_profile or
+# ~/.config/fish/config.fish.
+# This script's own block (wire_shell_path) still reaches what that leaves out:
+# ~/.bash_login and ~/.profile (what a macOS login bash falls through to when
+# there is no ~/.bash_profile), fish under $XDG_CONFIG_HOME, an rc that did not
+# exist when atpkg's pass ran, and an rc atpkg's TCC fence skips.
+# Opt out with ATERM_NO_PATH=1.
 DO_PATH="${ATERM_NO_PATH:+0}"
 DO_PATH="${DO_PATH:-1}"
 DO_UNINSTALL=0
@@ -1904,6 +2484,14 @@ fi
 CLI_SKIP=""
 CLI_CARGO_SKIP=""
 ROOT=""
+# Filled by the source-lane pre-flight below (find_cargo_and_rustup +
+# cargo_honours_pin); empty whenever that lane is skipped.
+CARGO_BIN=""
+RUSTUP_BIN=""
+CARGO_LANE=""
+CARGO_VERSION=""
+CARGO_TOOLCHAIN=""
+CARGO_RUSTC=""
 # BIN_DIR and STORE_DIR are defined above the app pre-flight: on Linux the
 # store doubles as the app half's destination.
 if [[ "$DO_CLI" -eq 1 ]]; then
@@ -1921,19 +2509,58 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 		fi
 		if [[ -z "$ROOT" || ! -f "$ROOT/Cargo.toml" ]]; then
 			CLI_CARGO_SKIP="building from source needs a checkout (a piped script has none) — git clone https://github.com/$REPO_SLUG && cd ${REPO_SLUG##*/} && tools/install.sh"
-		elif ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
-			CLI_CARGO_SKIP="building from source needs cargo (and rustc) — install via https://rustup.rs (or: brew install rust)"
-		elif PINNED_CHANNEL="$(toml_single_str "$ROOT/rust-toolchain.toml" channel 0 2>/dev/null)" &&
+		elif ! find_cargo_and_rustup "$ROOT"; then
+			# TWO lanes, in order: the aterm-managed Trust store's targo
+			# (CARGO_LANE=store, no rustup consulted), else rustup's proxy by
+			# its own path, else PATH's cargo — and no store, no cargo, or a
+			# cargo with no rustup behind it, is a skip that names `aterm pkg
+			# install trust` first and rustup second, never `brew install
+			# rust` (a plain cargo cannot honour the pin).
+			CLI_CARGO_SKIP="$CARGO_RESOLVE_REASON"
+		elif [[ "$CARGO_LANE" != store ]] &&
+			PINNED_CHANNEL="$(toml_single_str "$ROOT/rust-toolchain.toml" channel 0 2>/dev/null)" &&
 			[[ -n "$PINNED_CHANNEL" ]] &&
-			! rustup toolchain list 2>/dev/null | awk '{print $1}' | grep -Eq "^${PINNED_CHANNEL}(-|$)"; then
-			# The checkout pins a CUSTOM toolchain (rust-toolchain.toml: the
-			# linked Trust stage2 — rustup cannot download it) and
-			# .cargo/config.toml injects -Ztrust-verify=off, which no stock
-			# rustc parses — so a build without the pinned toolchain is doomed
-			# on every machine but the operator's. FAILSAFE POLICY: detected
-			# HERE as a loud skip naming the acquisition path, never as a
-			# mid-flight abort of a build that cannot succeed.
-			CLI_CARGO_SKIP="building from source needs the pinned '$PINNED_CHANNEL' rustup toolchain, which rustup cannot download — unpack the rustc/cargo/rust-std dist tarballs from https://github.com/alabsystems/trust/releases into one prefix, then: rustup toolchain link $PINNED_CHANNEL <prefix>"
+			! env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$RUSTUP_BIN" toolchain list 2>/dev/null | awk '{print $1}' | grep -Eq "^${PINNED_CHANNEL}(-|$)"; then
+			# RUSTUP_AUTO_INSTALL=0 here too: run from a checkout whose pin is a
+			# downloadable channel that is absent, `rustup toolchain list`
+			# (rustup 1.29.1, observed on this host) installs it FIRST and then
+			# lists it — a fetch a read-only pre-flight must never start, and
+			# one that would erase the very skip this branch reports.
+			#
+			# A build without the pinned toolchain cannot succeed, so FAILSAFE
+			# POLICY applies: it is detected HERE as a loud skip naming the
+			# acquisition path, never as a mid-flight abort. That path depends
+			# on what the pin names:
+			#   * a CUSTOM name. The dev tree pins `trust`, the linked Trust
+			#     stage2, which rustup cannot download, and its
+			#     .cargo/config.toml injects -Ztrust-verify=off, which no stock
+			#     rustc parses. This branch is reached only when the store
+			#     lane above found no aterm-managed store, so for `trust` the
+			#     product's remedy comes FIRST — `aterm pkg install trust`
+			#     lays the store (its targo builds this checkout with no
+			#     rustup at all) and the ~/.rustup/toolchains/trust seam
+			#     rustup resolves the pin through (crates/atpkg/src/seam.rs)
+			#     — and the Trust tarballs, hand-linked, second;
+			#   * a rustup DIST channel. The PUBLIC snapshot ships this script
+			#     with publish/public-rust-toolchain.toml's stock
+			#     `channel = "1.97.1"`, which one `rustup toolchain install`
+			#     fetches. The no-download listing above no longer installs it,
+			#     so the skip names that command. The Trust recipe would have
+			#     the user link Trust under the stock name.
+			if rustup_dist_channel "$PINNED_CHANNEL"; then
+				CLI_CARGO_SKIP="building from source needs the pinned '$PINNED_CHANNEL' rustup toolchain, which is not installed (this pre-flight never downloads one) — rustup toolchain install $PINNED_CHANNEL"
+			elif [[ "$PINNED_CHANNEL" == trust ]]; then
+				CLI_CARGO_SKIP="building from source needs the pinned 'trust' rustup toolchain, which rustup cannot download, and no aterm-managed Trust store is in reach either — aterm pkg install trust (lays the store, whose targo builds this checkout without rustup, and the ~/.rustup/toolchains/trust seam rustup resolves the pin through); or unpack the rustc/cargo/rust-std dist tarballs from https://github.com/alabsystems/trust/releases into one prefix, then: rustup toolchain link trust <prefix>"
+			else
+				CLI_CARGO_SKIP="building from source needs the pinned '$PINNED_CHANNEL' rustup toolchain, which rustup cannot download — unpack the rustc/cargo/rust-std dist tarballs from https://github.com/alabsystems/trust/releases into one prefix, then: rustup toolchain link $PINNED_CHANNEL <prefix>"
+			fi
+		elif ! cargo_honours_pin "$ROOT"; then
+			# The toolchain is installed, but the cargo in hand does not
+			# dispatch to it (a Homebrew cargo, taken because no proxy sits
+			# beside rustup), or rustup resolves the checkout to something
+			# else (a `rustup override` on it): either way a build would
+			# silently use the wrong compiler.
+			CLI_CARGO_SKIP="$CARGO_RESOLVE_REASON"
 		elif ! ensure_dirs_writable "$STORE_DIR"; then
 			# Pre-flighted HERE (failsafe policy: an unwritable destination
 			# skips the half up front) — never discovered after the
@@ -2045,9 +2672,16 @@ install_app() {
 		echo "install.sh: using the lean container ($ASSET_NAME) — the recommended install."
 		;;
 	zip:no-toolchain)
-		echo "install.sh: --no-toolchain — using the lean container ($ASSET_NAME); the toolset"
-		echo "install.sh:   half is off for this run. Install the ALab toolset any time later"
-		echo "install.sh:   with \`aterm pkg seed\` or \`aterm pkg install --default-set\`."
+		# The flag excludes the toolset, and the part worth saying is the
+		# gap: the exclusion does not persist yet. It writes no config
+		# (docs/DESIGN-cli-toolchain-seed-2026-08-31.md, "Review
+		# corrections" 1), so the app's own first launch still adopts and
+		# installs the set. Only the key in aterm.toml, set first, stops that.
+		echo "install.sh: --no-toolchain — using the lean container ($ASSET_NAME), toolset excluded."
+		echo "install.sh:   The exclusion does not persist yet: no config is written, so the app's first"
+		echo "install.sh:   launch still installs the ALab toolset unless \`[packages].seed_install = false\`"
+		echo "install.sh:   is in ~/.config/aterm/aterm.toml first (\`aterm help pkg\`)."
+		echo "install.sh:   \`aterm pkg install --default-set\` installs it by hand."
 		;;
 	dmg:*)
 		# Only a pinned pre-lean release lands here: its manifest names no
@@ -2147,7 +2781,9 @@ install_app() {
 			echo "  itself on first launch with live progress — programs download individually,"
 			echo "  resumably, and only this machine's builds."
 		else
-			echo "  then: aterm.app -> $DEST. Toolset excluded (--no-toolchain); \`aterm pkg seed\` or \`aterm pkg install --default-set\` installs it later."
+			echo "  then: aterm.app -> $DEST. Toolset excluded (--no-toolchain), but the exclusion does not"
+			echo "  persist yet: no config is written, so the app's first launch still installs the ALab toolset"
+			echo "  unless \`[packages].seed_install = false\` is in ~/.config/aterm/aterm.toml first (\`aterm help pkg\`)."
 		fi
 	fi
 	# THE ONE WRITE OUTSIDE THE INSTALL DIRS RIDES THE SAME PLAN. By default
@@ -2482,8 +3118,19 @@ install_cli_from_source() {
 	# binary here to be silently installed.
 	rm -f "$rel/aterm"
 	# ONE binary carries everything: the session, the window, and every verb
-	# in-process (`-p aterm` pulls the whole library graph).
-	(cd "$ROOT" && env -u CARGO_BUILD_TARGET cargo build --release -p aterm --target-dir "$ROOT/target")
+	# in-process (`-p aterm` pulls the whole library graph). cargo_build_pinned
+	# runs the pre-flighted $CARGO_BIN (find_cargo_and_rustup +
+	# cargo_honours_pin) on the lane the pre-flight took: the aterm-managed
+	# store's targo on its explicit `--unverified` lane, the store's bin dir
+	# first on PATH and RUSTC/CARGO_BUILD_RUSTC scrubbed, so its compiler is
+	# the trustc beside it ($CARGO_RUSTC); else rustup's proxy with
+	# RUSTUP_TOOLCHAIN scrubbed as the probes had it, and $CARGO_HOME/bin
+	# then its own dir first on PATH so that cargo's `rustc` is the proxy
+	# proved with it ($CARGO_RUSTC). It never runs PATH's bare `cargo` or
+	# `rustc`, which differ on a Mac whose login shell put Homebrew's ahead
+	# of rustup's.
+	echo "install.sh: cargo: $CARGO_BIN ($CARGO_VERSION) — toolchain $CARGO_TOOLCHAIN — rustc $CARGO_RUSTC"
+	cargo_build_pinned "$ROOT"
 	if [[ ! -x "$rel/aterm" ]]; then
 		echo "install.sh: the build finished but produced no $rel/aterm — a [build] target in your cargo config redirected it; remove that setting (or install the released app instead: tools/install.sh --no-cli)" >&2
 		exit 1
@@ -3030,12 +3677,26 @@ install_toolchain() {
 }
 
 # --- PATH, for shells that are not aterm ------------------------------------------
-# atpkg writes a correct per-shell hook into ~/.aterm/shell.d on every install,
-# but ONLY an aterm session auto-sources it. So the toolset was installed,
-# verified, kept current — and invisible in iTerm, VS Code's terminal, and over
-# ssh, where `trustc` simply did not exist. `atpkg doctor` reported this as a
-# warning with the exact fix, which is one step better than silence and several
-# steps short of working.
+# atpkg writes a correct per-shell hook into ~/.aterm/shell.d on every install.
+# aterm's own shell integration sources it inside an aterm session, and since
+# owner decision 188326a4 (2026-08-31) atpkg's install/update pass also appends
+# a marker block (`# >>> atpkg shell integration >>>`) that sources it to an
+# EXISTING ~/.zshrc, ~/.bashrc, ~/.bash_profile or ~/.config/fish/config.fish. Before that, shell.d
+# reached no shell outside aterm: the toolset was installed, verified, kept
+# current — and invisible in iTerm, VS Code's terminal, and over ssh, where
+# `trustc` simply did not exist. `atpkg doctor` reported this as a warning with
+# the exact fix, which is one step better than silence and several steps short of
+# working.
+#
+# This block still matters for what atpkg does not wire: path_block_rc_target
+# falls through to ~/.bash_login and then ~/.profile when a macOS home has no
+# ~/.bash_profile, and atpkg has no row for either; fish under $XDG_CONFIG_HOME
+# reads a config.fish atpkg never touches; atpkg never creates an rc, so a
+# profile that did not exist when its pass ran is wired only here (the append
+# below creates it); and atpkg's pass SKIPS an rc that resolves under a folder
+# macOS guards with a consent dialog, which this script — run from a shell the
+# user is sitting at — may prompt for and get. Where both blocks land in one rc,
+# both source the same hook, whose PATH guards make a second source a no-op.
 #
 # Sourcing the generated hook (rather than writing a PATH line) keeps ONE
 # definition of the bin directory: atpkg rewrites the hook whenever the prefix
