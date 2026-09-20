@@ -1738,9 +1738,12 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
 /// sweeper — it leaked forever, and while it sat there it blocked every swap of that build
 /// by a process holding the same pid.
 ///
-/// A superseded sibling is NOT swept while `<build>` is absent and the recovery above
+/// A superseded DIRECTORY is NOT swept while `<build>` is absent and the recovery above
 /// declined to move it: that is the only copy of the build on disk, and deleting it is
-/// what [`recover_interrupted_swap`] refused to risk. See the comment on the guard.
+/// what [`recover_interrupted_swap`] refused to risk. A directory, because that is what a
+/// swap parks and what that recovery filters on — a file or a symlink at the same name is
+/// nobody's only copy, and is still swept by the paragraph above. See the comment on the
+/// guard.
 pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     // STOP FIRST, DELETE SECOND: a launchd-parented lane helper outlives the stager that
     // submitted it, and the store lock it dropped says nothing about the helper.
@@ -1760,10 +1763,24 @@ pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     // present (recovery's other `false`) the sibling is genuine leftover and is still
     // swept, `<build>.incoming-<pid>` half-extracts are nobody's only copy and are still
     // swept, the next stage of this build sweeps the sibling the moment `<build>` is whole
-    // again, and `crate::gc`'s pass still reports and reclaims a genuinely ambiguous pair.
+    // again, and `crate::gc`'s pass REPORTS a genuinely ambiguous pair — as a program with no
+    // live witness, the `diverged` line `atpkg doctor` prints. It does not reclaim one: that
+    // pass holds this same guard (it did not until 2026-09-19, which is the whole of what
+    // this guard was worth while the pass that runs after every install deleted the tree
+    // anyway).
     let parked_only_copy = !recovered && std::fs::symlink_metadata(build_dir).is_err();
     for (kind, path) in scratch_siblings(build_dir) {
-        if parked_only_copy && kind == Scratch::Superseded {
+        // A DIRECTORY, the predicate [`recover_interrupted_swap`] itself filters on: what a
+        // swap parks here is a tree. Written as "skip every superseded entry", this guard
+        // also spared a regular file or a symlink at that name — nobody's only copy, and
+        // the one entry NEITHER sweeper can otherwise reclaim (`remove_dir_all` fails on a
+        // file, and gc's pass scans directories only). That re-opened, three paragraphs
+        // under the doc saying this function closes it, the leak that blocks every later
+        // swap of this build by a process holding the same pid.
+        if parked_only_copy
+            && kind == Scratch::Superseded
+            && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+        {
             continue;
         }
         // `symlink_metadata`, not `is_dir()`: `remove_dir_all` refuses a SYMLINK to a

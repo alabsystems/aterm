@@ -1329,6 +1329,15 @@ pub(crate) enum NativeConfigOrigin {
     SeriousMode {
         desired: bool,
     },
+    /// A View ▸ Presence Band / Rim toggle's durable write (round 19): `key` is
+    /// the `[presence]` leaf (`presence.band` / `presence.rim`), `desired` the
+    /// bit the human chose. The LIVE bit was flipped at the click
+    /// (`App::user_toggle_presence`); this completion only adopts the durable
+    /// truth or, on a refused write, says so and reverts the live bit to it.
+    Presence {
+        key: &'static str,
+        desired: bool,
+    },
     /// Completion sink for the stable `settings set|unset` wire command. The
     /// control thread remains blocked on this one-shot while the main loop stays
     /// free to receive the worker completion. Non-success outcomes are returned
@@ -2015,7 +2024,7 @@ impl App {
         let (_, ch) = self.win_cell_size(wid);
         self.win_pad_top(wid)
             .saturating_add(self.win_head(wid))
-            .saturating_add(usize::from(self.chrome_rows()).saturating_mul(ch))
+            .saturating_add(usize::from(self.chrome_rows(wid)).saturating_mul(ch))
     }
 
     pub(crate) fn native_ui_compile_stamp(
@@ -3745,8 +3754,81 @@ impl App {
                     NativeConfigOrigin::Control { key, value, .. } => {
                         control_serious_mode_intent(key, value.as_deref())
                     }
-                    NativeConfigOrigin::View { .. } => None,
+                    NativeConfigOrigin::View { .. } | NativeConfigOrigin::Presence { .. } => None,
                 });
+    }
+
+    /// A presence toggle's durable write completed (round 19). The live bit
+    /// was flipped at the click; an APPLIED write only adopts the durable
+    /// `[presence]` table into `self.config` (so a later resolver read agrees),
+    /// while a refused one — a conflict with a hand edit, an indeterminate or
+    /// rejected write — says so on the notice and reverts the live bit to the
+    /// durable truth, exactly as Serious Mode's completion reports on itself.
+    fn publish_presence_completion(
+        &mut self,
+        key: &'static str,
+        desired: bool,
+        outcome: &ConfigPatchOutcome,
+        authoritative: Option<&crate::native_config_service::ConfigSnapshot>,
+    ) {
+        let label = crate::app_fabric_menu::presence_key_label(key);
+        let feedback = match outcome {
+            ConfigPatchOutcome::Applied { .. } => {
+                if let Some(snapshot) = authoritative {
+                    self.config.presence = snapshot.config.presence.clone();
+                }
+                None
+            }
+            ConfigPatchOutcome::Conflict { .. } => Some(format!(
+                "{label} was not saved because aterm.toml changed first; its current value was kept."
+            )),
+            ConfigPatchOutcome::Indeterminate { message } => {
+                Some(format!("{label} may not have been saved: {message}"))
+            }
+            other => Some(format!(
+                "{label} was not saved: {}",
+                control_settings_completion_reply(key, Some(&desired.to_string()), other, None)
+                    .err()
+                    .unwrap_or_else(|| "the write was refused".to_string())
+            )),
+        };
+        if let Some(words) = feedback {
+            // The durable truth wins over the click: re-read it from the
+            // authoritative snapshot when there is one, else from the config
+            // the App last adopted.
+            let durable = authoritative.map_or_else(
+                || crate::app_fabric_menu::presence_key_resolve(key, &self.config),
+                |snapshot| crate::app_fabric_menu::presence_key_resolve(key, &snapshot.config),
+            );
+            self.set_presence_bit(key, durable);
+            self.config_notice =
+                crate::config_notice::ConfigNotice::new(vec![words], std::time::Instant::now());
+            self.request_redraw_all_windows();
+        }
+    }
+
+    /// Queue the durable write for a presence toggle (round 19): the leaf key
+    /// `presence.band` / `presence.rim` set to `desired`, through the same
+    /// serialized lane and OCC materialization Serious Mode uses — the value is
+    /// composed at dequeue against the newest service revision, so rapid
+    /// clicks cannot conflict with each other's completions.
+    pub(crate) fn queue_presence_write(
+        &mut self,
+        key: &'static str,
+        desired: bool,
+    ) -> Result<(), String> {
+        self.proxy
+            .as_ref()
+            .ok_or_else(|| "config persistence needs an event-loop proxy".to_string())?;
+        let _ = native_config_queue()?;
+        self.native_config_pending.push_back(NativeConfigRequest {
+            origin: NativeConfigOrigin::Presence { key, desired },
+            work: NativeConfigWork::ControlField {
+                key: key.to_string(),
+                value: Some(desired.to_string()),
+            },
+        });
+        self.pump_native_config()
     }
 
     /// Build the exact compare-and-swap request for a Serious Mode intent at
@@ -4482,6 +4564,9 @@ impl App {
                 authoritative,
                 synchronization_error,
             ),
+            NativeConfigOrigin::Presence { key, desired } => {
+                self.publish_presence_completion(key, desired, &outcome, authoritative.as_ref());
+            }
             NativeConfigOrigin::Control {
                 key, value, reply, ..
             } => {
@@ -5445,7 +5530,7 @@ impl App {
         // A STAGED build settles permanently: the real apply launches its successor
         // through this same lane from this same clean bundle and sheds the tag for free,
         // so a repair would only cost a second freeze.
-        if snapshot.staged.is_some() || self.pending_update_handoff.is_some() {
+        if snapshot.staged.is_some() || self.update_handoff_in_flight() {
             self.provenance_repair.settle();
             return;
         }
@@ -5779,7 +5864,7 @@ impl App {
         // budget spent, re-polled shortly. A no-op for real handoffs, which already set
         // `active`/`Applying` (2026-09-17).
         let work_active = self.native_updater_service.snapshot().active.is_some()
-            || self.pending_update_handoff.is_some();
+            || self.update_handoff_in_flight();
         let applying = self.native_updater_service.snapshot().phase == UpdaterPhase::Applying;
         // Durable facts are collected by workers and reduced by their exact wakes. A
         // timer callback is intentionally memory-only: it may wait for publication,
@@ -7647,7 +7732,7 @@ impl App {
             self.apply_native_update(ApplyMode::CleanQuit),
             UpdateOutcome::Accepted
         );
-        accepted && self.pending_update_handoff.is_some()
+        accepted && self.update_handoff_in_flight()
     }
 
     /// Viewing the exact published update revision quiets its one announcement
@@ -9607,7 +9692,9 @@ fn apply(c: &mut Command) {
             .iter()
             .map(|request| match &request.origin {
                 NativeConfigOrigin::SeriousMode { desired } => *desired,
-                NativeConfigOrigin::View { .. } | NativeConfigOrigin::Control { .. } => {
+                NativeConfigOrigin::View { .. }
+                | NativeConfigOrigin::Control { .. }
+                | NativeConfigOrigin::Presence { .. } => {
                     panic!("unexpected non-Serious-Mode request")
                 }
             })
@@ -10094,7 +10181,9 @@ fn apply(c: &mut Command) {
                 .expect("queued Serious Mode intent");
             let desired = match origin {
                 NativeConfigOrigin::SeriousMode { desired } => desired,
-                NativeConfigOrigin::View { .. } | NativeConfigOrigin::Control { .. } => {
+                NativeConfigOrigin::View { .. }
+                | NativeConfigOrigin::Control { .. }
+                | NativeConfigOrigin::Presence { .. } => {
                     panic!("unexpected non-Serious-Mode request")
                 }
             };
@@ -10160,7 +10249,9 @@ fn apply(c: &mut Command) {
                 .iter()
                 .map(|request| match request.origin {
                     NativeConfigOrigin::SeriousMode { desired } => desired,
-                    NativeConfigOrigin::View { .. } | NativeConfigOrigin::Control { .. } => {
+                    NativeConfigOrigin::View { .. }
+                    | NativeConfigOrigin::Control { .. }
+                    | NativeConfigOrigin::Presence { .. } => {
                         panic!("unexpected non-Serious-Mode request")
                     }
                 })

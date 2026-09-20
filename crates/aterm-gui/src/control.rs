@@ -192,6 +192,10 @@ pub(crate) use control_session::{raise_turn_ids, turn_ids_minted};
 pub(crate) use control_query::cmd_offscreen;
 #[cfg(test)]
 pub(crate) use control_session::cmd_history;
+/// The `turn` composite and its io, for the presence tests that drive a REAL
+/// turn through the lease seam (`app_presence`'s driver-attribution tests).
+#[cfg(test)]
+pub(crate) use control_session::{TurnIo, cmd_turn};
 
 /// The containment subsystem name used in audit denials from this socket.
 const AUDIT_SUBSYSTEM: &str = "control_socket";
@@ -4185,6 +4189,50 @@ fn dispatch_hold_verb(
 
 const FABRIC_USAGE: &str = "ERR usage: fabric status | fabric attach [<command...>]\n";
 
+/// `story <verb> [<text>]` (round 19, design §5): the watcher's decision for a
+/// session, told to the window. Owner-only — the watcher runs on the instance
+/// token, and a child edge must not be able to write `✓ approved` onto a band
+/// it does not drive — and SESSION-SCOPED through the ordinary selector: `@<sid>
+/// story approved` from the watcher, bare `story …` for the connection's own
+/// session (`self_session`). The early, terminal-less dispatch hands only a
+/// selector-named session here and lets the bare form fall through to `handle`,
+/// which knows the connection's session — so the `None` arm below is defensive
+/// and names the remedy. The grammar itself is checked in
+/// [`control_query::cmd_story`] so a junk form is a usage error and never a wake.
+fn dispatch_story_verb(
+    rest: &str,
+    selector: Option<&Selector>,
+    scope: Scope,
+    store: &Store,
+    self_session: Option<u64>,
+    proxy: &EventLoopProxy<Wake>,
+) -> String {
+    if !scope.is_owner_class() {
+        log_denial(
+            AUDIT_SUBSYSTEM,
+            "story",
+            aterm_containment::mode_or_containment(),
+            "story is owner-class: an edge token may not write the band",
+        );
+        return "ERR denied\n".to_string();
+    }
+    let session = match selector {
+        Some(Selector::Local(n)) => *n,
+        Some(Selector::Sid(sid)) => {
+            let g = store.read().unwrap_or_else(|p| p.into_inner());
+            match g.by_sid(sid) {
+                Some(h) => h.local_id,
+                None => return "ERR no such session\n".to_string(),
+            }
+        }
+        None | Some(Selector::SelfTok) => match self_session {
+            Some(s) => s,
+            None => return "ERR story: no session (name one: @<sid> story …)\n".to_string(),
+        },
+    };
+    control_query::cmd_story(proxy, session, rest)
+}
+
 /// The `fabric` sub-forms. `attach`'s argv is the words after it, split on
 /// whitespace exactly as `fabric_launch::configured_command` splits the config
 /// string — and never a shell, for the same reason: a metacharacter is one more
@@ -4399,6 +4447,19 @@ fn dispatch_before_session(
         // carried when the verb was bridge-only, and it must keep carrying it.
         if verb == "hold" {
             return Some(dispatch_hold_verb(rest, selector.as_ref(), scope, store).into());
+        }
+        // `story` names its session with the ordinary `@<sid>` selector (the
+        // watcher's every request carries one), so it too is answered BEFORE the
+        // self-only gate below — a selector that names a session resolves here
+        // with no terminal at all; the bare form is the connection's own
+        // session, which `handle` resolves.
+        if verb == "story" {
+            return match selector.as_ref() {
+                Some(sel @ (Selector::Local(_) | Selector::Sid(_))) => {
+                    Some(dispatch_story_verb(rest, Some(sel), scope, store, None, proxy).into())
+                }
+                None | Some(Selector::SelfTok) => None,
+            };
         }
         if !matches!(selector, None | Some(Selector::SelfTok)) || !scope.is_owner_class() {
             return Some("ERR denied\n".into());
@@ -7664,6 +7725,24 @@ fn dispatch_authorized(scope: Scope, verb: &str, rest: &str, target_ctx: &Sessio
 /// human is mid-overlay. (`feed-bin` also writes the sink directly and is intercepted
 /// before this dispatch WITHOUT a proxy, so it takes no overlay hop — it cannot drive the
 /// overlay, only the shell.)
+/// The session a `turn` is credited to ([`crate::Lease::Turn::driver`],
+/// [`control_session::TurnIo::driver`]): for an edge-scoped connection, the
+/// source the presented token was granted to in the RESOLVED target's table
+/// — the same lookup [`control_session::caller_actor`] makes for the exits
+/// ledger; `None` for Owner-class scopes, which name a connection, not a
+/// session.
+fn turn_driver(scope: Scope, ctx: &SessionCtx) -> Option<SessionId> {
+    match scope {
+        Scope::Owner | Scope::Bridge => None,
+        Scope::Edge(presented) => ctx
+            .edges
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .src_of(&presented)
+            .cloned(),
+    }
+}
+
 fn is_front_driving_verb(verb: &str) -> bool {
     matches!(
         verb,
@@ -8486,6 +8565,19 @@ fn handle(
         if verb == "hold" {
             return dispatch_hold_verb(rest, selector.as_ref(), scope, store);
         }
+        // `story` (round 19) takes a session selector like any session verb —
+        // see `dispatch_before_session`; the bare form lands here with the
+        // connection's own session.
+        if verb == "story" {
+            return dispatch_story_verb(
+                rest,
+                selector.as_ref(),
+                scope,
+                store,
+                Some(self_session),
+                proxy,
+            );
+        }
         if !matches!(selector, None | Some(Selector::SelfTok)) {
             return "ERR denied\n".to_string();
         }
@@ -8992,6 +9084,11 @@ fn handle(
             // reads the target's typing momentum on the main thread (`turn
             // yield=`), the reading `trail status momentum=` reports.
             let momentum = || typing_momentum_reading(proxy, session);
+            // WHO drives, for the lease and the presence band: an edge-scoped
+            // caller is the session its token was granted to (read from the
+            // resolved target's table, the one that just authorized it);
+            // Owner-class callers are nobody a session can be credited with.
+            let driver = turn_driver(scope, ctx);
             if turn_input_route(is_cross, targets_front) == TurnInputRoute::Front {
                 // An explicit selector naming the visible tab is still a
                 // visible App drive. Route BOTH phases of the composite turn
@@ -9028,6 +9125,7 @@ fn handle(
                         press: &press,
                         key: &key,
                         momentum: &momentum,
+                        driver: driver.clone(),
                     },
                 )
             } else if turn_input_route(is_cross, targets_front) == TurnInputRoute::Background {
@@ -9059,6 +9157,7 @@ fn handle(
                         press: &press,
                         key: &key,
                         momentum: &momentum,
+                        driver: driver.clone(),
                     },
                 )
             } else {
@@ -9084,6 +9183,7 @@ fn handle(
                         press: &press,
                         key: &key,
                         momentum: &momentum,
+                        driver: driver.clone(),
                     },
                 )
             }
@@ -15624,6 +15724,10 @@ mod tests {
                 // write op-class; the orthogonal `OwnerOnly` scope gate is what keeps
                 // a child edge from posting one.
                 "appnotice",
+                // `story` MUTATES the presence band (the phase slot reads the
+                // watcher's verb), so it takes the write op-class too; the same
+                // `OwnerOnly` gate keeps a child edge from writing `✓ approved`.
+                "story",
             ],
             "WriteInput set (input vocabulary + app-drive verbs)",
         );
@@ -17432,7 +17536,10 @@ mod tests {
         );
 
         // A held turn lease shows as the driver; a live subscription as a watcher.
-        *root.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn(9));
+        *root.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+            id: 9,
+            driver: None,
+        });
         let _watch = subscribe::SubscriberSet::register(&subs, &[0]);
         let out = cmd_who(&store, &subs);
         let line = out.lines().nth(1).expect("one session line");
@@ -20633,6 +20740,7 @@ mod tests {
                     press: &press,
                     key: &key,
                     momentum: &momentum,
+                    driver: None,
                 },
             );
             let laid = app.borrow().windows[&wid].cursor_glow.ribbon_segments();
@@ -20708,6 +20816,7 @@ mod tests {
                 press: &press,
                 key: &key,
                 momentum: &momentum,
+                driver: None,
             },
         );
         assert!(out.starts_with("OK "), "{out}");
@@ -20813,6 +20922,7 @@ mod tests {
                 press: &press,
                 key: &key,
                 momentum: &momentum,
+                driver: None,
             },
         );
         let verdict = out.lines().next().unwrap_or("");
@@ -20979,6 +21089,7 @@ mod tests {
                 press: &press,
                 key: &key,
                 momentum: &momentum,
+                driver: None,
             },
         );
         let verdict = out.lines().next().unwrap_or("");
@@ -21004,6 +21115,7 @@ mod tests {
                 press: &press,
                 key: &key,
                 momentum: &never,
+                driver: None,
             },
         );
         assert_eq!(out, "ERR yield timeout momentum=0.90\n");
@@ -21663,7 +21775,10 @@ mod tests {
 
         // A held lease (as if another connection's turn were mid-flight) refuses
         // a new turn, naming the holder.
-        *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn(41));
+        *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+            id: 41,
+            driver: None,
+        });
         let paste = |_: &str| true;
         let press = |_: &str| true;
         let out = cmd_turn(
@@ -21847,7 +21962,10 @@ mod tests {
         store.write().unwrap().register(h.clone());
 
         // A wedged turn holds the hard lease.
-        *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn(77));
+        *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+            id: 77,
+            driver: None,
+        });
         // A plain release refuses (a turn releases its own lease)...
         let refused = cmd_lease(&h.ctx, "release");
         assert!(refused.starts_with("ERR busy turn=77"), "{refused}");

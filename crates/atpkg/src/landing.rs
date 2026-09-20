@@ -52,7 +52,7 @@
 //!   prints on STDERR `atpkg: waiting for the claude update to land — 2.1.274 (build
 //!   2026091702), downloading 42% (12.3 of 29.0 MB) — Ctrl-C runs 2.1.273 now` and
 //!   refreshes it every [`REFRESH_SECS`] (a new line, or `\r` on a terminal), bounded by
-//!   [`WAIT_SECS_ENV`] (default [`DEFAULT_WAIT_SECS`]; `0` = warn once and do not wait).
+//!   [`WAIT_SECS`] — a constant, 45 s; there is no environment knob (owner, 2026-09-19).
 //!   LANDED means ONE thing: `bin/<program>` resolves into the incoming build
 //!   ([`shim_runs_build`]) — never merely "the marker is gone". The guard's drop removes
 //!   the marker on EVERY exit of the install, a failed download or a rolled-back
@@ -83,6 +83,17 @@
 //! The verb never `exec`s the `agents/` twin (that would re-enter the prelude); it
 //! `exec`s `bin/<program>`, which carries no prelude. Every line it prints goes to
 //! stderr and starts with `atpkg: ` — stdout is the tool's.
+//!
+//! **The twin's FIRST block is not this one (2026-09-19).** Ahead of the landing prelude
+//! sits the self-update block ([`crate::selfupdate`],
+//! [`crate::platform::sh_selfupdate_prelude`], composed by
+//! [`crate::platform::twin_prelude`]): `case "$1" in update|upgrade|install)` on the
+//! program's rostered verbs, handing over to `atpkg __selfupdate` through the same
+//! variable `exec` and the same operand grammar ([`HandOver`], [`shim_command`] are
+//! shared). In that order on purpose: a `claude update` typed while the marker stands
+//! must become the STANDARD update, which queues on the store lock the landing pass
+//! holds — never a `__landing` wait that then runs `bin/claude update`, where `bin/`
+//! carries no block and the vendor's own updater would run.
 //!
 //! **Windows carries the same wait (2026-09-17; residual R4 of 2026-09-16, closed).** The
 //! `.cmd` twin is the `.cmd` shim behind a `goto`-shaped prelude
@@ -218,14 +229,14 @@ pub fn shim_command(layout: &Layout, tool: &ToolName, args: &[String]) -> std::p
     command
 }
 
-/// How long the verb waits for the landing, in seconds. Unset or unparsable ⇒
-/// [`DEFAULT_WAIT_SECS`]; `0` ⇒ warn once and run the current build without waiting.
-pub const WAIT_SECS_ENV: &str = "ATPKG_LANDING_WAIT_SECS";
-
-/// The default bound on the wait: long enough for a 30–60 MB agent bundle on a home
+/// The bound on the wait, in seconds: long enough for a 30–60 MB agent bundle on a home
 /// connection to finish downloading and staging, short enough that a stalled pass never
-/// holds a typed command hostage.
-pub const DEFAULT_WAIT_SECS: u64 = 45;
+/// holds a typed command hostage. A CONSTANT: the environment override the first cut
+/// read (unset ⇒ 45; `0` ⇒ warn once, no wait) was retired on 2026-09-19 at the owner's
+/// direction (*"remove all these env flags so that aterm works correctly by default"*),
+/// and `no_environment_knob_reaches_the_landing` pins that nothing reads one. The `0`
+/// ending survives as [`Outcome::NoWait`] for a test that passes its own bound.
+pub const WAIT_SECS: u64 = 45;
 
 /// How often the waiting line is refreshed.
 pub const REFRESH_SECS: u64 = 2;
@@ -557,18 +568,6 @@ pub fn sweep_stale(layout: &Layout) {
     }
 }
 
-/// [`WAIT_SECS_ENV`]'s value as the bound: unset, empty or unparsable ⇒
-/// [`DEFAULT_WAIT_SECS`]; a number is taken as is (`0` = warn once, no wait).
-#[must_use]
-pub fn wait_secs_from_env(value: Option<&std::ffi::OsStr>) -> u64 {
-    value
-        .and_then(|v| v.to_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_WAIT_SECS)
-}
-
 /// The verb's I/O seam, so the state machine runs in tests with no process, no TTY
 /// and no real sleep: `say(line, refresh)` receives each stderr line — `refresh`
 /// true for the periodic waiting line (a terminal overwrites it with `\r`), false for
@@ -602,7 +601,8 @@ pub enum Outcome {
 }
 
 /// The `__landing` state machine — see the module doc. `max_wait_secs` bounds the wait
-/// ([`wait_secs_from_env`]).
+/// ([`WAIT_SECS`] in the process; a test passes its own, `0` ending as
+/// [`Outcome::NoWait`]).
 pub fn wait_for_landing(
     layout: &Layout,
     program: &str,
@@ -889,21 +889,46 @@ mod pure_tests {
     }
 
     #[test]
-    fn the_bound_reads_the_env_with_a_default_and_a_zero() {
-        assert_eq!(wait_secs_from_env(None), DEFAULT_WAIT_SECS);
-        assert_eq!(
-            wait_secs_from_env(Some(std::ffi::OsStr::new(""))),
-            DEFAULT_WAIT_SECS
-        );
-        assert_eq!(
-            wait_secs_from_env(Some(std::ffi::OsStr::new("abc"))),
-            DEFAULT_WAIT_SECS
-        );
-        assert_eq!(wait_secs_from_env(Some(std::ffi::OsStr::new(" 10 "))), 10);
-        assert_eq!(wait_secs_from_env(Some(std::ffi::OsStr::new("0"))), 0);
-        assert_eq!(DEFAULT_WAIT_SECS, 45);
-        assert_eq!(WAIT_SECS_ENV, "ATPKG_LANDING_WAIT_SECS");
+    fn the_bound_is_a_constant() {
+        assert_eq!(WAIT_SECS, 45);
+        assert_eq!(REFRESH_SECS, 2);
         assert_eq!(HIDDEN_VERB, "__landing");
+    }
+
+    /// The retired knob (the first cut's `ATPKG_LANDING_WAIT_SECS`, spelled here by
+    /// concatenation so this test is not its own hit) is named nowhere in this module's
+    /// production text, and neither that text nor `cli::cmd_landing` reads the
+    /// environment (this test module does, for a Windows path — outside the fence): the
+    /// bound is [`WAIT_SECS`], full stop (owner, 2026-09-19).
+    #[test]
+    fn no_environment_knob_reaches_the_landing() {
+        let knob = ["ATPKG_LANDING", "_WAIT_SECS"].concat();
+        let env_read = ["env::", "var"].concat();
+        let env_read_os = ["var", "_os"].concat();
+        let whole = include_str!("landing.rs");
+        let (production, _) = whole
+            .split_once("#[cfg(test)]")
+            .expect("the test module's gate");
+        assert!(!production.contains(&knob), "landing.rs names {knob}");
+        assert!(
+            !production.contains(&env_read) && !production.contains(&env_read_os),
+            "landing.rs reads the environment"
+        );
+        let cli = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"),
+        )
+        .expect("cli.rs beside this crate");
+        assert!(!cli.contains(&knob), "cli.rs names {knob}");
+        let start = cli.find("fn cmd_landing(").expect("the verb");
+        let end = cli[start..]
+            .find("fn cmd_selfupdate(")
+            .expect("the verb after it");
+        let verb = &cli[start..start + end];
+        assert!(
+            !verb.contains(&env_read) && !verb.contains(&env_read_os),
+            "cmd_landing reads the environment"
+        );
+        assert!(verb.contains("landing::WAIT_SECS"), "cmd_landing's bound");
     }
 
     /// THE VERB'S OPERANDS AND WHAT IT RUNS (pinned on every platform, 2026-09-17): the

@@ -497,6 +497,30 @@ pub struct RobiShowFrame {
     pub frame: crate::robi::RobiFrame,
 }
 
+/// What one [`WordDecorations::robi`] call actually put on glass.
+///
+/// TWO facts, not one, because the emitter can draw the LADDER on a frame
+/// where the body does not resolve — a fresh baker (a config reload, or the
+/// font-size step that drops every held tile) mid-ladder spends the shared
+/// two-bake budget on the ladder plus the body's first slice and defers the
+/// rest. Reporting that as "a robot was drawn" made the host install Robi's
+/// click-to-dismiss hit-box over a body nobody could see, and a click there
+/// writes `robi = false` and retires him for good.
+///
+/// [`Self::body_px`] is the rect the emitter REALLY drew — resolved from the
+/// slices it stamped, so it is the held body's size on a deferred frame, not
+/// the size the current geometry would have asked for. The host's hit-box is
+/// therefore the sprite rather than a model of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RobiEmission {
+    /// Fingerprint fold for the host's early-out (ladder + body, whatever
+    /// this frame drew).
+    pub fp: u64,
+    /// The BODY's drawn dest rect in grid px (`x0, x1, y0, y1`, right/bottom
+    /// exclusive), or `None` when only the ladder made it onto the glass.
+    pub body_px: Option<(i32, i32, i32, i32)>,
+}
+
 /// A fully hosted robot body: the pose, its dest size, and every vertical
 /// slice's atlas rect (Robi is taller than the 2-row host-tile ceiling, so
 /// one body is 2–3 stacked slices). Held as the last-resolved fallback.
@@ -2235,7 +2259,14 @@ pub struct WordDecorations {
     dog_baker: crate::dog_baker::DogBaker,
     /// The last dog tile that actually resolved: `(ax, ay, look)`. Same
     /// deferred-bake tolerance as [`Self::pet_last_tile`], same atlas-scoped
-    /// invalidation.
+    /// invalidation — and, like the pet's, LOOK-KEYED on the read: a hold from
+    /// a different breed is refused rather than re-stamped. "dog dog dog" is a
+    /// parade of DISTINCT breeds by design ([`crate::dog_cameo::DogCameo::on_summon`]),
+    /// so the swap frame is exactly when the hold names the wrong animal — and
+    /// the destination rect is sized from the CURRENT breed's authored aspect
+    /// ([`crate::dog_baker::DogBaker::aspect`]), so a breed drawn from another
+    /// breed's band would also be sampled at the wrong source width the moment
+    /// the roster stops being uniform-aspect.
     dog_last_tile: Option<(u16, u16, crate::dog_cameo::DogLook)>,
     /// The ROBI roster's own exact-size tile cache ([`crate::robi_baker`]) —
     /// the helper robot's bake path, reaching the screen through the same
@@ -2247,6 +2278,21 @@ pub struct WordDecorations {
     /// budget-starved frame re-draws the whole previous robot rather than
     /// half of a new one.
     robi_last_body: Option<RobiBodySlices>,
+    /// The cell metric the four held tiles above were resolved against.
+    ///
+    /// Every one of those holds documents itself as "cleared with the atlas, so
+    /// it can never name a tile that no longer exists" — and that was only true
+    /// of [`Self::reset_transient_state`]. `CatBaker::begin_frame` ALSO wipes the
+    /// shared atlas, whenever the cell metric moves, and nothing dropped the
+    /// holds on that path. A hold is a raw `(ax, ay)` band, so after the wipe it
+    /// names whatever the re-bake happened to put there: measured on a font-size
+    /// step, the pet body sampled DOG art, and a departing ghost wore another
+    /// ghost's pose for a frame.
+    ///
+    /// Tracking the metric here makes the invalidation idempotent, so
+    /// [`Self::drop_holds_if_metric_moved`] can be called from every entry that
+    /// reaches a baker without needing to be the first.
+    held_tile_metric: (u16, u16),
     /// A USER-supplied cursor sprite (via `cursor_nyan_sprite`), overriding the
     /// built-in CatBaker cat: the decoded native RGBA `(w, h, rgba)` plus a cache
     /// of the last nearest-resample to the current target size `(tw, th, rgba)`.
@@ -3182,6 +3228,31 @@ impl WordDecorations {
         self.robi_last_body = None;
     }
 
+    /// Drop every held tile when the shared atlas is about to be cleared for a
+    /// NEW CELL METRIC — the other door out of the atlas, beside
+    /// [`Self::reset_transient_state`].
+    ///
+    /// Reached by a font-size step (`FontIncrease`/`FontDecrease`/`FontReset`,
+    /// and the `window.text_scale_*` commands) or any DPI/monitor change: all of
+    /// them move `geom.cell_w`/`cell_h`, `CatBaker::begin_frame` clears the atlas,
+    /// and the re-bake lays different art in the same bands. A hold that survives
+    /// that names a band it no longer owns, and the two-bake budget decides who
+    /// wears it — which is why the symptom is one frame of the wrong sprite
+    /// rather than a steady wrong picture.
+    ///
+    /// Idempotent by design: it compares the metric and returns, so calling it
+    /// from every companion entry costs nothing and none of them has to be first.
+    fn drop_holds_if_metric_moved(&mut self, cell_w: u16, cell_h: u16) {
+        if (cell_w, cell_h) == self.held_tile_metric {
+            return;
+        }
+        self.held_tile_metric = (cell_w, cell_h);
+        self.pet_last_tile = None;
+        self.pet_depart_tiles = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
+        self.dog_last_tile = None;
+        self.robi_last_body = None;
+    }
+
     /// Word-owned half of [`Self::reset_transient_state`]. Keep cursor
     /// companion placement and the shared atlas/bakers out of this function:
     /// Sparkle Words is a content effect, not their lifecycle owner.
@@ -3741,6 +3812,7 @@ impl WordDecorations {
         );
         self.cat_baker.set_free_tiles(true);
         if !self.cat_baker_ready {
+            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
@@ -4129,10 +4201,12 @@ impl WordDecorations {
         }
         self.cat_baker.set_free_tiles(true);
         if !self.cat_baker_ready {
+            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
         }
+        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         self.pet_baker.begin_frame(geom.cell_w, geom.cell_h);
 
         // Natural size from the authored art height. `host_tile` requires
@@ -4693,9 +4767,11 @@ impl WordDecorations {
         }
         self.cat_baker.set_free_tiles(true);
         if !self.cat_baker_ready {
+            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
         }
+        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         self.dog_baker.begin_frame(geom.cell_w, geom.cell_h);
 
         // Natural size: 1.45 rows of art height — a shade under the ambient
@@ -4727,7 +4803,14 @@ impl WordDecorations {
         if let Some(r) = resolved {
             self.dog_last_tile = Some(r);
         }
-        let (ax, ay, _) = resolved.or(self.dog_last_tile)?;
+        // LOOK-KEYED fallback, the pet's law ([`Self::pet_last_tile`]): a held
+        // tile belonging to a DIFFERENT breed is refused. A re-summon always
+        // rolls a new breed, and its first frame is at the restarted
+        // envelope's near-zero alpha — so skipping that frame is invisible,
+        // where re-stamping the previous breed's band is the old dog wearing
+        // the new dog's fade.
+        let (ax, ay, _) =
+            resolved.or_else(|| self.dog_last_tile.filter(|&(.., held)| held == look))?;
 
         // Trail just BEHIND the cursor cell (see `DOG_TRAIL_NUM`). Near the
         // left margin the dog CLAMPS to the grid edge; a clamp that would
@@ -4793,18 +4876,28 @@ impl WordDecorations {
     /// exactly how Robi reaches the tab bar and the titlebar band.
     ///
     /// Call AFTER `tick`, appending into the same `free` buffer it filled.
-    /// Returns a fingerprint fold for the host's early-out, `None` when
-    /// nothing was emitted.
-    pub fn robi(&mut self, show: RobiShowFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
+    /// Returns what was drawn ([`RobiEmission`] — the fingerprint fold for the
+    /// host's early-out, and the BODY's rect when a body actually landed),
+    /// `None` when nothing was emitted.
+    pub fn robi(
+        &mut self,
+        show: RobiShowFrame,
+        free: &mut Vec<FreeSprite>,
+    ) -> Option<RobiEmission> {
         let RobiShowFrame { geom, frame } = show;
         if frame.alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
         self.cat_baker.set_free_tiles(true);
         if !self.cat_baker_ready {
+            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
         }
+        // Like the pet's and the dog's: the guard is idempotent, so asking
+        // here as well costs a compare and keeps this entry from depending on
+        // some OTHER companion having run the prologue first.
+        self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
         self.robi_baker.begin_frame(geom.cell_w, geom.cell_h);
 
         let mut fp = 0xCBF2_9CE4_8422_2325u64;
@@ -4828,10 +4921,29 @@ impl WordDecorations {
                 .tile(&key)
                 .and_then(|rgba| self.cat_baker.host_tile(key.host_id(), lw, lh, rgba));
             if let Some(t) = tile {
+                // THE RUNAWAY GUARD IS SIZED FROM THE GRID, not spelled as a
+                // number. A ladder spans at most the window (`RobiShow::frame`
+                // clamps `top_y`/`bot_y` into `win_top..win_bot`), and a
+                // segment is `ladder_tile_px().1 = round(0.219 · art_rows ·
+                // cell_h)` tall — 0.70·cell_h where `art_rows` bottoms out at
+                // [`crate::robi::ART_ROWS`], 1.18·cell_h where it tops out at
+                // `ART_ROWS_MAX`. So the stack needs ≤ 46 segments on any grid
+                // up to 54 rows, and ≤ 0.85·rows above that: `max(64, rows+8)`
+                // clears both with room and still bounds a pathological ladder.
+                //
+                // A FLAT 64 did not. It silently cut the TOP off every ladder
+                // on a window taller than ~76 rows — measured 115 px short at
+                // 80 rows and 840 px (≈24 rows) short at 100 — and the top is
+                // exactly where the climb ends, so he finished the climb on
+                // nothing and hung from a bar above a ladder stopping in
+                // mid-air. The brain sizes the ladder from `ladder_tile_px`
+                // too; a cap it could not see was the emitter disagreeing with
+                // the extent it had been handed.
+                let max_segments = u32::from(geom.rows).saturating_add(8).max(64);
                 let x = ladder.x - i32::from(lw) / 2;
                 let mut y = ladder.bot_y - i32::from(lh);
                 let mut segments = 0u32;
-                while y >= ladder.top_y - i32::from(lh) / 4 && segments < 64 {
+                while y >= ladder.top_y - i32::from(lh) / 4 && segments < max_segments {
                     let sprite = FreeSprite {
                         x,
                         y,
@@ -4899,8 +5011,13 @@ impl WordDecorations {
         if let Some(r) = resolved {
             self.robi_last_body = Some(r);
         }
+        // NO BODY THIS FRAME. The ladder may still have drawn (it is a
+        // separate tile with its own bake), so the fingerprint still has to
+        // carry it — but the emission reports `body_px: None`, because a host
+        // that reads "something was drawn" as "the robot was drawn" hangs his
+        // dismiss hit-box on empty grid.
         let Some(body) = resolved.or(self.robi_last_body) else {
-            return emitted.then_some(fp);
+            return emitted.then_some(RobiEmission { fp, body_px: None });
         };
 
         // Anchor: feet on the ground line, or hands on the bar line — the
@@ -4934,7 +5051,14 @@ impl WordDecorations {
         }
         fp = fold_u64(fp, self.cat_baker.version());
         fp = fold_u64(fp, self.robi_baker.version());
-        Some(fp)
+        // The rect the slices above really occupy: `body_rect_px` applied to
+        // the RESOLVED body's size, which on a deferred frame is the held
+        // body's. The host's hit-box is this rect, so the click box IS the
+        // sprite even across the one accepted transient.
+        Some(RobiEmission {
+            fp,
+            body_px: Some(crate::robi::body_rect_px(&frame, body.w, body.h)),
+        })
     }
 
     /// Install one already-resolved immutable source.  This function performs
@@ -6905,6 +7029,7 @@ impl WordDecorations {
         // size). Unbracketed hosts clear the flag at tick start, which is the
         // historical one-prologue-per-tick behaviour verbatim.
         if !self.cat_baker_ready {
+            self.drop_holds_if_metric_moved(geom.cell_w, geom.cell_h);
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
@@ -11281,6 +11406,7 @@ mod tests {
         let mut free = Vec::new();
         let pet =
             crate::kitty_pet::PetBrain::default().tick_static_capture(crate::kitty_pet::PetSense {
+                caret_drawn: true,
                 now,
                 caret: Some(cell),
                 rows: geom.rows,
@@ -25219,6 +25345,113 @@ mod pet_stays_inside_the_grid_tests {
     /// padding — it is the TAB STRIP, over the tab titles and whatever chrome
     /// shares that band. Both of the pet's lanes used to reach it: `body_px` and
     /// the mote emitter each clamped x into `[0, grid_w)` and left y free, and the
+    /// A HELD TILE NEVER SURVIVES THE ATLAS IT NAMES.
+    ///
+    /// Each of the four holds documents itself as "cleared with the atlas, so it
+    /// can never name a tile that no longer exists" — and that was only true of
+    /// `reset_transient_state`. `CatBaker::begin_frame` also wipes the shared
+    /// atlas, whenever the cell metric moves, and nothing dropped the holds on
+    /// that path. A hold is a raw `(ax, ay)` band, so after the wipe it names
+    /// whatever the re-bake put there: on a font-size step the pet body sampled
+    /// DOG art, and a departing ghost wore another ghost's pose for a frame.
+    #[test]
+    fn a_metric_change_drops_every_held_tile() {
+        let mut wd = WordDecorations::default();
+        wd.drop_holds_if_metric_moved(GEOM.cell_w, GEOM.cell_h);
+
+        // Stand in for a frame that resolved every hold.
+        wd.pet_last_tile = Some((0, 0, crate::pet_glyphs_gen::PetGlyphId::PetLoaf, 0, 0));
+        wd.pet_depart_tiles[0] = Some((1.0, 0, 40));
+        wd.dog_last_tile = Some((
+            0,
+            80,
+            crate::dog_cameo::DogLook {
+                breed: crate::dog_glyphs_gen::DogGlyphId::D1Beagle,
+                coat: 0,
+            },
+        ));
+
+        // POSITIVE CONTROL: the same metric must NOT throw the frame's work away
+        // — without this the guard could pass by clearing unconditionally, which
+        // would strobe the companion every frame.
+        wd.drop_holds_if_metric_moved(GEOM.cell_w, GEOM.cell_h);
+        assert!(
+            wd.pet_last_tile.is_some() && wd.pet_depart_tiles[0].is_some(),
+            "an unchanged metric keeps the holds"
+        );
+
+        // The font-size step: same atlas door, and every hold must go with it.
+        wd.drop_holds_if_metric_moved(GEOM.cell_w * 2, GEOM.cell_h * 2);
+        assert!(wd.pet_last_tile.is_none(), "the pet body's hold survived");
+        assert!(
+            wd.pet_depart_tiles.iter().all(Option::is_none),
+            "a departing ghost's hold survived"
+        );
+        assert!(wd.dog_last_tile.is_none(), "the dog's hold survived");
+        assert!(wd.robi_last_body.is_none(), "the robot's hold survived");
+    }
+
+    /// AND EVERY COMPANION ENTRY ASKS. The guard is idempotent so it does not
+    /// matter which entry runs first — but it does matter that a NEW one cannot
+    /// quietly skip it, which is how the holds outlived the atlas in the first
+    /// place. A source scan for the same reason `ty_drivers_are_armed` is one:
+    /// the failure is a call site that never calls the helper, which no runtime
+    /// hook on the helper can observe.
+    /// A production baker-frame STATEMENT: `self.<x>_baker.begin_frame(geom…);`
+    /// at the start of a line. Excludes this scan's OWN filter expressions —
+    /// they mention the same substrings and matched themselves — and test code
+    /// driving a baker directly through its own fixture, which holds nothing
+    /// across the call. Both were false positives this check produced before it
+    /// was allowed to be believed.
+    fn is_production_baker_frame(line: &str) -> bool {
+        let t = line.trim_start();
+        t.starts_with("self.")
+            && t.contains("_baker.begin_frame(geom.cell_w, geom.cell_h);")
+            && !t.contains("contains(")
+    }
+
+    #[test]
+    fn every_baker_begin_frame_is_preceded_by_the_hold_guard() {
+        let src = include_str!("word_decorations.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut unguarded = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            // PRODUCTION call sites only: the `self.` receiver. A test driving a
+            // baker directly (`wd.cat_baker.begin_frame(..)`) owns its own
+            // fixture and holds nothing across it — scanning those was this
+            // check's own first false positive.
+            if !is_production_baker_frame(line) {
+                continue;
+            }
+            // The guard sits within the few lines above (same block, possibly
+            // with a sibling baker's call between).
+            let guarded = lines[i.saturating_sub(4)..i]
+                .iter()
+                .any(|l| l.contains("drop_holds_if_metric_moved"));
+            if !guarded {
+                unguarded.push(format!("line {}: {}", i + 1, line.trim()));
+            }
+        }
+        // ANTI-VACUITY: the scan must still be FINDING the production sites it
+        // guards. If a refactor moves or renames them this would otherwise pass
+        // while checking nothing.
+        let scanned = lines
+            .iter()
+            .filter(|l| is_production_baker_frame(l))
+            .count();
+        assert!(
+            scanned >= 5,
+            "the scan matched only {scanned} production baker frame(s) — it has \
+             stopped finding them, so a green result here would mean nothing"
+        );
+        assert!(
+            unguarded.is_empty(),
+            "these baker frames clear the shared atlas on a metric change without \
+             first dropping the tiles held against it:\n  {}",
+            unguarded.join("\n  ")
+        );
+    }
+
     /// art stands 1.7 rows tall on its baseline while motes are born ~0.6 rows
     /// above it. A companion on row 0 therefore put its head — and its sleep z's —
     /// outside the terminal it lives in.
@@ -25380,6 +25613,252 @@ mod dog_cameo_emission_tests {
             s.w
         );
         assert!(s.w > 0 && s.h > 0);
+    }
+
+    /// A HELD DOG TILE IS THE BREED IT WAS BAKED FOR.
+    ///
+    /// "dog dog dog" is a PARADE: `DogCameo::on_summon` never re-rolls onto
+    /// the resident breed, so a re-summon always changes which animal the
+    /// sprite is. The deferred-bake fallback re-emits the last resolved band,
+    /// and that band belongs to the OLD breed — the pet refuses exactly this
+    /// (`pet_last_tile` is look-keyed) and the dog's hold stored the look and
+    /// then read it back as `_`.
+    ///
+    /// POSITIVE CONTROL first, on the SAME starvation: a matching look still
+    /// falls back, so the refusal below is look-keyed and not the budget
+    /// blanking every deferred frame.
+    #[test]
+    fn a_held_dog_tile_is_refused_to_another_breed() {
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 24,
+            cols: 80,
+        };
+        let breeds = crate::dog_glyphs_gen::DOG_HEADS;
+        assert!(breeds.len() >= 2, "fixture: the parade needs two breeds");
+        let look = |i: usize| crate::dog_cameo::DogLook {
+            breed: breeds[i],
+            coat: 9,
+        };
+        let frame = |l: crate::dog_cameo::DogLook, accent: u8| DogCameoFrame {
+            geom,
+            cursor: (5, 40),
+            look: l,
+            colors: CatColorKey {
+                accent,
+                background: 0,
+            },
+            bob: 0.0,
+            alpha: 255,
+        };
+        let mut wd = WordDecorations::default();
+        // Each palette is a fresh bake key, so two of them spend the shared
+        // two-bake budget and the third must take the held-tile path.
+        fn spend_budget_then(
+            wd: &mut WordDecorations,
+            warm: [DogCameoFrame; 2],
+            ask: DogCameoFrame,
+        ) -> Option<u64> {
+            let mut free = Vec::new();
+            wd.begin_host_frame();
+            for f in warm {
+                free.clear();
+                wd.dog_cameo(f, &mut free);
+            }
+            free.clear();
+            wd.dog_cameo(ask, &mut free)
+        }
+        // Warm the hold onto breed 0 (the first palette lands on frame one).
+        let mut free = Vec::new();
+        for accent in [0u8, 1] {
+            wd.begin_host_frame();
+            free.clear();
+            wd.dog_cameo(frame(look(0), accent), &mut free);
+        }
+        // Every warm-up palette must be UNSEEN — a repeat is an atlas HIT and
+        // spends no bake, which silently un-starves the frame.
+        // CONTROL: starved, SAME breed ⇒ the hold is used.
+        assert!(
+            spend_budget_then(
+                &mut wd,
+                [frame(look(0), 2), frame(look(0), 3)],
+                frame(look(0), 7)
+            )
+            .is_some(),
+            "a starved frame must still re-emit the held tile for its OWN breed \
+             — without this the refusal below would prove nothing"
+        );
+        // THE REFUSAL: starved, a DIFFERENT breed ⇒ no sprite rather than the
+        // resident breed wearing the newcomer's fade.
+        assert!(
+            spend_budget_then(
+                &mut wd,
+                [frame(look(0), 4), frame(look(0), 5)],
+                frame(look(1), 8)
+            )
+            .is_none(),
+            "a held tile from another breed was re-stamped as the new one"
+        );
+    }
+}
+
+#[cfg(test)]
+mod robi_emission_tests {
+    use super::*;
+    use crate::robi::{RobiAnchor, RobiFrame, RobiLadder};
+    use crate::robi_glyphs_gen::RobiGlyphId;
+
+    fn geom(rows: u16, cell_h: u16) -> EffectGeom {
+        EffectGeom {
+            cell_w: cell_h / 2,
+            cell_h,
+            rows,
+            cols: 100,
+        }
+    }
+
+    /// Mid-climb: a ladder planted on the caret row, reaching just above row 0.
+    fn climbing(g: &EffectGeom) -> RobiFrame {
+        let ground = i32::from(g.rows) * i32::from(g.cell_h);
+        RobiFrame {
+            pose: RobiGlyphId::RobiClimb0,
+            x: i32::from(g.cols) * i32::from(g.cell_w) / 2,
+            anchor_y: ground,
+            anchor: RobiAnchor::Feet,
+            flip_x: false,
+            alpha: 255,
+            ladder: Some(RobiLadder {
+                x: i32::from(g.cols) * i32::from(g.cell_w) / 2,
+                top_y: -1 + i32::from(g.cell_h) / 4,
+                bot_y: ground,
+            }),
+            tip: None,
+            animating: true,
+        }
+    }
+
+    /// A LADDER IS NOT A ROBOT.
+    ///
+    /// Robi's body bakes as one tile and enters the shared atlas as three
+    /// stacked slices, so a COLD baker mid-climb — a config reload, or the
+    /// font-size step that drops every held tile — spends the frame's two
+    /// shared bakes on the ladder plus the body's first slice and defers the
+    /// rest. The body does not resolve and there is no hold to fall back on, so
+    /// nothing of Robi is drawn; only his ladder is.
+    ///
+    /// The emission used to report that frame the same way it reports a drawn
+    /// robot, and `redraw_window` hangs his click-to-dismiss hit-box on exactly
+    /// that answer — a live box over empty grid, where one click writes
+    /// `robi = false` and retires him for good.
+    #[test]
+    fn a_ladder_only_frame_reports_no_body() {
+        let g = geom(60, 20);
+        let frame = climbing(&g);
+        let mut wd = WordDecorations::default();
+        let mut free = Vec::new();
+
+        wd.begin_host_frame();
+        let first = wd
+            .robi(RobiShowFrame { geom: g, frame }, &mut free)
+            .expect("the ladder drew, so something was emitted");
+        let body_sprites = free.iter().filter(|s| s.z == FreeZ::OverText).count();
+        let ladder_sprites = free.iter().filter(|s| s.z == FreeZ::UnderText).count();
+        // ANTI-VACUITY: this must be the ladder-only frame the finding names,
+        // not an empty one — `body_px: None` on a frame that drew nothing at
+        // all would prove nothing about the hit-box.
+        assert!(
+            ladder_sprites > 0,
+            "fixture: the ladder must have drawn on the first frame"
+        );
+        assert_eq!(
+            body_sprites, 0,
+            "fixture: the body cannot resolve on the first frame (3 slices, 2 bakes)"
+        );
+        assert!(
+            first.body_px.is_none(),
+            "a frame that drew no body must not report one — the host hangs \
+             Robi's dismiss hit-box on this answer (got {:?})",
+            first.body_px
+        );
+
+        // And the very next frame, with the slices landed, DOES report the body
+        // — at exactly the rect its slices occupy.
+        wd.begin_host_frame();
+        free.clear();
+        let second = wd
+            .robi(RobiShowFrame { geom: g, frame }, &mut free)
+            .expect("emitted");
+        let body: Vec<&FreeSprite> = free.iter().filter(|s| s.z == FreeZ::OverText).collect();
+        assert!(!body.is_empty(), "the body lands on the second frame");
+        let rect = second.body_px.expect("a drawn body reports its rect");
+        let top = body.iter().map(|s| s.y).min().expect("nonempty");
+        let bot = body
+            .iter()
+            .map(|s| s.y + i32::from(s.h))
+            .max()
+            .expect("nonempty");
+        let left = body.iter().map(|s| s.x).min().expect("nonempty");
+        let right = body
+            .iter()
+            .map(|s| s.x + i32::from(s.w))
+            .max()
+            .expect("nonempty");
+        assert_eq!(
+            rect,
+            (left, right, top, bot),
+            "the reported rect must BE the drawn sprite, not a model of it"
+        );
+    }
+
+    /// THE LADDER REACHES THE BAR ON A TALL WINDOW.
+    ///
+    /// The stack is bounded by the WINDOW (one segment is taller than one cell
+    /// row), not by a constant. A fixed 64-segment cap cut the top off every
+    /// ladder taller than ~76 rows — 840 px, about 24 rows, short at 100 — and
+    /// the top is where the climb ends, so he finished on nothing and hung from
+    /// a bar above a ladder that stopped in mid-air.
+    #[test]
+    fn the_ladder_reaches_the_top_of_a_tall_window() {
+        for (rows, cell_h) in [(24u16, 20u16), (60, 20), (80, 20), (100, 34), (120, 16)] {
+            let g = geom(rows, cell_h);
+            let frame = climbing(&g);
+            let ladder = frame.ladder.expect("fixture");
+            let (_, lh) = crate::robi::ladder_tile_px(&g);
+            let mut wd = WordDecorations::default();
+            let mut free = Vec::new();
+            // The ladder tile is one bake; give it a couple of frames in case
+            // the body's slices take the budget first.
+            let mut segments = Vec::new();
+            for _ in 0..4 {
+                wd.begin_host_frame();
+                free.clear();
+                wd.robi(RobiShowFrame { geom: g, frame }, &mut free);
+                segments = free
+                    .iter()
+                    .filter(|s| s.z == FreeZ::UnderText)
+                    .map(|s| s.y)
+                    .collect();
+                if !segments.is_empty() {
+                    break;
+                }
+            }
+            let top = *segments
+                .iter()
+                .min()
+                .unwrap_or_else(|| panic!("{rows}x{cell_h}: the ladder never drew"));
+            // The stack is discrete, so its top segment starts within one tile
+            // of `top_y` (the loop's own `- lh/4` slack is what lets it reach
+            // the bar). Anything further down is the cap having truncated it.
+            assert!(
+                top < ladder.top_y + i32::from(lh),
+                "{rows} rows @ {cell_h} px: the stack stops at y={top}, {} px short of \
+                 the ladder's own top_y={} (tile {lh} px, {} segments drawn)",
+                top - ladder.top_y,
+                ladder.top_y,
+                segments.len()
+            );
+        }
     }
 }
 

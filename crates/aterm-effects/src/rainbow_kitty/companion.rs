@@ -808,6 +808,11 @@ pub struct HostSense {
     /// swap so the pet fades out holding position. A host that migrates to
     /// [`sense`] hands v2 that same post-law value, never the raw grid read.
     pub caret: Option<(u16, u16)>,
+    /// Is the emulator PAINTING that caret this frame (DECTCEM shown)? A
+    /// hidden cursor is still a caret and still travels in `caret`; this is
+    /// the separate fact about whether the user can SEE it. See
+    /// [`PetSense::caret`] for the conflation this pair replaced.
+    pub caret_drawn: bool,
     /// The emulator wrapped the caret since the last host read. A FACT from
     /// the grid, never a heuristic: it is the only thing separating a
     /// bottom-row scrolled wrap from `Home` at the last column, which look
@@ -846,6 +851,7 @@ pub fn sense(ctx: &Ctx<'_>, host: HostSense) -> PetSense {
     PetSense {
         now: ctx.now,
         caret: host.caret,
+        caret_drawn: host.caret_drawn,
         wrapped: host.wrapped,
         rows: u16::try_from(ctx.geom.rows).unwrap_or(u16::MAX),
         cols: u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX),
@@ -1850,6 +1856,7 @@ mod tests {
         let s = sense(
             &ctx,
             HostSense {
+                caret_drawn: true,
                 caret: Some((2, 9)),
                 wrapped: true,
                 output_burst: true,
@@ -1930,6 +1937,7 @@ mod tests {
         for (i, &caret) in walk.iter().enumerate() {
             let now = start + Duration::from_millis(16 * i as u64);
             let a = v1.tick(PetSense {
+                caret_drawn: true,
                 now,
                 caret,
                 wrapped: false,
@@ -1959,6 +1967,7 @@ mod tests {
             let b = v2.tick(sense(
                 &ctx,
                 HostSense {
+                    caret_drawn: true,
                     caret,
                     wrapped: false,
                     output_burst: false,

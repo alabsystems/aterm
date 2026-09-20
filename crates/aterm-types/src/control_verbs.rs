@@ -227,6 +227,15 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// alternative is rewording unrelated verbs' prose to make room, which is the
 /// drift a generated golden exists to catch - and the shape is unchanged: one
 /// summary row per verb under [`SUMMARY_MAX_CHARS`].
+///
+/// Round 19's `story` — the presence band's write face, the one verb the round
+/// adds — and the `chrome` summary that now names the presence line landed on
+/// the same raise, taking the table from 105 entries to 106. The GUI's short
+/// `help` MEASURES 10 238 B with both rounds' rows (10 199 B of content lines
+/// after the `OK 109 …` status line — three framing lines and the 106 rows —
+/// read through aterm-ctl on the headless live try of 2026-09-19): two bytes
+/// under 10 240, so the next row raises it again. Same accounting, same
+/// shape.
 pub const SHORT_CATALOG_MAX_BYTES: usize = 10240;
 /// The column a catalog row's text starts in: a 28-wide name plus one space.
 pub const CATALOG_TEXT_COLUMN: usize = 29;
@@ -420,19 +429,41 @@ pub const VERBS: &[VerbSpec] = &[
          `containment`, `warmup=`, `observer`, `remediate` and a closing `note`. Free text is \
          pct-encoded and `-` is unset. A background check in flight reports `full_disk_access=unknown` \
          and `probe=pending`, with no sample age (`-`, or null in JSON). Reading this verb raises NO dialog: the probe reads state \
-         that already exists, and no value here is inferred from another. Per-folder state is \
-         `unknown` BY CONSTRUCTION — the only way to learn whether a folder is readable is to \
-         read it, which is the very act that raises the prompt — so a `folder` value leaves \
-         `unknown` only where aterm itself observed an access (its own EPERM, or a warm-up the \
-         human asked for), never because Full Disk Access is granted. `unavailable` on an \
+         that already exists, and no value here is inferred from another. Per-folder state \
+         defaults to `unknown` BY CONSTRUCTION — the only way to learn whether a folder is \
+         readable is to read it, which is the very act that raises the prompt — and a `folder` \
+         value leaves `unknown` for exactly two reasons: aterm itself observed an access (its \
+         own EPERM, or a warm-up the human asked for, rendered `allowed`/`denied`/`asking`/`error`), \
+         or the service is one a MEASURED Full Disk Access grant covers, rendered \
+         `covered-by-fda`. An observation always outranks the coverage rule, so a warmed folder \
+         that answered EPERM reads `denied` even while the grant is held. A service with no \
+         measurement of its own is never moved off `unknown` by the grant. `source=` names where \
+         the non-`unknown` values came from — `none`, `warmup`, `fda`, or `warmup,fda`. \
+         `anchor=` on the `install=` row is whether macOS can still FIND the code this \
+         process's grants are keyed to: `live`, `displaced` (the bundle is on disk under a \
+         different name), `deleted` (its path no longer resolves at all), `not-bundled` (a dev \
+         run, not a fault) or `unknown`. `displaced` and `deleted` mean NO grant can be \
+         validated against this process — every consent decision for it and for the sessions \
+         it spawned falls back to asking — and they earn their own `note` row, because \
+         `running=` follows the vnode and therefore reads healthy in exactly that state, and \
+         `full_disk_access=granted` can be true at the same moment and mean nothing. \
+         `unavailable` on an \
          `observer` row is a THIRD value, distinct from `off` and from `false`: the observer \
          could not be consulted, which is not the same as its having answered no. \
          `full_disk_access=granted` removes this class of interruption for the folders that \
-         grant covers, and establishes exactly two things: `fda_scope=this_process` and Apple's \
-         documented `app-data` coverage for THIS host (`covers=app-data`). Every other service \
-         stays `unmeasured` (the never-covered class `uncovered`), an adopted session inherits \
-         nothing, and the `folder` rows stay `unknown`. Only a human can change any of this — \
-         aterm cannot grant it, and neither can you.",
+         grant covers, and establishes exactly two things: `fda_scope=this_process` and \
+         `app-data` coverage for THIS host (`covers=app-data`) — MEASURED 2026-09-19 on macOS \
+         26.6.2, not merely documented: with the grant held, four other-app data locations read \
+         with zero dialogs and no `tccd` traffic at all. That is the prompt owners actually hit \
+         (`\"would like to access data from other apps\"`), and it is the ONLY durable answer to \
+         it: macOS records an app-data allow against one process instance (a pid / pid_version / \
+         boot-session triple) and ships no System Settings switch for the class, so answering \
+         the dialog cannot hold across a restart. Every other measurable service stays \
+         `unmeasured`; `uncovered` is the never-covered class — cloud-storage File Provider \
+         domains, the media and photo libraries, and App Management, each its own service with \
+         its own Settings pane that this grant does not reach. An adopted session inherits \
+         nothing. Only a human can change any of this — aterm cannot grant it, and neither can \
+         you.",
     ),
     // screen / terminal state
     v(
@@ -717,13 +748,46 @@ pub const VERBS: &[VerbSpec] = &[
          an Info row on the named lane, held 30 s, then kept in the `appstatus` ledger. Reply \
          `OK posted`. Owner-only: only the instance token may write to the pull-down.",
     ),
+    // `story` is the WRITE face of the PRESENCE band (round 19): a watcher's
+    // decision, told to the session's window. Owner-only (a child edge must not
+    // write `✓ approved` onto a band it does not drive), Write op-class because it
+    // mutates App state, Session target because it names the session it is about.
+    va(
+        "story",
+        Write,
+        Status,
+        Session,
+        OwnerOnly,
+        "story <approved|dismissed|reconnected|timeout|exit|compacted|warned> [<text>]: tell the \
+         window",
+        "Tell the session's window what the watcher decided. The presence band under the tab bar \
+         says who is driving a session and what happened while the human was away; a watcher's decisions (`aterm drive watch`: an approved \
+         read, a dismissed survey, an outage ridden out, its TIMEOUT or EXIT, the worker's \
+         compaction and the context warning before it) live in another process and reach the \
+         band only here. `aterm drive watch` posts one per journaled decision by itself. The \
+         verb is the CLOSED SET above — anything else is `ERR usage` — and the text is \
+         optional, at most 96 bytes, no control byte. The point takes the phase slot for three \
+         seconds (`✓ approved`, then back to the phase), is spoken to a screen reader as \
+         `approved by watcher`, and is a story point: the tab's violet dot until the human \
+         looks, and an approval is counted in the `◇ quiet` summary. Never send the command: \
+         the band carries no command text, and the watcher tells an approval bare. Reply `OK \
+         story=<n>`, the point's seq (`status story=` reports it). Takes the ordinary \
+         `@<sid>` selector; bare, it is the connection's own session. Owner-only.",
+    ),
     v(
         "chrome",
         Read,
         Lines,
         App,
-        "the front window's native macOS UI (toolbar + menu bar)",
-        "",
+        "the front window's native UI (toolbar + menu bar) and its presence line",
+        "The last line is `presence rim=<none|drive|wait|stop|stop-hold> level=<quiet|note|story|\
+         driving|driven|attention|limited|hold> band=\"<row>\" sentence=\"<spoken>\"` — what \
+         the human sees of the presence band under the front window's tab bar: the rim's \
+         colour state, the severity, the band row's six slots fitted to the window's width \
+         (role, phase and since, hand, mail, `ctx <n>%`, fabric — two spaces between slots; \
+         `\"\"` when the row is folded) and the sentence a screen reader gets. Both quoted values escape `\"` and \
+         `\\`. The band never carries command text, a mail body, an OSC title or a limit \
+         message, so neither does this line. Read-only.",
     ),
     v(
         "controls",
@@ -820,7 +884,10 @@ pub const VERBS: &[VerbSpec] = &[
          confidence=exact|strong|heuristic|unknown reasons= attribution=live|adopted|unknown \
          fs_consent=covered|denied|unknown conflict= revision= enabled= hold=<0|1> \
          fabric=<connected|stalled|disconnected|absent> fabric_rtt_ms=<n|-> \
-         fabric_link_age_ms=<n|-> identity=<name|->. `attribution=`/`fs_consent=` are this \
+         fabric_link_age_ms=<n|-> identity=<name|-> \
+         hand=<-|turn:<id>[:<holder>]|lease:<holder>|driving:<sid>> \
+         level=<quiet|note|story|driving|driven|attention|limited|hold> story=<n>. \
+         `attribution=`/`fs_consent=` are this \
          session's consent posture (see `privacy` and `await consent`). \
          Read-only. `observed=false` means never classified, which is NOT `phase=unknown` \
          (classified, no evidence); `subject_source=unavailable` means the terminal lock was \
@@ -858,6 +925,17 @@ pub const VERBS: &[VerbSpec] = &[
          identity=<name>`), `-` for the human's own agent config - the same word the \
          `sessions` roster carries, so a driver polling one session need not re-read the \
          fleet to learn whose login it is driving. \
+         `hand=` is whose hand is on the keyboard, as the presence band prints it: `turn:<id>` \
+         a peer's open `turn` (`:<holder>` names the driver by its `meta role` or short sid \
+         when the turn came over an edge — the edge's source; an Owner-token turn names \
+         nobody, whatever edges stand), `lease:<holder>` a cooperative drive lease, \
+         `driving:<sid>` this session's own open turn into another, `-` nobody. `level=` is the band's severity, ascending \
+         `quiet < note < story < driving < driven < attention < limited < hold` (the rim is \
+         teal from `driven`, amber at `attention`, red at `limited`/`hold`; `story` is the \
+         violet dot: something happened since the human last looked); `story=` is the seq of \
+         the newest story point (`0` = nothing ever happened; `ctl story` replies with it). \
+         All three are read from the presence slot the wakes keep current — no lock, no \
+         classifier — so they cost the poll nothing. \
          No `window=` here: `status` is \
          polled, and the window lives on the main thread, so a per-poll hop would be a \
          latency regression — ask `sessions`/`ls` (one hop for the whole fleet) or `dims`",
@@ -2993,10 +3071,12 @@ mod tests {
             sessions.detail
         );
         let status = spec("status").expect("status is in the table");
+        // `identity=` follows the fabric tail; round 19's presence tail
+        // (`hand= level= story=`) follows IT, the same additive way.
         assert!(
             status
                 .detail
-                .contains("fabric_link_age_ms=<n|-> identity=<name|->."),
+                .contains("fabric_link_age_ms=<n|-> identity=<name|-> hand="),
             "{}",
             status.detail
         );
@@ -3100,6 +3180,9 @@ mod tests {
             owner_only,
             [
                 "appnotice",
+                // The presence band's write face (round 19): the watcher tells the
+                // window what it decided; a child edge may not.
+                "story",
                 // The drive halt. Owner-class so the LOCAL owner can halt its own
                 // drivers; the handler keeps the FLEET hold (set, replace, lift)
                 // bridge-issued only — see `Access::OwnerOnly`'s doc.

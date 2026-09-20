@@ -756,6 +756,59 @@ impl SessionFabric {
     /// A short leaf-lock read with no allocation, taken by the render thread
     /// on frames it already draws; the ring is bounded by [`RING_CAP`], so
     /// the scan is too.
+    /// **THE BAND'S READ** (`crate::presence`, round 19): the mail counts the
+    /// presence band prints and the `(kind, from, trust)` of the row its mail
+    /// slot names — an unread `task` or `ask` if one waits (the row the amber
+    /// rim is lit for, so a later note never hides it), else the newest unread
+    /// row — trust FIRST on the wire because it is the receiver's verdict.
+    /// `unread` is every row above the HANDLED watermark, `pending` those of
+    /// them a non-peek `inbox` has already LISTED (read, not yet decided — a
+    /// fresh delivery is unread and not pending), `dropped` the monotone
+    /// eviction count,
+    /// `queued` the posts still waiting for a bridge to carry them, `head` the
+    /// newest row id ever delivered (how the story counts arrivals). One leaf
+    /// lock, taken at CHANGE rate (never per frame); the only allocation is the
+    /// three-token copy of the newest row.
+    pub(crate) fn mail_facts(&self) -> crate::presence::MailFacts {
+        let inbox = self.lock();
+        let seen = inbox.seen;
+        let unread = inbox.rows.iter().filter(|r| r.id > seen).count() as u64;
+        let pending = inbox
+            .rows
+            .iter()
+            .filter(|r| r.id > seen && r.listed)
+            .count() as u64;
+        let queued = inbox
+            .posts
+            .iter()
+            .filter(|p| p.off.is_none() && !p.dead)
+            .count() as u64;
+        // The newest unread row — unless a TASK or ASK waits anywhere above
+        // the watermark: that is the row the amber rim is lit for, so it is
+        // the row the mail slot names (a later note never hides it).
+        let is_unread = |r: &&InboxRow| r.id > seen;
+        let last = inbox
+            .rows
+            .iter()
+            .rev()
+            .filter(is_unread)
+            .find(|r| r.kind == "task" || r.kind == "ask")
+            .or_else(|| inbox.rows.iter().rev().find(is_unread))
+            .map(|r| crate::presence::MailLast {
+                kind: r.kind.clone(),
+                from: r.from.clone(),
+                trust: r.trust.clone(),
+            });
+        crate::presence::MailFacts {
+            unread,
+            pending,
+            dropped: inbox.dropped,
+            queued,
+            last,
+            head: inbox.rows.back().map_or(0, |r| r.id),
+        }
+    }
+
     pub(crate) fn room_facts(&self, now_ms: u64) -> (u64, bool, bool) {
         let inbox = self.lock();
         let seen = inbox.seen;
@@ -816,6 +869,15 @@ struct LinkReport {
     rtt_ms: Option<u64>,
     /// When that ack was reported.
     acked_at: Option<std::time::Instant>,
+    /// When the CURRENT stall began — the instant the link was last reported
+    /// DOWN after being up (or after `starting`, when the dial itself
+    /// failed). `None` while up, and `None` for a fresh attach that has said
+    /// nothing yet: a link that never came up has no stall to date, and the
+    /// band prints `~` with no figure rather than a number it made up
+    /// (round 19's review measured `~ 0s` for the life of a dialing bridge,
+    /// and `~ 3600s` one second into the stall of a link that had been quiet
+    /// for an hour — the ack's age, [`fabric_link_facts`], is NOT the stall's).
+    stalled_at: Option<std::time::Instant>,
     /// Whether THIS incarnation has ever sent a `link` record. A bridge from
     /// before the link report (0.85 and earlier) never does, and for one the
     /// endpoint takes a delivery or a landing as the evidence it is — see
@@ -894,6 +956,7 @@ static LINK: FabricLink = FabricLink {
         reason: String::new(),
         rtt_ms: None,
         acked_at: None,
+        stalled_at: None,
         reported: false,
     }),
 };
@@ -1050,6 +1113,21 @@ pub(crate) fn fabric_link_facts() -> (String, Option<u64>, Option<u64>) {
     (reason, link.rtt_ms, age)
 }
 
+/// How long the link has been DOWN, in ms — the age of the stall itself,
+/// which is what the presence band's fabric slot prints (`~ 7s`). `None`
+/// while the link is up, before a bridge has attached, and for an attached
+/// bridge that has never reported (its dial has not been answered either
+/// way: there is no stall to date). Computed at read time like the ack's age,
+/// so two readers a second apart see it grow by a second.
+pub(crate) fn fabric_stalled_ms() -> Option<u64> {
+    let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    if link.up {
+        return None;
+    }
+    link.stalled_at
+        .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
 /// The tail `status` appends after `fabric=`: `fabric_rtt_ms=<n|->
 /// fabric_link_age_ms=<n|->`.
 pub(crate) fn fabric_status_tail() -> String {
@@ -1103,6 +1181,9 @@ pub(crate) fn bridge_attached(generation: BridgeGeneration) {
         // history, and `fabric_rtt_ms=-` on a fresh attach is the truth.
         link.rtt_ms = None;
         link.acked_at = None;
+        // And no stall to date: `starting` is a dial nobody has answered,
+        // not a link that fell over ([`fabric_stalled_ms`]).
+        link.stalled_at = None;
         link.reported = false;
     }
     LINK.state.store(FABRIC_STALLED, Ordering::Relaxed);
@@ -1148,6 +1229,7 @@ pub(crate) fn link_evidence(generation: Option<BridgeGeneration>) {
     link.reason.clear();
     link.rtt_ms = None;
     link.acked_at = Some(std::time::Instant::now());
+    link.stalled_at = None;
     LINK.state.store(FABRIC_CONNECTED, Ordering::Relaxed);
 }
 
@@ -1180,7 +1262,7 @@ pub(crate) fn link_report(
     reason: &str,
     rtt_ms: Option<u64>,
 ) -> bool {
-    let went_down = {
+    let (went_down, went_up) = {
         let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
         if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
             return false;
@@ -1197,22 +1279,51 @@ pub(crate) fn link_report(
             link.reason.clear();
             link.rtt_ms = rtt_ms;
             link.acked_at = Some(std::time::Instant::now());
+            link.stalled_at = None;
         } else {
             link.reason = reason.to_string();
             if rtt_ms.is_some() {
                 link.rtt_ms = rtt_ms;
+            }
+            // THE STALL IS DATED FROM ITS OWN TRANSITION: the moment the link
+            // was last up (or the dial was first refused), never the last
+            // ack — a quiet link acks nothing for an hour and is not an hour
+            // stalled when it drops. A second `down` while already down (a
+            // reason that changed) is the same stall and keeps its date.
+            if was_up || link.stalled_at.is_none() {
+                link.stalled_at = Some(std::time::Instant::now());
             }
         }
         LINK.state.store(
             if up { FABRIC_CONNECTED } else { FABRIC_STALLED },
             Ordering::Relaxed,
         );
-        (was_up || was_starting) && !up
+        (
+            (was_up || was_starting) && !up,
+            (!was_up || was_starting) && up,
+        )
     };
     if went_down {
         wake_parked(store);
+    } else if went_up {
+        // The link is BACK: every band's fabric slot returns from `~ Ns` to
+        // `⟟` — a presence wake per live session, and no parked `await inbox`
+        // is woken (its answer did not change).
+        wake_presence(store);
     }
     true
+}
+
+/// A presence wake for every live session, and nothing else — the link's
+/// recovery moves the band's fabric slot but answers no parked waiter.
+fn wake_presence(store: &Store) {
+    let live: Vec<SessionId> = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        g.live_handles().map(|h| h.ctx.self_id.clone()).collect()
+    };
+    for sid in &live {
+        crate::presence::post_fabric_changed(sid);
+    }
 }
 
 const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>]\n";
@@ -1291,6 +1402,7 @@ fn wake_parked(store: &Store) {
     for ctx in &parked {
         let guard = ctx.fabric.lock();
         ctx.fabric.changed.notify_all();
+        crate::presence::post_fabric_changed(&ctx.self_id);
         drop(guard);
     }
 }
@@ -1384,6 +1496,9 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
             let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
             link.up = false;
             link.reason = LINK_BRIDGE_LOST.to_string();
+            // Not a stall: the band's fabric slot reads `✕ lost` for a
+            // disconnected bridge and prints no age ([`fabric_stalled_ms`]).
+            link.stalled_at = None;
         }
     }
     // EVERY registry's sids, not just this store's. Each one is looked up in
@@ -1848,6 +1963,7 @@ fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>, issuer: HoldIssuer) -> Appli
     drop(inbox);
     if changed {
         ctx.fabric.changed.notify_all();
+        crate::presence::post_fabric_changed(&ctx.self_id);
         Applied::Changed
     } else {
         Applied::Unchanged
@@ -1913,6 +2029,7 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
             link.reason.clear();
             link.rtt_ms = None;
             link.acked_at = None;
+            link.stalled_at = None;
         }
         LINK.touched
             .lock()
@@ -2293,6 +2410,7 @@ fn deliver_fetched(ctx: &SessionCtx, toks: &[&str]) -> String {
     }
     drop(inbox);
     ctx.fabric.changed.notify_all();
+    crate::presence::post_fabric_changed(&ctx.self_id);
     "OK\n".to_string()
 }
 
@@ -2309,6 +2427,7 @@ fn refuse_fetched(ctx: &SessionCtx, off: u64, reply: &str) -> String {
         *slot = FetchSlot::Failed("malformed".to_string());
         drop(inbox);
         ctx.fabric.changed.notify_all();
+        crate::presence::post_fabric_changed(&ctx.self_id);
     }
     reply.to_string()
 }
@@ -2533,6 +2652,7 @@ fn retire_post(
     inbox.trim_retired_posts();
     drop(inbox);
     ctx.fabric.changed.notify_all();
+    crate::presence::post_fabric_changed(&ctx.self_id);
     Ok(())
 }
 
@@ -2812,6 +2932,7 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
         .record("inbox", format!("{id} from={from} kind={kind} off={off}"));
     drop(inbox);
     ctx.fabric.changed.notify_all();
+    crate::presence::post_fabric_changed(&ctx.self_id);
     format!("OK {id}\n")
 }
 
@@ -3312,6 +3433,7 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
         .record("inbox-seen", payload);
     drop(inbox);
     ctx.fabric.changed.notify_all();
+    crate::presence::post_fabric_changed(&ctx.self_id);
     format!("OK seen={seen}\n")
 }
 
@@ -3565,6 +3687,7 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
         .record("post", payload);
     drop(inbox);
     ctx.fabric.changed.notify_all();
+    crate::presence::post_fabric_changed(&ctx.self_id);
 
     let Some(wait) = wait else {
         return format!("OK {id}\n");
@@ -7599,6 +7722,13 @@ mod inbox_hold {
                 "posts a text row on the pull-down status bars (chrome, not the \
                  grid); it puts no bytes on a PTY and retires no session, and it is \
                  Owner-only at the socket besides",
+            ),
+            (
+                "story",
+                "tells the presence band what the watcher decided (chrome, not the \
+                 grid); it puts no bytes on a PTY and retires no session, it is \
+                 Owner-only at the socket besides, and a held worker's window is \
+                 exactly the one whose story (`exit`, `timeout`) must still arrive",
             ),
             (
                 "spawn",

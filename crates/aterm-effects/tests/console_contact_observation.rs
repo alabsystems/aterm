@@ -58,6 +58,7 @@ impl Scene {
         self.now += Duration::from_millis(millis);
         let cursor = self.term.cursor();
         self.brain.tick(PetSense {
+            caret_drawn: true,
             now: self.now,
             caret: (self.term.cursor_visible() && self.term.grid().display_offset() == 0)
                 .then_some((cursor.row, cursor.col)),

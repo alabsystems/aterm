@@ -1183,7 +1183,7 @@ impl App {
             ch,
             rows,
             cols,
-            self.chrome_rows(),
+            self.chrome_rows(wid),
             geom.pad,
             geom.pad_top,
             geom.head,
@@ -1240,7 +1240,7 @@ impl App {
             front: ws.and_then(|ws| ws.front_content),
             win_px: ws.and_then(|ws| ws.win_px.map(|px| (px.width, px.height))),
             dims: ws.map_or((0, 0), |ws| (ws.rows, ws.cols)),
-            chrome_rows: self.chrome_rows(),
+            chrome_rows: self.chrome_rows(wid),
             geom,
             pane_rect,
         }
@@ -1271,7 +1271,7 @@ impl App {
         }
         let (ox, oy) = self.frame_origin_with(wid, geom);
         // The same three insets `pixel_to_term_cell` strips, put back in its order.
-        let strip_px = usize::from(self.chrome_rows()) * ch;
+        let strip_px = usize::from(self.chrome_rows(wid)) * ch;
         let fx = usize::from(col) * cw + cw / 2 + geom.pad;
         let fy = usize::from(row) * ch + ch / 2 + strip_px + geom.pad_top + geom.head;
         #[allow(
@@ -1349,7 +1349,7 @@ impl App {
         };
         let (cw, ch) = geom.cell;
         let (pad, pad_top, head) = (geom.pad, geom.pad_top, geom.head);
-        let composed_rows = usize::from(ws.rows).saturating_add(usize::from(self.chrome_rows()));
+        let composed_rows = usize::from(ws.rows).saturating_add(usize::from(self.chrome_rows(wid)));
         let frame_w = usize::from(ws.cols)
             .saturating_mul(cw)
             .saturating_add(pad.saturating_mul(2));
@@ -1430,7 +1430,10 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<crate::status_bars::Lane> {
-        if self.status_bar_rows == 0 {
+        // The PRESENCE row (round 19) sits between the strip and the bars, in
+        // the row its window committed; the bars start below it.
+        let presence_rows = self.windows.get(&wid).map_or(0, |ws| ws.presence.rows);
+        if self.status_bar_rows == 0 && presence_rows == 0 {
             return None;
         }
         let geom = self.pointer_geometry(wid);
@@ -1438,11 +1441,16 @@ impl App {
         let (_, y) = self.window_to_frame_with(wid, geom, x, y);
         let gy = (y as usize).saturating_sub(geom.pad_top + geom.head);
         let strip_px = usize::from(self.tab_strip_rows) * ch.max(1);
+        let presence_px = usize::from(presence_rows) * ch.max(1);
         let bars_px = usize::from(self.status_bar_rows) * ch.max(1);
-        if gy < strip_px || gy >= strip_px + bars_px {
+        if gy < strip_px || gy >= strip_px + presence_px + bars_px {
             return None;
         }
-        self.status_bars.lane_at((gy - strip_px) / ch.max(1))
+        if gy < strip_px + presence_px {
+            return Some(crate::status_bars::Lane::Presence);
+        }
+        self.status_bars
+            .lane_at((gy - strip_px - presence_px) / ch.max(1))
     }
 
     /// [`Self::strip_col_at`] against geometry the caller already derived.
@@ -2029,7 +2037,7 @@ impl App {
         // bottom-anchored bar never risked this; the top bar does.)
         let (ox, oy) = self.frame_origin(wid);
         let (fx, fy) = (x - ox as f64, y - oy as f64);
-        let frame_row = usize::from(self.chrome_rows()) + band.start;
+        let frame_row = usize::from(self.chrome_rows(wid)) + band.start;
         let top = (pad_top + self.win_head(wid) + frame_row * ch) as f64;
         let bottom = top + (band.len() * ch) as f64;
         if fy < top || fy >= bottom || fx < pad as f64 {
@@ -3212,7 +3220,7 @@ impl App {
         // height from `y` before taking the per-cell remainder (matches
         // `pixel_to_term_cell`). Ignored by every cell-coordinate encoding — see
         // [`crate::input::PixelOffset`].
-        let strip_px = usize::from(self.chrome_rows()) * ch;
+        let strip_px = usize::from(self.chrome_rows(wid)) * ch;
         // The chrome headroom sits above the pad on the y-axis (x carries none),
         // matching `pixel_to_term_cell`'s `pad_top + head` inset.
         let gy = (fy - (geom.pad_top + geom.head) as f64).max(0.0) as usize;
@@ -3477,7 +3485,7 @@ impl App {
             .pad_top
             .saturating_add(geom.head)
             .saturating_add(usize::from(pane_row).saturating_mul(ch));
-        let strip_px = usize::from(self.chrome_rows()) * ch;
+        let strip_px = usize::from(self.chrome_rows(wid)) * ch;
         // W1: window→frame first, so the grid's top/bottom edges account for the
         // leading remainder band like every other pointer consumer — but on the
         // SIGNED seam. A drag past the TOP edge lives entirely in the negative
@@ -4358,6 +4366,8 @@ impl App {
                     // build applies in place on a press — what the retired
                     // floating card did — and any other state opens the details.
                     crate::status_bars::Lane::Update => self.press_update_bar(),
+                    // The presence band has no press action (design §2).
+                    crate::status_bars::Lane::Presence => {}
                 }
                 return;
             }
@@ -5696,7 +5706,7 @@ mod tests {
         (
             ox as f64 + pad as f64 + f64::from(rx + rw * 0.5) * scale,
             oy as f64
-                + (head + usize::from(app.chrome_rows()) * ch) as f64
+                + (head + usize::from(app.chrome_rows(wid)) * ch) as f64
                 + f64::from(ry + rh * 0.5) * scale,
         )
     }
@@ -7982,7 +7992,7 @@ mod tests {
             &geom,
             now,
             motion,
-            app.notice_clear_rows(),
+            app.notice_clear_rows(wid),
         );
         assert!(
             rw > 0.0 && rh > 0.0,
@@ -9795,7 +9805,7 @@ mod tests {
         assert_eq!(pane_row, 0, "the original terminal is the top pane");
         assert!(pane_rows < app.windows[&wid].rows);
         let ch = app.win_cell_size(wid).1.max(1);
-        let strip_px = usize::from(app.chrome_rows()) * ch;
+        let strip_px = usize::from(app.chrome_rows(wid)) * ch;
         let pane_bottom = app.win_pad_top(wid)
             + app.win_head(wid)
             + strip_px
@@ -9835,7 +9845,7 @@ mod tests {
         assert!(pane_row > 0, "the new terminal is the bottom pane");
         assert!(pane_rows < app.windows[&wid].rows);
         let ch = app.win_cell_size(wid).1.max(1);
-        let strip_px = usize::from(app.chrome_rows()) * ch;
+        let strip_px = usize::from(app.chrome_rows(wid)) * ch;
         let pane_top =
             app.win_pad_top(wid) + app.win_head(wid) + strip_px + usize::from(pane_row) * ch;
         let pointer = pane_top as f64 - 1.0;
@@ -9942,7 +9952,7 @@ mod tests {
             crate::app_render::selection_autoscroll_lines(
                 past_bottom,
                 native.win_pad_top(wid) + native.win_head(wid),
-                usize::from(native.chrome_rows()) * guard_ch,
+                usize::from(native.chrome_rows(wid)) * guard_ch,
                 guard_ch,
                 native.windows[&wid].rows,
             ),

@@ -40,19 +40,6 @@ const MAX_CMD_ROWS: usize = 14;
 /// on top (2), and the key-hint footer on the bottom (1).
 const CHROME_ROWS: usize = 3;
 
-/// The session-connection command rows (design §2.3) — palette-only ids with
-/// NO menu-bar item (the bar mirror stays exactly the bar; `MENU_MODEL`
-/// completeness proofs pin them OUT of the model). Listed here so the palette
-/// and the `invoke` verb (which resolves names through
-/// [`PaletteState::action_by_name`]) reach them; the picker/sheet resolve the
-/// peer parameter after dispatch.
-const CONNECTION_ROWS: &[(&str, MenuAction)] = &[
-    ("Connect to Session…", MenuAction::ConnectToSession),
-    ("Configure Connection…", MenuAction::ConfigureConnection),
-    ("Disconnect Session…", MenuAction::DisconnectSession),
-    ("Show Connection Map", MenuAction::ShowConnectionMap),
-];
-
 /// Maximum logical width of the floating command card. Wide windows should leave enough
 /// of the owning app visible to read as a modal layer, not stretch a short command label
 /// across an entire desktop-sized surface.
@@ -223,6 +210,15 @@ pub(crate) struct PaletteLive {
     /// This platform has a real local-file picker. Picker-backed rows remain visible but
     /// disabled where `menu::choose_local_file` cannot produce a path.
     pub local_file_picker_available: bool,
+    /// The standing hold on the front session, when one stands (round 19, the
+    /// Fabric menu's halt pair): `fleet` decides which of Hold / Lift Hold is
+    /// live, and a fleet hold's `reason` rides the greyed rows' labels.
+    pub front_hold: Option<crate::presence::HoldFact>,
+    /// The View ▸ Presence Band checkmark: the band is shown (`[presence] band`,
+    /// as the App currently applies it).
+    pub presence_band: bool,
+    /// The View ▸ Presence Rim checkmark.
+    pub presence_rim: bool,
     /// A strictly-newer `(build, version)` is STAGED (the `App.relaunch` nudge): the
     /// Version section shows the one-click "↑ Update to v<staged> — apply now, shells
     /// keep running" row.
@@ -256,47 +252,34 @@ pub(crate) struct PaletteLive {
 
 impl PaletteState {
     /// Build the palette from [`MENU_MODEL`], every command enabled and unchecked (the pure,
-    /// `App`-free default the unit tests use), then the session-connection
-    /// command rows ([`CONNECTION_ROWS`]) — ids that live in NO menu bar
-    /// (design §2.3: "all palette/`invoke`-reachable"), appended BESIDE the
-    /// model so the bar mirror stays exactly the bar. `App::palette_enter`
-    /// calls [`Self::resolve`] right after to fold in live enabled/checked
-    /// state.
+    /// `App`-free default the unit tests use). The palette MIRRORS the bar and nothing
+    /// else: every row is a model item, in model order, its section chip the menu's
+    /// title — or, for a submenu's rows (File ▸ Driving), the submenu's label, the
+    /// word a human would say. The connection ids that used to ride a palette-only
+    /// "Connections" section are Fabric-menu rows since round 19, so they come
+    /// through the model like every other command. `App::palette_enter` calls
+    /// [`Self::resolve`] right after to fold in live enabled/checked state.
     pub(crate) fn new() -> Self {
         let mut rows = Vec::new();
         for section in MENU_MODEL {
             for entry in section.entries {
-                if let MenuEntry::Item {
-                    label,
-                    action,
-                    key,
-                    mods,
-                } = entry
-                {
+                let chip = match entry {
+                    MenuEntry::Submenu { label, .. } => *label,
+                    MenuEntry::Item { .. } | MenuEntry::Separator => section.title,
+                };
+                for (label, action, key, mods) in entry.items() {
                     rows.push(PaletteRow {
-                        section: Cow::Borrowed(section.title),
+                        section: Cow::Borrowed(chip),
                         label: Cow::Borrowed(label),
-                        action: PaletteTarget::Menu(*action),
+                        action: PaletteTarget::Menu(action),
                         key,
-                        mods: *mods,
+                        mods,
                         shortcut: Cow::Borrowed(""),
                         enabled: true,
                         checked: None,
                     });
                 }
             }
-        }
-        for (label, action) in CONNECTION_ROWS {
-            rows.push(PaletteRow {
-                section: Cow::Borrowed("Connections"),
-                label: Cow::Borrowed(label),
-                action: PaletteTarget::Menu(*action),
-                key: "",
-                mods: MenuMods::None,
-                shortcut: Cow::Borrowed(""),
-                enabled: true,
-                checked: None,
-            });
         }
         Self {
             rows,
@@ -551,9 +534,43 @@ impl PaletteState {
                 | MenuAction::NewControllerTab
                 | MenuAction::ConnectToSession
                 | MenuAction::ConfigureConnection
-                | MenuAction::DisconnectSession => {
+                | MenuAction::DisconnectSession
+                // The Fabric menu's session rows (round 19): the inbox and the
+                // ledger are the focused session's.
+                | MenuAction::Inbox
+                | MenuAction::LedgerForSession => {
                     row.enabled = live.terminal_front;
                 }
+                // Same editor as the pin, same surface rule.
+                MenuAction::SetRole => {
+                    row.enabled = live.terminal_front && live.can_rename;
+                }
+                // THE HALT PAIR reads the live hold (the Packages doctrine):
+                // Hold only with nothing standing, Lift only against a LOCAL
+                // hold. Under a FLEET hold both grey and both say why — the
+                // reason and that it cannot be lifted here — so the disabled
+                // row explains itself instead of merely refusing.
+                MenuAction::HoldSession | MenuAction::LiftHold => {
+                    let base = if action == MenuAction::HoldSession {
+                        "Hold This Session"
+                    } else {
+                        "Lift Hold (This Session)"
+                    };
+                    row.label = Cow::Borrowed(base);
+                    match &live.front_hold {
+                        None => row.enabled = live.terminal_front && action == MenuAction::HoldSession,
+                        Some(h) if h.fleet => {
+                            row.enabled = false;
+                            row.label = Cow::Owned(format!(
+                                "{base} \u{2014} {}",
+                                crate::menu::hold_row_reason(&h.reason)
+                            ));
+                        }
+                        Some(_) => row.enabled = live.terminal_front && action == MenuAction::LiftHold,
+                    }
+                }
+                MenuAction::TogglePresenceBand => row.checked = Some(live.presence_band),
+                MenuAction::TogglePresenceRim => row.checked = Some(live.presence_rim),
                 _ => {}
             }
         }
@@ -931,11 +948,18 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
         // what VoiceOver says about every menu row. This lane is about removing
         // a lie off macOS, not about adding speech on it.
         let accel = platform_accel(&row.shortcut);
-        let description = if accel.is_empty() {
+        let mut description = if accel.is_empty() {
             row.section.to_string()
         } else {
             format!("{} \u{b7} {accel}", row.section)
         };
+        // The row's HELP sentence (round 19, SPEC19 §9: an accessibility label
+        // on every menu item) — the same words the native item carries as its
+        // tool tip, so a screen reader hears what a hover shows.
+        if let Some(action) = row.action.menu() {
+            description.push_str(": ");
+            description.push_str(action.help());
+        }
         node.set_description(description);
         if let Some(on) = row.checked {
             node.set_toggled(Toggled::from(on));
@@ -1014,6 +1038,13 @@ impl PaletteState {
     /// (never a silent no-op — the same `validateMenuItem:` conditions the native bar
     /// enforces), an unmatched name errs as unknown. An enabled row wins over a
     /// disabled duplicate (the Version section may render an action in two states).
+    /// The resolved rows, in order — what the painter, `controls menu` and the
+    /// a11y tree all read; the tests of other modules read the same slice.
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> &[PaletteRow] {
+        &self.rows
+    }
+
     pub(crate) fn action_by_name(&self, name: &str) -> Result<MenuAction, String> {
         // LEGACY SPELLING: `FavouriteSessionKitty` was the wire name until the
         // launch-kitty ruling (2026-08-17) retired the session kitty; scripts
@@ -1540,33 +1571,65 @@ mod tests {
         assert!(s.rows.iter().any(|r| r.action == MenuAction::About));
         assert!(s.rows.iter().any(|r| r.action == MenuAction::Copy));
         assert!(s.rows.iter().any(|r| r.action == MenuAction::Help));
-        // Same count as the model's Item entries PLUS the palette-only
-        // session-connection rows (design §2.3 — ids with no bar item).
+        // Exactly the model's items, submenus flattened — the palette mirrors
+        // the bar and nothing else (round 19 folded the palette-only
+        // "Connections" rows into the bar's Fabric menu).
         let model_items = MENU_MODEL
             .iter()
             .flat_map(|sec| sec.entries.iter())
-            .filter(|e| matches!(e, MenuEntry::Item { .. }))
+            .flat_map(MenuEntry::items)
             .count();
-        assert_eq!(s.rows.len(), model_items + CONNECTION_ROWS.len());
+        assert_eq!(s.rows.len(), model_items);
+        // The section chips are the bar's titles, plus the one submenu's label
+        // for its rows, in bar order.
+        let mut chips: Vec<&str> = s.rows.iter().map(|r| r.section.as_ref()).collect();
+        chips.dedup();
+        assert_eq!(
+            chips,
+            [
+                "aterm", "File", "Driving", "File", "Edit", "View", "Fabric", "Window", "Help",
+                "Version"
+            ]
+        );
+        let driving: Vec<&str> = s
+            .rows
+            .iter()
+            .filter(|r| r.section == "Driving")
+            .map(|r| r.label.as_ref())
+            .collect();
+        assert_eq!(
+            driving,
+            [
+                "New Controlled Session in New Window",
+                "New Controlled Session as Tab",
+                "New Controller Session in New Window",
+                "New Controller Session as Tab"
+            ]
+        );
     }
 
     /// The §2.3 connection ids have palette rows (design: "all palette/
-    /// `invoke`-reachable") in their own section, resolvable BY NAME for the
-    /// `invoke` verb; the session-subject ones gate on a front terminal while
-    /// the instance-wide map stays enabled.
+    /// `invoke`-reachable") — in the Fabric section since round 19, resolvable
+    /// BY NAME for the `invoke` verb; the session-subject ones gate on a front
+    /// terminal while the instance-wide map stays enabled.
     #[test]
     fn connection_ids_have_palette_rows_and_gate_on_a_front_terminal() {
         let mut s = PaletteState::new();
-        for (label, action) in CONNECTION_ROWS {
+        for (label, action) in [
+            ("Connect to Session…", MenuAction::ConnectToSession),
+            ("Configure Connection…", MenuAction::ConfigureConnection),
+            ("Disconnect Session…", MenuAction::DisconnectSession),
+            ("Show Connection Map", MenuAction::ShowConnectionMap),
+        ] {
             let row = s
                 .rows
                 .iter()
-                .find(|r| r.action == *action)
+                .find(|r| r.action == action)
                 .unwrap_or_else(|| panic!("{action:?} has a palette row"));
-            assert_eq!(row.section, "Connections");
-            assert_eq!(row.label, *label);
+            assert_eq!(row.section, "Fabric");
+            assert_eq!(row.label, label);
             // Resolvable by its invoke name (the `invoke` verb's path).
-            assert_eq!(s.action_by_name(&format!("{action:?}")), Ok(*action));
+            assert_eq!(s.action_by_name(&format!("{action:?}")), Ok(action));
         }
         // No front terminal: the session-subject ids disable (and invoke
         // refuses with the disabled reason); the map row stays live.
@@ -1596,6 +1659,112 @@ mod tests {
                 .enabled,
             "the map is instance-wide"
         );
+    }
+
+    /// ROUND 19: the halt pair follows the live hold — Hold live with nothing
+    /// standing, Lift live against a LOCAL hold, and under a FLEET hold both
+    /// grey with the fleet's reason in their labels (and `invoke` refuses them
+    /// as disabled); the two presence rows are checkable from the live bits;
+    /// the session rows of the Fabric menu need a front terminal while the
+    /// fabric commands never grey.
+    #[test]
+    fn the_halt_pair_follows_the_hold_and_the_presence_rows_check() {
+        let mut s = PaletteState::new();
+        let row = |s: &PaletteState, a: MenuAction| {
+            s.rows
+                .iter()
+                .find(|r| r.action == a)
+                .cloned()
+                .unwrap_or_else(|| panic!("{a:?} has a row"))
+        };
+        let live = PaletteLive {
+            terminal_front: true,
+            can_rename: true,
+            presence_band: true,
+            presence_rim: false,
+            ..PaletteLive::default()
+        };
+        s.resolve(&live);
+        assert!(row(&s, MenuAction::HoldSession).enabled);
+        assert!(!row(&s, MenuAction::LiftHold).enabled);
+        assert_eq!(row(&s, MenuAction::TogglePresenceBand).checked, Some(true));
+        assert_eq!(row(&s, MenuAction::TogglePresenceRim).checked, Some(false));
+        for a in [
+            MenuAction::Inbox,
+            MenuAction::LedgerForSession,
+            MenuAction::SetRole,
+        ] {
+            assert!(row(&s, a).enabled, "{a:?} with a front session");
+        }
+
+        // A LOCAL hold: Lift is the live one.
+        s.resolve(&PaletteLive {
+            front_hold: Some(crate::presence::HoldFact {
+                reason: "pause".into(),
+                fleet: false,
+            }),
+            ..live.clone()
+        });
+        assert!(!row(&s, MenuAction::HoldSession).enabled);
+        assert!(row(&s, MenuAction::LiftHold).enabled);
+        assert_eq!(
+            row(&s, MenuAction::LiftHold).label,
+            "Lift Hold (This Session)"
+        );
+
+        // A FLEET hold: neither, and both say why.
+        s.resolve(&PaletteLive {
+            front_hold: Some(crate::presence::HoldFact {
+                reason: "main%20broken".into(),
+                fleet: true,
+            }),
+            ..live.clone()
+        });
+        for a in [MenuAction::HoldSession, MenuAction::LiftHold] {
+            let r = row(&s, a);
+            assert!(!r.enabled, "{a:?} under a fleet hold");
+            assert!(
+                r.label
+                    .ends_with("\u{2014} fleet hold: main broken, cannot be lifted here"),
+                "{a:?}: {}",
+                r.label
+            );
+            assert!(
+                s.action_by_name(&format!("{a:?}"))
+                    .is_err_and(|e| e.contains("disabled")),
+                "{a:?} refuses with the disabled reason"
+            );
+        }
+        // Lifted: back to the first state, the label restored.
+        s.resolve(&live);
+        assert_eq!(
+            row(&s, MenuAction::LiftHold).label,
+            "Lift Hold (This Session)"
+        );
+        assert!(row(&s, MenuAction::HoldSession).enabled);
+
+        // No front session: the session rows grey, the instance rows do not.
+        s.resolve(&PaletteLive {
+            terminal_front: false,
+            ..PaletteLive::default()
+        });
+        for a in [
+            MenuAction::Inbox,
+            MenuAction::LedgerForSession,
+            MenuAction::HoldSession,
+            MenuAction::LiftHold,
+            MenuAction::SetRole,
+        ] {
+            assert!(!row(&s, a).enabled, "{a:?} needs a session");
+        }
+        for a in [
+            MenuAction::Fleet,
+            MenuAction::FabricStatus,
+            MenuAction::FabricOn,
+            MenuAction::FabricOff,
+        ] {
+            assert!(row(&s, a).enabled, "{a:?} is instance-wide");
+        }
     }
 
     /// AUDIT I9 — the accelerator projection, both platforms in one table.

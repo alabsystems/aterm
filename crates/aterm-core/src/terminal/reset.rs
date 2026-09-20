@@ -222,6 +222,8 @@ impl Terminal {
         // CursorStyle::default(), but the host's configured default must survive a
         // reset (it's host preference, not app state, like the policy flags above).
         self.modes.cursor_style = self.default_cursor_style;
+        // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
+        self.modes.cursor_blink = self.modes.cursor_style.blinks();
         // Invalidate BiDi render cache — mode flags are reset but the cache
         // may hold stale resolutions from pre-reset content (#7488).
         self.invalidate_bidi_all();

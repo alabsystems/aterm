@@ -3807,7 +3807,23 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
 /// a box whose own `rustc -vV` host triple is a cell's triple and is missing
 /// here FAILS that test rather than quietly making this gate mean something
 /// else.
-const FLEET_HOST_TRIPLES: &[&str] = &["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"];
+///
+/// `x86_64-apple-darwin` joined on 2026-09-19, by that test doing exactly its
+/// job. `mac-x64` was not a cell until `fa57c6f97` (`the six triples atpkg
+/// publishes are the six a compiler reads`) added it with `linux-arm` and
+/// `win-arm`, and the fleet's Intel Mac HOSTS that triple — so from the day the
+/// cell arrived, `cells-foreign` was cross-compiling on the other boxes a cell
+/// this one builds natively, which is the host-vs-cross divergence the two
+/// bullets above describe. Measured on that box (macOS 13.7.8, 4-core x86_64) in
+/// the merge gate's own test stage: the test failed naming this const and the
+/// triple to add. The subset it leaves is `win`, `wasm-cpu`, `wasm-gpu`,
+/// `linux-arm` and `win-arm` — still non-empty, and still carrying the Windows
+/// and wasm32 cells that are the gate's reason to exist.
+const FLEET_HOST_TRIPLES: &[&str] = &[
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+];
 
 /// The cells [`gate_cells_foreign`] compiles: every forge cell whose triple is
 /// in nobody's [`FLEET_HOST_TRIPLES`]. DERIVED from

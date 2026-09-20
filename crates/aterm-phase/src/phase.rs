@@ -794,24 +794,45 @@ fn is_said(row: &str, width: Option<usize>) -> bool {
 /// under it skipped) is a block under the `⎿` gutter — Claude Code's own
 /// output, never the worker's `⏺` prose, a paragraph of it or a user row —
 /// and the block OPENS with a limit notice; or the footer under the bottom
-/// rule carries one. Anything said after a notice makes it history: a later
+/// rule carries one; or a banner row Claude Code parks under the last thing
+/// said — between it and the composer's top rule, the status row's own
+/// position included, above or below a done row — a status glyph first
+/// ([`is_status_row`]: `⚠`, never a spinner's) opens with one: `⚠ Usage
+/// limit reached · continuing automatically at 1:50pm · esc to cancel` (its
+/// text measured 2026-09-17 13:50 on the live worker; a second reading said
+/// `continuing shortly`; where on the screen Claude Code draws it was not
+/// measured, so the banner, the footer and the gutter all read it,
+/// [`banner_limit`]). Anything said after a notice makes it history: a later
 /// turn's words (a background command or a monitor event starts one with no
 /// user row), the `/model` output that switched the model (measured), the
-/// worker's reply to a retry.
+/// worker's reply to a retry — the turn the auto-continue notice resumed,
+/// once its words are under it. Whether the worker WORKS under a notice is
+/// [`worker_phase`]'s to say, not this function's: the auto-continue notice
+/// stays on the screen while the worker resumes under it, and a busy status
+/// row or footer under a notice makes the screen busy, never limited.
 ///
 /// A notice opens with `You've reached your … limit` / `You've hit your …
 /// limit` (Claude Code's second person — `You've reached your Fable limit. Run
 /// /usage-credits to continue or switch models with /model.`, `You've hit your
 /// session limit · resets 7:30pm (America/Los_Angeles)`), with a few words and
 /// `limit reached` (`5-hour limit reached ∙ resets 3am`, `Claude usage limit
-/// reached. Your limit will reset at 3pm (America/New_York).`), or with `API
-/// Error` and a rate or usage limit (`API Error: Rate limit reached for
-/// requests`). Text that says `Approaching` a limit is a warning, and never
-/// counts. The block's continuation rows are part of the message; `reset` is
-/// read from whichever of its rows says `resets …` / `reset at …`.
+/// reached. Your limit will reset at 3pm (America/New_York).`, `⚠ Usage limit
+/// reached · continuing automatically at 1:50pm`), or with `API Error` and a
+/// rate or usage limit (`API Error: Rate limit reached for requests`). Text
+/// that says `Approaching` a limit is a warning, and never counts. The
+/// block's continuation rows are part of the message; `reset` is read from
+/// whichever of its rows says `resets …` / `reset at …` — or, the
+/// auto-continue notice, `continuing automatically at <time>` / `continuing
+/// shortly` ([`reset_of`]).
 pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
-    if let Some(found) = composer_frame(rows).and_then(|f| footer_limit(&rows[f.bottom + 1..])) {
-        return Some(found);
+    if let Some(frame) = composer_frame(rows) {
+        if let Some(found) = footer_limit(&rows[frame.bottom + 1..]) {
+            return Some(found);
+        }
+        let width = rows[frame.bottom].trim_end().chars().count();
+        if let Some(found) = banner_limit(rows, frame.top, width) {
+            return Some(found);
+        }
     }
     let last = last_said_index(rows)?;
     let open = gutter_open(rows, last)?;
@@ -851,16 +872,49 @@ fn footer_limit(footer: &[String]) -> Option<(String, Option<String>)> {
         })
 }
 
+/// A notice on a banner row under the last thing said: the rows after
+/// [`last_said_index`]'s (from the top of the screen when nothing is said)
+/// up to the composer's top rule — the status row's own position included,
+/// so a notice above a done row with nothing said between counts as one
+/// below it — the lowest row that starts with a status glyph
+/// ([`is_status_row`]: `⚠`, `✔`, …, never a spinner's) and opens with a
+/// limit notice. A banner starts where Claude Code's own rows do — in the
+/// transcript's columns, short of the gutter's text column, or against the
+/// right edge as a hint ([`is_hint`]; the update banner is drawn there) —
+/// and never on a row that hangs from a `⎿` gutter ([`gutter_open`]): a
+/// tool's output is the worker's words at whatever column it puts them, a
+/// peer's screen the worker read included, right-aligned as the peer's
+/// Claude Code drew it (the round-20 review: such a copy twenty columns in
+/// read as the wall). A blank row ends the gutter's block; a banner under
+/// that blank is Claude Code's own. A notice above a said row is history
+/// and is not looked at.
+fn banner_limit(rows: &[String], top: usize, width: usize) -> Option<(String, Option<String>)> {
+    let from = last_said_index(rows).map_or(0, |i| i + 1);
+    (from..top).rev().find_map(|i| {
+        let row = &rows[i];
+        let t = row.trim();
+        let placed = (leading_spaces(row) < GUTTER_TEXT_COLUMN || is_hint(row, Some(width)))
+            && gutter_open(rows, i).is_none();
+        (placed && is_status_row(t) && !is_glyph_row(t) && is_limit_notice(t))
+            .then(|| (t.to_string(), reset_of(t)))
+    })
+}
+
+/// The column the `⎿` gutter's text starts at (`  ⎿  queued 8 runs`): a
+/// block's continuation rows are indented to it or further.
+const GUTTER_TEXT_COLUMN: usize = 5;
+
 /// The `⎿` row that opens the gutter block row `i` belongs to: `i` itself, or
-/// the row its continuation rows (indented to the gutter's text, five columns
-/// or more) hang from. `None` when `i` is not under the gutter.
+/// the row its continuation rows (indented to the gutter's text,
+/// [`GUTTER_TEXT_COLUMN`] or more) hang from. `None` when `i` is not under
+/// the gutter.
 fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
     loop {
         let t = rows[i].trim_start();
         if t.starts_with('⎿') {
             return Some(i);
         }
-        if t.is_empty() || leading_spaces(&rows[i]) < 5 {
+        if t.is_empty() || leading_spaces(&rows[i]) < GUTTER_TEXT_COLUMN {
             return None;
         }
         i = i.checked_sub(1)?;
@@ -904,11 +958,22 @@ fn second_person_limit(lower: &str) -> bool {
 
 /// When the notice says the limit resets: the text after `resets at ` /
 /// `reset at ` / `resets `, up to a ` · ` or ` ∙ ` separator, without a closing
-/// `.`.
+/// `.`. The auto-continue notice names no reset but says when Claude Code
+/// goes on by itself, which is the same clock: the text after `continuing
+/// automatically at ` (`1:50pm`), or `shortly` for `continuing shortly` —
+/// the word as printed, so the `reset=` a line carries is what the screen
+/// said (`aterm-agent`'s `limit::parse_reset` reads both).
 fn reset_of(message: &str) -> Option<String> {
-    let at = ["resets at ", "reset at ", "resets "]
-        .iter()
-        .find_map(|k| find_ascii_ci(message, k).map(|i| i + k.len()))?;
+    let Some(at) = [
+        "resets at ",
+        "reset at ",
+        "resets ",
+        "continuing automatically at ",
+    ]
+    .iter()
+    .find_map(|k| find_ascii_ci(message, k).map(|i| i + k.len())) else {
+        return find_ascii_ci(message, "continuing shortly").map(|_| "shortly".to_string());
+    };
     let rest = &message[at..];
     let cut = [" · ", " ∙ "]
         .iter()
@@ -2531,6 +2596,241 @@ mod tests {
             "  ⏵⏵ auto mode on     Approaching usage limit · resets at 7pm",
         );
         assert_eq!(worker_phase(&warns), Phase::Idle);
+    }
+
+    /// The auto-continue notice (its text measured 2026-09-17 13:50 on the
+    /// live worker, the rows around it reconstructed): a banner row Claude
+    /// Code parks in the live zone, `⚠` first, that names no reset the old
+    /// spellings had — and it STAYS on the screen while the worker resumes
+    /// under it. Alone above the top rule, with nothing busy under it, the
+    /// worker is LIMITED, and the reset is the time it says it continues at
+    /// (`1:50pm`), or `shortly`; with a spinner status row under it, or a
+    /// busy footer (`esc to interrupt`, `2 shells`), the worker is BUSY —
+    /// the notice is history the moment the worker works — and the same
+    /// three rows in the footer or under the `⎿` gutter read the same way.
+    /// A banner above a done row is history, idle.
+    #[test]
+    fn the_auto_continue_notice_is_limited_alone_and_busy_once_the_worker_works() {
+        const NOTICE: &str =
+            "⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel";
+        const SHORTLY: &str = "⚠ Usage limit reached · continuing shortly · esc to cancel";
+        const SPINNER: &str = "✶ Deliberating… (4s · ↑ 1.2k tokens · esc to interrupt)";
+        const IDLE_FOOTER: &str = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+        const BUSY_FOOTER: &str =
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · 2 shells";
+        let transcript = [
+            "❯ run the campaign",
+            "",
+            "⏺ Bash(./run.sh --queue 8)",
+            "  ⎿  queued 8 runs",
+            "",
+        ];
+        let with = |live: &[&str], footer: &str| {
+            let mut body: Vec<&str> = transcript.to_vec();
+            body.extend_from_slice(live);
+            screen(&body, footer)
+        };
+        // The wait: the notice alone, nothing busy under it.
+        let waiting = with(&[NOTICE], IDLE_FOOTER);
+        assert_eq!(signal(&waiting), None);
+        assert_eq!(
+            limit_notice(&waiting),
+            Some((NOTICE.to_string(), Some("1:50pm".to_string())))
+        );
+        assert_eq!(
+            worker_phase(&waiting),
+            Phase::Limited {
+                message: NOTICE.to_string(),
+                reset: Some("1:50pm".to_string()),
+            }
+        );
+        assert_eq!(
+            worker_phase(&with(&[SHORTLY], IDLE_FOOTER)),
+            Phase::Limited {
+                message: SHORTLY.to_string(),
+                reset: Some("shortly".to_string()),
+            }
+        );
+        // The exact three rows of the live defect: the notice, a spinner
+        // status row, the busy footer — BUSY, by the status row.
+        let resumed = with(&[NOTICE, SPINNER], BUSY_FOOTER);
+        assert_eq!(signal(&resumed).as_deref(), Some("status row: spinner"));
+        assert_eq!(worker_phase(&resumed), Phase::Busy);
+        // The footer alone busy, no spinner: busy by the footer.
+        let shells = with(&[NOTICE], BUSY_FOOTER);
+        assert_eq!(signal(&shells).as_deref(), Some("footer: esc to interrupt"));
+        assert_eq!(worker_phase(&shells), Phase::Busy);
+        assert_eq!(
+            worker_phase(&with(&[SHORTLY, SPINNER], IDLE_FOOTER)),
+            Phase::Busy
+        );
+        // The turn over, the notice above the done row is history.
+        let ended = with(
+            &[
+                NOTICE,
+                "⏺ All 8 runs are in.",
+                "",
+                "✻ Worked for 3m 2s · done 2:10 PM",
+                "",
+            ],
+            IDLE_FOOTER,
+        );
+        assert_eq!(limit_notice(&ended), None);
+        assert_eq!(worker_phase(&ended), Phase::Idle);
+        // The same notice in the footer, and under the gutter: limited alone,
+        // busy with a spinner under it.
+        let footer_wait = with(&[], &format!("  {NOTICE}"));
+        assert_eq!(
+            worker_phase(&footer_wait),
+            Phase::Limited {
+                message: NOTICE.to_string(),
+                reset: Some("1:50pm".to_string()),
+            }
+        );
+        assert_eq!(
+            worker_phase(&with(&[SPINNER], &format!("  {NOTICE}"))),
+            Phase::Busy
+        );
+        let gutter = format!("  ⎿  {SHORTLY}");
+        assert_eq!(
+            worker_phase(&with(&[gutter.as_str(), ""], IDLE_FOOTER)),
+            Phase::Limited {
+                message: SHORTLY.to_string(),
+                reset: Some("shortly".to_string()),
+            }
+        );
+        assert_eq!(
+            worker_phase(&with(&[gutter.as_str(), "", SPINNER], BUSY_FOOTER)),
+            Phase::Busy
+        );
+        // A banner that is not a notice stays what it was: parked, not the
+        // wall.
+        let banner = with(&["✔ Update installed · Restart to update"], IDLE_FOOTER);
+        assert_eq!(worker_phase(&banner), Phase::Idle);
+        // The continuation cancelled by hand (`esc`), the turn ended on the
+        // notice: the notice above a done row with nothing said between is
+        // the wall still — and so is one drawn against the right edge, where
+        // Claude Code parks its update banner.
+        let cancelled = with(
+            &[NOTICE, "", "✻ Worked for 3m 2s · done 1:52 PM", ""],
+            IDLE_FOOTER,
+        );
+        assert_eq!(
+            worker_phase(&cancelled),
+            Phase::Limited {
+                message: NOTICE.to_string(),
+                reset: Some("1:50pm".to_string()),
+            }
+        );
+        let right = format!("{NOTICE:>118}");
+        assert_eq!(
+            worker_phase(&with(&[right.as_str()], IDLE_FOOTER)),
+            Phase::Limited {
+                message: NOTICE.to_string(),
+                reset: Some("1:50pm".to_string()),
+            }
+        );
+        // A copy of the notice in a tool's output — a peer's screen the
+        // worker read, indented under the gutter — is the worker's words,
+        // not the wall.
+        let quoted = with(
+            &[
+                "⏺ Bash(aterm ctl @s-9 text)",
+                "  ⎿  ✻ Worked for 3m 2s · done 1:50 PM",
+                &format!("     {NOTICE}"),
+                "",
+            ],
+            IDLE_FOOTER,
+        );
+        assert_eq!(limit_notice(&quoted), None);
+        assert_eq!(worker_phase(&quoted), Phase::Idle);
+        assert_eq!(
+            reset_of("Usage limit reached · Continuing automatically at 11:05 am · esc to cancel"),
+            Some("11:05 am".to_string())
+        );
+        assert_eq!(
+            reset_of("⚠ Usage limit reached · continuing shortly."),
+            Some("shortly".to_string())
+        );
+    }
+
+    /// A copy of the notice in a tool's output can sit anywhere on its row:
+    /// `aterm ctl @s-9 text` of a peer whose Claude Code parks the banner
+    /// against ITS right edge lands the row right-aligned under the `⎿`
+    /// gutter — twenty columns in and more, where a hint starts. The rows
+    /// under the gutter are the worker's words whatever their column; the
+    /// wall is never read there.
+    #[test]
+    fn a_right_aligned_copy_under_the_gutter_is_not_the_wall() {
+        const NOTICE: &str =
+            "⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel";
+        let right = format!("     {NOTICE:>100}");
+        let quoted = screen(
+            &[
+                "❯ is the other worker limited?",
+                "",
+                "⏺ Bash(aterm ctl @s-9 text | grep limit)",
+                "  ⎿  ✻ Worked for 3m 2s · done 1:50 PM",
+                &right,
+                "",
+            ],
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        );
+        assert_eq!(limit_notice(&quoted), None, "{right:?}");
+        assert_eq!(worker_phase(&quoted), Phase::Idle);
+        // A copy against the screen's own right edge, as the peer's was,
+        // reads the same — however many rows of the block are above it.
+        let edge = format!("{NOTICE:>118}");
+        let quoted = screen(
+            &[
+                "⏺ Bash(aterm ctl @s-9 text)",
+                "  ⎿  ⏺ Running the A/B on m7 now.",
+                "     ✻ Worked for 3m 2s · done 1:50 PM",
+                &edge,
+                "",
+            ],
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        );
+        assert_eq!(worker_phase(&quoted), Phase::Idle);
+        // A blank row under the gutter ends the block: a banner after it,
+        // wherever Claude Code draws it, is the wall.
+        let after = screen(
+            &["⏺ Bash(./run.sh)", "  ⎿  queued 8 runs", "", &edge],
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        );
+        assert!(matches!(worker_phase(&after), Phase::Limited { .. }));
+    }
+
+    /// The reviewer's design note (round 20): a continuation that said
+    /// nothing — the notice, a blank, a done row, no words — is the same
+    /// screen as the continuation cancelled by hand, and reads LIMITED
+    /// on purpose: the two cannot be told apart, and the wall missed is the
+    /// two-day stall while the wall read wrongly is one probe's answer
+    /// (`EVENT resumed`) away — and Claude Code prints its words before a
+    /// done row on every measured turn.
+    #[test]
+    fn a_silent_continuation_reads_as_the_cancelled_wall() {
+        const NOTICE: &str =
+            "⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel";
+        let silent = screen(
+            &[
+                "⏺ Bash(./run.sh --queue 8)",
+                "  ⎿  queued 8 runs",
+                "",
+                NOTICE,
+                "",
+                "✻ Worked for 3m 2s · done 1:52 PM",
+                "",
+            ],
+            "  ⏵⏵ auto mode on (shift+tab to cycle)",
+        );
+        assert_eq!(
+            worker_phase(&silent),
+            Phase::Limited {
+                message: NOTICE.to_string(),
+                reset: Some("1:50pm".to_string()),
+            }
+        );
     }
 
     /// The worker's words about limits are never the wall: its `⏺` prose, a

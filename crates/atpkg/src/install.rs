@@ -2192,6 +2192,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&b.dir);
     }
 
+    // THE GUARD ABOVE MUST NOT RE-OPEN THE LEAK IT WAS ADDED BESIDE. What it protects is a
+    // parked TREE: the swap moves a directory to `<build>.superseded-<pid>`, and that is the
+    // predicate `recover_interrupted_swap` itself filters on. Written as "skip every
+    // superseded entry", it also spared a regular file (or a symlink) at that name — nobody's
+    // only copy, and the one entry NEITHER sweeper can otherwise reclaim: `remove_dir_all`
+    // fails on a file and `gc`'s pass scans directories only. So it leaked forever, three
+    // paragraphs under the doc that says this function closes exactly that leak, and while it
+    // sat there it blocked every later swap of this build by a process holding the same pid.
+    #[test]
+    fn the_parked_guard_spares_a_parked_tree_not_a_file_at_the_same_name() {
+        let b = bundle("crash-window-nondir");
+        let (build, witness) = b.installed();
+        let parked = crate::store::superseded_dir(&build).unwrap();
+        crate::store::clear_build_ready(&build).unwrap();
+        std::fs::rename(&build, &parked).unwrap();
+        // A second parked tree, so recovery refuses to guess and the guard stays ENGAGED:
+        // were `<build>` restored, the sweep would take every sibling anyway and this test
+        // would prove nothing.
+        let other = build.with_file_name(format!(
+            "{}.superseded-4242",
+            build.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::create_dir_all(&other).unwrap();
+        // THE LEAK: a regular file at a superseded scratch name.
+        let stray = build.with_file_name(format!(
+            "{}.superseded-9999",
+            build.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::write(&stray, b"not a tree").unwrap();
+        assert!(!build.exists(), "PRECONDITION: the swap window, ambiguous");
+
+        crate::store::sweep_stage_scratch(&build);
+
+        assert!(
+            !stray.exists(),
+            "a file at a scratch name is no tree of anyone's, and no other sweeper can ever \
+             reclaim it"
+        );
+        assert!(
+            parked.join(witness.file_name().unwrap()).exists(),
+            "and the guard still keeps the only copy of the user's tree"
+        );
+        assert!(
+            other.is_dir(),
+            "and the tree it could not be told apart from"
+        );
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
     // The store sweep's recogniser must honour the SAME promise `gc::is_stage_scratch`
     // writes down: an unguarded `remove_dir_all` in a directory the user can also put
     // things in only fires on the producer's exact shape. `<build>.incoming-drafts` is not

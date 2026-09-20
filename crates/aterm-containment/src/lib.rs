@@ -177,10 +177,11 @@ pub use capability::{
 // completion on the crate root.
 pub use consent::{
     Attribution, CachedProbe, ConsentCache, ConsentKey, ConsentPosture, DrClass, FdaProbe,
-    FdaScope, FdaState, Folder, FsConsent, PostureInputs, ProbeGate, ProbeLabel, ProbeOutcome,
-    ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus, Responsible,
-    ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr, probe_fda,
-    protected_roots, responsible_app, responsible_pid,
+    FdaScope, FdaState, Folder, FsConsent, ImageAnchor, PostureInputs, ProbeGate, ProbeLabel,
+    ProbeOutcome, ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus,
+    Responsible, ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr,
+    classify_image_anchor, image_anchor, probe_fda, protected_roots, responsible_app,
+    responsible_pid,
 };
 pub use mode::{ContainmentMode, ParseModeError};
 pub use output_filter::OutputSanitizer;

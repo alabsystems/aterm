@@ -10,8 +10,11 @@
 //! versions into `~/.local/share/claude/versions/` that the managed shim never runs —
 //! wasted bandwidth and a `claude doctor` complaint — while the signed index re-pin is
 //! the only update path atpkg honours. Claude Code honours `DISABLE_AUTOUPDATER=1` (the
-//! background check stops; `claude update` still works) and `DISABLE_UPDATES=1` (blocks
-//! all). So the signed pkg manifest may declare
+//! background check stops; `claude update` still works — measured 2026-09-19, exit 0 —
+//! and on the MANAGED name it is answered, since that day, by the twin's self-update
+//! intercept ([`crate::selfupdate`]), which runs the standard `aterm pkg update claude`;
+//! this switch stays the background-updater half) and `DISABLE_UPDATES=1` (blocks all).
+//! So the signed pkg manifest may declare
 //!
 //! ```toml
 //! shim_env = ["DISABLE_AUTOUPDATER=1"]

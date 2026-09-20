@@ -429,6 +429,10 @@ impl App {
         let split = crate::control_privacy::covers_split(facts.fda, evidence);
         crate::native_settings::MacosAccess {
             enabled: facts.enabled,
+            // Read FRESH, never cached: the whole point is that it changes
+            // under a running process when an apply renames the bundle out
+            // from under it and boot-health deletes it.
+            anchor: aterm_containment::image_anchor(),
             fda: facts.fda,
             probe: facts.probe,
             dr: facts.dr,
@@ -2068,7 +2072,7 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return Vec::new();
         };
-        let strip = usize::from(self.chrome_rows());
+        let strip = usize::from(self.chrome_rows(wid));
         let total = plan.leaves.len();
         plan.leaves
             .iter()
@@ -2147,7 +2151,7 @@ impl App {
         cols: std::ops::Range<usize>,
     ) -> Option<crate::accesskit_tree::GridSpan> {
         let ws = self.windows.get(&wid)?;
-        let strip = usize::from(self.chrome_rows());
+        let strip = usize::from(self.chrome_rows(wid));
         let mut keys: Vec<aterm_core::render::SelectionRowKey> = Vec::new();
         let mut anchor: Option<(usize, usize)> = None;
         let mut focus: Option<(usize, usize)> = None;
@@ -2273,6 +2277,15 @@ impl App {
         };
         let mut out: Vec<GridMessage> = Vec::new();
 
+        // THE PRESENCE BAND FIRST (round 19): it is painted directly under the strip,
+        // above the bars, in the one row its window committed — so it is bar row 0 and
+        // every bar below it moves down by that row. Its sentence is the band's words
+        // ("driven by manager, turn 41"); the fitted line is the detail.
+        let presence_rows = usize::from(ws.presence.rows);
+        if let Some(message) = self.presence_a11y_message(wid) {
+            out.push(message);
+        }
+
         // The status bands, top to bottom, but only the ones whose rows the geometry has
         // actually committed — `splice_status_bars` trims its painted cache to that count
         // too, so the tree can never describe a band the frame does not carry.
@@ -2282,6 +2295,7 @@ impl App {
             .take(usize::from(self.status_bar_rows))
             .enumerate()
         {
+            let row = row + presence_rows;
             let mut text = bar.text.title.clone();
             if !bar.text.detail.is_empty() {
                 text.push_str(" \u{00b7} ");
@@ -2291,6 +2305,9 @@ impl App {
                 message: match lane {
                     crate::status_bars::Lane::Toolchain => ChromeMessage::ToolchainStatus,
                     crate::status_bars::Lane::Update => ChromeMessage::UpdateStatus,
+                    // Never yielded by `bars()` (the presence row is per window and
+                    // published above); the arm keeps the match total.
+                    crate::status_bars::Lane::Presence => ChromeMessage::PresenceStatus,
                 },
                 text,
                 detail: (!bar.text.stats.is_empty()).then(|| bar.text.stats.clone()),
@@ -2395,6 +2412,9 @@ impl App {
     ) {
         use crate::accesskit_tree::ChromeMessage;
         match message {
+            // The presence band informs and never activates (`activates: false`); a
+            // stale activate on it is a no-op, like a click on it.
+            ChromeMessage::PresenceStatus => {}
             ChromeMessage::Notice => {
                 // `App::notice_click`'s gates, minus its hit test: the card must be on
                 // THIS window's glass and still legible. No kind carries a one-press
@@ -2437,6 +2457,7 @@ impl App {
                         let _ =
                             self.open_settings_tab(crate::native_settings::SettingsRoute::Packages);
                     }
+                    crate::status_bars::Lane::Presence => {}
                     // The same press rule as the mouse path: a staged row applies.
                     crate::status_bars::Lane::Update => self.press_update_bar(),
                 }

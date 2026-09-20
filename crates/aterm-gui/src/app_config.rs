@@ -1081,6 +1081,11 @@ pub(crate) struct Config {
     /// costume mode is opt-in, required by the zero-cost pins); set
     /// `enabled = true` to rain. See [`MatrixRainConfig`].
     pub(crate) matrix_rain: Option<MatrixRainConfig>,
+    /// PRESENCE (`[presence]`, round 19): the two surfaces a window shows who
+    /// is driving it on — the band under the tab bar and the colour rim —
+    /// each a durable on/off the View menu's checkables write. Absent ⇒ both
+    /// ON. See [`PresenceConfig`].
+    pub(crate) presence: Option<PresenceConfig>,
     /// PRISM WAKE — the output streak (`[output_streak]`,
     /// `docs/DESIGN-output-streak-2026-08-30.md`): a thin per-theme rainbow
     /// comet answering fresh PROGRAM OUTPUT, plus one soft pip per episode.
@@ -2499,6 +2504,26 @@ pub(crate) struct MatrixRainConfig {
     /// Field seed. 0 (default) ⇒ a stable per-window seed is derived at
     /// engine build; nonzero ⇒ reproducible (demos/tests).
     pub(crate) seed: Option<u64>,
+}
+
+/// The `[presence]` table (round 19, SPEC19 §9): the View ▸ Presence Band and
+/// Presence Rim checkables' durable state. BOTH ON BY DEFAULT — the band and
+/// the rim are how a window says who is driving it, and a quiet window costs
+/// nothing for them (the rim is change-driven, the row folds). Every field is
+/// optional; an absent key and `true` are indistinguishable, which is what the
+/// resolvers [`Config::presence_band_enabled`] / [`Config::presence_rim_enabled`]
+/// encode. The toggles write the leaf keys (`presence.band`, `presence.rim`)
+/// through the one serialized config lane, never a whole-table rewrite.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct PresenceConfig {
+    /// The band row under the tab bar. Absent ⇒ shown (its fold law applies);
+    /// `false` ⇒ hidden, and `chrome` reports an empty band.
+    pub(crate) band: Option<bool>,
+    /// The colour rim. Absent ⇒ shown; `false` ⇒ never painted (the band,
+    /// when shown, still says the fact in words — the rim never carried a fact
+    /// the band does not).
+    pub(crate) rim: Option<bool>,
 }
 
 /// The `[output_streak]` table — PRISM WAKE
@@ -4582,6 +4607,18 @@ impl Config {
             .as_ref()
             .and_then(|mr| mr.enabled)
             .unwrap_or(false)
+    }
+
+    /// The `[presence] band` RESOLVED bit (default TRUE): whether the presence
+    /// band row is shown. See [`PresenceConfig`].
+    pub(crate) fn presence_band_enabled(&self) -> bool {
+        self.presence.as_ref().and_then(|p| p.band).unwrap_or(true)
+    }
+
+    /// The `[presence] rim` RESOLVED bit (default TRUE): whether the presence
+    /// rim is painted.
+    pub(crate) fn presence_rim_enabled(&self) -> bool {
+        self.presence.as_ref().and_then(|p| p.rim).unwrap_or(true)
     }
 
     /// The `[packages]` `auto_update` RESOLVED bit (default TRUE — today's 6h
@@ -9146,7 +9183,7 @@ impl App {
             pad,
             ch,
         ) as u16;
-        let rows = win_rows.saturating_sub(self.chrome_rows()).max(1);
+        let rows = win_rows.saturating_sub(self.chrome_rows(wid)).max(1);
         (rows, cols)
     }
 
@@ -9191,7 +9228,7 @@ impl App {
         let base_h = self.win_head(wid)
             + self.win_pad_top(wid)
             + pad
-            + (1 + usize::from(self.chrome_rows())) * ch;
+            + (1 + usize::from(self.chrome_rows(wid))) * ch;
         let min_h = base_h + floor_h.saturating_sub(base_h).div_ceil(ch) * ch;
         PhysicalSize::new(
             u32::try_from(min_w).unwrap_or(u32::MAX),
@@ -10501,6 +10538,10 @@ impl App {
         // just-reloaded `enabled` bit) — re-resolve it so the row can't show
         // the pre-reload state until closed and reopened.
         self.rain_dirty = true;
+        // [presence]: a reload can flip the band or the rim (a hand edit, or
+        // the View toggles' own durable write landing) — adopt the bits and
+        // re-project every window (`app_fabric_menu.rs`).
+        self.adopt_presence_config();
         self.palette_refresh_live();
         // [packages] consent flags feed the Settings ▸ Packages projection;
         // re-publish (memory-only) so a flipped switch or a hand-edit shows on

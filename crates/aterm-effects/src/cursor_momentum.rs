@@ -79,6 +79,14 @@ pub const MOMENTUM_GLOW_TAU_S: f32 = 1.2;
 /// At or above this the cursor is HOT: blink is suppressed and the halo is
 /// on glass. Below it the cursor is exactly the configured cursor. Chosen to
 /// match the rainbow twinkle's settled-energy floor.
+///
+/// WHICH VALUE IS COMPARED MATTERS, and two published readings get it wrong on
+/// purpose: [`TypingRate::hot`] and [`TypingRate::cold_at`] test the RAW decayed
+/// rate, while the gate that decides the glass ([`MomentumGlow::tick`]) tests
+/// the raw rate SCALED BY `intensity`. Those part company for any intensity
+/// below ~1, so `hot` answers a question about the typing rate, not about
+/// whether anything is drawn. Read `MomentumGlow::is_active` (which reads the
+/// latched, post-intensity value) for the glass.
 pub const MOMENTUM_GLOW_HOT: f32 = 0.02;
 
 /// Snap-to-exact-zero threshold: below this the value reads 0 and the state
@@ -235,11 +243,28 @@ impl MomentumGlow {
 
     /// While hot the host needs a frame every ~33 ms (the present gate dedups
     /// identical u8 frames); cold needs nothing.
+    ///
+    /// READS THE SAME QUANTITY THE GLASS DOES. This asked `TypingRate::hot`,
+    /// which tests the RAW rate, while [`Self::tick`] goes inert on
+    /// `raw * intensity < MOMENTUM_GLOW_HOT`. Since intensity is at most 1 the
+    /// two can only disagree one way — the deadline says "keep waking" for an
+    /// effect that draws nothing — and it disagrees precisely when intensity is
+    /// low, which on the shipped path is the motion-amplitude preference times
+    /// the load-shed envelope. That is a 33 ms wake loop for an inert effect
+    /// exactly under reduced motion and load shed, the two states that asked for
+    /// less work.
+    ///
+    /// It takes the config now rather than a bare `tau_s` so it cannot read a
+    /// different number than the gate again.
     #[must_use]
-    pub fn next_change_deadline(&self, now: Instant, tau_s: f32) -> Option<Instant> {
-        self.rate
-            .hot(now, tau_s)
-            .then(|| now + std::time::Duration::from_millis(33))
+    pub fn next_change_deadline(&self, now: Instant, cfg: &MomentumGlowConfig) -> Option<Instant> {
+        let raw = self.rate.value(now, cfg.tau_s);
+        let a = if cfg.intensity.is_finite() {
+            (raw * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (cfg.enabled && a >= MOMENTUM_GLOW_HOT).then(|| now + std::time::Duration::from_millis(33))
     }
 
     /// One frame. Pushes additive quads into `out` (the host's aurora
@@ -420,6 +445,52 @@ mod tests {
             dark_theme: dark,
             block: true,
         }
+    }
+
+    /// THE WAKE DEADLINE AGREES WITH THE GLASS. `next_change_deadline` asked
+    /// `TypingRate::hot`, which tests the RAW decayed rate, while `tick` goes
+    /// inert on `raw * intensity < MOMENTUM_GLOW_HOT`. Intensity is at most 1,
+    /// so the two can only disagree one way: the deadline says "keep waking" for
+    /// an effect that draws nothing — and it does so precisely when intensity is
+    /// low, which on the shipped path is the motion-amplitude preference times
+    /// the load-shed envelope. A 33 ms wake loop for an inert effect, under
+    /// exactly the two states that asked for less work.
+    #[test]
+    fn the_wake_deadline_never_outlives_what_the_glass_draws() {
+        let t0 = Instant::now();
+        let mut glow = MomentumGlow::default();
+        let mut cfg = on(0x0000_0000, true);
+        let mut out: Vec<GlowQuad> = Vec::new();
+
+        // A real run of typing, read at the last key: hot on the raw rate.
+        let last = script(&mut glow.rate, t0, 12.0, 2.0);
+        assert!(
+            glow.rate.value(last, cfg.tau_s) >= MOMENTUM_GLOW_HOT,
+            "fixture: the raw rate is hot"
+        );
+
+        // POSITIVE CONTROL at full intensity: drawn, and a deadline asked for.
+        out.clear();
+        let full = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out);
+        assert!(full.hot, "fixture: at intensity 1 it is on glass");
+        assert!(
+            glow.next_change_deadline(last, &cfg).is_some(),
+            "and the host is asked for the next frame"
+        );
+
+        // Now scale it below the floor — the state a low motion amplitude or a
+        // load-shed envelope produces.
+        cfg.intensity = MOMENTUM_GLOW_HOT / glow.rate.value(last, cfg.tau_s) * 0.5;
+        out.clear();
+        let dim = glow.tick(Some((1, 1)), last, geom(), &cfg, &mut out);
+        assert!(
+            !dim.hot && out.is_empty(),
+            "fixture: scaled below the floor the effect is inert"
+        );
+        assert!(
+            glow.next_change_deadline(last, &cfg).is_none(),
+            "an inert effect must not hold the host at a 33 ms wake loop"
+        );
     }
 
     /// Feed keys at `rate` keys/s from `t0` for `secs`; returns the instant of

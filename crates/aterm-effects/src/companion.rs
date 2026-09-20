@@ -1002,6 +1002,7 @@ impl CompanionOwner {
         // Singing never changes the resident's caret custody. Visibility
         // still follows the real surface and user settings.
         let sense = PetSense {
+            caret_drawn: true,
             now,
             caret: if pet_caret_admitted(pet_visible, sing.drive, reduced_motion) {
                 facts.caret
@@ -1574,6 +1575,7 @@ mod law_tests {
         );
 
         let sense = PetSense {
+            caret_drawn: true,
             now,
             caret: Some((2, 10)),
             rows: 6,
@@ -1617,6 +1619,7 @@ mod law_tests {
     /// able to interrupt. Returns the brain and the clock it stopped at.
     fn a_live_pet() -> (PetBrain, Instant) {
         let sense = |now, caret| PetSense {
+            caret_drawn: true,
             now,
             caret,
             rows: 24,
@@ -1952,6 +1955,7 @@ mod law_tests {
 
         let t0 = Instant::now();
         let sense = |now, caret| PetSense {
+            caret_drawn: true,
             now,
             caret,
             rows: 24,
@@ -2196,6 +2200,7 @@ mod law_tests {
     fn history_clears_the_pet_hit_target_while_the_brain_settles() {
         let t0 = Instant::now();
         let sense = |now, caret| PetSense {
+            caret_drawn: true,
             now,
             caret,
             rows: 24,

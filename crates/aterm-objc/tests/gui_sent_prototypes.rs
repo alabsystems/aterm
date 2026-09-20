@@ -708,8 +708,19 @@ fn the_scope_is_a_named_fraction_of_the_crate() {
         in_scope.len()
     );
     let uncovered = crate_wide.len() - in_scope.len();
+    // 282 -> 283 on 2026-09-19 (merge): main carried it to 282 while this branch
+    // carried it to 281 from the same 280, and the two moves are independent —
+    // main's rows plus this branch's one new selector is 283.
+    //
+    // This branch's move, 280 -> 281: the late park's Commit-time activation
+    // (`app_launch_successor::activate_running`) introduced exactly one selector
+    // the crate did not already send — `yieldActivationToApplication:`, the one
+    // that lets an about-to-exit parent hand the front to its successor. The
+    // other four it sends (`sharedApplication`, `respondsToSelector:`,
+    // `runningApplicationWithProcessIdentifier:`, `activateWithOptions:`) were
+    // already crate-wide, which is why this moved by one and not by five.
     assert_eq!(
-        uncovered, 280,
+        uncovered, 283,
         "the UNCENSUSED remainder of `crates/aterm-gui/src` moved to {uncovered}. \
          That is not a failure — it is the number this file exists to make \
          visible. Update it in the commit that moves it, in either direction"

@@ -1277,6 +1277,21 @@ pub struct RenderInput {
     /// Host-owned animation; the engine leaves it untouched. EMPTY in the
     /// common case (feature off / no match) → byte-identical to the pre-cat
     /// render path.
+    ///
+    /// **ATERM'S OWN CURSOR CAT DOES NOT COME THROUGH HERE.** It is emitted as
+    /// [`free_sprites`](RenderInput::free_sprites) — one `FreeSprite` per
+    /// peeking cat plus its gaze dots (overlay Phase 4) — and aterm's GUI only
+    /// ever CLEARS this channel. That is worth stating where a reader lands,
+    /// because the two channels have different DIRTY-MARKING rules and the
+    /// difference decides whether a moved sprite leaves a ghost: a cat quad is
+    /// marked by its `row` tag alone, on the invariant above, while a free
+    /// sprite has no row tag and its true pixel extent is re-derived to mark
+    /// every band it covers. Chasing a suspected one-frame artifact through the
+    /// quad arm, which nothing in this app feeds, costs an afternoon.
+    ///
+    /// The channel stays because it is part of the renderer's public input
+    /// contract and is held by the CPU/GPU parity suites (`cat_parity.rs`,
+    /// `free_parity.rs`); it is unused by this host, not unsupported.
     pub cat_quads: Vec<SpriteQuad>,
     /// RGBA8 atlas for [`cat_quads`](RenderInput::cat_quads) (host-baked by the
     /// `CatBaker`, versioned by [`SceneAtlas::version`]:

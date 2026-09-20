@@ -252,6 +252,54 @@ impl App {
         ))
     }
 
+    /// THE ONE CONSENT CLASS A HELD GRANT DOES NOT REACH, fenced off the
+    /// control surface (design §3.5's rule, applied where it was missing).
+    ///
+    /// `open_app` is reachable from inside a session, so the URI can come from
+    /// a program's output. Every other protected root is covered by the Full
+    /// Disk Access grant the design asks the owner for once — but the file
+    /// provider domains are `NEVER_COVERED`, so an open there raises
+    /// `"aterm" wants to access files managed by "iCloud Drive"` in aterm's
+    /// name however the owner has answered everything else. A dialog a program
+    /// can raise is a consent surface an agent controls, which is the same rule
+    /// that keeps the warm-up and `tccutil reset` on the Security panel and
+    /// nowhere else.
+    ///
+    /// The owner's OWN gesture is untouched: this guards the control path only.
+    /// Opening an iCloud document from the app is an explicit human choice, and
+    /// macOS asking about it then is correct.
+    ///
+    /// Fails OPEN by design. A URI that is not a `file://` path, a home that
+    /// cannot be read, or anything else unparseable is passed through — this is
+    /// a fence around one named class, not a general admission check, and
+    /// refusing what it cannot classify would break ordinary opens for no
+    /// consent benefit. The predicate is lexical and touches no filesystem
+    /// (§1.5: `canonicalize` is not gated, `open` is), so it raises nothing
+    /// itself.
+    fn refuse_file_provider_open(uri: &str) -> Result<(), String> {
+        let Ok(path) = crate::native_document_host::file_uri_path(uri) else {
+            return Ok(());
+        };
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return Ok(());
+        };
+        // Resolve where we can, so a symlink out of an ordinary folder into a
+        // synced one is still caught; fall back to the spelling when it does
+        // not resolve yet.
+        let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        if atpkg::protected::under_file_provider_domain(&home, &resolved) {
+            return Err(
+                "refusing to open a document inside a cloud-storage folder from the control \
+                 surface: macOS asks for that access in aterm's name, and no Full Disk Access \
+                 grant covers it, so a program in a session must not be able to raise it. Open \
+                 this one from the app itself."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn open_app(&mut self, request: OpenRequest) -> Result<String, String> {
         match request {
             OpenRequest::Settings(route) => self
@@ -259,9 +307,11 @@ impl App {
                 .then(|| format!("app settings {}", route.path()))
                 .ok_or_else(|| "Settings could not be opened in the requesting window".to_string()),
             OpenRequest::Markdown(uri) => {
+                Self::refuse_file_provider_open(&uri)?;
                 self.open_document_tab(crate::native_app::AppKind::Markdown, &uri)
             }
             OpenRequest::Editor(uri) => {
+                Self::refuse_file_provider_open(&uri)?;
                 self.open_document_tab(crate::native_app::AppKind::Editor, &uri)
             }
         }
@@ -2042,5 +2092,58 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// THE CONTROL SURFACE MAY NOT RAISE THE ONE DIALOG NO GRANT SILENCES.
+    ///
+    /// `open_app` takes a URI that can come from a program's output, and the
+    /// file-provider domains are `NEVER_COVERED` — an open there asks in
+    /// aterm's name whatever the owner has granted. Everything else stays
+    /// openable, because a held Full Disk Access grant reaches it and refusing
+    /// would cost the owner function for no consent benefit.
+    #[test]
+    fn the_control_surface_refuses_only_cloud_storage_opens() {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return; // no home to reason about; the guard fails open by design
+        };
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        let uri = |p: &std::path::Path| {
+            crate::native_document_host::path_to_file_uri(p).expect("a file uri")
+        };
+
+        for domain in ["Library/Mobile Documents", "Library/CloudStorage"] {
+            let path = home.join(domain).join("provider").join("notes.md");
+            let refused = crate::App::refuse_file_provider_open(&uri(&path));
+            assert!(refused.is_err(), "{}", path.display());
+            let message = refused.unwrap_err();
+            assert!(message.contains("cloud-storage"), "{message}");
+            assert!(
+                message.contains("from the app itself"),
+                "the refusal names the route that still works: {message}"
+            );
+        }
+
+        // Protected but COVERED classes stay openable — this fence is one named
+        // class, not a general admission check.
+        for ordinary in [
+            "Documents/notes.md",
+            "Desktop/notes.md",
+            "src/aterm/README.md",
+        ] {
+            let path = home.join(ordinary);
+            assert!(
+                crate::App::refuse_file_provider_open(&uri(&path)).is_ok(),
+                "{}",
+                path.display()
+            );
+        }
+
+        // Fails OPEN on anything it cannot classify.
+        for opaque in ["https://example.invalid/x", "not-a-uri", ""] {
+            assert!(
+                crate::App::refuse_file_provider_open(opaque).is_ok(),
+                "{opaque}"
+            );
+        }
     }
 }

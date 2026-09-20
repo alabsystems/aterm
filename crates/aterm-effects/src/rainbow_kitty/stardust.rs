@@ -13549,6 +13549,7 @@ mod tests {
 
     fn paw_sense(now: Instant, caret: (u16, u16)) -> PetSense {
         PetSense {
+            caret_drawn: true,
             now,
             caret: Some(caret),
             wrapped: false,

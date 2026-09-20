@@ -26,6 +26,21 @@ const PERCH_REACH: f32 = 24.0;
 /// the resident across the pane. Rows cost twice a column in this bound.
 const HOME_REACH: f32 = 6.0;
 
+/// How long the resident holds still for an UNPAINTED caret before the
+/// ordinary ladder takes over again.
+///
+/// A DECTCEM hide means "I am repainting", and a repaint is milliseconds — the
+/// fake-Claude fixture brackets one per frame at ~6/s, and a synchronized
+/// output bracket is shorter still. So a quarter second is many repaints' worth
+/// of patience and still nothing a person would call a pause.
+///
+/// It is a BOUND rather than a latch because the old hold had none: the cat sat
+/// frozen for as long as the program kept its cursor hidden — measured at
+/// 20.04 s and 20.15 s on v0.88.0, which is a `cargo build`, a `git clone`, a
+/// pager or an LLM reply, not a repaint. Past this bound the caret is still
+/// known (the host feeds it hidden or not), so the pet simply follows it.
+const HIDDEN_HOLD_MAX: f32 = 0.25;
+
 /// How long a SPENT interest — a content perch with no live event left to
 /// react to — may hold the resident before the pet is handed back its own
 /// life. The perch is a visit, not a tenancy: without this the console layer
@@ -371,6 +386,10 @@ pub(super) struct ConsoleLife {
     result_at: Option<(Instant, bool)>,
     pose: Option<PetGlyphId>,
     still: bool,
+    /// Seconds the caret has been continuously unpainted (see the hold in
+    /// [`PetBrain::tick_console_resident`] and [`HIDDEN_HOLD_MAX`]). Zeroed by
+    /// any frame that paints one, so a repainting console never accumulates.
+    hidden_hold: f32,
     tick_stamp: Option<PetWorldStamp>,
     repair_until: Option<Instant>,
     repair_target: Option<(f32, f32)>,
@@ -1207,13 +1226,36 @@ impl PetBrain {
                 if exact_scroll {
                     let dy = (stamp.top_absolute_row - old.top_absolute_row) as f32;
                     target.row -= dy;
-                    self.row -= dy;
                     body.row -= dy;
-                    leaving_view = dy > 0.0 && target.row < 2.0;
-                    if let Some(trip) = self.console.trip.as_mut() {
-                        trip.from.1 -= dy;
-                        trip.to.1 -= dy;
+                    // THE CONTENT MAY CARRY THE BODY ONLY WHILE THE BODY STAYS
+                    // ON THE GLASS. `dy` is a whole inter-tick scroll — a fast
+                    // log licenses most of a screen between two ticks — and
+                    // this subtraction had no floor, so the pet's row went
+                    // NEGATIVE and `emit`'s `self.row.clamp(0.0, max_row)`
+                    // wrote that back into brain state as exactly 0.0. That is
+                    // a draw clamp answering where the animal stands, and the
+                    // answer it gives is the top row, which is where the owner
+                    // kept finding the cat (2026-09-19). The row is also the
+                    // one coordinate nothing else restores: `leaving_view` was
+                    // judged on `target.row`, never on the body, and only ever
+                    // abandoned the anchor.
+                    //
+                    // So a scroll that would carry the body off the top does
+                    // not move it at all. The pet keeps the seat it can be
+                    // seen in, the perch it was holding is given up (the
+                    // anchor has genuinely left the view), and the caret's
+                    // escort re-stations it — which is the documented intent
+                    // here: output scrolls its own anchor, it cannot carry the
+                    // resident away from input.
+                    let scrolled_off_top = self.row - dy < 0.0;
+                    if !scrolled_off_top {
+                        self.row -= dy;
+                        if let Some(trip) = self.console.trip.as_mut() {
+                            trip.from.1 -= dy;
+                            trip.to.1 -= dy;
+                        }
                     }
+                    leaving_view = dy > 0.0 && (target.row < 2.0 || scrolled_off_top);
                 } else if old.top_absolute_row != stamp.top_absolute_row {
                     self.console.anchor = None;
                     self.console.target = None;
@@ -1270,9 +1312,51 @@ impl PetBrain {
         // the resident's last real home without inventing a caret for the move
         // sensor. Admission happens AFTER begin_console_tick has handled real
         // selection, input, and OSC command facts: hidden pixels do not erase
-        // attention ownership or lose a completion.
+        // attention ownership or lose a completion. The body is re-seated from
+        // the rect that was DRAWN, which holds the visible feet across the
+        // scroll compensation in `choose_console_perch` — output scrolls its
+        // own anchor and may not carry the resident away with it
+        // (`hidden_cursor_home_stays_put_while_real_output_scrolls`).
+        //
+        // WHAT CHANGED, 2026-09-19 — THE HOLD IS BOUNDED WHEN THERE IS
+        // SOMETHING BETTER TO DO. This arm used to fire on `sense.caret
+        // .is_none()` alone, and the host set that for a merely HIDDEN cursor
+        // (`app_render.rs`, the `cur` note). A hide is how a program says "I
+        // am repainting", and a repaint is milliseconds — but nothing bounded
+        // the hold, so the pet held its seat for as long as the program kept
+        // its cursor dark. MEASURED on the shipped v0.88.0 with `aterm ctl
+        // trail status`, driving a DECTCEM-hiding TUI: the pet sat at row 0.0
+        // for 20.04 s while the caret was on row 44, and at row 23.4 for
+        // 20.15 s in the same fixture started mid-screen — it holds wherever
+        // it stands, and "the top of the screen" is simply where it most often
+        // was standing (a fresh prompt, a `clear`, a console whose input row is
+        // near the top). When the cursor came back it crossed 28.4 cells in
+        // ONE frame. That is the owner's report of 2026-09-19: *"not correctly
+        // following the cursor reliably … getting shoved away as like a glitch
+        // … sometimes getting trapped at the top of the screen"*. Every
+        // progress bar, spinner, pager, editor and LLM console hides the
+        // cursor while it works.
+        //
+        // WHICH REFUSAL IS IT is the whole fix. The host now says separately
+        // whether a caret EXISTS and whether it is PAINTED ([`PetSense::caret`]
+        // / [`PetSense::caret_drawn`]):
+        //
+        //  * caret ABSENT — the viewport is scrolled into history, or the
+        //    song's law is withholding it. There is no better place to send a
+        //    cat than the one it is standing in, so that hold keeps its old
+        //    unbounded patience.
+        //  * caret PRESENT but unpainted — a repaint. Hold for
+        //    [`HIDDEN_HOLD_MAX`], which is many repaints' worth, and then let
+        //    the ordinary ladder follow the caret it can see perfectly well.
+        let unpainted = !sense.caret_drawn || sense.caret.is_none();
+        if unpainted {
+            self.console.hidden_hold += dt.max(0.0);
+        } else {
+            self.console.hidden_hold = 0.0;
+        }
         if self.console.presentable
-            && sense.caret.is_none()
+            && unpainted
+            && (sense.caret.is_none() || self.console.hidden_hold <= HIDDEN_HOLD_MAX)
             && self.console.cursor_home.is_some()
             && self.alpha > 0.0
         {
@@ -1294,6 +1378,25 @@ impl PetBrain {
             }
             self.console.still = true;
             self.last_caret = None;
+        } else if unpainted && sense.caret.is_some() && self.console.presentable {
+            // THE HOLD OUTLASTED THE REPAINT IT WAS FOR, and the caret is in
+            // plain sight of the brain even though the emulator is not drawing
+            // it. Bounding the hold above is not enough on its own: residency
+            // survives it, and a resident sits at `console.target`, which is
+            // the seat the hold last pinned. Nothing else resigns it while the
+            // cursor stays dark, so the cat kept the stale seat for the whole
+            // of a build (measured: 20.04 s).
+            //
+            // So hand the body back to the caret's own escort. `resident` is
+            // the console layer's claim on the pet, and this is the one
+            // condition under which it should not have one: there IS a caret,
+            // it is simply unpainted, and the ordinary ladder knows exactly
+            // where it is. A frame that paints the caret again re-establishes
+            // residency through the usual door.
+            self.console.resident = false;
+            self.console.target = None;
+            self.console.trip = None;
+            self.console.still = false;
         }
         if !self.console.resident || !self.console.presentable {
             self.console.resident_handoff = false;
@@ -2364,6 +2467,7 @@ mod tests {
             self.pet.set_console_presentable(true);
             let c = self.term.cursor();
             self.pet.tick(PetSense {
+                caret_drawn: true,
                 now: self.now,
                 caret: (self.term.cursor_visible() && self.term.grid().display_offset() == 0)
                     .then_some((c.row, c.col)),
@@ -2500,6 +2604,7 @@ mod tests {
         s.pet.observe_console(&input, &facts, PetPane::full(&input));
         s.now += Duration::from_millis(16);
         let f = s.pet.tick(PetSense {
+            caret_drawn: true,
             now: s.now,
             caret: Some((5, 23)),
             wrapped: false,
@@ -2800,6 +2905,7 @@ mod tests {
             s.now += Duration::from_millis(16);
             let input_seq = s.pet.console_input_seq();
             s.pet.tick(PetSense {
+                caret_drawn: true,
                 now: s.now,
                 caret: None,
                 wrapped: false,

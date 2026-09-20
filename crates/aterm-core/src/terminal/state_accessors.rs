@@ -901,6 +901,8 @@ impl Terminal {
         self.default_cursor_style = style;
         if was_default && self.modes.cursor_style != style {
             self.modes.cursor_style = style;
+            // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
+            self.modes.cursor_blink = style.blinks();
             if let Some(callback) = self.cursor_style_callback.as_mut() {
                 callback(style);
             }

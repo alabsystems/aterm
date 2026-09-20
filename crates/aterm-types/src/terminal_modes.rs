@@ -335,6 +335,11 @@ impl TerminalModes {
     pub fn new() -> Self {
         Self {
             cursor_visible: true,
+            // DEC mode 12 is the blink bit of `cursor_style`, whose power-on
+            // value is `BlinkingBlock` — so the power-on mode 12 is SET. The
+            // derived all-false `Default` (not used for live terminals) would
+            // otherwise claim a steady cursor while the block on screen blinks.
+            cursor_blink: true,
             auto_wrap: true,
             bidi_arrow_swap: true,
             // #7782: fail-closed. Hosts must opt in via

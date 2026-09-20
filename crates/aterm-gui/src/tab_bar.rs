@@ -51,6 +51,7 @@ use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_render::Theme;
 
+pub(crate) use crate::presence::ChipLevel;
 /// The connection-mark role (design §4), re-exported beside the icon kind for the
 /// same reason: both renderers consume one typed vocabulary defined on the tab
 /// model, so the strips cannot drift on what a mark means.
@@ -70,7 +71,12 @@ pub(crate) struct TabStripMetadata {
     pub(crate) icon: Option<TabIconKind>,
     pub(crate) dirty: bool,
     pub(crate) busy: bool,
-    pub(crate) attention: bool,
+    /// The attention mark as a LEVEL (round 19): `Wait` is the hollow diamond
+    /// the indicator bits always drew, `Stop` a filled one (held, or at a
+    /// limit), `Story` a dot (something happened while the human was away).
+    /// The indicator owners spell `Wait`; the presence stamp
+    /// (`App::stamp_presence_chips`) folds the session's level over it.
+    pub(crate) attention: ChipLevel,
     /// The connection-mark role (design §4). `Option` rather than a bool pair
     /// because the mark is one shape per role; the `Hash` derive folds it into
     /// the in-grid strip fingerprint automatically.
@@ -95,7 +101,9 @@ impl TabStripMetadata {
             dirty: presentation.indicators.dirty,
             busy: presentation.indicators.busy,
             // The strip draws ONE attention mark, so the two owners fold here.
-            attention: presentation.indicators.wants_attention(),
+            attention: crate::app_presence::chip_of_attention(
+                presentation.indicators.wants_attention(),
+            ),
             conn: presentation.conn,
             closable: presentation.closable,
             drop_target: false,
@@ -104,14 +112,14 @@ impl TabStripMetadata {
 
     #[must_use]
     pub(crate) const fn has_status(self) -> bool {
-        self.dirty || self.busy || self.attention || self.conn.is_some()
+        self.dirty || self.busy || !matches!(self.attention, ChipLevel::Off) || self.conn.is_some()
     }
 
     #[must_use]
     pub(crate) const fn status_count(self) -> usize {
         self.dirty as usize
             + self.busy as usize
-            + self.attention as usize
+            + !matches!(self.attention, ChipLevel::Off) as usize
             + self.conn.is_some() as usize
     }
 
@@ -121,7 +129,7 @@ impl TabStripMetadata {
             icon: Some(icon),
             dirty: false,
             busy: false,
-            attention: false,
+            attention: ChipLevel::Off,
             conn: None,
             closable: true,
             drop_target: false,
@@ -156,7 +164,7 @@ impl TabStripMetadata {
         match kind {
             TabStatusKind::Dirty => self.dirty,
             TabStatusKind::Busy => self.busy,
-            TabStatusKind::Attention => self.attention,
+            TabStatusKind::Attention => !matches!(self.attention, ChipLevel::Off),
             TabStatusKind::Connection => self.conn.is_some(),
         }
     }
@@ -763,7 +771,7 @@ const PLAIN_TAB: TabStripMetadata = TabStripMetadata {
     icon: None,
     dirty: false,
     busy: false,
-    attention: false,
+    attention: ChipLevel::Off,
     conn: None,
     drop_target: false,
     closable: true,
@@ -2554,7 +2562,7 @@ fn paint_strip_impl(
                     append_icon_images(&mut images, icon_start, kind, color);
                 }
                 if let (Some(item), Some(col)) = (item, layout.status_col) {
-                    let color = if item.dirty || item.attention {
+                    let color = if item.dirty || item.attention >= ChipLevel::Wait {
                         colors.accent
                     } else if is_active {
                         colors.fg
@@ -2726,9 +2734,33 @@ fn status_primitives(metadata: TabStripMetadata) -> Vec<TabIconPrimitive> {
                 width: 1.25 * s,
             }),
             // Diamond = something completed or otherwise needs the user's attention.
+            // As a LEVEL (round 19): hollow to WAIT, filled at a STOP, a dot for a
+            // STORY — the same three marks the native chip draws (`toolbar.rs`).
             TabStatusKind::Attention => {
                 let w = 1.15 * s;
                 let r = 2.5 * s;
+                match metadata.attention {
+                    ChipLevel::Off => continue,
+                    ChipLevel::Story => {
+                        primitives.push(TabIconPrimitive::Dot {
+                            center: [x, 8.0],
+                            radius: 1.5 * s,
+                        });
+                        continue;
+                    }
+                    ChipLevel::Stop => {
+                        primitives.extend([
+                            TabIconPrimitive::Triangle {
+                                points: [[x, 8.0 - r], [x + r, 8.0], [x - r, 8.0]],
+                            },
+                            TabIconPrimitive::Triangle {
+                                points: [[x - r, 8.0], [x + r, 8.0], [x, 8.0 + r]],
+                            },
+                        ]);
+                        continue;
+                    }
+                    ChipLevel::Wait => {}
+                }
                 primitives.extend([
                     TabIconPrimitive::Line {
                         from: [x, 8.0 - r],
@@ -2925,7 +2957,7 @@ enum IconKey {
     Status {
         dirty: bool,
         busy: bool,
-        attention: bool,
+        attention: ChipLevel,
         color: [u8; 3],
     },
 }
@@ -4333,7 +4365,7 @@ pub(crate) mod pixel_band {
                         );
                     }
                     if let (Some(item), Some(col)) = (item, layout.status_col) {
-                        let color = if item.dirty || item.attention {
+                        let color = if item.dirty || item.attention >= ChipLevel::Wait {
                             colors.accent
                         } else {
                             // One ink per surface (see the icon above).
@@ -5513,7 +5545,7 @@ pub(crate) mod pixel_band {
                     icon: None,
                     dirty: false,
                     busy: false,
-                    attention: false,
+                    attention: ChipLevel::Off,
                     conn: None,
                     closable: true,
                     drop_target: false,
@@ -8470,7 +8502,7 @@ mod tests {
                 icon: Some(TabIconKind::Settings),
                 dirty: true,
                 busy: true,
-                attention: true,
+                attention: ChipLevel::Wait,
                 conn: Some(TabConnRole::Both),
                 closable: false,
                 drop_target: false,
@@ -8514,7 +8546,7 @@ mod tests {
                 icon: Some(TabIconKind::Settings),
                 dirty: true,
                 busy: true,
-                attention: true,
+                attention: ChipLevel::Wait,
                 conn: None,
                 closable: true,
                 drop_target: false,
@@ -8634,7 +8666,7 @@ mod tests {
                     icon: None,
                     dirty: bits & 0b001 != 0,
                     busy: bits & 0b010 != 0,
-                    attention: bits & 0b100 != 0,
+                    attention: crate::app_presence::chip_of_attention(bits & 0b100 != 0),
                     conn: None,
                     drop_target: false,
                     closable: true,
@@ -8869,7 +8901,7 @@ mod tests {
             icon: Some(TabIconKind::Settings),
             dirty: true,
             busy: true,
-            attention: true,
+            attention: ChipLevel::Wait,
             conn: None,
             closable: true,
             drop_target: false,
@@ -8940,7 +8972,7 @@ mod tests {
             icon: None,
             dirty: true,
             busy: true,
-            attention: true,
+            attention: ChipLevel::Wait,
             conn: Some(TabConnRole::Both),
             closable: true,
             drop_target: false,
@@ -8987,7 +9019,7 @@ mod tests {
             icon: None,
             dirty: false,
             busy: false,
-            attention: false,
+            attention: ChipLevel::Off,
             conn: Some(role),
             closable: true,
             drop_target: false,

@@ -1018,12 +1018,31 @@ pub fn strays(layout: &Layout) -> Vec<(PathBuf, Stray)> {
 /// that is not a real directory is not walked: [`ensure_root`] refuses to lay into it,
 /// and says so.
 ///
-/// Callers hold the store lock, as every verb that lays or discards a build does, so no
-/// other atpkg is mid-way through laying a temp this would take for debris.
+/// # Why it is safe here
+///
+/// Callers hold the store lock, as every verb that lays or discards a build does — but
+/// that lock speaks only for the processes that TAKE it, and the lane that lays a root is
+/// not one of them. A provenance-tracked pass hands the lay to a LAUNCHD job
+/// ([`ensure_root_with`] submits a [`crate::seam::ViewJob::Root`], whose helper runs
+/// [`ensure_root_in_process`] in a process of launchd's, under the `view-helper` stem),
+/// so the helper is launchd's child rather than the submitter's and holds no lock of its
+/// own. A `kill -9` of that pass drops the store lock while its helper keeps laying into
+/// the very `.<n>.tmp-<pid>` and `.<n>.old-<pid>` names this sweep removes as debris: the
+/// tree came back within the helper's next write, and nothing under `compat/` is ever
+/// named again unless that same build number is laid once more.
+///
+/// So the orphaned lane jobs are STOPPED, and waited out, before a single entry is read —
+/// exactly as [`crate::store::sweep_stage_scratch`], `gc`'s partial sweep and
+/// `seam`'s view-debris sweep do it. The set of labels stopped is unchanged and
+/// unwidened: only this prefix, only these stems, and a job whose owner pid is ALIVE
+/// (another pass in flight, or a pid since reused) is left alone.
 #[must_use]
 pub fn sweep(layout: &Layout) -> Report {
     #[cfg(unix)]
     {
+        // STOP FIRST, DELETE SECOND: a launchd-parented lane helper outlives the pass that
+        // submitted it, and the store lock that pass dropped says nothing about the helper.
+        crate::stage_helper::stop_orphaned_lane_jobs();
         let mut report = Report::default();
         let Some(dir) = walkable_roots_dir(layout) else {
             return report;

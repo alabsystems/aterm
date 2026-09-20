@@ -844,7 +844,10 @@ mod tests {
             let g = app.store.read().unwrap();
             g.by_sid(&sids[1]).unwrap().ctx.clone()
         };
-        *ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn(42));
+        *ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn {
+            id: 42,
+            driver: None,
+        });
         app.connection_map_prepaint(wid);
         let lines = app.windows[&wid].connection_map().unwrap().controls_lines();
         assert!(

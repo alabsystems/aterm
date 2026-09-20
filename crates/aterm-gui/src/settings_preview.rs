@@ -2197,11 +2197,17 @@ fn build_terminal_specimen_input(
         selection_foreground: spec.appearance.selection_foreground.map(packed_rgb),
         bold_is_bright: spec.appearance.bold_is_bright,
         faint_opacity: spec.appearance.faint_opacity,
+        // The blink lives IN the style (`CursorStyle` names shape + blink, and
+        // the renderer arms its blink clock off the `Blinking*` variants), so
+        // the preview folds `spec.cursor.blink` into the shape. Setting the
+        // sibling `cursor_blink` alone left the preview steady while the
+        // settings pane said the cursor blinks.
         cursor_style: match spec.cursor.style {
             PreviewCursorStyle::Bar => CursorStyle::SteadyBar,
             PreviewCursorStyle::Underline => CursorStyle::SteadyUnderline,
             PreviewCursorStyle::Hidden | PreviewCursorStyle::Block => CursorStyle::SteadyBlock,
-        },
+        }
+        .with_blink(spec.cursor.blink),
         cursor_blink: spec.cursor.blink,
         ..aterm_core::config::TerminalConfig::default()
     };

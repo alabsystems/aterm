@@ -875,6 +875,27 @@ fn random_nonce() -> String {
     aterm_uds::rand::hex_token::<16>().unwrap_or_else(|_| "0".repeat(32))
 }
 
+/// Mint the attempt nonce an outgoing handoff is named by. Minted by the caller
+/// BEFORE anything is written (2026-09-19, the late park): the successor is
+/// launched with the manifest's PATH in its environment before the manifest
+/// exists, so the writer ([`write_outgoing`]) and the launch environment must
+/// derive the same name from the same nonce ([`outgoing_manifest_path`]).
+pub(crate) fn mint_outgoing_nonce() -> String {
+    random_nonce()
+}
+
+/// The manifest's file name under the private control dir for `nonce`: the one
+/// spelling both the writer and the launch environment use.
+fn outgoing_manifest_name(nonce: &str) -> String {
+    format!("seamless-{}-{nonce}.toml", std::process::id())
+}
+
+/// Where [`write_outgoing`] will put the manifest for `nonce` — `None` when there
+/// is no private control dir (then no seamless handoff is possible at all).
+pub(crate) fn outgoing_manifest_path(nonce: &str) -> Option<std::path::PathBuf> {
+    Some(crate::control_auth::socket_dir()?.join(outgoing_manifest_name(nonce)))
+}
+
 /// Write `bytes` to `path` with owner-only permissions (the manifest's `0600`
 /// posture); `None` on any failure.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
@@ -1349,16 +1370,20 @@ pub(crate) struct OutgoingHandoff {
 /// the record by `control = "<len> <sha256hex>"`. The opposite of the screen
 /// carry: best-effort, outside both proof digests — a sidecar that cannot be
 /// written is left out, and never fails the preparation.
+///
+/// `nonce` is the attempt nonce ([`mint_outgoing_nonce`]), supplied by the caller
+/// so the successor can be launched with the manifest's path before this runs;
+/// it is echoed in the result and written as the manifest's first line.
 pub(crate) fn write_outgoing(
     manifest: &SessionHandoff,
     fds: &HandoffFds,
     screens: &[(u64, TerminalCheckpoint)],
     window: Option<WindowCarry>,
     controls: &[(u64, Vec<u8>)],
+    nonce: &str,
 ) -> Option<OutgoingHandoff> {
     let dir = crate::control_auth::socket_dir()?;
-    let nonce = random_nonce();
-    let path = dir.join(format!("seamless-{}-{nonce}.toml", std::process::id()));
+    let path = dir.join(outgoing_manifest_name(nonce));
 
     let _ = validated_identities(manifest, fds)?;
     let mut session_ids = manifest
@@ -1567,7 +1592,7 @@ pub(crate) fn write_outgoing(
     }
     Some(OutgoingHandoff {
         manifest_path: path.to_string_lossy().into_owned(),
-        nonce,
+        nonce: nonce.to_string(),
         fds_wire: fds.encode(),
         screen_digest: carry_digest,
     })
@@ -4921,14 +4946,36 @@ mod tests {
         let fds = HandoffFds {
             entries: live.clone(),
         };
+        // The nonce is the CALLER'S (2026-09-19): the writer names every file
+        // from it and writes it as the manifest's first line, so a successor
+        // launched with the path before the write can authenticate the file.
+        let attempt_nonce = mint_outgoing_nonce();
         let outgoing = write_outgoing(
             &manifest,
             &fds,
             &screens,
             manifest.window.clone(),
             carry.map_or(&[][..], |c| &c.controls[..]),
+            &attempt_nonce,
         )
         .expect("outgoing handoff is written");
+        assert_eq!(
+            outgoing.nonce, attempt_nonce,
+            "the writer echoes the supplied nonce"
+        );
+        assert_eq!(
+            std::path::Path::new(&outgoing.manifest_path),
+            outgoing_manifest_path(&attempt_nonce)
+                .expect("the control dir exists")
+                .as_path(),
+            "the launch environment and the writer derive the same manifest path"
+        );
+        assert!(
+            std::fs::read_to_string(&outgoing.manifest_path)
+                .expect("read manifest")
+                .starts_with(&format!("{attempt_nonce}\n")),
+            "the supplied nonce is the manifest's first line"
+        );
 
         // The PARENT's layout commitment is a pure function of the bytes it
         // writes to the sidecar — `restore::write_to` writes exactly

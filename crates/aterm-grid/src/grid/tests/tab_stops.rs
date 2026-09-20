@@ -271,11 +271,33 @@ fn grid_resize_preserves_tab_stops() {
         grid.storage.tab_stops[5],
         "Custom tab stop at column 5 should be preserved"
     );
-    // New default tab stops should be added for new columns
+    // ...AND THE WIDEN INVENTS NONE. TBC 3 said "no stop at any column"; a
+    // window getting wider is not an application asking for stops back. xterm
+    // clears its whole (fixed-size) tab bitmap on TBC 3 and `ScreenResize`
+    // never re-seeds it — the resurrection here was an artifact of aterm
+    // materializing the array lazily at the current width.
     assert!(
-        grid.storage.tab_stops[48],
-        "Default tab stop at column 48 should be added"
+        !grid.storage.tab_stops[48],
+        "a widen must not resurrect a default stop the application cleared"
     );
+    assert!(
+        grid.storage.tab_stops.iter().filter(|&&s| s).count() == 1,
+        "column 5 is the ONLY stop after TBC 3 + one HTS, at any width"
+    );
+}
+
+#[test]
+fn grid_widen_still_seeds_defaults_when_no_one_cleared_them() {
+    // The other half of the rule: a grid whose default every-8 stops are intact
+    // must GAIN them in the columns a widen adds, or a tab past the old width
+    // would run to the right edge. (This is what xterm gets for free from a
+    // tab bitmap that is 1024 columns wide from the start.)
+    let mut grid = Grid::new(24, 40);
+    grid.resize(24, 80);
+    assert!(grid.storage.tab_stops[48], "default stop at 48 after widen");
+    grid.set_cursor(0, 41);
+    grid.tab();
+    assert_eq!(grid.cursor_col(), 48, "HT reaches the seeded default stop");
 }
 
 #[test]
@@ -290,7 +312,10 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
     assert!(model.fire("SetCustomFutureStop", &mut state));
     source.resize(6, 40);
     assert!(model.fire("ShrinkSourceNarrow", &mut state));
-    assert_eq!(source.tab_stops().len(), 120);
+    // The backing array outlives the shrink and still covers column 96. (TBC 3
+    // widens it to MAX_GRID_COLS so a later grow cannot re-seed cleared stops,
+    // so this is a lower bound, not an equality.)
+    assert!(source.tab_stops().len() >= 120);
     assert!(source.tab_stops()[96]);
 
     let carried = source.tab_stops().to_vec();

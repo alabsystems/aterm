@@ -471,6 +471,127 @@ pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// The image anchor — can macOS still FIND the code this process's grants are
+// keyed to? (design §, the promoted 2026-09-10 OPEN item)
+// ---------------------------------------------------------------------------
+
+/// Whether the bundle macOS keys this process's consent decisions to can still
+/// be found on disk.
+///
+/// # Why this exists
+///
+/// A TCC grant is stored with the client's designated requirement and validated
+/// against the running code on every request that is not already cached. If the
+/// bundle the process was launched from is renamed or deleted while it runs,
+/// `tccd` cannot build a static code object for it, the requirement cannot
+/// match, and **every** consent decision for that process — and for every
+/// descendant attributed to it — falls back to asking. Measured on the owner's
+/// machine 2026-09-19 at 13:42:41, verbatim:
+///
+/// ```text
+/// -[TCCDAccessIdentity staticCode]: SecStaticCodeCreateWithPath(
+///     file:///Applications/aterm.app.rollback) fails for bundle
+///     file:///Applications/aterm.app.rollback/: -67068
+/// ```
+///
+/// aterm's own updater produces exactly that shape: the apply is an atomic
+/// `RENAME_SWAP` that moves the bundle this process was exec'd from to
+/// `aterm.app.rollback`, and boot-health confirmation then deletes it.
+///
+/// # Why the existing probe cannot see it
+///
+/// [`probe_fda`] reads `proc_pidpath`, which follows the vnode — so it reports
+/// the CURRENT name of the running image and looks perfectly healthy in exactly
+/// the broken state. Measured the same session: a live process's recorded path
+/// followed a rename of its binary (`victim` → `victim.rollback`) and went
+/// EMPTY once that file was deleted. The grant was silently not applying for
+/// four and a half hours and nothing in the posture said so.
+///
+/// This is a cheap, prompt-free `exists` check on a path the process already
+/// knows. It reads no protected location and raises no dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageAnchor {
+    /// The running image is inside a `.app` that is still on disk under that
+    /// name. Grants keyed to it can be validated.
+    Live,
+    /// The image is laid out as a bundle (`…/Contents/MacOS/…`) but the
+    /// directory enclosing it is no longer named `<something>.app` — it was
+    /// renamed out from under this process. `aterm.app.rollback` is this.
+    Displaced,
+    /// The running image's own path no longer resolves. The bundle was deleted
+    /// while this process runs, so there is no code left for macOS to check.
+    Deleted,
+    /// Not a bundled layout at all: a test binary, `targo run`, a dev build
+    /// outside a `.app`. Not a fault, and never reported as one.
+    NotBundled,
+    /// The executable path could not be read.
+    Unknown,
+}
+
+impl ImageAnchor {
+    /// The wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Displaced => "displaced",
+            Self::Deleted => "deleted",
+            Self::NotBundled => "not-bundled",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether this anchor means a held grant cannot be validated against the
+    /// running code. `NotBundled` and `Unknown` are NOT faults — the first is an
+    /// ordinary dev run and the second is a failed read, and reporting either as
+    /// a broken grant would be the same over-claim the design forbids
+    /// everywhere else.
+    #[must_use]
+    pub const fn grant_unverifiable(self) -> bool {
+        matches!(self, Self::Displaced | Self::Deleted)
+    }
+}
+
+/// [`ImageAnchor`] for this process.
+#[must_use]
+pub fn image_anchor() -> ImageAnchor {
+    let exe = std::env::current_exe().ok();
+    classify_image_anchor(exe.as_deref(), Path::exists)
+}
+
+/// The classification, pure over the path and an existence oracle.
+///
+/// `exists` is injected so the table test drives every arm without creating or
+/// deleting anything, and so the ordering below is testable: **deletion is
+/// checked first**, because a deleted bundle answers `None` from
+/// [`app_bundle_root`] for the same reason a renamed one does, and collapsing
+/// the two would report the more recoverable state for the less recoverable one.
+#[must_use]
+pub fn classify_image_anchor(exe: Option<&Path>, exists: impl Fn(&Path) -> bool) -> ImageAnchor {
+    let Some(exe) = exe else {
+        return ImageAnchor::Unknown;
+    };
+    if !exists(exe) {
+        return ImageAnchor::Deleted;
+    }
+    // A bundled LAYOUT is what makes `.app` the expected name. Without it there
+    // is nothing to be displaced from.
+    let components: Vec<Component<'_>> = exe.components().collect();
+    let bundled_layout = components.len() >= 4
+        && components
+            .windows(2)
+            .any(|w| w[0].as_os_str() == "Contents" && w[1].as_os_str() == "MacOS");
+    if !bundled_layout {
+        return ImageAnchor::NotBundled;
+    }
+    if app_bundle_root(exe).is_some() {
+        ImageAnchor::Live
+    } else {
+        ImageAnchor::Displaced
+    }
+}
+
 /// `true` when the path cannot be handed to a C API because it contains an
 /// interior NUL byte.
 #[must_use]
@@ -2114,6 +2235,82 @@ mod tests {
         assert!(path_is_in_app_bundle(Path::new(
             "sub/aterm.app/Contents/MacOS/aterm"
         )));
+    }
+
+    /// THE IMAGE ANCHOR, as a table. Every arm, and the ordering that
+    /// distinguishes the two failing ones.
+    ///
+    /// This is the detector for the defect that silently cost the owner four
+    /// and a half hours on 2026-09-19: the bundle a live aterm was exec'd from
+    /// is renamed to `aterm.app.rollback` by the apply and then deleted by
+    /// boot-health confirmation, after which `tccd` cannot build a code
+    /// identity and every grant stops matching. Nothing in the posture could
+    /// see it, because the existing probe reads a path that follows the vnode.
+    #[test]
+    fn the_image_anchor_names_every_way_the_code_can_go_missing() {
+        let live = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let displaced = Path::new("/Applications/aterm.app.rollback/Contents/MacOS/aterm");
+        let unbundled = Path::new("/Users//a/aterm/target/debug/deps/aterm_gui-abc");
+
+        // Present on disk.
+        let there = |_: &Path| true;
+        assert_eq!(classify_image_anchor(Some(live), there), ImageAnchor::Live);
+        // The real shape of the bug: still on disk, but not under a `.app`
+        // name any more. `app_bundle_root` answers None because the enclosing
+        // directory's extension is `rollback`, and the bundled LAYOUT is what
+        // tells that apart from an ordinary unbundled binary.
+        assert_eq!(
+            classify_image_anchor(Some(displaced), there),
+            ImageAnchor::Displaced
+        );
+        assert_eq!(
+            classify_image_anchor(Some(unbundled), there),
+            ImageAnchor::NotBundled
+        );
+
+        // Gone from disk. Deletion is checked FIRST and outranks everything:
+        // a deleted bundle and a renamed one both answer None from
+        // `app_bundle_root`, and reporting the recoverable state for the
+        // unrecoverable one would be the wrong way round.
+        let gone = |_: &Path| false;
+        for path in [live, displaced, unbundled] {
+            assert_eq!(
+                classify_image_anchor(Some(path), gone),
+                ImageAnchor::Deleted,
+                "{path:?}"
+            );
+        }
+
+        // No path to classify is not a fault.
+        assert_eq!(classify_image_anchor(None, there), ImageAnchor::Unknown);
+
+        // Only the two real failures claim the grant cannot be validated. A dev
+        // run and a failed read must never be reported as a broken grant.
+        assert!(ImageAnchor::Displaced.grant_unverifiable());
+        assert!(ImageAnchor::Deleted.grant_unverifiable());
+        for ok in [
+            ImageAnchor::Live,
+            ImageAnchor::NotBundled,
+            ImageAnchor::Unknown,
+        ] {
+            assert!(!ok.grant_unverifiable(), "{ok:?}");
+        }
+
+        // Wire spellings are stable: they are read by agents.
+        assert_eq!(ImageAnchor::Live.as_str(), "live");
+        assert_eq!(ImageAnchor::Displaced.as_str(), "displaced");
+        assert_eq!(ImageAnchor::Deleted.as_str(), "deleted");
+        assert_eq!(ImageAnchor::NotBundled.as_str(), "not-bundled");
+        assert_eq!(ImageAnchor::Unknown.as_str(), "unknown");
+    }
+
+    /// The classifier performs NO syscall of its own: the existence oracle is
+    /// the only thing that may touch the filesystem, and a panicking one proves
+    /// the early arms never reach it.
+    #[test]
+    fn the_image_anchor_touches_the_filesystem_only_through_its_oracle() {
+        let boom = |_: &Path| panic!("the classifier must not stat anything itself");
+        assert_eq!(classify_image_anchor(None, boom), ImageAnchor::Unknown);
     }
 
     #[test]

@@ -659,6 +659,21 @@ pub fn native_update_auto_intent_model() -> Model {
             var target = 0;
             var stale_wake_seen = 0;
             var quiet = 0;
+            // THE PARK IS NO LONGER THE ATTEMPT (2026-09-19, the late park), and
+            // this variable is the park. `Attempt` used to set it, because the
+            // park WAS the first thing an attempt did; on the launched lane the
+            // attempt now starts by LAUNCHING the successor, which costs the user
+            // nothing — every reader stays live through its swap, second start
+            // and boot check — and the park happens later, when `ParkReaders`
+            // finds a moment for it.
+            //
+            // The invariant below is unchanged and its meaning is unchanged: the
+            // readers are stopped only at a quiet-or-past-grace moment. What
+            // changed is that it now binds the instant the terminal really
+            // freezes instead of the instant the attempt was authorized — which
+            // are, under the late park, a second and a half to two minutes apart.
+            // The LAUNCH keeps its own gate: `Attempt`'s guard, which the
+            // conformance test binds to the real poll policy.
             var parked = 0;
             var deferrals = 0;
             var grace_expired = 0;
@@ -742,7 +757,47 @@ pub fn native_update_auto_intent_model() -> Model {
                     attempts
                 };
                 last_unsuccessful = 0;
+            }
+            // THE HOLD, between the launch and the park. The successor is
+            // booting or holding its claim; every reader is live, so activity
+            // here costs the user nothing and simply postpones the park. This is
+            // the state the late park adds, and the reason the gate had to move:
+            // a machine that was quiet when the attempt was authorized can be
+            // busy again by the time the successor is ready to take over.
+            action HoldActivity when (
+                phase == 3 && parked == 0 && deferrals <= MaxDeferrals - 1
+            ) {
+                quiet = 0;
+                deferrals = deferrals + 1;
+            }
+            action HoldQuietElapsed when (phase == 3 && parked == 0 && quiet == 0) {
+                quiet = 1;
+            }
+            // THE PARK ITSELF, gated on the facts re-read at THIS instant —
+            // the whole content of `prelaunch_park_admitted`. `Buggy` parks
+            // regardless, which is the shape the invariant catches.
+            action ParkReaders when (
+                phase == 3 && parked == 0 &&
+                (Buggy == 1 || quiet == 1 || grace_expired == 1)
+            ) {
                 parked = 1;
+            }
+            // A park that missed its freeze budget: the readers resume, nothing
+            // was granted, the successor is still held, and the next park is
+            // gated afresh. One attempt may do this once.
+            action ReparkAfterMissedBudget when (
+                phase == 3 && parked == 1 && accepted == 0
+            ) {
+                parked = 0;
+            }
+            // The hold cap: a terminal that never offered a moment to pause in.
+            // The intent is RETAINED (a later quiet window tries again) and no
+            // reader was ever stopped.
+            action HoldCapStandsDown when (
+                phase == 3 && parked == 0 && quiet == 0 && grace_expired == 0
+            ) {
+                phase = 2;
+                last_unsuccessful = 1;
             }
             action AttemptDidNotReplace when (
                 phase == 3 && staged == 1 && intent == 1 && accepted == 0
@@ -760,8 +815,12 @@ pub fn native_update_auto_intent_model() -> Model {
                 manual_only = 1;
                 parked = 0;
             }
+            // COMMIT REQUIRES THE PARK. The proof the successor sends is over a
+            // screen this process captured with every reader stopped; there is
+            // no path to acceptance that did not park first.
             action AttemptAccepted when (
-                phase == 3 && staged == 1 && intent == 1 && accepted == 0
+                phase == 3 && staged == 1 && intent == 1 && accepted == 0 &&
+                (Buggy == 1 || parked == 1)
             ) {
                 phase = 4;
                 intent = 0;
@@ -812,6 +871,15 @@ pub fn native_update_auto_intent_model() -> Model {
                     quiet == 1 || grace_expired == 1
                 } else {
                     quiet <= 1
+                };
+            // NO ACCEPTANCE WITHOUT A PARK. The proof the successor sends is over
+            // a screen captured with every reader stopped, so an accepted attempt
+            // that never parked would be a Commit over a screen nobody froze.
+            invariant AcceptedRequiresParkedReaders:
+                if accepted == 1 {
+                    parked == 1
+                } else {
+                    accepted == 0
                 };
             invariant DeferralsBounded: deferrals <= MaxDeferrals;
             invariant AcceptedAtMostOnce: accepted <= 1;

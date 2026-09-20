@@ -2627,7 +2627,7 @@ impl App {
             let pad = u32::try_from(ws.metrics.pad).unwrap_or(u32::MAX);
             let pad_top = u32::try_from(ws.metrics.pad_top).unwrap_or(u32::MAX);
             let head = u32::try_from(ws.metrics.head).unwrap_or(u32::MAX);
-            let tab_rows = u32::from(self.chrome_rows());
+            let tab_rows = u32::from(self.chrome_rows(wid));
             let window_rows = u32::from(ws.rows);
             let window_cols = u32::from(ws.cols);
             let composed_rows = window_rows.saturating_add(tab_rows);
@@ -2992,6 +2992,7 @@ impl App {
             Some((focus, pane_origin)),
         );
         let pet_sense = aterm_effects::kitty_pet::PetSense {
+            caret_drawn: true,
             now,
             caret: if pet_caret_live { focus_cursor } else { None },
             rows: pane_rows,
@@ -3423,6 +3424,7 @@ impl App {
             // damage session, even when no word scanner is enabled.
             let cur = exact_focus.cursor;
             let pet_sense = aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
                 now,
                 caret: if pet_caret_live { cur } else { None },
                 rows: effect_geom.rows,
@@ -3526,6 +3528,7 @@ impl App {
         // not a guess. A pet that cannot be drawn is fed `caret: None`, so it
         // fades out and releases honestly, exactly as the windowed paths do.
         let pet_sense = aterm_effects::kitty_pet::PetSense {
+            caret_drawn: true,
             now,
             caret: if pet_caret_live { cur } else { None },
             rows: effect_geom.rows,
@@ -4838,7 +4841,7 @@ impl App {
         // is the one a boot-built device would have written. No-op everywhere
         // else (windowed, and headless once redeemed or declined).
         self.ensure_pixel_backend();
-        let strip_rows = usize::from(self.chrome_rows());
+        let strip_rows = usize::from(self.chrome_rows(front));
         let has_os_window = self
             .windows
             .get(&front)
@@ -6670,21 +6673,54 @@ impl App {
                         } else {
                             appkit::send_usize(kids, sel!(count))
                         };
-                        let names: Vec<String> = (0..kn)
-                            .map(|j| {
-                                let kid = appkit::send_id_usize(kids, sel!(objectAtIndex:), j);
-                                if kid.is_null() {
-                                    String::new()
-                                } else {
-                                    appkit::nsstring_to_rust(appkit::send_id(kid, sel!(title)))
-                                }
-                            })
+                        // One level of SUBMENU (round 19, File ▸ Driving) prints
+                        // exactly as the model serialiser prints it
+                        // (`menu::menu_chrome_lines`): `<label> ▸` in this line,
+                        // then the submenu as its own `menu "<parent> ▸ <label>"`
+                        // line right after — byte-matched by
+                        // `chrome_lines_render_titled_sections`' golden off macOS.
+                        let mut names: Vec<String> = Vec::with_capacity(kn);
+                        let mut nested: Vec<String> = Vec::new();
+                        for j in 0..kn {
+                            let kid = appkit::send_id_usize(kids, sel!(objectAtIndex:), j);
+                            if kid.is_null() {
+                                continue;
+                            }
+                            let name = appkit::nsstring_to_rust(appkit::send_id(kid, sel!(title)));
                             // Skip separators (empty title) so the listing reads as
-                            // the command set, not the dividers. A nil item lands
-                            // here too, which is the same "nothing to name" case.
-                            .filter(|t| !t.is_empty())
-                            .collect();
+                            // the command set, not the dividers.
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let sub = appkit::send_id(kid, sel!(submenu));
+                            if sub.is_null() {
+                                names.push(name);
+                                continue;
+                            }
+                            names.push(format!("{name} \u{25b8}"));
+                            let sub_title = format!("{title} \u{25b8} {name}");
+                            let grand = appkit::send_id(sub, sel!(itemArray));
+                            let gn = if grand.is_null() {
+                                0
+                            } else {
+                                appkit::send_usize(grand, sel!(count))
+                            };
+                            let rows: Vec<String> = (0..gn)
+                                .map(|g| {
+                                    let item =
+                                        appkit::send_id_usize(grand, sel!(objectAtIndex:), g);
+                                    if item.is_null() {
+                                        String::new()
+                                    } else {
+                                        appkit::nsstring_to_rust(appkit::send_id(item, sel!(title)))
+                                    }
+                                })
+                                .filter(|t| !t.is_empty())
+                                .collect();
+                            nested.push(format!("menu {sub_title:?}: {}", rows.join(", ")));
+                        }
                         out.push(format!("menu {title:?}: {}", names.join(", ")));
+                        out.append(&mut nested);
                     }
                 }
             }
@@ -14049,6 +14085,159 @@ mod encode_worker_tests {
             "inline capture never publishes a file"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE GOLDEN RIM IMAGES (§7), through the SACRED `image` path: for each
+    /// presence rim — drive, wait, stop, and the doubled, washed hold — the
+    /// captured PNG is the quiet baseline with exactly the rim's
+    /// [`OverlayGlow`] applied by `apply_overlay_at` (the one CPU compositor
+    /// the present, the capture and the GPU blit's `DropOverlay` twin all
+    /// resolve to; the blit maps the same four fields verbatim). The hold is
+    /// thicker than the stop and carries the 12/255 wash. Under REDUCED MOTION
+    /// (a headless window is unfocused, so its policy is `Reduced`) the
+    /// turn-submit ripple never starts and the frame is the steady image.
+    #[test]
+    fn presence_rims_reach_the_sacred_image_path_and_reduced_motion_is_the_same_image() {
+        use crate::presence::{Level, Rim};
+        let dir = unique_dir("capture-presence-rim");
+        ensure_private_dir(&dir).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.windows[&wid].os_window.is_none());
+        let baseline = visual_capture_pixels(&mut app, &dir, "quiet.png", None);
+        assert_eq!(app.host_visual_state(wid, Instant::now()).overlay, None);
+        let (w, h) = (baseline.width, baseline.height);
+        let set_rim = |app: &mut App, level: Level| {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.presence.level = level;
+            ws.presence.rim = level.rim();
+            ws.presence.seed += 1;
+        };
+        let mut shots: Vec<(&str, Frame, OverlayGlow)> = Vec::new();
+        for (name, level) in [
+            ("drive", Level::Driven),
+            ("wait", Level::Attention),
+            ("stop", Level::Limited),
+            ("hold", Level::Hold),
+        ] {
+            set_rim(&mut app, level);
+            let overlay = app
+                .host_visual_state(wid, Instant::now())
+                .overlay
+                .unwrap_or_else(|| panic!("{name}: the third arm"));
+            // The GPU blit's descriptor is the same four numbers, verbatim.
+            let gpu = aterm_gpu::DropOverlay {
+                accent: overlay.accent,
+                wash_a: overlay.wash_a,
+                border_a: overlay.border_a,
+                border_scale_q4: overlay.border_scale_q4,
+            };
+            assert_eq!(
+                (gpu.accent, gpu.wash_a, gpu.border_a, gpu.border_scale_q4),
+                (
+                    overlay.accent,
+                    overlay.wash_a,
+                    overlay.border_a,
+                    overlay.border_scale_q4
+                )
+            );
+            let shot = visual_capture_pixels(&mut app, &dir, &format!("{name}.png"), None);
+            assert_eq!((shot.width, shot.height), (w, h));
+            let mut expected = baseline.clone();
+            apply_overlay_at(&mut expected.pixels, w, h, 0, 0, w, h, overlay);
+            assert_eq!(
+                shot.pixels, expected.pixels,
+                "{name}: the sacred path paints the rim"
+            );
+            assert_ne!(shot.pixels, baseline.pixels, "{name}: a rim is visible");
+            assert_ne!(
+                shot.pixels[0], baseline.pixels[0],
+                "{name}: the corner is rim"
+            );
+            shots.push((name, shot, overlay));
+        }
+        let glow = |n: &str| shots.iter().find(|(m, _, _)| *m == n).unwrap();
+        assert_eq!(glow("hold").2.border_scale_q4, 32, "hold: 2x the rim");
+        assert_eq!(glow("stop").2.border_scale_q4, 16, "stop: 1x");
+        assert_eq!(glow("hold").2.wash_a, 12, "hold: the 12/255 wash");
+        assert_eq!(glow("stop").2.wash_a, 0);
+        assert_eq!(glow("drive").2.wash_a, 0);
+        assert_ne!(glow("drive").2.accent, glow("wait").2.accent);
+        assert_ne!(glow("wait").2.accent, glow("stop").2.accent);
+        assert_eq!(glow("stop").2.accent, glow("hold").2.accent, "one stop hue");
+        // The wash reaches the interior only under a hold.
+        let mid = (h / 2) * w + w / 2;
+        assert_ne!(
+            glow("hold").1.pixels[mid],
+            baseline.pixels[mid],
+            "hold washes the body"
+        );
+        assert_eq!(
+            glow("stop").1.pixels[mid],
+            baseline.pixels[mid],
+            "stop does not"
+        );
+        assert_eq!(glow("drive").1.pixels[mid], baseline.pixels[mid]);
+
+        // Reduced motion (`motion = "reduced"` in aterm.toml, or the OS flag):
+        // the ripple has amplitude 0 and never starts.
+        set_rim(&mut app, Level::Driven);
+        app.config.motion = Some("reduced".to_string());
+        let focused = app.motion_focus(wid, app.windows[&wid].focused);
+        assert_eq!(
+            app.motion_policy(focused),
+            crate::motion::MotionPolicy::Reduced
+        );
+        assert_eq!(
+            app.motion_policy(focused)
+                .amplitude(crate::motion::MotionEffect::PresenceRipple),
+            0.0
+        );
+        let steady = app.host_visual_state(wid, Instant::now());
+        let before = app.windows[&wid].presence.fp(Instant::now());
+        app.start_presence_ripple(wid, Instant::now());
+        assert!(
+            app.windows[&wid].presence.ripple_at.is_none(),
+            "no ripple starts"
+        );
+        assert_eq!(
+            app.windows[&wid].presence.fp(Instant::now()),
+            before,
+            "the key is still"
+        );
+        assert_eq!(app.host_visual_state(wid, Instant::now()), steady);
+        let again = visual_capture_pixels(&mut app, &dir, "drive-reduced.png", None);
+        assert_eq!(again.pixels, glow("drive").1.pixels, "the same image");
+        assert_eq!(app.windows[&wid].presence.rim, Rim::Drive);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A QUIET WINDOW IS BYTE-IDENTICAL WITH PRESENCE PRESENT (§7): no row is
+    /// committed, no overlay resolves, `presence_fp` is 0, the chrome-row count
+    /// is the shared one — so the `image` capture before and after every
+    /// presence entry point has run is the same PNG, byte for byte. The
+    /// pre-feature frame IS this frame: nothing on the path reads the module.
+    #[test]
+    fn a_quiet_window_captures_byte_identical_with_presence_present() {
+        let dir = unique_dir("capture-presence-quiet");
+        ensure_private_dir(&dir).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let sid = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(sid));
+        let before = visual_capture_pixels(&mut app, &dir, "before.png", None);
+        let now = Instant::now();
+        app.refresh_presence_session(sid, false);
+        app.refresh_presence_all_windows();
+        assert!(app.presence_tick(now).is_empty());
+        assert_eq!(app.presence_fp(wid, now), 0);
+        assert!(app.presence_overlay(wid, now).is_none());
+        assert_eq!(app.chrome_rows(wid), app.chrome_rows_shared());
+        assert_eq!(app.windows[&wid].presence.rows, 0);
+        let after = visual_capture_pixels(&mut app, &dir, "after.png", None);
+        assert_eq!((before.width, before.height), (after.width, after.height));
+        assert_eq!(before.pixels, after.pixels, "the quiet frame is untouched");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

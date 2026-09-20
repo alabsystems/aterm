@@ -376,7 +376,7 @@ static LAST_SLOW_PRESENT_LOG_NS: AtomicU64 = AtomicU64::new(0);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 37;
+const DEADLINE_OWNER_SLOTS: usize = 39;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
@@ -618,6 +618,19 @@ pub(crate) enum DeadlineOwner {
     /// spin, whose producer was THIS observer, was reported as `title_summary`
     /// and cost the investigation its first hour on the wrong module.
     SessionStatus = 35,
+    /// PRESENCE (`crate::presence`): the band's `since` text tick (once a
+    /// second while it prints seconds, once a minute after) and the nine steps
+    /// of the turn-submit ripple — armed only while a band row or a ripple is
+    /// up. A quiet window folds nothing here (`presence_fp == 0`).
+    Presence = 37,
+    /// The late park's gate re-run (`App::try_park_for_prelaunched_successor`):
+    /// a prelaunched update attempt waiting for a quiet moment to park.
+    ///
+    /// 38 and not 37: this and `Presence` were written against the same tree
+    /// and both took the next free slot. The table is an APPEND-ONLY WIRE
+    /// CONTRACT (`every_deadline_owner_has_its_own_label_and_its_own_slot`), so
+    /// the one that reached main first keeps its number and this one moves.
+    HandoffPark = 38,
 }
 
 impl DeadlineOwner {
@@ -659,6 +672,8 @@ impl DeadlineOwner {
             36 => Self::ConsentCard,
             34 => Self::StatusBars,
             35 => Self::SessionStatus,
+            37 => Self::Presence,
+            38 => Self::HandoffPark,
             _ => Self::None,
         }
     }
@@ -703,6 +718,8 @@ impl DeadlineOwner {
             Self::ConsentCard => "consent_card",
             Self::StatusBars => "status_bars",
             Self::SessionStatus => "session_status",
+            Self::Presence => "presence",
+            Self::HandoffPark => "handoff_park",
         }
     }
 }

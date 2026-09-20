@@ -1933,6 +1933,75 @@ const SHIFT_SCOOP_SEMITONES: f32 = 2.0;
 /// the first third of the note's own τ_v.
 const SHIFT_SCOOP_GLIDE_S: f32 = 0.010;
 
+/// **EVERY SHIFTED KEY SOUNDS ONE OCTAVE OVER THE LINE** (owner, 2026-09-19,
+/// on shipped v0.88.0: *"shift key needs the tones that I specified (higher
+/// tone, brighter tones when using shifted keys, louder first word
+/// capitalized"* — the fourth time "higher" was asked, after 2026-08-30
+/// *"make it higher pitched"*, 2026-09-10 *"a pitch shift for shifted keys"*
+/// and 2026-09-16 *"make shifted keys higher in pitch and louder"*).
+///
+/// **WHAT WAS MEASURED ON v0.88.0, AND WHY THE EAR WAS RIGHT.** "Higher" was
+/// carried by [`CAPITAL_LIFT_DEG`] and the 10 ms scoop, and neither is a
+/// promise. The lift fires only where a capital OPENS something, never on a
+/// session's first key, and it REFLECTS at the register's bound — so a
+/// capital could sound LOWER and DULLER than its own lowercase twin. Rendered
+/// key for key against the same text in lower case: the `F` of "Brown Fox"
+/// −1.8 semitones and −630 Hz of centroid; the `L L O` of "say HELLO" −1.8 /
+/// −1.8 / −3.2 semitones, −217 / −14 / −307 Hz; a session-opening `T` +0.0
+/// semitones, −53 Hz. The scoop ends in 45 ms on the SAME note, so it is a
+/// gesture the ear files under attack, not under pitch. Three asks for
+/// "higher" had been answered with a move that was higher only on average.
+///
+/// **SO THE PROMISE IS MADE WHERE A FOLD CANNOT REACH IT: ON THE SOUNDED
+/// NOTE, NOT ON THE WALK.** The line ([`MelodyV2::on_typed`]) derives exactly
+/// what it derived — lift, reflection, the Q4 contour law and its pin
+/// `a_run_of_capitals_keeps_its_contour_instead_of_stacking_on_the_ceiling`
+/// all untouched, because they are about `walk` — and the shifted key's
+/// STRIKE is voiced [`SHIFT_OCTAVE_DEG`] lattice degrees over the degree the
+/// line gave it. Five pentatonic degrees is `× 2` exactly, which is v1's own
+/// argument ([`super::SHIFT_GLYPH_LIFT`]): the same pitch class, so the chord
+/// snap, the lattice law (§9.5: an octave cannot beat against anything its
+/// root was consonant with) and the melody's contour all survive — a run of
+/// capitals is the lowercase line's own shape an octave up, not a plateau.
+/// Worst case against the lowercase twin is the reflected lift's −3 degrees
+/// plus this +5: never under +2 degrees (≥ +4 semitones), on every shifted
+/// key, first key and interior capitals included.
+///
+/// It rides the strike, the ring (the STRUCK note's octave, as it always
+/// was), and the `?` / bracket / math grafts, which are intervals over the
+/// struck note. It does NOT ride the bloom (Q4's "no bloom bonus on shifted
+/// keys": the hang stays on the line's own degree, the same pitch class) and
+/// not a felt key, which has no pitch to move.
+const SHIFT_OCTAVE_DEG: i32 = 5;
+/// **…AND ITS ROOF GOES UP WITH ITS NOTE — "BRIGHTER"** (same ruling). The
+/// tine's partials sit at f, 2f and 2.76f under one low-pass; move the note
+/// an octave under a fixed roof and the top two partials of the upper half
+/// of the register are what the roof eats, so the octave would arrive
+/// DULLER relative to its own fundamental and lighter than its weight — v1
+/// measured exactly that (+0.8 dB at the worst degree for a +2.6 dB weight)
+/// and cured it the same way (`TrailSynth::shift_octave`). The shifted key's
+/// roof is the roof its plain self would have had, times the same ratio as
+/// its note, under its own ceiling: the same instrument an octave up, which
+/// is what doubles the centroid rather than merely moving the fundamental.
+const SHIFT_ROOF_MUL: f32 = 2.0;
+/// The shifted roof's ceiling, Hz. Over [`ROOF_MAX_HZ`] by design (that
+/// ceiling is the UNSHIFTED glass line) and well under the 24 kHz Nyquist.
+const SHIFT_ROOF_MAX_HZ: f32 = 13_000.0;
+/// **THE CAPITAL THAT OPENS A WORD IS LOUDER STILL** (same ruling: *"louder
+/// first word capitalized"*). On v0.88.0 every shifted glyph carried the one
+/// weight ([`super::SHIFT_GLYPH_GAIN`], +2.6 dB), so the capital that begins
+/// a word or a sentence measured exactly what a camelCase interior capital
+/// did, and against the running text around it the head read +2.1..+2.9 dB —
+/// at the loudness JND, which is "not louder" to a hand that is typing.
+/// A capital LETTER at a WORD HEAD takes this on top of its weight: +3.0 dB,
+/// +5.6 dB over its plain self. Not a shifted mark (an opening `(` or `"` is
+/// not "capitalized"), and not an interior capital — which is also what keeps
+/// SHOUTING from becoming an alarm: one accent per shouted word, where §3.1
+/// puts every other accent. At the host default volume an isolated step is
+/// −21 dBFS, so the head crests near −15.4: under the bus limiter's −14 dBFS
+/// knee, which is the cap on anything louder.
+const WORD_CAPITAL_GAIN: f32 = 1.412_537_5;
+
 /// **AND IT ARRIVES WITH THE BLOOM, NOT BEFORE THE NOTE** (§9.6's loudness
 /// law; fixed 2026-09-09) — [`BLOOM_DELAY_S`] + [`BLOOM_ATTACK_S`], which is
 /// the instant the bloom opens on.
@@ -4600,8 +4669,28 @@ impl TrailSynth {
         // THE ARC (§3.3 item 3): the hue opens the roof, or does nothing at
         // all with the stop out — `hue_arc(0) == 0`, so `plain` is exact.
         let arc = if stops.hue { hue_arc(ev.hue) } else { 0.0 };
-        let roof = roof_hz(cps, lit_roof, ev.heat, arc, plan.touch);
-        let deg = plan.deg + i32::from(self.song_key);
+        let line_roof = roof_hz(cps, lit_roof, ev.heat, arc, plan.touch);
+        // THE LINE'S OWN DEGREE — what the walk derived, in the song's key.
+        // The bloom hangs here whatever the spelling (Q4).
+        let line_deg = plan.deg + i32::from(self.song_key);
+        // **A SHIFTED KEY SOUNDS AN OCTAVE OVER THE LINE, UNDER A ROOF THAT
+        // WENT UP WITH IT** ([`SHIFT_OCTAVE_DEG`], [`SHIFT_ROOF_MUL`]; owner,
+        // 2026-09-19: "higher tone, brighter tones when using shifted keys").
+        // On the SOUNDED note, never on the walk, so no fold can take it
+        // back. A felt key has no pitch to move. `+ 0` and the untouched
+        // `roof` on every unshifted key: the goldens' operands are theirs.
+        // The bloom keeps the line's degree AND the line's roof.
+        let shift_up = if ev.shifted && !plan.mallet_only {
+            SHIFT_OCTAVE_DEG
+        } else {
+            0
+        };
+        let roof = if shift_up != 0 {
+            (line_roof * SHIFT_ROOF_MUL).min(SHIFT_ROOF_MAX_HZ)
+        } else {
+            line_roof
+        };
+        let deg = line_deg + shift_up;
         let f = penta(TINE_BASE_HZ, deg);
         if plan.repeat {
             // §9.5 law 5: a same-pitch note damps the old voice first. Two
@@ -4628,12 +4717,27 @@ impl TrailSynth {
         // golden (all `shifted: false`) evaluates the operands it always
         // did. This is a decibel bought with SPELLING, not with speed: §9.6
         // is about rate, and a capital is the same one strike at every rate.
+        // **THE CAPITAL THAT OPENS A WORD IS LOUDER STILL**
+        // ([`WORD_CAPITAL_GAIN`]; owner, 2026-09-19: "louder first word
+        // capitalized"). A LETTER, shifted, at a word head, on a step — and
+        // exactly ×1.0 everywhere else.
+        let word_capital = if ev.shifted
+            && plan.word_head
+            && class == LETTER
+            && plan.touch == Touch::Step
+            && !plan.mallet_only
+        {
+            WORD_CAPITAL_GAIN
+        } else {
+            1.0
+        };
         let gain = ev.gain
             * KEY_TINE_TRIM
             * plan.level
             * g
             * vel
-            * super::shift_gain(ev, SoundKind::Typed);
+            * super::shift_gain(ev, SoundKind::Typed)
+            * word_capital;
         // THE CLASS RESHAPES THE ONE TINE (§10.4) — one key, one TUNE voice,
         // whatever the glyph. A DIGIT is the wood bar ([`wood`]) on a blip's
         // τ ([`DIGIT_TAU_MUL`]); a KNOCKING mark ([`knock_class`]) is dead
@@ -4699,7 +4803,7 @@ impl TrailSynth {
         };
         let bloom_gain = ev.gain * KEY_TINE_TRIM * plan.level * g * vel * BLOOM_LEVEL * air;
         if blooms {
-            self.v2_spawn(bloom(deg, roof, tau), bloom_gain, pan + spread);
+            self.v2_spawn(bloom(line_deg, line_roof, tau), bloom_gain, pan + spread);
         }
 
         // **THE SPARKLE** ([`KEY_GLINT_LEVEL_MUL`]) — one glint on every
@@ -4807,11 +4911,13 @@ impl TrailSynth {
                 }
                 // `( [ {` TINK UP, `) ] }` TINK DOWN: the grace note.
                 OPEN => {
-                    let t_deg = reflect_deg(plan.deg + TINK_DEG) + i32::from(self.song_key);
+                    let t_deg =
+                        reflect_deg(plan.deg + TINK_DEG) + i32::from(self.song_key) + shift_up;
                     self.v2.graft = self.v2_tink(t_deg, roof, gain, pan);
                 }
                 CLOSE => {
-                    let t_deg = reflect_deg(plan.deg - TINK_DEG) + i32::from(self.song_key);
+                    let t_deg =
+                        reflect_deg(plan.deg - TINK_DEG) + i32::from(self.song_key) + shift_up;
                     self.v2.graft = self.v2_tink(t_deg, roof, gain, pan);
                 }
                 // `+ = * % ^ < >` sound their FIFTH: the rise's voice,
@@ -8280,6 +8386,17 @@ for it up front.\n\
     /// eight v1 palettes' law and is pinned there
     /// (`a_shifted_glyph_lands_an_octave_over_its_plain_self`). The
     /// 2026-09-16 change to the music box's capital is LOUDNESS only.
+    ///
+    /// **SUPERSEDED ON PITCH, 2026-09-19** (owner, on v0.88.0: *"shift key
+    /// needs the tones that I specified (higher tone, brighter tones when
+    /// using shifted keys, louder first word capitalized"*): the music box
+    /// now DOES strike every shifted key an octave over the line
+    /// ([`SHIFT_OCTAVE_DEG`]), and a capital that opens a word carries
+    /// [`WORD_CAPITAL_GAIN`] over the weight, so the `"hello "` context's
+    /// exact weights are +5.6 / +7.6 dB. Re-measured that day: crest
+    /// +4.86..+6.08 dB word-opening, +2.63..+4.90 mid-word; every energy,
+    /// body and octave-bin floor below held unchanged. The cross-context pin
+    /// is `a_shifted_key_is_higher_and_brighter_and_a_word_opening_capital_is_loudest`.
     #[test]
     fn a_capital_rings_and_out_peaks_its_plain_self_by_its_weight() {
         const SEEDS: [u32; 4] = [SEED, 0x5EED_1234, 0x504F_4F46, 0xCAFE_F00D];
@@ -8347,12 +8464,21 @@ for it up front.\n\
                 .expect("every key is a step");
             (v.gl * v.gl + v.gr * v.gr).sqrt()
         };
+        // …and since 2026-09-19 the capital that OPENS A WORD carries
+        // [`WORD_CAPITAL_GAIN`] on top (owner: "louder first word
+        // capitalized"), so the word-head context's exact weights are the
+        // mid-word ones times it — +5.6 dB lit, +7.6 over a passing plain key.
         let weight_of = |ctx: &str, c: char| -> Option<f32> {
             let (lo, hi) = (tune_gain(ctx, c), tune_gain(ctx, c.to_ascii_uppercase()));
             let ratio = hi / lo;
+            let head = if ctx.ends_with(' ') {
+                WORD_CAPITAL_GAIN
+            } else {
+                1.0
+            };
             [
-                crate::trail_sound::SHIFT_GLYPH_GAIN,
-                crate::trail_sound::SHIFT_GLYPH_GAIN / PASSING_LEVEL,
+                crate::trail_sound::SHIFT_GLYPH_GAIN * head,
+                crate::trail_sound::SHIFT_GLYPH_GAIN * head / PASSING_LEVEL,
             ]
             .into_iter()
             .find(|w| (ratio / w - 1.0).abs() < 1e-4)
@@ -8961,7 +9087,14 @@ for it up front.\n\
                 },
             );
             let lead = s.voices[usize::from(s.v2.lead.expect("one strike").0)];
-            let f = penta(TINE_BASE_HZ, i32::from(s.v2.walk()) + i32::from(s.song_key));
+            // The STRUCK note is the line's degree an octave up since
+            // 2026-09-19 ([`SHIFT_OCTAVE_DEG`]; owner: "higher tone, brighter
+            // tones when using shifted keys") — the timbre's target is that
+            // note's partial table, and the ring is that note's octave.
+            let f = penta(
+                TINE_BASE_HZ,
+                i32::from(s.v2.walk()) + i32::from(s.song_key) + SHIFT_OCTAVE_DEG,
+            );
             let ratios = if class == DIGIT {
                 [1.0, WOOD_P2_RATIO, WOOD_P3_RATIO]
             } else {
@@ -10905,15 +11038,33 @@ for it up front.\n\
     /// 872.1). Two semitones is +12.2 % from the very bottom of the glide;
     /// the head window opens 2 ms in and runs 16, i.e. past one τ, so what it
     /// averages is the part of the bend the ear still has left.
+    ///
+    /// **RE-MEASURED 2026-09-19** (owner, on v0.88.0: *"higher tone, brighter
+    /// tones when using shifted keys"*). The shifted key's note is now the
+    /// line's degree an OCTAVE up ([`SHIFT_OCTAVE_DEG`]) — the transposition
+    /// the bend was never allowed to be is a separate, stated law — and the
+    /// bend still arrives exactly on THAT lattice pitch: shifted **1672 →
+    /// 1743 Hz** (+4.3 %, lattice 1744.2), lower 655 → 655 unchanged. The
+    /// lowpass and the search band ride each take's own lattice pitch, because
+    /// the fixed 300-900 Hz band read the octave's subharmonic (872 Hz).
     #[test]
     fn a_shifted_key_bends_up_into_its_note_and_its_lowercase_twin_does_not() {
         /// Fundamental of `x`, Hz, by autocorrelation with parabolic
         /// interpolation over the lag axis — the only estimator here fine
         /// enough to resolve a two-semitone bend inside a 15 ms window, where
         /// a DFT bin is 67 Hz wide and the whole move is 60.
-        fn pitch_hz(x: &[f32]) -> f32 {
-            let lo = (SR / 900.0) as usize;
-            let hi = (SR / 300.0) as usize;
+        ///
+        /// The search band is `[lo_hz, hi_hz]`: an autocorrelation peaks at
+        /// every whole number of periods, so a band an octave under the note
+        /// reads the note's SUBHARMONIC — which is what the fixed 300-900 Hz
+        /// band did to the shifted take the day the shifted key went up an
+        /// octave ([`SHIFT_OCTAVE_DEG`], 2026-09-19: it read 872 Hz for a
+        /// 1744 Hz note). The caller centres the band on the take's own
+        /// lattice pitch, ±a fourth: wide enough for a two-semitone bend,
+        /// narrower than the octave either side.
+        fn pitch_hz(x: &[f32], lo_hz: f32, hi_hz: f32) -> f32 {
+            let lo = (SR / hi_hz) as usize;
+            let hi = (SR / lo_hz) as usize;
             if x.len() <= hi + 2 {
                 return 0.0;
             }
@@ -10987,14 +11138,17 @@ for it up front.\n\
                         v.p[0].f0
                     }
                 });
-            let x = lp(&render_mono(&mut s, 20), 1_200.0);
+            // The lowpass rides the note (1.85 × the lattice pitch — the
+            // 1 200 Hz this test always used for the lowercase 654 Hz), and
+            // so does the search band.
+            let x = lp(&render_mono(&mut s, 20), 1.85 * rest);
             let env: Vec<f32> = x.chunks(256).map(rms).collect();
             let peak = env.iter().fold(0.0f32, |m, v| m.max(*v));
             let on = env.iter().position(|e| *e > peak * 0.15).unwrap_or(0) * 256;
             let win = |from_ms: f32, len_ms: f32| -> f32 {
                 let a = (on + (from_ms * 0.001 * SR) as usize).min(x.len());
                 let b = (a + (len_ms * 0.001 * SR) as usize).min(x.len());
-                pitch_hz(&x[a..b])
+                pitch_hz(&x[a..b], rest * 0.75, rest * 1.34)
             };
             // The head straddles the bend (τ 10 ms); the body is 3.5 τ past
             // its end, where the note is the lattice note.
@@ -14219,5 +14373,235 @@ for it up front.\n\
                 "{voice:?}: a word hop 30 ms after a key must still sound"
             );
         }
+    }
+
+    /// **A SHIFTED KEY IS HIGHER AND BRIGHTER THAN ITS PLAIN SELF — EVERY
+    /// ONE, EVERYWHERE — AND THE CAPITAL THAT OPENS A WORD IS THE LOUDEST KEY
+    /// IN IT** (owner, 2026-09-19, on shipped v0.88.0: *"shift key needs the
+    /// tones that I specified (higher tone, brighter tones when using shifted
+    /// keys, louder first word capitalized"*).
+    ///
+    /// The pin the three earlier asks never had: each of them was settled on
+    /// ONE context (a word head after `"hello "`), where the lift happens to
+    /// fire and happens not to fold. Measured on v0.88.0 across contexts, the
+    /// same text typed both ways: the `F` of "Brown Fox" −1.8 semitones and
+    /// −630 Hz of centroid against `f`; the `L L O` of "say HELLO" −1.8 / −1.8
+    /// / −3.2 semitones; a session-opening `T` +0.0 semitones, −53 Hz; and a
+    /// word-opening capital exactly as loud as a camelCase one (one weight,
+    /// +2.6 dB). See [`SHIFT_OCTAVE_DEG`], [`SHIFT_ROOF_MUL`],
+    /// [`WORD_CAPITAL_GAIN`].
+    ///
+    /// FOUR CONTEXTS — a session's first key, a word head, mid-word, and the
+    /// interior of a shouted run — each key typed shifted and not from the
+    /// SAME line state, tails flushed (400 ms rendered; the stamps are the
+    /// host's, so the render moves no gap), on three seeds:
+    ///
+    /// 1. **HIGHER**: the struck fundamental is ≥ +4 semitones over the plain
+    ///    twin's (the reflected lift's worst −3 degrees under the octave's +5
+    ///    is +2 degrees), and exactly `× 2` over the line's own degree;
+    /// 2. **BRIGHTER**: the strike's first 40 ms has ≥ 1.2 × the plain twin's
+    ///    spectral centroid;
+    /// 3. **LOUDER**: ≥ +2.0 dB on the strike's first 80 ms of RMS wherever it
+    ///    is shifted (2026-09-16's floor, kept), ≥ +4.5 dB where a capital
+    ///    LETTER opens a word — and the TUNE gain's own ratio is exactly the
+    ///    weight, times [`WORD_CAPITAL_GAIN`] at a word head and nowhere else
+    ///    (not mid-word, not inside a run, not on a shifted mark).
+    ///
+    /// And the Q4 law survives it: over the shouted pangram the SOUNDED
+    /// pitches are the line's own degrees an octave up — so the contour
+    /// `a_run_of_capitals_keeps_its_contour_instead_of_stacking_on_the_ceiling`
+    /// pins on the walk is the contour the ear gets — with no single pitch on
+    /// a third of the keys (the walk's own busiest degree holds 9 of 35).
+    ///
+    /// MEASURED 2026-09-19, worst case over every context, key and seed
+    /// here: +12.0 semitones, centroid × 1.23 (the mallet's chirp and the
+    /// unshifted bloom are common to both takes and dilute the ratio; the
+    /// struck note's own partials are all exactly × 2), a word-opening
+    /// capital +5.15 dB, any other shifted key +2.07 dB.
+    #[test]
+    fn a_shifted_key_is_higher_and_brighter_and_a_word_opening_capital_is_loudest() {
+        const SEEDS: [u32; 3] = [SEED, 0x5EED_1234, 0xCAFE_F00D];
+        const HEAD_BLOCKS: usize = 40;
+        const TAKE_BLOCKS: usize = 12;
+        const ONSET: usize = 3_840;
+        const SPECTRUM: usize = 1_920;
+        const HIGHER_FLOOR_ST: f32 = 4.0;
+        const BRIGHTER_FLOOR: f32 = 1.2;
+        const SHIFTED_FLOOR_DB: f32 = 2.0;
+        const WORD_CAPITAL_FLOOR_DB: f32 = 4.5;
+        // (context, the keys under test, is the key a word head)
+        const CONTEXTS: [(&str, &str, bool); 4] = [
+            ("", "atw", true),
+            ("hello ", "awfbq?(", true),
+            ("hel", "awfbq?(", false),
+            ("say HEL", "leo", false),
+        ];
+        let db = |x: f32| 20.0 * x.log10();
+        let head = |s: &mut TrailSynth, ctx: &str| {
+            for (i, ch) in ctx.chars().enumerate() {
+                let kind = if ch == ' ' {
+                    SoundKind::Space
+                } else {
+                    SoundKind::Typed
+                };
+                push_ch(s, kind, 1_000 + i as u32 * 150, ch);
+            }
+        };
+        // One take: the glyph `ch`, spelled shifted or not (a letter is its
+        // capital; a mark is the same mark from a layout that needs no
+        // Shift) → (struck Hz, line Hz, TUNE gain, onset RMS, centroid).
+        let take = |seed: u32, ctx: &str, ch: char, shifted: bool| {
+            let mut s = TrailSynth::new(SR, seed);
+            head(&mut s, ctx);
+            let _ = render_mono(&mut s, HEAD_BLOCKS);
+            let glyph = if shifted { ch.to_ascii_uppercase() } else { ch };
+            let mark = s.born_seq;
+            s.push_meta(
+                event(SoundKind::Typed, 0.0, shifted),
+                EventMeta {
+                    at_ms: 1_000 + ctx.chars().count() as u32 * 150,
+                    glyph_class: crate::trail_sound::typed_glyph_class(Some(glyph)),
+                    rank: crate::trail_sound::typed_glyph_rank(Some(glyph)),
+                    ..EventMeta::default()
+                },
+            );
+            let v = since(&s, mark)
+                .into_iter()
+                .find(|v| v.lane == LANE_TUNE)
+                .expect("every key is a step");
+            let p = v.p[0];
+            let f = if p.glide > 0.0 { p.f1 } else { p.f0 };
+            let line = penta(TINE_BASE_HZ, i32::from(s.v2.walk()) + i32::from(s.song_key));
+            let x = render_mono(&mut s, TAKE_BLOCKS);
+            (
+                f,
+                line,
+                (v.gl * v.gl + v.gr * v.gr).sqrt(),
+                rms_of(&x[..ONSET]),
+                centroid_hz(&x[..SPECTRUM]),
+            )
+        };
+        let mut worst = (f32::MAX, f32::MAX, f32::MAX, f32::MAX);
+        for (ctx, keys, word_head) in CONTEXTS {
+            for ch in keys.chars() {
+                let knocks = knock_class(crate::trail_sound::typed_glyph_class(Some(ch)));
+                for seed in SEEDS {
+                    let (f0, _, g0, r0, c0) = take(seed, ctx, ch, false);
+                    let (f1, line, g1, r1, c1) = take(seed, ctx, ch, true);
+                    let tag = format!("seed {seed:#x} `{ch}` after {ctx:?}");
+                    // 1 — HIGHER, and by exactly the octave over the line.
+                    let st = 12.0 * (f1 / f0).log2();
+                    assert!(
+                        st >= HIGHER_FLOOR_ST,
+                        "{tag}: shifted it strikes {f1:.1} Hz against the plain {f0:.1} \
+                         ({st:+.2} semitones) — not higher"
+                    );
+                    assert!(
+                        (f1 / (2.0 * line) - 1.0).abs() < 1e-5,
+                        "{tag}: struck {f1:.1} Hz over a line at {line:.1} — not its octave"
+                    );
+                    // 2 — BRIGHTER. (A knock is dead wood by class: its
+                    // identity is the tock, and the roof is what moves.)
+                    if !knocks {
+                        assert!(
+                            c1 >= c0 * BRIGHTER_FLOOR,
+                            "{tag}: the shifted strike's centroid is {c1:.0} Hz against \
+                             the plain {c0:.0} — not brighter"
+                        );
+                        worst.1 = worst.1.min(c1 / c0);
+                    }
+                    // 3 — LOUDER, and loudest where a capital opens a word.
+                    let capital_head = word_head && ch.is_alphabetic();
+                    let gain_db = db(g1 / g0);
+                    let weights = [
+                        crate::trail_sound::SHIFT_GLYPH_GAIN,
+                        crate::trail_sound::SHIFT_GLYPH_GAIN / PASSING_LEVEL,
+                    ]
+                    .map(|w| {
+                        if capital_head {
+                            w * WORD_CAPITAL_GAIN
+                        } else {
+                            w
+                        }
+                    });
+                    // A re-struck capital (`LL`) is measured against a
+                    // re-struck `ll`: the ladder is shared, so the ratio is
+                    // still the weight.
+                    assert!(
+                        weights.iter().any(|w| (g1 / g0 / w - 1.0).abs() < 1e-3),
+                        "{tag}: the strike's gain is {gain_db:+.2} dB over the plain key — \
+                         not the capital's weight (word-opening capital: {capital_head})"
+                    );
+                    let d = db(r1 / r0);
+                    let floor = if capital_head {
+                        WORD_CAPITAL_FLOOR_DB
+                    } else {
+                        SHIFTED_FLOOR_DB
+                    };
+                    assert!(
+                        d >= floor,
+                        "{tag}: the strike's first 80 ms is {d:+.2} dB over the plain key — \
+                         under +{floor} (word-opening capital: {capital_head})"
+                    );
+                    worst.0 = worst.0.min(st);
+                    if capital_head {
+                        worst.2 = worst.2.min(d);
+                    } else {
+                        worst.3 = worst.3.min(d);
+                    }
+                }
+            }
+        }
+        println!(
+            "shifted over plain, worst case: {:+.2} semitones, centroid ×{:.2}, \
+             word-opening capital {:+.2} dB, any other shifted key {:+.2} dB",
+            worst.0, worst.1, worst.2, worst.3
+        );
+
+        // THE SHOUTED LINE KEEPS ITS CONTOUR IN THE EAR, not only on the walk.
+        let mut s = synth();
+        let mut sounded = Vec::new();
+        let mut at = 1_000u32;
+        for ch in "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG".chars() {
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            let mark = s.born_seq;
+            push_ch(&mut s, kind, at, ch);
+            at += 110;
+            if kind != SoundKind::Typed {
+                continue;
+            }
+            let Some(v) = since(&s, mark).into_iter().find(|v| v.lane == LANE_TUNE) else {
+                continue;
+            };
+            let p = v.p[0];
+            if p.lvl <= 0.0 {
+                continue;
+            }
+            let f = if p.glide > 0.0 { p.f1 } else { p.f0 };
+            let line = penta(TINE_BASE_HZ, i32::from(s.v2.walk()) + i32::from(s.song_key));
+            assert!(
+                (f / (2.0 * line) - 1.0).abs() < 1e-5,
+                "`{ch}`: a shouted key struck {f:.1} Hz over a line at {line:.1}"
+            );
+            sounded.push((f * 10.0) as u32);
+        }
+        let mut pitches = sounded.clone();
+        pitches.sort_unstable();
+        pitches.dedup();
+        let most = pitches
+            .iter()
+            .map(|p| sounded.iter().filter(|q| *q == p).count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            pitches.len() >= 5 && most * 3 < sounded.len(),
+            "the shouted line sounded {} pitches, one of them {most} times in {}: a plateau",
+            pitches.len(),
+            sounded.len()
+        );
     }
 }

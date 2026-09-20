@@ -1334,13 +1334,24 @@ fn is_view_debris(name: &str) -> bool {
 /// not a mismatch, the view reads as current, and the clones it holds keep a superseded
 /// build's blocks allocated for as long as the prefix lives — one more per crash.
 ///
-/// WHY IT IS SAFE HERE. A view is laid under the store-wide writer lock, as every verb
-/// that lays or discards a build is ([`crate::lock::try_lock_store`]; the untracked lane's
-/// helper runs inside its parent's hold), so debris found here is owned by a process that
-/// no longer exists — the argument [`crate::compat::sweep`] makes for the identical shape
-/// under `compat/trust`. Best-effort throughout: what will not go is left for the next
-/// pass, exactly as a failed in-pass removal already is.
+/// WHY IT IS SAFE HERE — AND THE LOCK IS NOT, BY ITSELF, THE REASON. A view is laid under
+/// the store-wide writer lock, as every verb that lays or discards a build is
+/// ([`crate::lock::try_lock_store`]), so the pass that left this debris has exited. GONE IS
+/// NOT QUIET, though, and this lane is the exact machinery that proved it: the view lane
+/// hands its work to a LAUNCHD job ([`crate::stage_helper::Job::prepare`], stem
+/// `view-helper`), which is launchd's child and not the submitter's, and its helper holds
+/// no store lock of its own. A `kill -9` of the pass therefore drops the lock while the
+/// helper keeps writing into the very `.<stem>.tmp-<pid>` / `.<stem>.old-<pid>` names swept
+/// here. That is the same disproof `crate::store::sweep_stage_scratch` and `crate::gc`'s
+/// pass took on 2026-09-17 — this sweep was written the same day from the lock-alone
+/// argument they had just abandoned — so the orphaned lane jobs are stopped, and waited
+/// out, BEFORE a single entry is removed ([`crate::stage_helper::stop_orphaned_lane_jobs`]).
+/// Best-effort throughout: what will not go is left for the next pass, exactly as a failed
+/// in-pass removal already is.
 fn sweep_view_debris(view: &Path) {
+    // STOP FIRST, DELETE SECOND: a launchd-parented lane helper outlives the pass that
+    // submitted it, and the store lock that pass dropped says nothing about the helper.
+    crate::stage_helper::stop_orphaned_lane_jobs();
     let Ok(entries) = std::fs::read_dir(view) else {
         return;
     };

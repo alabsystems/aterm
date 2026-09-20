@@ -141,11 +141,129 @@ fn strip_exe_suffix<'a>(name: &'a str, ext: &str) -> &'a str {
     }
 }
 
-/// Remove shims a failed [`link`] created, best-effort. Only paths that call brought
-/// into existence are passed in, so this can never widen into a name that already stood.
-fn roll_back(created: &[PathBuf]) {
-    for shim in created {
-        let _ = fs::remove_file(shim);
+/// What stood at a `bin/<tool>` name before this [`link`] replaced it — enough to put it
+/// back EXACTLY, captured BEFORE the overwrite.
+///
+/// A rollback restores what WAS there, never what this build would render for that name
+/// today: a store shim's body carries its own target, its own exported environment
+/// ([`crate::shim_env`]) and its own compat route, and a tombstone carries no target at
+/// all — so re-deriving one would quietly rewrite any of those.
+enum PriorShim {
+    /// Nothing stood there. The rollback REMOVES the shim this call created, which is the
+    /// only arm on which it deletes anything at all.
+    Absent,
+    /// A regular file — the store's exec stub, a tombstone, or a Windows `.cmd` — kept as
+    /// its bytes and its mode.
+    File(Vec<u8>, fs::Permissions),
+    /// A symlink, the shape a shim laid by an older atpkg still has: its target.
+    Symlink(PathBuf),
+}
+
+/// Read what stands at `shim` into a [`PriorShim`], or refuse to touch it.
+///
+/// Only a REGULAR file is read: a FIFO at a shim name would park this process on the open
+/// forever, and neither a directory nor a device is a shim this manager laid. Those are an
+/// explicit error here — raised BEFORE the overwrite — rather than something replaced with
+/// no way back, the same shape the link marker's own readers use for a special file.
+fn capture_shim(shim: &Path) -> Result<PriorShim, LinkError> {
+    let meta = match fs::symlink_metadata(shim) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PriorShim::Absent),
+        Err(e) => return Err(LinkError::Io(format!("{}: {e}", shim.display()))),
+    };
+    if meta.is_symlink() {
+        return fs::read_link(shim)
+            .map(PriorShim::Symlink)
+            .map_err(|e| LinkError::Io(format!("{}: {e}", shim.display())));
+    }
+    if !meta.is_file() {
+        return Err(LinkError::Io(format!(
+            "{} is neither a file nor a symlink; refusing to replace what cannot be put back",
+            shim.display()
+        )));
+    }
+    if meta.len() > crate::platform::MAX_SHIM_BYTES as u64 {
+        return Err(LinkError::Io(format!(
+            "{} is {} bytes; a shim is at most {}",
+            shim.display(),
+            meta.len(),
+            crate::platform::MAX_SHIM_BYTES
+        )));
+    }
+    fs::read(shim)
+        .map(|bytes| PriorShim::File(bytes, meta.permissions()))
+        .map_err(|e| LinkError::Io(format!("{}: {e}", shim.display())))
+}
+
+/// The rollback's temp sibling of `shim`: a dot-name in `bin/`, pid-scoped like every other
+/// temp this crate writes.
+fn rollback_tmp(shim: &Path) -> std::io::Result<PathBuf> {
+    let name = shim.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shim path has no file name",
+        )
+    })?;
+    Ok(shim.with_file_name(format!(".{name}.atpkg-rollback-{}", std::process::id())))
+}
+
+/// Put a captured regular-file shim back, through a temp + rename like every other shim
+/// writer here, so a name on the user's PATH is never briefly absent or half-written. The
+/// temp goes on EVERY error arm.
+fn restore_file(shim: &Path, bytes: &[u8], mode: &fs::Permissions) -> std::io::Result<()> {
+    let tmp = rollback_tmp(shim)?;
+    let _ = fs::remove_file(&tmp);
+    let restored = fs::write(&tmp, bytes)
+        .and_then(|()| fs::set_permissions(&tmp, mode.clone()))
+        .and_then(|()| fs::rename(&tmp, shim));
+    if restored.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    restored
+}
+
+/// Put a captured symlink shim back, temp + rename like [`restore_file`].
+#[cfg(unix)]
+fn restore_symlink(shim: &Path, target: &Path) -> std::io::Result<()> {
+    let tmp = rollback_tmp(shim)?;
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp)?;
+    let restored = fs::rename(&tmp, shim);
+    if restored.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    restored
+}
+
+/// Windows shims are `.cmd` files, never links, and an unprivileged process there cannot
+/// create a symlink — so nothing this crate lays on Windows is ever captured as one.
+#[cfg(not(unix))]
+fn restore_symlink(shim: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("cannot restore a symlink shim at {}", shim.display()),
+    ))
+}
+
+/// Undo the shim mutations of a failed [`link`], best-effort and newest first: a name this
+/// call BROUGHT INTO EXISTENCE is removed, and a name it OVERWROTE is put back byte for
+/// byte.
+///
+/// IT MUST PUT BACK WHAT IT REPLACED, NOT ONLY WHAT IT CREATED (review, 2026-09-19). The
+/// rollback removed only the shims that were NEW, so the shim of a program that was already
+/// INSTALLED — the ordinary case for a dev link, and the only one in which a shim is
+/// overwritten at all — was left re-pointed at the dev binary with no marker recording it:
+/// exactly the untracked dev shim this rollback exists to prevent, and the one state
+/// `unlink` cannot undo, because `unlink` reads the marker that was never written. Only
+/// paths this call itself replaced are passed in, so the removal arm can still never widen
+/// into a name that already stood.
+fn roll_back(replaced: &[(PathBuf, PriorShim)]) {
+    for (shim, prior) in replaced.iter().rev() {
+        let _ = match prior {
+            PriorShim::Absent => fs::remove_file(shim),
+            PriorShim::File(bytes, mode) => restore_file(shim, bytes, mode),
+            PriorShim::Symlink(target) => restore_symlink(shim, target),
+        };
     }
 }
 
@@ -192,10 +310,11 @@ pub fn link(
 
     let mut linked = Vec::new();
     let mut refused = Vec::new();
-    // The shims this call BROUGHT INTO EXISTENCE, for the rollback below. Only those:
-    // a name that already stood is somebody else's (a store shim, a hand-made file),
-    // and undoing our own failure must never delete it.
-    let mut created: Vec<PathBuf> = Vec::new();
+    // Every shim this call MUTATES, paired with what stood there first, for the rollback
+    // below: a name it created is removed again, a name it overwrote is put back. A name
+    // that already stood is somebody else's (a store shim, a hand-made file), so undoing
+    // our own failure RESTORES it and never deletes it.
+    let mut replaced: Vec<(PathBuf, PriorShim)> = Vec::new();
     for rel in bins {
         let Some(name) = bin_tool_name(rel) else {
             continue;
@@ -211,18 +330,26 @@ pub fn link(
             continue; // a not-yet-built bin is simply skipped (refresh picks it up later)
         }
         let shim = layout.shim(&tool);
-        let is_new = fs::symlink_metadata(&shim).is_err();
+        // CAPTURED BEFORE THE OVERWRITE — once the dev shim is laid, the store shim's own
+        // bytes are gone and nothing could say what they were.
+        let prior = match capture_shim(&shim) {
+            Ok(prior) => prior,
+            Err(e) => {
+                roll_back(&replaced);
+                return Err(e);
+            }
+        };
         if let Err(e) = crate::platform::install_shim_to(&shim, &src) {
-            roll_back(&created);
+            // The shim writer is temp + rename, so a failure here leaves THIS name as it
+            // was; only the ones already replaced need undoing.
+            roll_back(&replaced);
             return Err(LinkError::Io(e.to_string()));
         }
-        if is_new {
-            created.push(shim);
-        }
+        replaced.push((shim, prior));
         linked.push(name.to_string());
     }
     if linked.is_empty() {
-        roll_back(&created);
+        roll_back(&replaced);
         return Err(LinkError::NoBins);
     }
 
@@ -230,10 +357,11 @@ pub fn link(
     // first and a failed marker write simply propagated, leaving a checkout wired into
     // `bin/` that NOTHING recorded: `is_linked` said no, so `update`/`apply` would not
     // hard-skip the program and would re-point the shims under the developer, and
-    // `unlink` — which reads the marker — had nothing to undo. The shims this call
-    // created are rolled back, so a link either stands recorded or does not stand.
+    // `unlink` — which reads the marker — had nothing to undo. Every shim this call
+    // touched is rolled back — the ones it created removed, the ones it OVERWROTE put
+    // back — so a link either stands recorded or does not stand.
     if let Err(e) = write_marker(&layout.link_marker(program), &marker) {
-        roll_back(&created);
+        roll_back(&replaced);
         return Err(LinkError::Io(e.to_string()));
     }
     // A DEV LINK HAS TO WIN ON PATH. For an agent program (`crate::stub::AGENT_PROGRAMS`)
@@ -685,6 +813,80 @@ mod tests {
         let _ = fs::remove_dir_all(&l.prefix);
         let _ = fs::remove_dir_all(&co);
     }
+
+    /// AND IT PUTS BACK THE SHIM IT OVERWROTE, NOT ONLY THE ONES IT CREATED (review,
+    /// 2026-09-19).
+    ///
+    /// The rollback recorded a shim only when the name was NEW, so it undid nothing for a
+    /// program that was already INSTALLED — the ordinary case for a dev link, and the only
+    /// one in which a shim is overwritten at all. The failed marker write then left
+    /// `bin/ay` re-pointed at the dev checkout with nothing recording it: `is_linked`
+    /// answered no, so `update`/`apply` would not hard-skip the program, and `unlink` —
+    /// which reads the marker that was never written — could not put it back either. So
+    /// the exact outcome the rollback exists to prevent still happened, on every machine
+    /// where the program was installed. The store's shim must come out of a failed link
+    /// byte for byte.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_link_restores_the_shim_it_overwrote() {
+        let l = layout("overwrite");
+        let co = checkout("overwrite", &["ay"]);
+        let bins = [PathBuf::from("target/release/ay")];
+        // THE PROGRAM IS ALREADY INSTALLED: the store's own shim stands at `bin/ay`.
+        fs::create_dir_all(l.bin_dir()).unwrap();
+        let store_bin = l.prefix.join("store-build").join("ay");
+        fs::create_dir_all(store_bin.parent().unwrap()).unwrap();
+        fs::write(&store_bin, b"#!/bin/true\n").unwrap();
+        let shim = shim_of(&l, "ay");
+        crate::platform::install_shim_to(&shim, &store_bin).unwrap();
+        let before = fs::read(&shim).unwrap();
+        let mode_before = fs::metadata(&shim).unwrap().permissions().mode() & 0o777;
+
+        // The marker's destination is a NON-EMPTY DIRECTORY, so the marker write fails
+        // with the shim already re-pointed at the checkout.
+        fs::create_dir_all(l.links_dir().join("ay").join("occupied")).unwrap();
+
+        let out = link(&l, "ay", &co, &bins);
+        assert!(
+            out.is_err(),
+            "a marker that cannot be written must fail the link"
+        );
+        assert_eq!(
+            fs::read(&shim).unwrap(),
+            before,
+            "the OVERWRITTEN store shim must be restored byte for byte, never left \
+             pointing into the dev checkout"
+        );
+        assert_eq!(
+            fs::metadata(&shim).unwrap().permissions().mode() & 0o777,
+            mode_before,
+            "the restored shim keeps its mode"
+        );
+        assert_eq!(
+            crate::platform::resolve_shim(&shim).as_deref(),
+            Some(store_bin.as_path()),
+            "the restored shim forwards to the STORE build, never to the checkout"
+        );
+        assert!(
+            !is_linked(&l, "ay"),
+            "no marker, so no dev link is recorded"
+        );
+        // And the restore leaves no temp of its own beside the shim.
+        let litter: Vec<String> = fs::read_dir(l.bin_dir())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|n| n.contains(".atpkg-rollback-"))
+            .collect();
+        assert!(
+            litter.is_empty(),
+            "the rollback must leave no temp behind, found {litter:?}"
+        );
+
+        let _ = fs::remove_dir_all(&l.prefix);
+        let _ = fs::remove_dir_all(&co);
+    }
+
     #[test]
     fn link_and_unlink_round_trip() {
         let l = layout("rt");

@@ -185,8 +185,15 @@ fn an_armed_boot_health_check_times_out_without_counting_a_launch() {
     let worker_staging = s.clone();
     let (send, receive) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let result =
-            check_boot_health_with_lock_wait(&worker_staging, 42, None, &[], &[], Duration::ZERO);
+        let result = check_boot_health_with_lock_wait(
+            &worker_staging,
+            42,
+            None,
+            &[],
+            &[],
+            false,
+            Duration::ZERO,
+        );
         send.send(result).unwrap();
     });
     let before_release = receive.recv_timeout(Duration::from_secs(2));

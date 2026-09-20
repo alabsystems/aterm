@@ -836,15 +836,19 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let manager = manager_sid(&sub);
             let reconnect = sub.reconnect_s;
             let mut lane = CtlClient::new(ctl.clone(), opts.socket.clone());
+            // The story lane: the worker's window is told each decision as
+            // `aterm ctl @sid story …` (round 19), through a client of its own.
+            let mut teller = CtlClient::new(ctl.clone(), opts.socket.clone());
             let mut session = Session::new(&mut client, sub.sid);
             set_reconnect(&mut session, reconnect);
             session.set_manager(manager);
             session.set_resume(resume);
             // stdout itself, not its lock: the mail lane's thread prints
             // through the same sink.
-            let code = session.watch_mail(
+            let code = session.watch_telling(
                 &sopts,
                 sopts.mail.is_some().then_some(&mut lane),
+                Some(&mut teller),
                 &mut std::io::stdout(),
             );
             Ok(Reply {

@@ -178,6 +178,14 @@ pub struct TerminalConfig {
     pub cursor_style: CursorStyle,
 
     /// Whether the cursor should blink.
+    ///
+    /// MIRROR, NOT AUTHORITY: the blink the renderer acts on — and that DEC
+    /// private mode 12 reports — is the blink bit of [`Self::cursor_style`]
+    /// (`BlinkingBlock`/`BlinkingBar`/`BlinkingUnderline` vs their `Steady`
+    /// twins). `apply_config` applies the style and then sets this to match, so
+    /// a caller asking for a steady cursor must spell it in `cursor_style`;
+    /// setting this alone changes nothing. [`CursorStyle::with_blink`] folds a
+    /// blink preference into a shape.
     pub cursor_blink: bool,
 
     /// Cursor color override (None uses default from color scheme).

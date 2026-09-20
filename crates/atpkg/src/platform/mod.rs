@@ -666,6 +666,47 @@ pub(crate) fn cmd_landing_prelude(
     s
 }
 
+/// THE `.cmd` SELF-UPDATE BLOCK — TARGET, NOT RENDERED (2026-09-19). The Windows twin of
+/// [`sh_selfupdate_prelude`] would sit ahead of [`cmd_landing_prelude`] and read:
+///
+/// ```text
+/// @rem atpkg agents twin: claude update, upgrade and install are answered by atpkg __selfupdate (aterm help pkg).
+/// @if /I "%~1"=="update" goto selfupdate
+/// @if /I "%~1"=="upgrade" goto selfupdate
+/// @if /I "%~1"=="install" goto selfupdate
+/// @goto landing
+/// :selfupdate
+/// @if not exist "<atpkg>" goto landing
+/// @"<atpkg>" __selfupdate "claude" "<prefix>" -- %* & @exit /b
+/// :landing
+/// ```
+///
+/// It answers the EMPTY string on every input, so the `.cmd` twin is byte for byte what
+/// it was before the intercept existed and `claude update` there runs the vendor's verb
+/// as it did. Why: `"%~1"=="update"` expands the USER'S first argument onto a batch line
+/// — a construct no line of the shipped twin uses — and an argument carrying a `"` (or an
+/// unbalanced one) can make `cmd.exe` report a syntax error and END the batch with the
+/// tool never run: exactly the strand the Unix rule forbids (the `exec` is the
+/// guarantee), on a platform no machine of this repo runs. Every added line that runs a
+/// program would also have to end the batch on that line (the offset-resume rule of
+/// [`cmd_landing_prelude`]), and the counts pinned by
+/// `cmd_agents_twin_carries_the_landing_prelude_and_still_resolves_to_the_store` would
+/// move with it. Rendering it is a decision for a Windows host that has measured `%~1`
+/// with `"`, `%` and `^` in the argument; until then the block is fail-closed, like every
+/// `.cmd` path this crate refuses to embed. The Rust half (`cli::cmd_selfupdate`) is
+/// platform-neutral and needs nothing when that day comes. The arguments are taken so the
+/// signature is the renderer's, ready for the text above.
+#[must_use]
+pub(crate) fn cmd_selfupdate_prelude(
+    program: &str,
+    prefix: &Path,
+    atpkg: &Path,
+    verbs: &[&str],
+) -> String {
+    let _ = (program, prefix, atpkg, verbs);
+    String::new()
+}
+
 /// A path as the `.cmd` landing prelude embeds it, or `None` when it cannot be
 /// (2026-09-17): the verbatim prefix off ([`strip_verbatim_prefix`]), trailing `\` and
 /// `/` trimmed — a quoted operand ending in `\"` is an escaped quote to the launched
@@ -700,6 +741,35 @@ pub(crate) fn landing_prelude(program: &str, prefix: &Path, marker: &Path, atpkg
     } else {
         sh_landing_prelude(program, prefix, marker, atpkg)
     }
+}
+
+/// THE WHOLE PRELUDE of the `agents/` twin (2026-09-19) — what
+/// [`crate::activate::reconcile_agents`] renders now: the self-update block
+/// ([`sh_selfupdate_prelude`] on Unix; [`cmd_selfupdate_prelude`], empty, on Windows) and
+/// THEN the landing prelude ([`landing_prelude`], unchanged). In that order on purpose: a
+/// `claude update` typed while a landing marker stands must hand over to `__selfupdate`,
+/// whose child update queues on the store lock the landing pass holds (the standard
+/// update), and never to `__landing`, which would wait out the landing and then run
+/// `bin/claude update` — `bin/` carries neither block, so the vendor's own updater would
+/// run ([`crate::selfupdate`]). `verbs` is the program's row ([`crate::selfupdate::verbs_of`]):
+/// empty renders no block, and the twin is byte for byte the landing-only twin of
+/// 2026-09-16. A twin laid before this block existed compares unequal on the next pass
+/// and is re-laid once (temp + rename; a running `sh` keeps the old inode).
+#[must_use]
+pub(crate) fn twin_prelude(
+    program: &str,
+    prefix: &Path,
+    marker: &Path,
+    atpkg: &Path,
+    verbs: &[&str],
+) -> String {
+    let mut s = if cfg!(windows) {
+        cmd_selfupdate_prelude(program, prefix, atpkg, verbs)
+    } else {
+        sh_selfupdate_prelude(program, prefix, atpkg, verbs)
+    };
+    s.push_str(&landing_prelude(program, prefix, marker, atpkg));
+    s
 }
 
 /// The Unix `bin/` shim body: a `/bin/sh` stub that EXECs the store binary.
@@ -853,6 +923,17 @@ const SH_LANDING_NOTE: &str = "# atpkg agents twin: while a newer build of this 
 /// the store target off the twin's real `exec` line. `parse_sh_shim_env` reads only
 /// `export ` lines, of which the prelude has none. `is_pending_stub` reads line 2, which
 /// stays the shim comment.
+///
+/// THE SELF-UPDATE BLOCK PRECEDES THIS ONE (2026-09-19, [`sh_selfupdate_prelude`],
+/// [`crate::selfupdate`]): the twin's prelude is that block and then this one
+/// ([`twin_prelude`]), so a `claude update` typed while a landing marker stands hands
+/// over to `atpkg __selfupdate` — whose child update QUEUES on the store lock the
+/// landing pass holds, which is the standard update — and never to `__landing`, which
+/// would wait out the landing and then run `bin/claude update`: `bin/` carries no block,
+/// and the vendor's own updater would run. That block keeps every rule above — no literal
+/// `exec '`, no `export `, every embedded string through [`sh_quote_str`] — and repeats
+/// the `__atpkg=` assignment rather than hoisting it, so this function's bytes, and every
+/// test pinning them, are untouched.
 #[must_use]
 pub(crate) fn sh_landing_prelude(
     program: &str,
@@ -873,6 +954,91 @@ pub(crate) fn sh_landing_prelude(
     s.push(' ');
     s.push_str(&operands);
     s.push_str(" -- \"$@\"; fi\nfi\n");
+    s
+}
+
+/// The invariant tail of the self-update block's note line — what follows the program,
+/// its verbs and the verb name, which are rendered per row: a human reading
+/// `agents/claude` learns what the `case` ahead of the exports does, and where to ask.
+const SH_SELFUPDATE_NOTE: &str = "` — aterm's package manager keeps this copy at the vendor's latest through the signed \
+     index (aterm help pkg).\n";
+
+/// THE SELF-UPDATE BLOCK of an `agents/` twin ([`crate::selfupdate`], 2026-09-19),
+/// rendered AHEAD of [`sh_landing_prelude`] by [`twin_prelude`]:
+///
+/// ```text
+/// # atpkg agents twin: `claude update|upgrade|install` is answered by `atpkg __selfupdate` — aterm's package manager keeps this copy at the vendor's latest through the signed index (aterm help pkg).
+/// case "$1" in
+///   update|upgrade|install)
+///     __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'
+///     if [ -x "$__atpkg" ]; then exec "$__atpkg" __selfupdate 'claude' '/Users//u/Library/Application Support/aterm/pkg' -- "$@"; fi
+///     ;;
+/// esac
+/// ```
+///
+/// * `case "$1"` — the FIRST TOKEN, exactly, and never glob-expanded (the word is
+///   quoted); the patterns are literal words from the row, validated by
+///   [`crate::selfupdate::is_shell_safe_verb`] at render; an unset `$1` is the empty
+///   string and matches nothing; `"$@"` is verbatim. No user byte is ever parsed as
+///   shell, which is why the classification of everything past `$1` lives in Rust.
+/// * THE EXEC IS THE GUARANTEE (the landing rule, review 2026-09-16): when `$__atpkg` is
+///   not executable — the app relocated, the bundle gone — the arm falls through `;;` to
+///   the landing check, the twin's own exports and the store `exec`, so the vendor's verb
+///   runs exactly as it did before this block existed; never `command -v atpkg`, which
+///   would exec an OLDER `atpkg` into `unknown verb` exit 2 with the tool never run.
+/// * NO LINE HERE IS A LITERAL `exec '` (the one `exec` is `exec "$__atpkg"` on a line
+///   starting with `if`), NO `export ` line, no pending-stub marker; every embedded
+///   string goes through [`sh_quote_str`] — so `parse_sh_shim_target`, `resolve_shim`,
+///   `sweep_agents_dir`'s keep-predicate and `parse_sh_shim_env` all answer as before.
+/// * FAIL-CLOSED RENDER: the EMPTY string — the twin is the landing-only twin — when
+///   `verbs` is empty (a member with no self-updater, or a program with no row), when any
+///   verb fails the word rule (it would break the `case` pattern — including `esac`, the
+///   one regex-shaped word `sh` reserves where a pattern list starts: measured 2026-09-19,
+///   `esac)` in that slot is a parse error in sh, bash, dash, zsh and ksh, and the twin
+///   would never reach its `exec`; [`crate::selfupdate::is_shell_safe_verb`] refuses it),
+///   or when the program is not a [`crate::store::ToolName`] or fails the same word rule
+///   (it lands in the note line and in a quoted operand). Never an injectable line, never
+///   a stranded tool.
+///
+/// The `__atpkg=` assignment is repeated here rather than hoisted above both blocks so
+/// [`sh_landing_prelude`]'s bytes, and every test pinning them, stay untouched. Pure
+/// string building, rendered and pinned on every platform; the `.cmd` twin renders
+/// nothing yet ([`cmd_selfupdate_prelude`]).
+#[must_use]
+pub(crate) fn sh_selfupdate_prelude(
+    program: &str,
+    prefix: &Path,
+    atpkg: &Path,
+    verbs: &[&str],
+) -> String {
+    if verbs.is_empty()
+        || !verbs
+            .iter()
+            .all(|v| crate::selfupdate::is_shell_safe_verb(v))
+        || crate::store::ToolName::new(program).is_none()
+        || !crate::selfupdate::is_shell_safe_verb(program)
+    {
+        return String::new();
+    }
+    let patterns = verbs.join("|");
+    let mut s = String::from("# atpkg agents twin: `");
+    s.push_str(program);
+    s.push(' ');
+    s.push_str(&patterns);
+    s.push_str("` is answered by `atpkg ");
+    s.push_str(crate::selfupdate::HIDDEN_VERB);
+    s.push_str(SH_SELFUPDATE_NOTE);
+    s.push_str("case \"$1\" in\n  ");
+    s.push_str(&patterns);
+    s.push_str(")\n    __atpkg=");
+    s.push_str(&sh_quote_str(&atpkg.to_string_lossy()));
+    s.push_str("\n    if [ -x \"$__atpkg\" ]; then exec \"$__atpkg\" ");
+    s.push_str(crate::selfupdate::HIDDEN_VERB);
+    s.push(' ');
+    s.push_str(&sh_quote_str(program));
+    s.push(' ');
+    s.push_str(&sh_quote_str(&prefix.to_string_lossy()));
+    s.push_str(" -- \"$@\"; fi\n    ;;\nesac\n");
     s
 }
 
@@ -1431,6 +1597,79 @@ mod tests {
                 sh_landing_prelude("claude", prefix, marker, atpkg)
             );
         }
+    }
+
+    /// THE `.cmd` TWIN IS UNCHANGED BY THE SELF-UPDATE INTERCEPT (2026-09-19, TARGET):
+    /// [`cmd_selfupdate_prelude`] answers the empty string on every input — a verb list of
+    /// any shape, an injection-shaped path — so the composed prelude is byte for byte the
+    /// landing prelude pinned above, the count assertions of that test hold over the
+    /// composed twin, no `%~1` and no `__selfupdate` reach a batch line, and on the Windows
+    /// arm [`twin_prelude`] IS [`cmd_landing_prelude`]. The renderers are called directly,
+    /// cfg-free, so this pins the Windows bytes from the Unix suite like every `.cmd` test.
+    #[test]
+    fn the_cmd_twin_is_unchanged_by_the_self_update_intercept() {
+        let prefix = Path::new("C:\\Program Files (x86)\\aterm\\pkg");
+        let marker = Path::new("C:\\Program Files (x86)\\aterm\\pkg\\landing\\claude");
+        let atpkg = Path::new("C:\\Program Files (x86)\\aterm\\app\\atpkg.exe");
+        let target = Path::new(
+            "C:\\Program Files (x86)\\aterm\\pkg\\store\\claude\\2026091601\\bin\\claude.exe",
+        );
+        let landing = cmd_landing_prelude("claude", prefix, marker, atpkg);
+        assert!(!landing.is_empty());
+        for verbs in [
+            &[][..],
+            &["update"],
+            &["update", "upgrade", "install"],
+            &["up|date)"],
+            crate::selfupdate::verbs_of("claude"),
+            crate::selfupdate::verbs_of("codex"),
+        ] {
+            assert_eq!(
+                cmd_selfupdate_prelude("claude", prefix, atpkg, verbs),
+                "",
+                "{verbs:?}"
+            );
+            let mut composed = cmd_selfupdate_prelude("claude", prefix, atpkg, verbs);
+            composed.push_str(&landing);
+            assert_eq!(composed, landing, "{verbs:?}");
+        }
+        assert_eq!(
+            cmd_selfupdate_prelude(
+                "claude",
+                Path::new("C:\\x\\\"&calc.exe\""),
+                atpkg,
+                &["update"]
+            ),
+            ""
+        );
+        assert_eq!(
+            cmd_selfupdate_prelude("cla%ude", prefix, atpkg, &["update"]),
+            ""
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                twin_prelude(
+                    "claude",
+                    prefix,
+                    marker,
+                    atpkg,
+                    &["update", "upgrade", "install"]
+                ),
+                landing,
+                "on Windows the whole prelude is the landing prelude"
+            );
+        }
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        let mut prelude = cmd_selfupdate_prelude("claude", prefix, atpkg, &["update"]);
+        prelude.push_str(&landing);
+        let twin = cmd_shim_content_twin(target, &env, &prelude);
+        assert_eq!(twin, cmd_shim_content_twin(target, &env, &landing));
+        assert_eq!(twin.matches(" & @exit /b").count(), 2, "{twin}");
+        assert_eq!(twin.matches("\r\n@exit /b\r\n").count(), 1, "{twin}");
+        assert!(!twin.contains("%~1"), "{twin}");
+        assert!(!twin.contains(crate::selfupdate::HIDDEN_VERB), "{twin}");
+        assert_eq!(parse_cmd_shim_target(&twin), Some(target.to_path_buf()));
+        assert_eq!(parse_cmd_shim_env(&twin), env);
     }
 
     /// THE FRAME (2026-09-18), exact: `@goto :main`, 51 lines of 78 colons, `@exit /b`,
@@ -2145,5 +2384,151 @@ mod sh_shim_tests {
             assert_eq!(run(shell), ran(&store), "{shell}, no root");
         }
         std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
+    }
+
+    /// THE SELF-UPDATE BLOCK (2026-09-19, [`crate::selfupdate`]), exact, for claude (three
+    /// verbs) and codex (one): the note, the `case "$1"` on the row's verbs, the repeated
+    /// `__atpkg=` assignment, the variable `exec` with the program and the prefix quoted
+    /// and `"$@"` verbatim, `;;`, `esac`. Empty for an empty verb list, for a verb that
+    /// would break the `case` pattern, for a program with a quote in it and for a name the
+    /// tool-name gate refuses; a quote in the prefix or the atpkg path is POSIX-escaped in
+    /// every slot. [`twin_prelude`] is this block and then the landing prelude, in that
+    /// order, and the whole twin still reads as before: exactly one literal `exec '` line
+    /// (the store target), no `export ` in either block, the target and the env parse back,
+    /// no pending-stub marker, the block ahead of the exports, and the `bin/` shim carries
+    /// none of it.
+    #[test]
+    fn the_self_update_block_is_exact_precedes_the_landing_block_and_breaks_no_reader() {
+        let prefix = Path::new("/Users//u/Library/Application Support/aterm/pkg");
+        let marker = Path::new("/Users//u/Library/Application Support/aterm/pkg/landing/claude");
+        let atpkg = Path::new("/Applications/aterm.app/Contents/MacOS/atpkg");
+        let target = Path::new(
+            "/Users//u/Library/Application Support/aterm/pkg/store/claude/2026091902/bin/claude",
+        );
+        let verbs = crate::selfupdate::verbs_of("claude");
+        let block = sh_selfupdate_prelude("claude", prefix, atpkg, verbs);
+        assert_eq!(
+            block,
+            "# atpkg agents twin: `claude update|upgrade|install` is answered by `atpkg \
+             __selfupdate` — aterm's package manager keeps this copy at the vendor's latest \
+             through the signed index (aterm help pkg).\n\
+             case \"$1\" in\n\
+             \x20 update|upgrade|install)\n\
+             \x20   __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'\n\
+             \x20   if [ -x \"$__atpkg\" ]; then exec \"$__atpkg\" __selfupdate 'claude' \
+             '/Users//u/Library/Application Support/aterm/pkg' -- \"$@\"; fi\n\
+             \x20   ;;\n\
+             esac\n"
+        );
+        let codex =
+            sh_selfupdate_prelude("codex", prefix, atpkg, crate::selfupdate::verbs_of("codex"));
+        assert_eq!(
+            codex,
+            "# atpkg agents twin: `codex update` is answered by `atpkg __selfupdate` — aterm's \
+             package manager keeps this copy at the vendor's latest through the signed index \
+             (aterm help pkg).\n\
+             case \"$1\" in\n\
+             \x20 update)\n\
+             \x20   __atpkg='/Applications/aterm.app/Contents/MacOS/atpkg'\n\
+             \x20   if [ -x \"$__atpkg\" ]; then exec \"$__atpkg\" __selfupdate 'codex' \
+             '/Users//u/Library/Application Support/aterm/pkg' -- \"$@\"; fi\n\
+             \x20   ;;\n\
+             esac\n"
+        );
+        // Fail-closed: no verbs, an unsafe verb, an unsafe program, a refused tool name.
+        assert_eq!(sh_selfupdate_prelude("claude", prefix, atpkg, &[]), "");
+        assert_eq!(
+            sh_selfupdate_prelude("ay", prefix, atpkg, crate::selfupdate::verbs_of("ay")),
+            "",
+            "a program with no row has no verbs and no block"
+        );
+        assert_eq!(
+            sh_selfupdate_prelude("claude", prefix, atpkg, &["update", "up|date)"]),
+            ""
+        );
+        assert_eq!(
+            sh_selfupdate_prelude("claude", prefix, atpkg, &["Update"]),
+            ""
+        );
+        // `esac` passes the regex and breaks the pattern (measured 2026-09-19 in sh, bash,
+        // dash, zsh, ksh: a parse error before any exec); refused per verb, so it is
+        // refused in every slot, first or not.
+        assert_eq!(
+            sh_selfupdate_prelude("claude", prefix, atpkg, &["esac"]),
+            ""
+        );
+        assert_eq!(
+            sh_selfupdate_prelude("claude", prefix, atpkg, &["update", "esac"]),
+            ""
+        );
+        assert_eq!(sh_selfupdate_prelude("cl'aude", prefix, atpkg, verbs), "");
+        assert_eq!(sh_selfupdate_prelude("cl aude", prefix, atpkg, verbs), "");
+        assert_eq!(
+            sh_selfupdate_prelude("sudo", prefix, atpkg, verbs),
+            "",
+            "not a tool name"
+        );
+        // A quote in the prefix and in the atpkg path is escaped in every slot.
+        let quoted = sh_selfupdate_prelude(
+            "claude",
+            Path::new("/it's/pkg"),
+            Path::new("/it's/app/atpkg"),
+            verbs,
+        );
+        assert!(quoted.contains("__atpkg='/it'\\''s/app/atpkg'"), "{quoted}");
+        assert!(
+            quoted.contains("__selfupdate 'claude' '/it'\\''s/pkg' -- \"$@\"; fi"),
+            "{quoted}"
+        );
+        assert!(!quoted.contains("/it's/"), "{quoted}");
+        // The whole prelude: the block, then the landing prelude, in that order.
+        let landing = sh_landing_prelude("claude", prefix, marker, atpkg);
+        let mut want = block.clone();
+        want.push_str(&landing);
+        let twin_pre = twin_prelude("claude", prefix, marker, atpkg, verbs);
+        if cfg!(windows) {
+            assert_eq!(
+                twin_pre,
+                cmd_landing_prelude("claude", prefix, marker, atpkg)
+            );
+        } else {
+            assert_eq!(twin_pre, want);
+        }
+        assert!(
+            want.find("case \"$1\" in").unwrap() < want.find("while a newer build").unwrap(),
+            "the block precedes the landing note: {want}"
+        );
+        assert_eq!(
+            twin_prelude("claude", prefix, marker, atpkg, &[]),
+            landing_prelude("claude", prefix, marker, atpkg),
+            "no verbs: the landing-only twin, byte for byte"
+        );
+        // The full twin, read by every parser as before.
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        let twin = sh_shim_content_twin(target, &env, None, &want);
+        assert_eq!(
+            twin.lines()
+                .filter(|l| l.trim().starts_with("exec '"))
+                .count(),
+            1,
+            "{twin}"
+        );
+        assert!(
+            !want.lines().any(|l| l.trim().starts_with("export ")),
+            "{want}"
+        );
+        assert_eq!(parse_sh_shim_target(&twin).as_deref(), Some(target));
+        assert_eq!(parse_sh_shim_env(&twin), env);
+        assert!(!twin.contains("pending-program stub"), "{twin}");
+        assert!(
+            twin.find("case \"$1\"").unwrap() < twin.find("export DISABLE_AUTOUPDATER").unwrap(),
+            "{twin}"
+        );
+        assert!(twin.trim_end().ends_with("\"$@\""));
+        assert!(!sh_shim_content_env(target, &env).contains("__selfupdate"));
+        assert_eq!(
+            sh_shim_content_twin(target, &env, None, ""),
+            sh_shim_content_env(target, &env)
+        );
     }
 }

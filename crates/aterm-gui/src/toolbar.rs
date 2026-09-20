@@ -223,9 +223,7 @@ pub(crate) fn format_tab_chrome(
                 if metadata.busy {
                     state.push("busy");
                 }
-                if metadata.attention {
-                    state.push("attention");
-                }
+                state.extend(metadata.attention.chrome_states());
                 // `conn-out` / `conn-in`; a both-ways connection reports BOTH
                 // tokens, so the states list stays total per direction (§6:
                 // the mark is never visual-only).
@@ -270,8 +268,8 @@ fn tab_help(
     if metadata.busy {
         parts.push("Working".to_string());
     }
-    if metadata.attention {
-        parts.push("Needs attention".to_string());
+    if let Some(help) = metadata.attention.help() {
+        parts.push(help.to_string());
     }
     // The §4 connection mark's non-visual twin, role-level like the mark
     // itself (per-peer detail belongs to the tooltip/menu composition).
@@ -379,7 +377,7 @@ mod shared_tests {
             icon: Some(crate::tab_bar::TabIconKind::Settings),
             dirty: true,
             busy: true,
-            attention: true,
+            attention: crate::tab_bar::ChipLevel::Wait,
             conn: Some(crate::tab_bar::TabConnRole::Both),
             closable: true,
             drop_target: false,
@@ -421,7 +419,7 @@ mod shared_tests {
             icon: None,
             dirty: false,
             busy: false,
-            attention: false,
+            attention: crate::tab_bar::ChipLevel::Off,
             conn,
             closable: true,
             drop_target: false,
@@ -1931,9 +1929,10 @@ mod macos {
         dirty: Cell<bool>,
         /// Background work state: a hollow ring in the same compact status canvas.
         busy: Cell<bool>,
-        /// User-attention state: an orange diamond, independently visible from dirty
-        /// and busy.
-        attention: Cell<bool>,
+        /// User-attention LEVEL (round 19): a hollow orange diamond to wait, a
+        /// filled one at a stop, a violet dot for a story — independently visible
+        /// from dirty and busy.
+        attention: Cell<crate::tab_bar::ChipLevel>,
         /// Connection-mark role (design §4): the fourth shape in the status
         /// canvas — ▲ outbound / ▽ inbound / hourglass both, in the muted busy
         /// ink. `None` draws nothing.
@@ -2754,6 +2753,22 @@ mod macos {
                                 appkit::send_v(ring, sel!(stroke));
                             }
                             TabStatusKind::Attention => {
+                                let level = metadata.attention;
+                                if level == crate::tab_bar::ChipLevel::Story {
+                                    // The story dot, in the presence violet.
+                                    appkit::send_v(ns_color(sel!(systemPurpleColor)), sel!(set));
+                                    let radius = 1.5 * scale;
+                                    appkit::send_v(
+                                        oval_in_rect(rect(
+                                            x - radius,
+                                            y - radius,
+                                            radius * 2.0,
+                                            radius * 2.0,
+                                        )),
+                                        sel!(fill),
+                                    );
+                                    continue;
+                                }
                                 appkit::send_v(ns_color(sel!(systemOrangeColor)), sel!(set));
                                 let radius = 2.5 * scale;
                                 let diamond = bezier_path();
@@ -2778,7 +2793,14 @@ mod macos {
                                     point(x - radius, y),
                                 );
                                 appkit::send_v(diamond, sel!(closePath));
-                                appkit::send_v(diamond, sel!(fill));
+                                // Hollow to WAIT, filled at a STOP — the in-grid
+                                // rasterizer's exact pair (`tab_bar::status_primitives`).
+                                if level == crate::tab_bar::ChipLevel::Stop {
+                                    appkit::send_v(diamond, sel!(fill));
+                                } else {
+                                    appkit::send_v_f64(diamond, sel!(setLineWidth:), 1.15 * scale);
+                                    appkit::send_v(diamond, sel!(stroke));
+                                }
                             }
                             // The connection mark (§4), in busy's muted ink and
                             // the exact geometry `tab_bar::status_primitives`
@@ -4183,7 +4205,7 @@ mod macos {
                 icon: None,
                 dirty: false,
                 busy: false,
-                attention: false,
+                attention: crate::tab_bar::ChipLevel::Off,
                 conn: None,
                 closable: true,
                 drop_target: false,

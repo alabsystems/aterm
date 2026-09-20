@@ -890,6 +890,16 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["streak", "effect", "output", "prism", "rainbow"],
         false,
     ),
+    // The `[presence]` table (round 19): its two Bool leaves ride the native
+    // registry (`prefs::NESTED_LEAVES`); this header is what lets Manual
+    // complete `[presence]` and what the dotted leaves' prefix rule requires.
+    manual(
+        "presence",
+        "Presence surfaces",
+        ConfigSchemaKind::Table,
+        &["presence", "band", "rim", "driving", "hold", "fabric"],
+        false,
+    ),
     manual(
         "sparkle_words",
         "Keyword toys",

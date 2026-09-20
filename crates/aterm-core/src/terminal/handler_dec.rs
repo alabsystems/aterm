@@ -927,7 +927,10 @@ impl TerminalHandler<'_> {
             5 => state(self.modes.reverse_video),
             6 => state(self.modes.origin_mode),
             7 => state(self.modes.auto_wrap),
-            12 => state(self.modes.cursor_blink),
+            // Mode 12 is the blink bit of the cursor STYLE (see
+            // `set_cursor_blink`): report the fact the renderer acts on, so the
+            // answer cannot disagree with the cursor the user is looking at.
+            12 => state(self.modes.cursor_style.blinks()),
             25 => state(self.modes.cursor_visible),
             40 => state(self.modes.deccolm_enable),
             45 => state(self.modes.reverse_wraparound),
@@ -1729,6 +1732,136 @@ mod in_band_size_tests {
         let _ = term.take_response(); // enable report
         term.process(b"\x1b[?2048$p");
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?2048;1$y");
+    }
+}
+
+#[cfg(test)]
+mod mode_and_query_agreement_tests {
+    //! The query and the glass are one fact, walked.
+    use crate::terminal::Terminal;
+    use aterm_types::CursorStyle;
+
+    fn decrqm(term: &mut Terminal, mode: u16) -> Vec<u8> {
+        term.process(format!("\x1b[?{mode}$p").as_bytes());
+        term.take_response().unwrap_or_default()
+    }
+
+    /// DEC MODE 12 IS THE BLINK BIT OF THE CURSOR STYLE.
+    ///
+    /// The renderer arms its blink clock off the `Blinking*` styles and nothing
+    /// else, so a mode 12 that only moved a flag beside them reached the code
+    /// and never the glass — while `CSI ? 12 $ p` answered that flag. Both
+    /// halves are checked here, and they matter on the most ordinary path
+    /// there is: aterm spawns shells with `TERM=xterm-256color`, whose terminfo
+    /// spells `cnorm` as `\E[?12l\E[?25h` and `cvvis` as `\E[?12;25h`, so every
+    /// ncurses `curs_set()` drives this mode.
+    #[test]
+    fn mode_12_moves_the_cursor_the_user_sees_and_reports_it() {
+        let mut term = Terminal::new(24, 80);
+        // Power-on cursor is a blinking block, so mode 12 is SET.
+        assert_eq!(term.cursor_style(), CursorStyle::BlinkingBlock);
+        assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;1$y");
+
+        // terminfo `cnorm`: stop blinking, show the cursor.
+        term.process(b"\x1b[?12l\x1b[?25h");
+        assert_eq!(
+            term.cursor_style(),
+            CursorStyle::SteadyBlock,
+            "?12l must steady the cursor, not just set a flag"
+        );
+        assert!(term.cursor_visible());
+        assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;2$y");
+
+        // terminfo `cvvis`: blink again. The SHAPE is untouched by mode 12, so
+        // a bar stays a bar.
+        term.process(b"\x1b[6 q"); // DECSCUSR steady bar
+        assert_eq!(term.cursor_style(), CursorStyle::SteadyBar);
+        assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;2$y");
+        term.process(b"\x1b[?12;25h");
+        assert_eq!(
+            term.cursor_style(),
+            CursorStyle::BlinkingBar,
+            "?12h must blink the CURRENT shape"
+        );
+        assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;1$y");
+    }
+
+    /// The other direction: DECSCUSR carries the blink bit too, so it moves
+    /// mode 12 with it. Otherwise a `vim` that set a steady bar left the query
+    /// claiming the cursor blinks.
+    #[test]
+    fn decscusr_moves_mode_12_with_the_style() {
+        for (param, style, want_set) in [
+            (1u16, CursorStyle::BlinkingBlock, true),
+            (2, CursorStyle::SteadyBlock, false),
+            (3, CursorStyle::BlinkingUnderline, true),
+            (4, CursorStyle::SteadyUnderline, false),
+            (5, CursorStyle::BlinkingBar, true),
+            (6, CursorStyle::SteadyBar, false),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            term.process(format!("\x1b[{param} q").as_bytes());
+            assert_eq!(term.cursor_style(), style);
+            let want = if want_set {
+                b"\x1b[?12;1$y".to_vec()
+            } else {
+                b"\x1b[?12;2$y".to_vec()
+            };
+            assert_eq!(decrqm(&mut term, 12), want, "DECSCUSR {param}");
+            // DECRQSS `?12` is the third spelling of the same fact.
+            term.process(b"\x1bP$q?12\x1b\\");
+            let decrqss = term.take_response().unwrap_or_default();
+            let expect_decrqss: &[u8] = if want_set {
+                b"\x1bP1$r?12h\x1b\\"
+            } else {
+                b"\x1bP1$r?12l\x1b\\"
+            };
+            assert_eq!(decrqss, expect_decrqss, "DECRQSS after DECSCUSR {param}");
+        }
+    }
+
+    /// A mode DECRQM can REPORT is a mode XTSAVE/XTRESTORE must be able to
+    /// CARRY. The two tables are two spellings of one fact (`query_dec_mode`
+    /// and `handle_decrqm`) and had drifted by seven modes, each of which made
+    /// `CSI ? Ps s` / `CSI ? Ps r` a silent no-op that looked exactly like a
+    /// working one.
+    #[test]
+    fn xtsave_covers_every_mode_decrqm_reports() {
+        // Every mode `handle_decrqm` answers 1/2 for (the 3/4 "permanently
+        // set/reset" and 0 "unknown" answers are not save/restorable state).
+        const REPORTED: &[u16] = &[
+            1, 3, 5, 6, 7, 9, 12, 25, 40, 45, 66, 67, 69, 80, 95, 1000, 1002, 1003, 1004, 1005,
+            1006, 1007, 1015, 1016, 1035, 1036, 1039, 1045, 1243, 2004, 2026, 2027, 2031, 2048,
+            2500, 2501,
+        ];
+        let mut lost = Vec::new();
+        for &mode in REPORTED {
+            let mut term = Terminal::new(24, 80);
+            // Mode 3 (DECCOLM) is only honored while mode 40 is set.
+            if mode == 3 {
+                term.process(b"\x1b[?40h");
+            }
+            term.process(format!("\x1b[?{mode}h").as_bytes());
+            let _ = term.take_response();
+            let armed = decrqm(&mut term, mode);
+            assert_eq!(
+                armed,
+                format!("\x1b[?{mode};1$y").into_bytes(),
+                "mode {mode} did not arm"
+            );
+            term.process(format!("\x1b[?{mode}s").as_bytes()); // XTSAVE
+            term.process(format!("\x1b[?{mode}l").as_bytes()); // clear it
+            let _ = term.take_response();
+            term.process(format!("\x1b[?{mode}r").as_bytes()); // XTRESTORE
+            let _ = term.take_response();
+            if decrqm(&mut term, mode) != format!("\x1b[?{mode};1$y").into_bytes() {
+                lost.push(mode);
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "XTSAVE/XTRESTORE silently dropped modes DECRQM reports: {lost:?}"
+        );
     }
 }
 

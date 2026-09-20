@@ -59,4 +59,53 @@ impl CursorStyle {
             _ => None,
         }
     }
+
+    /// Whether this style is one of the three BLINKING DECSCUSR shapes.
+    ///
+    /// This is the terminal's real answer to DEC private mode 12 (`att610`
+    /// cursor blink): the rendered blink is decided from the cursor STYLE, so
+    /// the style is what `CSI ? 12 $ p` must report and what `CSI ? 12 h/l`
+    /// must move. The frontend-only shapes (`Hidden`, `HollowBlock`, `Bolt`)
+    /// never blink.
+    #[must_use]
+    pub const fn blinks(self) -> bool {
+        matches!(
+            self,
+            Self::BlinkingBlock | Self::BlinkingUnderline | Self::BlinkingBar
+        )
+    }
+
+    /// The same SHAPE with its blink bit set to `blink` — the DEC mode 12 fold.
+    ///
+    /// `CSI ? 12 l` (terminfo `cnorm`) asks for a steady cursor of whatever
+    /// shape is current, and `CSI ? 12 h` (`cvvis`) asks for a blinking one;
+    /// neither changes the shape. The frontend-only shapes (`Hidden`,
+    /// `HollowBlock`, `Bolt`) have no blinking twin and pass through unchanged.
+    #[must_use]
+    pub const fn with_blink(self, blink: bool) -> Self {
+        match self {
+            Self::BlinkingBlock | Self::SteadyBlock => {
+                if blink {
+                    Self::BlinkingBlock
+                } else {
+                    Self::SteadyBlock
+                }
+            }
+            Self::BlinkingUnderline | Self::SteadyUnderline => {
+                if blink {
+                    Self::BlinkingUnderline
+                } else {
+                    Self::SteadyUnderline
+                }
+            }
+            Self::BlinkingBar | Self::SteadyBar => {
+                if blink {
+                    Self::BlinkingBar
+                } else {
+                    Self::SteadyBar
+                }
+            }
+            other => other,
+        }
+    }
 }

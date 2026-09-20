@@ -95,7 +95,9 @@ KEY USAGE
 WHEN TO REACH FOR IT
   Use `aterm` for a daily-driver shell in the current terminal, or as the single
   launcher for the chain — `aterm <tool>` gives the pinned, attested build. Use
-  `aterm --window` for a real window (tabs, splits, HiDPI). Use `aterm ctl` to introspect
+  `aterm --window` for a real window (tabs, splits, HiDPI, and the menu bar's FABRIC
+  menu: the fleet, this session's inbox and ledger, the halt, the connection rows and
+  `aterm fabric` on/off/status — see `aterm help fabric`). Use `aterm ctl` to introspect
   or drive a RUNNING instance from the outside.
 
 GOTCHAS
@@ -532,10 +534,10 @@ GOTCHAS (in the order they bite)
     verifying, extracting, activating), a `claude` typed in that window waits for it and
     says so on stderr — `atpkg: waiting for the claude update to land — 2.1.274 (build
     2026091702), downloading 42% (12.3 of 29.0 MB) — Ctrl-C runs 2.1.273 now` — refreshed
-    every 2 s, bounded by ATPKG_LANDING_WAIT_SECS (default 45; 0 = warn once and run the
-    current build at once). "Landed" means bin/<program> now resolves into the new build —
-    then `atpkg: the claude update landed — running 2.1.274 (build 2026091702)` and the new
-    build runs. When the bound expires, or on Ctrl-C, the build you had runs and the line
+    every 2 s, bounded at 45 s (a constant — there is no environment knob). "Landed"
+    means bin/<program> now resolves into the new build — then `atpkg: the claude update
+    landed — running 2.1.274 (build 2026091702)` and the new build runs. When the bound
+    expires, or on Ctrl-C, the build you had runs and the line
     says the new build runs once it lands (a `claude` typed while the update is still
     landing waits for it again). If the update ends without landing — a failed download, a
     rolled-back activation — the line says `atpkg: the claude update did not land (<why>)
@@ -559,9 +561,11 @@ GOTCHAS (in the order they bite)
     marker stands it hands over to the co-located atpkg, Ctrl-C during the wait runs the
     current build, and the twin runs the current build when that atpkg is gone) — unless
     the prelude could not be rendered safely, in which case the twin is laid as a plain
-    shim with NO wait, fail-closed, rather than one that might point anywhere. Two
-    caveats there, both unverified — the text is pinned by tests, but no Windows machine
-    has run it: a Ctrl-C typed inside the agent can raise cmd.exe's `Terminate batch job
+    shim with NO wait, fail-closed, rather than one that might point anywhere. It does
+    NOT carry the self-update intercept of the next bullet: on Windows `claude update`
+    still runs the vendor's own updater (TARGET). Two caveats there, both unverified —
+    the text is pinned by tests, but no Windows machine has run it: a Ctrl-C typed inside
+    the agent can raise cmd.exe's `Terminate batch job
     (Y/N)?` prompt twice ON THE LANDING PATH, where the hand-over runs the bin shim
     through cmd.exe and there are two batch levels (the ordinary path is one level and asks
     once); and arming the console handler is best-effort, so a Ctrl-C can end the wait's
@@ -575,6 +579,34 @@ GOTCHAS (in the order they bite)
     the rest). Every later re-lay is safe but for a residual microseconds-wide gap between
     two consecutive line reads of the prelude, the twin ending its batch on the line that
     runs the program.
+  * SELF-UPDATE VERBS ON THE MANAGED NAME (owner, 2026-09-19: "aterm reports that these
+    packages are automatically managed by atpkg to keep to the latest version (and then
+    does a check to make sure that they are updated and then actually updates) via the
+    standard pkg manager"): `claude update`, `claude upgrade`, `claude install [latest]
+    [--force]` and `codex update` typed on the managed name are answered by atpkg, never
+    by the vendor's own updater (which installs a copy this name never runs): one stderr
+    line says the copy is managed and follows the vendor's `latest` through the signed
+    index (re-pinned within about an hour of a vendor release), then the standard
+    `aterm pkg update <program>` runs and its stdout line is the verdict — `already
+    current (build N)`, `installed <program> build N`, `held by local pin` — a new build
+    can take a minute to land, silently. `claude install stable` and `claude install
+    <version>` are refused, exit 2, nothing run: aterm cannot honour a channel or version
+    pin (`aterm pkg pin <program>` holds the build you have), and the vendor's own
+    installer is not run instead — never through the managed name. `--help` prints one
+    note and then the vendor's own help. A store another pass holds — the window's own
+    update, a landing, a typed `aterm pkg` verb — is WAITED FOR, up to the 30 minutes
+    the window's own passes wait, and never silently: the child's own `lock-waiting:`
+    line appears on stdout after 2 s and its `lock-acquired:` line when it gets the
+    store (the wait lane's markers, which a typed `aterm pkg update` never prints), and
+    Ctrl-C stops the wait. Only if the whole 30 minutes run out does the line say that
+    pass is the one moving packages, exit 75; a failed check (offline, say) leaves the
+    build you have and names `aterm pkg doctor`, exit 1. There is no environment knob
+    for any of this: the intercept works by default. Only the FIRST word counts: a flag
+    ahead of the verb (`claude --bare update`) is not intercepted and runs the vendor's
+    updater, because `claude -p update` is a prompt and `claude --debug install` a debug
+    filter. With the package manager disabled the verb refuses, exit 1, nothing checked,
+    and `aterm pkg doctor` says why; with the co-located atpkg gone the twin runs the
+    store build as before. The Windows .cmd twin does not intercept yet (TARGET, above).
   * bin/ NEVER carries a `cargo`, `rustc`, or `rustup` shim
     (those names are on the sensitive-shim deny-list): cargo reaches the compiler
     through rustup's `trust` toolchain link, which atpkg points at its view of
@@ -1518,9 +1550,17 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      that would end before the reset the notice names plus
                      10 min is stretched to that, `EXTEND until=<UTC>
                      reset=<text>` printed once a reset — and clears the
-                     attention when the worker answers again. With --resume
-                     it probes the worker at the reset, or as soon as the
-                     screen leaves the notice (a `/login`, a `/model` line):
+                     attention when the worker works again: at the first
+                     busy read after Claude Code's auto-continue notice
+                     (`⚠ Usage limit reached · continuing automatically at
+                     1:50pm`, its time the reset; `continuing shortly`, a
+                     minute — the row stays on the screen while the worker
+                     resumes under it; the wall again before it answers is
+                     the same episode, mailed once), when it answers after
+                     a notice naming a reset. With --resume it probes the
+                     worker at the reset (a minute past an auto-continue
+                     time), or as soon as the screen leaves the notice (a
+                     `/login`, a `/model` line):
                      ONE turn (`Manager's watcher: the usage limit should
                      have reset. …`), only at an idle composer with nothing
                      typed; the answer prints `EVENT resumed seq=<n> <its
@@ -1810,9 +1850,19 @@ GOTCHAS
   * `attribution=adopted` means this session outlived the aterm process that started it
     (an update was applied in place; your shell kept running). Its file access may differ
     from a fresh tab's — opening a new tab is a valid recovery, and cheap.
-  * Per-folder state is `unknown` BY CONSTRUCTION: the only way to learn whether a folder
-    is readable is to read it, which is the very act that raises the prompt. `unknown` is
-    not `denied`, and neither is inferred from the Full Disk Access state.
+  * Per-folder state DEFAULTS to `unknown` by construction: the only way to learn whether
+    a folder is readable is to read it, which is the very act that raises the prompt.
+    `unknown` is not `denied`. Two things move a row off it, and nothing else does: an
+    access aterm actually observed (`allowed`/`denied`/`asking`/`error`, from a warm-up
+    the human asked for), and `covered-by-fda` for a service a held grant is MEASURED to
+    cover. An observation outranks the coverage rule. A service with no measurement of
+    its own is never moved off `unknown` by the grant, so `documents=unknown` under a
+    held grant means unmeasured, not denied. `source=` says which of the two spoke.
+  * The `data from other apps` prompt is the one you cannot wait out. macOS records that
+    answer against a SINGLE PROCESS INSTANCE and ships no Settings switch for the class,
+    so it returns every time aterm's process is replaced. One Full Disk Access grant is
+    the only durable answer, and it is measured to work: with it held, the row reads
+    `app-data=covered-by-fda`. Tell your operator that rather than retrying.
   * A dev build signed ad-hoc (no `tools/dev-sign-id.sh` identity) loses its grants on
     every build: macOS keys the grant to the code identity, and an ad-hoc identity is the
     exact bytes. `aterm doctor` says so when it applies.
@@ -3422,6 +3472,19 @@ WHO IS DOING WHAT — PRESENCE WITH MEANING (round 13)
   `aterm link serve --presence meta|minimal` and `--receipts`/`--no-receipts` on the
   bridge's command line win over the file. A bridge that predates round 13 leaves every
   new column `-`, and one that predates round 15 sends no receipts.
+
+IN THE WINDOW (the FABRIC menu, round 19)
+  The menu bar has a Fabric menu — the bar's face of everything on this page, never a
+  second mechanism: Fleet… (the Sessions/Connection Map until the fleet screen lands),
+  Inbox… (this session's inbox as a tab, METADATA ONLY — sender, kind, trust, never a
+  body), Ledger for This Session (⇧⌘L; `aterm drive ledger`), Hold This Session / Lift
+  Hold (the `hold` verb, LOCAL origin only — a fleet hold greys both rows with its
+  reason), the four connection rows, Fabric Status… (`aterm fabric` in a tab) and Turn
+  Fabric On… / Off… (`aterm fabric on|off`, behind a confirmation, Owner only). File ▸
+  Driving holds the four controlled/controller spawn rows; Window ▸ Set Role… writes
+  `meta role`; View ▸ Presence Band / Presence Rim switch the band and the rim and are
+  saved as `[presence] band` / `rim`. `aterm ctl chrome` lists the whole tree; every row
+  is an `aterm ctl invoke <Name>` command and every pre-round-19 name still works.
 
 TURNING IT ON (the operator does this once)
   aterm fabric on               ONE command, in the installed binary. It does all of the
@@ -5473,6 +5536,42 @@ mod tests {
     /// the page must hand over the argv, and it must be the config string's
     /// own words. The test joins the `\`-continued lines the way TOML (the
     /// config) and the shell (the attach) both do and compares the two.
+    /// ROUND 19 (SPEC19 §9): `aterm help` names the window's FABRIC menu — on
+    /// the fabric page, where every row's wire twin is documented, and on the
+    /// front `aterm` topic's pointer to the window — so an agent reading the
+    /// manual learns the human has a menu-bar face for the same verbs.
+    #[test]
+    fn the_manual_names_the_fabric_menu() {
+        let (page, _) = render(Some("fabric"), None);
+        let window = page
+            .split("IN THE WINDOW")
+            .nth(1)
+            .expect("the fabric page has an IN THE WINDOW section");
+        let window = window.split("TURNING IT ON").next().unwrap();
+        for needle in [
+            "Fabric menu",
+            "Fleet…",
+            "Inbox…",
+            "METADATA ONLY",
+            "Ledger for This Session (⇧⌘L",
+            "Hold This Session / Lift",
+            "Fabric Status…",
+            "Turn\n  Fabric On… / Off…",
+            "File ▸\n  Driving",
+            "Set Role…",
+            "Presence Band / Presence Rim",
+            "[presence] band",
+            "aterm ctl invoke <Name>",
+        ] {
+            assert!(window.contains(needle), "the window block names {needle:?}");
+        }
+        let (front, _) = render(Some("aterm"), None);
+        assert!(
+            front.contains("FABRIC\n  menu"),
+            "the aterm topic points at the Fabric menu"
+        );
+    }
+
     #[test]
     fn fabric_topic_turns_it_on_with_the_shipped_binary() {
         let (page, _) = render(Some("fabric"), None);

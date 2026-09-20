@@ -43,9 +43,17 @@ pub const TRAIL_PACK_SCHEMA_V1: u32 = 1;
 /// handful of tables) versus sparkle Toy Packs, so the cap is far smaller.
 pub const MAX_TRAIL_PACK_BYTES: usize = 64 * 1024;
 
-/// Maximum beam bloom layers — equal to the widest built-in stack
-/// (`aterm_render::MAX_CUSTOM_BEAM_LAYERS` == the LASER 6-layer stack).
-pub const MAX_TRAIL_LAYERS: usize = 6;
+/// Maximum beam bloom layers — the renderer's own budget, not a copy of it.
+///
+/// This used to be a second `6` beside [`aterm_render::MAX_CUSTOM_BEAM_LAYERS`],
+/// with a doc comment asserting the two were equal. They were, so nothing was
+/// broken — but a number whose agreement is maintained by a comment is one edit
+/// away from disagreeing, and this pair is the exact shape that hid a real
+/// drift elsewhere in this crate (a threshold with three spellings, two of them
+/// comparing differently at the boundary). The dependency points the legal way:
+/// aterm-effects already depends on aterm-render, so the enforced cap can BE the
+/// contract rather than promise to match it.
+pub const MAX_TRAIL_LAYERS: usize = aterm_render::MAX_CUSTOM_BEAM_LAYERS;
 /// Maximum live particle populations in one pack.
 pub const MAX_TRAIL_POPS: usize = 3;
 /// Maximum colour-ramp stops.

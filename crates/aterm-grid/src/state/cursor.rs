@@ -27,6 +27,22 @@ pub struct GridCursorState {
     /// Tab stops (true = tab stop at this column).
     /// Default tab stops are every 8 columns.
     pub tab_stops: Vec<bool>,
+    /// TBC 3 (`CSI 3 g`, "clear ALL tab stops") has been issued and no reset has
+    /// re-established the defaults since.
+    ///
+    /// The array is sized lazily and a resize only ever GROWS it, seeding the
+    /// columns it adds with the every-8 default — so clearing only the columns
+    /// that exist today let a later WIDEN resurrect default stops beyond the old
+    /// width, stops the application had explicitly erased reappearing because
+    /// the window got bigger. xterm has no such seam: its tab array is a fixed
+    /// 1024-column bitmap that `TabZonk` clears whole.
+    ///
+    /// This says the same thing — "no stop at any column" — without inflating an
+    /// array whose LENGTH is observable: the seamless update checkpoint
+    /// serialises this vector and validates it against the grid width, so
+    /// widening it to `MAX_GRID_COLS` broke that handoff (measured: 4096 where
+    /// the checkpoint required 120).
+    pub tab_defaults_suppressed: bool,
     /// Deferred wrap flag (xterm `wrapnext` / `do_wrap`).
     ///
     /// When a printable character is written to the last column, the cursor
@@ -163,6 +179,7 @@ impl GridCursorState {
             scroll_region: ScrollRegion::full(rows),
             horizontal_margins: HorizontalMargins::full(cols),
             tab_stops: Self::default_tab_stops(cols),
+            tab_defaults_suppressed: false,
             pending_wrap: false,
             cursor_template: Cell::EMPTY,
             cursor_template_bg_rgb: None,
@@ -319,13 +336,30 @@ impl GridCursorState {
         }
     }
 
+    /// Clear EVERY tab stop (TBC 3) — including the columns this grid does not
+    /// yet have.
+    ///
+    /// The array is widened to [`crate::MAX_GRID_COLS`] first, because a resize
+    /// only ever GROWS it (see `GridStorage::resize_viewport_state`) and seeds
+    /// the columns it adds with the every-8 default. Clearing only the columns
+    /// that exist today therefore let a later widen RESURRECT default stops at
+    /// 8-column spacing beyond the old width — stops the application had
+    /// explicitly erased, reappearing because the window got wider.
+    ///
+    /// xterm has no such seam: its tab array is a fixed 1024-column bitmap that
+    /// `TabZonk` clears whole, and `ScreenResize` never touches it. Widening the
+    /// array here is the same statement — "no stop at any column" — in a grid
+    /// that sizes its array lazily. The cost is one 4 KiB `Vec<bool>` on the
+    /// grids of applications that actually issue TBC 3.
     #[inline]
     pub(crate) fn clear_all_tab_stops(&mut self) {
+        self.tab_defaults_suppressed = true;
         self.tab_stops.fill(false);
     }
 
     #[inline]
     pub(crate) fn reset_tab_stops(&mut self, cols: u16) {
+        self.tab_defaults_suppressed = false;
         self.tab_stops = Self::default_tab_stops(cols);
     }
 

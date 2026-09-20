@@ -282,7 +282,7 @@ fn lease_status(ctx: &SessionCtx) -> String {
     let now = crate::metrics::now_us();
     let lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
     match lease.as_ref() {
-        Some(crate::Lease::Turn(id)) => format!("OK lease turn={id}\n"),
+        Some(crate::Lease::Turn { id, .. }) => format!("OK lease turn={id}\n"),
         Some(crate::Lease::Drive { holder, expires_us }) if *expires_us > now => {
             format!(
                 "OK lease holder={holder} expires_in_ms={}\n",
@@ -324,7 +324,7 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
     let mut lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(held) = lease.as_ref().filter(|h| h.is_live(now)) {
         match held {
-            crate::Lease::Turn(id) => return format!("ERR busy turn={id}\n"),
+            crate::Lease::Turn { id, .. } => return format!("ERR busy turn={id}\n"),
             crate::Lease::Drive {
                 holder: h,
                 expires_us,
@@ -341,6 +341,9 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         holder: holder.clone(),
         expires_us: now + ttl_ms.saturating_mul(1000),
     });
+    drop(lease);
+    // The presence rim follows the lease (round 19): one wake per change of hand.
+    crate::presence::post_lease_changed(&ctx.self_id, false);
     format!("OK lease acquired holder={holder} ttl_ms={ttl_ms} expires_in_ms={ttl_ms}\n")
 }
 
@@ -370,7 +373,7 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
     let mut lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
     let act = match lease.as_ref() {
         None => Act::None,
-        Some(crate::Lease::Turn(id)) => {
+        Some(crate::Lease::Turn { id, .. }) => {
             if force {
                 // Force-PREEMPT a wedged Turn lease: the crash-recovery escape hatch
                 // for a turn whose driver crashed/disconnected. The synchronous serve
@@ -404,6 +407,8 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         Act::None => "OK lease none\n".to_string(),
         Act::Release => {
             *lease = None;
+            drop(lease);
+            crate::presence::post_lease_changed(&ctx.self_id, false);
             "OK lease released\n".to_string()
         }
         Act::Refuse(e) => e,
@@ -1020,6 +1025,15 @@ pub(crate) struct TurnIo<'a> {
     /// reading exists (no event loop, a dropped reply); the turn then refuses
     /// the yield rather than typing over a ribbon it could not see.
     pub momentum: &'a dyn Fn() -> Result<(f32, std::time::Instant), String>,
+    /// WHO is driving: the session the connection's edge token was granted to
+    /// (`EdgeTable::src_of` on the resolved target's table — the one that
+    /// authorized this request), or `None` for an Owner-class caller (the
+    /// per-instance token, the bridge) and the embedded operator, none of
+    /// which is a session. Recorded in [`crate::Lease::Turn`] for the length
+    /// of the turn; the presence band's hand slot and `status hand=` name the
+    /// driver from it. Resolved by the dispatch site like the routes above,
+    /// because only the dispatch has the scope.
+    pub driver: Option<aterm_session::SessionId>,
 }
 
 impl TurnIo<'static> {
@@ -1042,6 +1056,7 @@ impl TurnIo<'static> {
             press: &no_paste,
             key: &no_key,
             momentum: &no_momentum,
+            driver: None,
         }
     }
 }
@@ -1650,12 +1665,18 @@ pub(crate) fn cmd_turn_guarded(
             .filter(|h| h.is_live(crate::metrics::now_us()))
         {
             return match held {
-                crate::Lease::Turn(id) => format!("ERR busy turn={id}\n"),
+                crate::Lease::Turn { id, .. } => format!("ERR busy turn={id}\n"),
                 crate::Lease::Drive { holder, .. } => format!("ERR busy lease={holder}\n"),
             };
         }
         let id = NEXT_TURN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        *lease = Some(crate::Lease::Turn(id));
+        // The lease names its issuer — the dispatch site's resolution of the
+        // connection's scope ([`TurnIo::driver`]) — so the presence band and
+        // `status hand=` credit the hand that is actually on the keyboard.
+        *lease = Some(crate::Lease::Turn {
+            id,
+            driver: io.driver.clone(),
+        });
         id
     };
     struct LeaseGuard<'a> {
@@ -1668,19 +1689,39 @@ pub(crate) fn cmd_turn_guarded(
         /// (whose driver crashed) followed by a fresh turn acquiring the slot is not
         /// stomped when this turn finally returns and its guard drops.
         id: u64,
+        /// The session's fabric id, for the presence wake the release posts.
+        sid: &'a aterm_session::SessionId,
+        /// The driving session, if a local one: its own band's `▸ @<sid>`
+        /// reads this lease too, so it is woken with the driven session.
+        driver: Option<&'a aterm_session::SessionId>,
     }
     impl Drop for LeaseGuard<'_> {
         fn drop(&mut self) {
             let mut lease = self.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
-            if matches!(lease.as_ref(), Some(crate::Lease::Turn(held)) if *held == self.id) {
+            if matches!(lease.as_ref(), Some(crate::Lease::Turn { id: held, .. }) if *held == self.id)
+            {
                 *lease = None;
+                drop(lease);
+                // The turn settled (or timed out, or was refused): the rim lifts.
+                crate::presence::post_lease_changed(self.sid, false);
+                if let Some(driver) = self.driver {
+                    crate::presence::post_lease_changed(driver, false);
+                }
             }
         }
     }
     let _lease = LeaseGuard {
         turn_lease: &ctx.turn_lease,
         id: turn_id,
+        sid: &ctx.self_id,
+        driver: io.driver.as_ref(),
     };
+    // The turn's lease is held: the presence rim goes teal (round 19) — and
+    // the driver's own band, if it is a local session, gains `▸ @<sid>`.
+    crate::presence::post_lease_changed(&ctx.self_id, false);
+    if let Some(driver) = &io.driver {
+        crate::presence::post_lease_changed(driver, false);
+    }
 
     if let Err(error) = preflight() {
         let error = error.trim_end_matches(['\r', '\n']);
@@ -1896,6 +1937,12 @@ pub(crate) fn cmd_turn_guarded(
                 break; // verified, or the overall deadline: report honestly
             }
         }
+    }
+
+    // The submit VERIFIABLY landed: the one edge the presence rim ripples on
+    // (round 19). Posted once, here, after the verdict — never on the press.
+    if submitted {
+        crate::presence::post_lease_changed(&ctx.self_id, true);
     }
 
     // ── phase 3: the turn settles — no content change for `idle_ms`. ──

@@ -158,6 +158,12 @@ pub(crate) enum Lane {
     Toolchain,
     /// aterm's own self-update (download → verify → staged).
     Update,
+    /// The PRESENCE band (round 19, `crate::presence`): who is driving this
+    /// window's session. Unlike the two lanes above it is PER WINDOW — one row
+    /// under the tab strip, committed by `App::sync_presence_rows` and painted
+    /// by [`paint_presence_row`] — so it never appears in [`StatusBars::bars`];
+    /// the variant names the lane for the a11y mapping and the pointer route.
+    Presence,
 }
 
 /// How a STAGED build will be applied — what the update bar's detail line may
@@ -517,8 +523,9 @@ fn staged_detail_unknown(build: u64) -> String {
 
 /// The bar's colour mood — information, a good end, or something the user
 /// should look at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum Tone {
+    #[default]
     Info,
     Success,
     Warn,
@@ -627,6 +634,7 @@ impl Lane {
         match self {
             Self::Toolchain => "toolchain",
             Self::Update => "update",
+            Self::Presence => "presence",
         }
     }
 }
@@ -1677,6 +1685,9 @@ impl StatusBars {
                     bar.fold_at = Some(now + HOLD_NOTICE);
                 }
             }
+            // The presence band prints facts, never notices (design §2: no free
+            // text on the band); `appnotice` cannot reach it.
+            Lane::Presence => {}
         }
     }
 
@@ -2656,9 +2667,96 @@ fn truncate(s: &str, max: usize) -> String {
 /// One EMPTY band row, in the same colours a painted bar uses. The compose pads
 /// with this when the geometry has committed more rows than the cache holds, so
 /// a reserved row is never a hole the terminal's own top row shows through.
+/// The cells of a `cols`-wide presence row that carry TEXT: the row keeps one
+/// margin cell each side, and `chrome band=` / the a11y detail fit the words
+/// at this width — the same line the human sees, never a slot past the margin.
+pub(crate) fn presence_text_cols(cols: usize) -> usize {
+    cols.saturating_sub(2 * MARGIN)
+}
+
 pub(crate) fn blank_band_row(cols: usize, theme: Theme) -> Vec<RenderCell> {
     let c = chrome_band::band_colors(theme);
     blank_row(cols, c.label, c.bar_bg, false)
+}
+
+/// Paint the PRESENCE band's one row (`crate::presence::Words`) at `cols`: the
+/// six slots laid out by [`crate::presence::Words::pieces`] (which sheds from the
+/// right in the design's order), on the chrome band's material, each slot in
+/// its own ink — the role in `value`, a `since`/fabric figure in `label`, the
+/// hand in the DRIVE hue while a peer types (the rim's own teal family, so
+/// the two surfaces read as one fact — at the TEXT floor,
+/// [`chrome_band::presence_inks`], since these are words), `⊘ hold` in STOP,
+/// the phase in WARN while the row's tone is `Warn` and in the drive hue for
+/// the two seconds after a settled turn. The trust glyph and `⚠` are
+/// text-presentation on purpose (a colour emoji would be two cells wide in
+/// one). The row carries no closing seam of its own: the splice adds it when
+/// no bar row follows.
+pub(crate) fn paint_presence_row(
+    words: &crate::presence::Words,
+    cols: usize,
+    theme: Theme,
+) -> Vec<RenderCell> {
+    use crate::presence::SlotKind;
+    let c = chrome_band::band_colors(theme);
+    let p = chrome_band::presence_inks(theme);
+    let mut row = blank_row(cols, c.label, c.bar_bg, false);
+    let pieces = words.pieces(presence_text_cols(cols));
+    let mut col = MARGIN;
+    for (i, (kind, text)) in pieces.iter().enumerate() {
+        if i > 0 {
+            col += if *kind == SlotKind::Since { 1 } else { 2 };
+        }
+        let (ink, bold) = match kind {
+            SlotKind::Role => (c.value, true),
+            SlotKind::Phase => match words.tone {
+                Tone::Warn => (c.warn, false),
+                Tone::Success => (p.drive, false),
+                Tone::Info => (c.value, false),
+            },
+            SlotKind::Since => (c.label, false),
+            SlotKind::Hand => {
+                if text.starts_with('\u{2298}') {
+                    (p.stop, true)
+                } else if text.starts_with('\u{25c2}') || text.starts_with('\u{25b8}') {
+                    (p.drive, false)
+                } else {
+                    (c.label, false)
+                }
+            }
+            SlotKind::Mail => (c.value, false),
+            SlotKind::Ctx => {
+                if text.ends_with('\u{26a0}') {
+                    (c.warn, false)
+                } else {
+                    (c.value, false)
+                }
+            }
+            SlotKind::Fabric => {
+                if text.starts_with('\u{2715}') {
+                    (p.stop, false)
+                } else if text.starts_with('~') {
+                    (c.warn, false)
+                } else {
+                    (c.label, false)
+                }
+            }
+        };
+        write_str(&mut row, cols, col, text, ink, c.bar_bg, bold);
+        // The glyphs that have an emoji form are pinned to one cell — the
+        // fleet lock included: U+1F512 is emoji-presentation by default, and
+        // the renderer would take its colour face two cells wide otherwise.
+        for (k, ch) in text.chars().enumerate() {
+            if matches!(
+                ch,
+                '\u{2713}' | '\u{2717}' | '\u{26a0}' | '\u{2709}' | '\u{2715}' | '\u{1f512}'
+            ) && let Some(cell) = row.get_mut(col + k)
+            {
+                cell.text_presentation = true;
+            }
+        }
+        col += text.chars().count();
+    }
+    row
 }
 
 pub(crate) fn paint_rows(bars: &StatusBars, cols: usize, theme: Theme) -> Vec<Vec<RenderCell>> {

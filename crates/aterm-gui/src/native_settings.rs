@@ -4061,6 +4061,10 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "sparkle_words.ink.enabled" => ink.and_then(|i| i.enabled),
         "sparkle_words.ink.loop" => ink.and_then(|i| i.loop_),
         "sparkle_words.emphasis.enabled" => emphasis.and_then(|e| e.enabled),
+        // The `[presence]` leaves (round 19): the CONFIGURED value only, the
+        // same contract as the dotted keys above.
+        prefs::EDIT_PRESENCE_BAND => config.presence.as_ref().and_then(|p| p.band),
+        prefs::EDIT_PRESENCE_RIM => config.presence.as_ref().and_then(|p| p.rim),
         "font_synthetic_style" => config.font_synthetic_style,
         "ligatures" => config.ligatures,
         "underline_skip_descenders" => config.underline_skip_descenders,
@@ -13601,6 +13605,11 @@ pub(crate) struct MacosAccess {
     pub(crate) install: &'static str,
     /// The canonical path this process runs from.
     pub(crate) running: Option<String>,
+    /// Whether macOS can still FIND the code a grant is keyed to. `running`
+    /// above follows the vnode, so it names the image's CURRENT path and reads
+    /// healthy in exactly the state where the bundle was renamed or deleted
+    /// under a live process — which is what an in-place apply does.
+    pub(crate) anchor: aterm_containment::ImageAnchor,
     /// Live sessions, and how many of them this process took over from a
     /// predecessor — those are attributed to that previous copy.
     pub(crate) sessions_total: usize,
@@ -13633,6 +13642,7 @@ impl Default for MacosAccess {
             probe: ProbeLabel::RefusedDisabled,
             dr: DrClass::Unknown,
             evidence: SpikeEvidence::UNMEASURED,
+            anchor: aterm_containment::ImageAnchor::Unknown,
             bundle_id: None,
             install: "unknown",
             running: None,
@@ -13979,6 +13989,9 @@ fn macos_access_service_label(service: &str) -> String {
             "network-volumes" => "Network drives".to_string(),
             "removable-volumes" => "Removable drives".to_string(),
             "file-provider-domains" => "Cloud-storage folders (File Provider)".to_string(),
+            "media-library" => "Music and media library".to_string(),
+            "photos" => "Photos library".to_string(),
+            "app-bundles" => "Other apps' bundles (App Management)".to_string(),
             other => other.to_string(),
         },
     }
@@ -14064,11 +14077,20 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
         "Full Disk Access is the single grant macOS offers for this, and its reach was measured on \
          this Mac: the rows below and aterm ctl privacy list exactly what the measurement found."
     } else {
-        "Full Disk Access is the single grant macOS offers for this. Apple documents it as the \
-         grant behind the \"access data from other applications\" request a program run in aterm \
-         can raise. The app-data row below reflects aterm's own access check; aterm has not \
-         measured its reach to other service classes or existing sessions on this Mac. \
-         Cloud-storage folders remain separate."
+        // MEASURED 2026-09-19 for app-data, still unmeasured for the rest. The
+        // old sentence told an owner who had just granted it that aterm "has
+        // not measured its reach" — on the one screen that exists to confirm
+        // the fix worked, about the one class that WAS measured, on a machine
+        // where it demonstrably worked. What is measured is now stated as
+        // measured, and the unmeasured classes are named rather than folded in.
+        "Full Disk Access is the single grant macOS offers for this, and it is the only durable \
+         answer to the \"access data from other applications\" request: macOS records that answer \
+         against one running process and offers no setting of its own for it, so it returns each \
+         time aterm's process is replaced. Measured on this Mac: with the grant held, that request \
+         stopped entirely. Its reach to your Documents, Desktop and Downloads folders, to network \
+         and removable drives, and to sessions that were already open has not been measured here. \
+         Cloud-storage folders, the photo and media libraries and App Management are separate \
+         settings this grant does not reach."
     };
     let identity = {
         let posture = match access.install {
@@ -14085,10 +14107,27 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
                   there and open that copy."
             }
         };
-        match access.running.as_deref() {
+        let mut text = match access.running.as_deref() {
             Some(path) => format!("Running from {path} ({posture}) \u{2014} {consequence}"),
             None => format!("Running {posture} \u{2014} {consequence}"),
+        };
+        // THE ONE STATE THE REST OF THIS PANEL CANNOT SHOW. A grant is checked
+        // against the running code; if the bundle is gone from that name, macOS
+        // has nothing to check and every request is asked again — while the
+        // headline above can still read "granted", because the probe reads a
+        // path that follows the vnode. Say it here, beside the path, in the
+        // owner's terms and without telling them to do anything: the sentence
+        // that would (quit, reopen) is fenced by the phrase guard, and the
+        // recovery is aterm's to perform, not theirs.
+        if access.anchor.grant_unverifiable() {
+            text.push_str(
+                " \u{2014} but that bundle is no longer on disk under this name, so macOS has no \
+                 code to check a grant against and asks again for everything. Access granted in \
+                 Settings is not reaching this copy. A copy started fresh from Applications is \
+                 unaffected.",
+            );
         }
+        text
     };
     let responsible = {
         let mut text = String::from(
@@ -14109,7 +14148,11 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
         let mut rows = Vec::new();
         for service in access.covers.iter() {
             if *service == "app-data" && !access.evidence.fda_coverage_measured {
-                rows.push("Other applications' data \u{2014} Full Disk Access confirmed for the observing aterm host; Apple-documented coverage".to_string());
+                // MEASURED 2026-09-19, so this row no longer attributes its
+                // claim to Apple's documentation. `fda_coverage_measured` is
+                // still false because it gates five classes at once and only
+                // this one was measured — the arm stays, its sentence changes.
+                rows.push("Other applications' data \u{2014} measured on this Mac: with Full Disk Access held, this request stopped".to_string());
                 continue;
             }
             rows.push(format!(
@@ -14139,9 +14182,13 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     // grants Full Disk Access, and the line used to stay byte-identical — so
     // the screen meant to confirm the fix could not show it working.
     let prompt = if access.prompt_possible() && access.fda == FdaState::Granted {
-        "Granted: Apple documents this grant as the one that stops the \"access data from other \
-         applications\" request; aterm has not measured that on this Mac, so an interruption \
-         cannot be ruled out."
+        // The measured half and the unmeasured half, kept apart. Saying only
+        // "an interruption cannot be ruled out" to an owner who has just fixed
+        // the exact thing they came here to fix reads as "it did not work".
+        "Granted, and measured on this Mac: the \"access data from other applications\" request \
+         stopped. Your Documents, Desktop and Downloads folders, network and removable drives, \
+         and sessions that were already open have not been measured here, so an interruption from \
+         those cannot be ruled out."
     } else if access.prompt_possible() {
         "A program running in aterm can still be interrupted by a macOS file-access request."
     } else {
@@ -21424,6 +21471,9 @@ mod tests {
     ) -> MacosAccess {
         MacosAccess {
             enabled: true,
+            // The healthy anchor is the fixture default; the tests that care
+            // set it explicitly.
+            anchor: aterm_containment::ImageAnchor::Live,
             fda,
             probe: match fda {
                 FdaState::Granted => ProbeLabel::OpenOk,
@@ -21458,6 +21508,64 @@ mod tests {
         }
     }
 
+    /// A grant that macOS cannot CHECK is said so on the panel, beside the
+    /// path, and does not hide behind a granted headline.
+    ///
+    /// This is the owner-facing half of the detector. The defect it names cost
+    /// the owner four and a half silent hours on 2026-09-19: an in-place apply
+    /// renames the bundle a live aterm was exec'd from and boot-health deletes
+    /// it, after which tccd can build no code identity and every request is
+    /// asked again — while this very panel could still read "granted", because
+    /// the probe follows the vnode.
+    #[test]
+    fn a_bundle_that_is_no_longer_there_is_named_on_the_panel() {
+        use aterm_containment::{FdaScope, ImageAnchor};
+
+        let healthy = access_fixture(FdaState::Granted, DrClass::Identity, FdaScope::Unknown);
+        let copy = macos_access_copy(&healthy);
+        assert!(
+            !copy.identity.contains("no longer on disk"),
+            "a live anchor says nothing extra: {}",
+            copy.identity
+        );
+
+        for anchor in [ImageAnchor::Displaced, ImageAnchor::Deleted] {
+            let mut broken =
+                access_fixture(FdaState::Granted, DrClass::Identity, FdaScope::Unknown);
+            broken.anchor = anchor;
+            let copy = macos_access_copy(&broken);
+            assert!(
+                copy.identity.contains("no longer on disk under this name"),
+                "{anchor:?}: {}",
+                copy.identity
+            );
+            assert!(
+                copy.identity.contains("asks again for everything"),
+                "{anchor:?}: the consequence, not just the fact: {}",
+                copy.identity
+            );
+            assert!(
+                copy.identity.contains("is not reaching this copy"),
+                "{anchor:?}: and that the Settings grant is not the problem: {}",
+                copy.identity
+            );
+        }
+
+        // The two non-faults stay silent: a dev run outside a bundle and a path
+        // that could not be read are not broken grants.
+        for benign in [ImageAnchor::NotBundled, ImageAnchor::Unknown] {
+            let mut access =
+                access_fixture(FdaState::Granted, DrClass::Identity, FdaScope::Unknown);
+            access.anchor = benign;
+            assert!(
+                !macos_access_copy(&access)
+                    .identity
+                    .contains("no longer on disk"),
+                "{benign:?} is not a fault"
+            );
+        }
+    }
+
     #[test]
     fn macos_access_app_data_uses_host_authority_without_claiming_adopted_access() {
         use aterm_containment::FdaScope;
@@ -21474,11 +21582,18 @@ mod tests {
                 .find(|row| row.starts_with("Other applications' data"))
                 .unwrap();
             if fda == FdaState::Granted {
+                // NARROWED 2026-09-19. The row used to attribute its claim to
+                // Apple's documentation, because that was all the tree had; §7
+                // S4 measured this class on this OS, so it now says measured.
+                // The obligation that survives is the one the test is named
+                // for: the claim stops at the OBSERVING HOST. It may not be
+                // stated for adopted sessions, which is what the `responsible`
+                // assertion below still pins.
+                assert!(app_data.contains("measured on this Mac"), "{app_data}");
                 assert!(
-                    app_data.contains("Full Disk Access confirmed for the observing aterm host"),
-                    "{app_data}"
+                    !app_data.contains("Apple-documented"),
+                    "a measurement is no longer reported as documentation: {app_data}"
                 );
-                assert!(app_data.contains("Apple-documented coverage"), "{app_data}");
                 assert!(!app_data.contains("not measured"), "{app_data}");
             } else {
                 assert!(app_data.contains("not measured"), "{app_data}");
@@ -21800,10 +21915,16 @@ mod tests {
         );
     }
 
-    /// The coverage sentence is selected by a NAMED FIELD, not by prose. Today
-    /// it says aterm has not measured what a grant covers; flipping
-    /// `fda_coverage_measured` is the only way a stronger sentence appears, and
-    /// even then it defers to the measurement instead of listing folders here.
+    /// The coverage sentence is selected by a NAMED FIELD, not by prose, and it
+    /// keeps the measured and unmeasured halves APART.
+    ///
+    /// NARROWED 2026-09-19, not deleted. The original asserted that the shipped
+    /// sentence says aterm "has not measured" — full stop — which was right
+    /// while §7 S4 was unrun and became wrong the day app-data was measured.
+    /// The tripwire's real job survives and is now stated as two obligations:
+    /// the sentence must still disclaim the classes nobody has measured, AND it
+    /// may not claim measured coverage for them. Naming the unmeasured classes
+    /// individually is what lets both assertions be checked at once.
     #[test]
     fn the_coverage_sentence_is_gated_on_measured_evidence() {
         use aterm_containment::FdaScope;
@@ -21811,10 +21932,19 @@ mod tests {
         assert!(!unmeasured.evidence.fda_coverage_measured);
         let today = macos_access_copy(&unmeasured);
         assert!(
-            today.coverage.contains("has not measured"),
-            "today's sentence must say the measurement was not made: {}",
+            today.coverage.contains("has not been measured"),
+            "the sentence must still say which reach was NOT measured: {}",
             today.coverage
         );
+        // The four classes S4 could not isolate have to be named, so the
+        // disclaimer cannot quietly shrink to nothing.
+        for unmeasured_class in ["Documents", "network and removable drives", "already open"] {
+            assert!(
+                today.coverage.contains(unmeasured_class),
+                "the unmeasured classes are named, not folded away ({unmeasured_class}): {}",
+                today.coverage
+            );
+        }
         assert!(
             today.coverage.contains("single grant macOS offers"),
             "…while still naming Full Disk Access as the one grant on offer: {}",

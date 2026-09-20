@@ -120,6 +120,12 @@ pub(crate) enum MotionEffect {
     /// information (an update is applying; it landed) is kept, the movement
     /// is removed: the notice pill's rule, not the matrix rain's.
     UpgradeSurge,
+    /// The PRESENCE rim's one edge ripple (`crate::presence`): a 300 ms flash
+    /// along the driven window's rim when a peer's turn submit verifiably
+    /// landed. 0 ⇒ the ripple never STARTS — the frame is the steady rim's
+    /// image, byte for byte (the information, "driven", is the rim itself and
+    /// the band's words; the flash is decoration).
+    PresenceRipple,
 }
 
 impl MotionEffect {
@@ -129,7 +135,7 @@ impl MotionEffect {
     /// cannot silently skip the reduced-motion invariant. Test-only, like
     /// `seq`: production consumers gate per-effect via [`MotionPolicy`].
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SettingsDemo,
@@ -141,6 +147,7 @@ impl MotionEffect {
         Self::Robi,
         Self::OutputStreak,
         Self::UpgradeSurge,
+        Self::PresenceRipple,
     ];
 
     /// Stable index of each variant (0..ALL.len()). EXHAUSTIVE match on purpose:
@@ -161,6 +168,7 @@ impl MotionEffect {
             Self::Robi => 8,
             Self::OutputStreak => 9,
             Self::UpgradeSurge => 10,
+            Self::PresenceRipple => 11,
         }
     }
 }
@@ -196,11 +204,14 @@ pub(crate) enum SeriousEffect {
     SettingsPreview,
     GpuPostFx,
     Robi,
+    /// The presence rim's turn-submit ripple: decoration on a rim that
+    /// otherwise moves only with a fact.
+    PresenceRipple,
 }
 
 impl SeriousEffect {
     #[cfg(test)]
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::TerminalSound,
         Self::CursorTrail,
         Self::CursorGlow,
@@ -213,6 +224,7 @@ impl SeriousEffect {
         Self::SettingsPreview,
         Self::GpuPostFx,
         Self::Robi,
+        Self::PresenceRipple,
     ];
 
     #[cfg(test)]
@@ -230,6 +242,7 @@ impl SeriousEffect {
             Self::SettingsPreview => 9,
             Self::GpuPostFx => 10,
             Self::Robi => 11,
+            Self::PresenceRipple => 12,
         }
     }
 }
@@ -263,7 +276,8 @@ impl SeriousModePolicy {
             | SeriousEffect::LevelUp
             | SeriousEffect::SettingsPreview
             | SeriousEffect::GpuPostFx
-            | SeriousEffect::Robi => !self.serious,
+            | SeriousEffect::Robi
+            | SeriousEffect::PresenceRipple => !self.serious,
         }
     }
 }
@@ -308,7 +322,8 @@ impl MotionPolicy {
                 | MotionEffect::NoticePill
                 | MotionEffect::Robi
                 | MotionEffect::OutputStreak
-                | MotionEffect::UpgradeSurge => 0.0,
+                | MotionEffect::UpgradeSurge
+                | MotionEffect::PresenceRipple => 0.0,
             },
         }
     }

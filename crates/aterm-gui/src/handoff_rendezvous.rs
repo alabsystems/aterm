@@ -71,7 +71,11 @@
 //!
 //! Exactly one connection is SERVED, exactly one message carrying every
 //! descriptor is sent, and then the socket is gone. There is no retry, no second
-//! grant, and no verb.
+//! grant, and no verb. The one served connection may be HELD between the claim
+//! and the grant (2026-09-19, the late park): the successor dials as soon as it
+//! has booted, holding nothing, and waits — under its own grant budget — for the
+//! outgoing process to park and send the one descriptor message, or for EOF,
+//! which is the parent standing the attempt down.
 //!
 //! A peer that presents the wrong secret is refused — but refusing a CONNECTION
 //! is not refusing the ATTEMPT, and an earlier shape here conflated the two:
@@ -932,6 +936,34 @@ pub(crate) struct ClaimedPeer {
 }
 
 impl ClaimedPeer {
+    /// Whether the held dialer has gone: one zero-timeout `poll` for HUP/ERR/NVAL
+    /// on the served stream. The parent's witness, while it HOLDS a claim between
+    /// accept and transfer, that the successor died before any descriptor left —
+    /// so the attempt is stood down without a park rather than granted to a
+    /// corpse. Never `true` for a merely idle peer (readable data is not a hangup).
+    #[must_use]
+    pub(crate) fn poll_hangup(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let mut fds = [libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            }];
+            // SAFETY: `fds` is a valid array of one initialised pollfd for the
+            // length of the call; a zero timeout never blocks.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+            if ready <= 0 {
+                return false;
+            }
+            fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     /// The kernel-attested dialer pid. This is the first identity the handoff
     /// has for a process it did not fork, and it is what `HandoffCandidate` and
     /// `signal_handoff_candidate` need before they may aim anything at a
@@ -1007,6 +1039,17 @@ impl ClaimedPeer {
 }
 
 /// The claim frame a successor presents.
+/// A test's dialer: connect to `path` and present `secret`, keeping the stream
+/// so the accepted claim can be HELD by the listener (the late park's shape)
+/// and closed from that side. The production dialer is `dial_and_claim`.
+#[cfg(test)]
+pub(crate) fn dial_for_test(path: &Path, secret: &str) -> std::io::Result<CtlStream> {
+    let stream = CtlStream::connect(path)?;
+    (&stream).write_all(&claim_frame(secret))?;
+    (&stream).flush()?;
+    Ok(stream)
+}
+
 fn claim_frame(secret: &str) -> [u8; CLAIM_FRAME_LEN] {
     let mut frame = [0u8; CLAIM_FRAME_LEN];
     frame[..CLAIM_MAGIC.len()].copy_from_slice(CLAIM_MAGIC);
@@ -1219,13 +1262,13 @@ pub(crate) fn take_device_proof_term() -> Option<bool> {
 /// path, before any thread or session spawn.
 pub(crate) fn claim_incoming(
     expected_nonce: &str,
-    deadline: Instant,
+    deadlines: ClaimDeadlines,
 ) -> Result<ClaimedHandoff, RendezvousError> {
     let (path, secret) = rendezvous_env(
         aterm_log::env::take(ENV_RENDEZVOUS),
         aterm_log::env::take(ENV_CLAIM),
     )?;
-    let claimed = dial_and_claim(&path, &secret, expected_nonce, deadline);
+    let claimed = dial_and_claim(&path, &secret, expected_nonce, deadlines);
     if claimed.is_ok() {
         let _ = std::fs::remove_file(&path);
     }
@@ -1272,11 +1315,24 @@ fn rendezvous_env(
     Ok((PathBuf::from(path), secret))
 }
 
+/// The two budgets of a dial (2026-09-19, the late park). `dial` bounds the
+/// connect, the uid check and the claim write — the parent is holding the
+/// listener open and answers at once, or it has given up and the connect fails
+/// at once, so this is short. `grant` bounds the wait for the one descriptor
+/// message: long, because the outgoing process parks only at a quiet moment
+/// AFTER the successor has dialled, and holds the claim meanwhile; EOF ends it
+/// at once either way.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClaimDeadlines {
+    pub dial: Instant,
+    pub grant: Instant,
+}
+
 fn dial_and_claim(
     path: &Path,
     secret: &str,
     expected_nonce: &str,
-    deadline: Instant,
+    deadlines: ClaimDeadlines,
 ) -> Result<ClaimedHandoff, RendezvousError> {
     let stream =
         CtlStream::connect(path).map_err(|error| RendezvousError::Dial(error.to_string()))?;
@@ -1294,7 +1350,7 @@ fn dial_and_claim(
             ));
         }
     }
-    let remaining = remaining_io_budget(deadline)?;
+    let remaining = remaining_io_budget(deadlines.dial)?;
     stream
         .set_read_timeout(Some(remaining))
         .and_then(|()| stream.set_write_timeout(Some(remaining)))
@@ -1318,7 +1374,7 @@ fn dial_and_claim(
     // would otherwise be allowed the full budget each.
     let mut header = [0u8; GRANT_HEADER_LEN];
     stream
-        .set_read_timeout(Some(remaining_io_budget(deadline)?))
+        .set_read_timeout(Some(remaining_io_budget(deadlines.grant)?))
         .map_err(grant_failed)?;
     let received = fdpass::recv_with_fds(&stream, &mut header, fdpass::MAX_FDS)
         .map_err(|error| RendezvousError::Grant(error.to_string()))?;
@@ -1332,7 +1388,7 @@ fn dial_and_claim(
         read_frame_by_deadline(
             &stream,
             &mut header[received.bytes..],
-            deadline,
+            deadlines.grant,
             &grant_failed,
         )?;
     }
@@ -1347,7 +1403,7 @@ fn dial_and_claim(
         return Err(RendezvousError::Grant("oversized body".to_string()));
     }
     let mut body = vec![0u8; body_len];
-    read_frame_by_deadline(&stream, &mut body, deadline, &grant_failed)?;
+    read_frame_by_deadline(&stream, &mut body, deadlines.grant, &grant_failed)?;
     let body =
         String::from_utf8(body).map_err(|_| RendezvousError::Grant("not UTF-8".to_string()))?;
     let sessions = parse_grant_body(&body, expected_nonce)?;
@@ -1664,14 +1720,8 @@ mod tests {
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
 
-        let dialer = std::thread::spawn(move || {
-            dial_and_claim(
-                &path,
-                &claim,
-                TEST_NONCE,
-                Instant::now() + Duration::from_secs(10),
-            )
-        });
+        let dialer =
+            std::thread::spawn(move || dial_and_claim(&path, &claim, TEST_NONCE, deadlines_in(10)));
 
         let peer = rendezvous
             .accept_claim(
@@ -1879,14 +1929,8 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("bound the wrong dialer's own read");
 
-        let successor = std::thread::spawn(move || {
-            dial_and_claim(
-                &path,
-                &claim,
-                TEST_NONCE,
-                Instant::now() + Duration::from_secs(10),
-            )
-        });
+        let successor =
+            std::thread::spawn(move || dial_and_claim(&path, &claim, TEST_NONCE, deadlines_in(10)));
         let peer = rendezvous
             .accept_claim(
                 Some(own_pid()),
@@ -2118,6 +2162,156 @@ mod tests {
     /// Bind a rendezvous under a test-only nonce, or skip when this machine has
     /// no usable control directory or a `$HOME` too long for `sun_path` — the
     /// same two refusals production falls back to the fork lane on.
+    fn deadlines_in(secs: u64) -> ClaimDeadlines {
+        let at = Instant::now() + Duration::from_secs(secs);
+        ClaimDeadlines {
+            dial: at,
+            grant: at,
+        }
+    }
+
+    /// THE HELD CLAIM (2026-09-19, the late park): the parent accepts the dial,
+    /// HOLDS the served stream while it does other work, and the one descriptor
+    /// message still arrives whole — and the hold is bounded by the dialer's
+    /// GRANT budget, not its dial budget, so a dial budget already spent by the
+    /// time the parent parks does not end a legitimate wait.
+    #[test]
+    fn a_held_claim_is_granted_after_the_hold_under_the_grant_budget() {
+        let Some(rendezvous) = bind_for_test() else {
+            return;
+        };
+        let (master, slave) = open_pty();
+        let (ready_rd, ready_wr) = pipe_for_test();
+        let (commit_rd, commit_wr) = pipe_for_test();
+        let claim = rendezvous.claim().to_string();
+        let path = rendezvous.path().to_path_buf();
+        let dialer = std::thread::spawn(move || {
+            dial_and_claim(
+                &path,
+                &claim,
+                TEST_NONCE,
+                ClaimDeadlines {
+                    // Spent long before the hold ends: the dial is over by then.
+                    dial: Instant::now() + Duration::from_millis(150),
+                    grant: Instant::now() + Duration::from_secs(10),
+                },
+            )
+        });
+        let peer = rendezvous
+            .accept_claim(
+                Some(own_pid()),
+                Instant::now() + Duration::from_secs(10),
+                &|| false,
+            )
+            .expect("claimed");
+        assert!(!peer.poll_hangup(), "a held, idle dialer is not a hangup");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !peer.poll_hangup(),
+            "…nor after the hold outlasted its dial budget"
+        );
+        // SAFETY: a descriptor this test owns for the length of the call.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(master) };
+        peer.transfer(
+            TEST_NONCE,
+            &[(11, 4242, borrowed)],
+            ready_wr.as_fd(),
+            commit_rd.as_fd(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("transfer after the hold");
+        let claimed = dialer
+            .join()
+            .expect("dialer thread")
+            .expect("claimed after the hold");
+        assert_eq!(claimed.session_count(), 1);
+        drop(claimed);
+        drop((ready_rd, ready_wr, commit_rd, commit_wr));
+        aterm_pty::close_fd(master);
+        aterm_pty::close_fd(slave);
+    }
+
+    /// STAND-DOWN IS EOF: a parent that drops the held peer and the rendezvous
+    /// without transferring ends the dialer's wait at once with the one error the
+    /// successor maps to "exit before any window", and no descriptor ever left.
+    #[test]
+    fn dropping_a_held_claim_ends_the_dialers_wait_with_eof_and_no_descriptors() {
+        let Some(rendezvous) = bind_for_test() else {
+            return;
+        };
+        let claim = rendezvous.claim().to_string();
+        let path = rendezvous.path().to_path_buf();
+        let dialer = std::thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = dial_and_claim(&path, &claim, TEST_NONCE, deadlines_in(10));
+            (outcome, started.elapsed())
+        });
+        let peer = rendezvous
+            .accept_claim(
+                Some(own_pid()),
+                Instant::now() + Duration::from_secs(10),
+                &|| false,
+            )
+            .expect("claimed");
+        std::thread::sleep(Duration::from_millis(100));
+        drop(peer);
+        drop(rendezvous);
+        let (outcome, elapsed) = dialer.join().expect("dialer thread");
+        match outcome {
+            Err(RendezvousError::Grant(reason)) => {
+                assert_eq!(reason, "the parent closed the rendezvous");
+            }
+            Err(other) => panic!("expected the EOF grant error, got {other}"),
+            Ok(_) => panic!("expected the EOF grant error, got a grant"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "EOF ends the wait at once, not at the grant budget: {elapsed:?}"
+        );
+    }
+
+    /// A dialer that dies during the hold is seen by the parent's `poll_hangup`
+    /// before any transfer, so the attempt can be stood down without a park.
+    #[test]
+    fn a_dialer_that_dies_during_the_hold_reads_as_a_hangup() {
+        let Some(rendezvous) = bind_for_test() else {
+            return;
+        };
+        let claim = rendezvous.claim().to_string();
+        let path = rendezvous.path().to_path_buf();
+        let dialer = std::thread::spawn(move || {
+            let stream = CtlStream::connect(&path).expect("connect");
+            (&stream)
+                .write_all(&claim_frame(&claim))
+                .and_then(|()| (&stream).flush())
+                .expect("claim written");
+            // Hold the stream long enough for the parent to accept, then die.
+            std::thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+        let peer = rendezvous
+            .accept_claim(
+                Some(own_pid()),
+                Instant::now() + Duration::from_secs(10),
+                &|| false,
+            )
+            .expect("claimed");
+        assert!(!peer.poll_hangup(), "alive while it holds the stream");
+        dialer.join().expect("dialer thread");
+        let mut saw_hangup = false;
+        for _ in 0..50 {
+            if peer.poll_hangup() {
+                saw_hangup = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_hangup,
+            "the closed peer reads as a hangup within a poll or two"
+        );
+    }
+
     fn bind_for_test() -> Option<Rendezvous> {
         let nonce = aterm_uds::rand::hex_token::<16>().ok()?;
         match Rendezvous::bind(&nonce) {

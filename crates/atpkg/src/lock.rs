@@ -870,7 +870,11 @@ mod tests {
     /// announcement ledger split `cmd_update_all` and `cmd_install_default_set` that
     /// way, so the pass's real verdict answers its own announcement); the one other
     /// non-literal argument is the lock edge's own match, which names this constant.
-    /// A caller keying on 75 can therefore never mistake another refusal for
+    /// The self-update verb (`cli::cmd_selfupdate`, 2026-09-19) relays its CHILD's
+    /// status the same way — literal arms for 0, 2 and everything else, and the named
+    /// `CONTENDED_EXIT` for 75, never a relayed variable — and `selfupdate.rs` builds no
+    /// exit code at all (its own test pins that), so the scanned set stays these two
+    /// files. A caller keying on 75 can therefore never mistake another refusal for
     /// contention.
     ///
     /// THE SPLIT IS EACH TEST MODULE'S OWN GATE, and a split that cannot find it

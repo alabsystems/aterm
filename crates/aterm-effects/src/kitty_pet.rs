@@ -2330,9 +2330,34 @@ impl PetAction {
 #[derive(Clone, Copy, Debug)]
 pub struct PetSense {
     pub now: Instant,
-    /// The visible caret cell, or `None` when the cursor is hidden or scrolled
-    /// out of view.
+    /// **THE CARET CELL**, or `None` when this frame genuinely has no caret in
+    /// the pet's coordinate space — which since 2026-09-19 means exactly one
+    /// thing: the viewport is scrolled into history, where the active grid's
+    /// `(row, col)` names an unrelated scrollback line.
+    ///
+    /// A cursor the emulator is not PAINTING (DECTCEM, `\x1b[?25l`) is still a
+    /// caret: the terminal knows its cell, it is in bounds, and text is being
+    /// written at it. It used to arrive here as `None` — "I am not drawing it"
+    /// returned as "it is not there", the house's bound-as-a-fact defect — and
+    /// that single conflation is what the owner reported on 2026-09-19 as *"not
+    /// correctly following the cursor reliably … getting shoved away as like a
+    /// glitch … sometimes getting trapped at the top of the screen"*. MEASURED
+    /// on the shipped v0.88.0 build with `aterm ctl trail status`: with the
+    /// cursor hidden the pet sat at row 0.0 for **20.04 s** while the caret was
+    /// on row 44, and at row 23.4 for **20.15 s** in the same run started
+    /// mid-screen — it holds wherever it is, for as long as the hide lasts —
+    /// and then crossed 28.4 cells in ONE frame when the cursor came back. Any
+    /// program that hides the cursor while it works does this: a progress bar,
+    /// a spinner, a pager, an editor, an LLM console between repaints.
+    ///
+    /// So the two facts travel separately now: this one says WHERE the caret
+    /// is, [`Self::caret_drawn`] says whether the user can see it.
     pub caret: Option<(u16, u16)>,
+    /// Is the emulator PAINTING that caret this frame? `false` for a DECTCEM
+    /// hide. The caret is no less real — [`Self::caret`] still carries its
+    /// cell — but a hide is how a program says "I am repainting", so the pet
+    /// keeps following it without reading the moves as a person typing.
+    pub caret_drawn: bool,
     /// The emulator wrapped the caret since the last host read; a fact from
     /// the grid, never a heuristic. It is the ONLY signal that separates the
     /// bottom-row scrolled wrap — where the caret's row never changes, so the
@@ -4654,13 +4679,6 @@ impl PetBrain {
         }
     }
 
-    /// **THE ROOM'S LEVELS**, `(lease, quiet, hold)` — host observability on
-    /// [`Self::pending_v2_offer`]'s precedent. Reads nothing else.
-    #[must_use]
-    pub fn room_levels(&self) -> (bool, bool, bool) {
-        (self.room_lease, self.room_quiet, self.room_hold)
-    }
-
     /// Queued, not-yet-consumed pets — host observability (the click seam's
     /// unit tests assert the latch moved without driving a full frame).
     #[must_use]
@@ -4727,6 +4745,23 @@ impl PetBrain {
         };
         let dt = elapsed.min(0.10);
         self.last_now = Some(sense.now);
+        // WAS THE CAT ALREADY IN THE AIR WHEN THIS TICK BEGAN? The ink-eviction
+        // hop ([`Self::leave_ground`] at the eviction arm) is the ONE launcher
+        // that does not return before the flight arm below — every other door
+        // emits immediately — so its brand-new arc, stamped `t: 0.0`
+        // microseconds earlier, used to be advanced by THIS tick's `elapsed` on
+        // its own launch frame. `elapsed` is the unclamped clock (up to 5 s) and
+        // a settled cat is off the frame train at the blink's ~1 Hz, so the
+        // advance saturated [`FLIGHT_STALL_MAX`] and the launch frame was drawn
+        // 0.16 s into an arc that had not started: a hop is drawn most of the
+        // way along, which is the single-frame jump this arm's own comment says
+        // it exists to abolish ("it used to land in ONE frame"). The bar is half
+        // the animal, ~2.8 columns.
+        //
+        // A flight born during this tick is therefore drawn at `u = 0` — its
+        // launch point, where the cat already is — and starts moving on the
+        // next frame, like every flight that goes through a returning door.
+        let airborne_at_entry = self.flight.is_some();
         // ── reversal bookkeeping (the frolic detector) ─────────────────────
         //
         // THE GESTURE WINDOWS RIDE THE WALL CLOCK (`elapsed`), not `dt`. Each
@@ -6074,7 +6109,38 @@ impl PetBrain {
         // BOTH places or in neither: the pose hold below carries the same
         // `!hugging`, because holding the pose returns before every door and
         // would otherwise discard the target chosen here.
-        let (target, target_row) = if self.stream && self.flight.is_none() && !hugging {
+        //
+        // A WATCHER SITS NEAR WHAT IT IS WATCHING — 2026-09-19. Holding the
+        // pet's own feet is right for a cat that is already beside the action.
+        // It is not a reason to stay stranded across the screen from it, and
+        // that is what it became for a REPAINTING console: a repaint prints no
+        // new rows, so `ink_live` is `None`, the live-edge hug above can never
+        // arm, and this hold pinned the pet wherever it happened to be standing
+        // for as long as the repaints lasted. Every LLM console, spinner,
+        // progress bar and full-screen TUI repaints several times a second,
+        // which is well inside [`STREAM_RUN`]'s three-events-in-[`STREAM_WINDOW`]
+        // trigger — the watch is armed the whole time you are using one.
+        //
+        // MEASURED on the shipped v0.88.0 with `aterm ctl trail status`,
+        // against a fixture that repaints 6.7x/s with the caret parked 44 rows
+        // from the pet: the pet sat still for 20.03 s of a 20 s stage (median
+        // gap 44.0 rows), and did the same at row 23.4 from a mid-screen start —
+        // it freezes wherever it stands. Slowing the SAME fixture to 1.4
+        // repaints/s, under the trigger, the median gap is 0.7 rows. That is the
+        // owner's *"not correctly following the cursor reliably … sometimes
+        // getting trapped at the top of the screen"*: the top is simply where
+        // the cat most often is when a console starts working — a fresh prompt,
+        // a `clear`, an input row near the top.
+        //
+        // So the hold keeps its whole purpose — a cat does not chase a build log
+        // line by line — and gives up the one thing it should never have had:
+        // the right to hold a seat the action has left. Past [`WATCH_HUG_ROWS`]
+        // (the same hysteresis the live-edge hug uses, so the two agree) the
+        // ordinary station is the target again and the pet travels to it, then
+        // sits and watches from there.
+        let watch_far = (target_row - self.row).abs() > WATCH_HUG_ROWS;
+        let (target, target_row) = if self.stream && self.flight.is_none() && !hugging && !watch_far
+        {
             (self.col, self.row)
         } else {
             (target, target_row)
@@ -6180,7 +6246,9 @@ impl PetBrain {
             // is a schedule and must finish on wall time even when the host
             // withheld frames for a synchronized-output bracket. See
             // [`FLIGHT_STALL_MAX`].
-            f.t += elapsed.min(FLIGHT_STALL_MAX);
+            if airborne_at_entry {
+                f.t += elapsed.min(FLIGHT_STALL_MAX);
+            }
             let u = (f.t / f.dur).clamp(0.0, 1.0);
             self.col = f.from_col + (f.to_col - f.from_col) * u;
             self.row = f.from_row + (f.to_row - f.from_row) * u;
@@ -6584,7 +6652,54 @@ impl PetBrain {
                 // facing already tracks each hit in `on_move`. The rally
                 // lapsing (or the caret going quiet enough to sleep) stands
                 // the watch down into the ordinary settle.
-                if (self.clock - self.tennis_last) as f32 <= TENNIS_LAPSE {
+                //
+                // A WATCHER SITS NEAR WHAT IT IS WATCHING — 2026-09-19, and
+                // this hold is what the owner was reporting. It returns BEFORE
+                // every door, the row-hop included, so while it is latched the
+                // cat cannot travel at all; and nothing in it asked where the
+                // rally actually was. Two things then compound:
+                //
+                //  * a REPAINTING CONSOLE rallies by accident. `\r`, `\x1b[1G`
+                //    or `ESC[row;1H` to the margin, erase, write, then back to
+                //    the caret column — that is a direction reversal per
+                //    repaint, [`FROLIC_REVERSALS`] of them arrive in a fraction
+                //    of a second, and a second frolic inside [`TENNIS_AFTER`]
+                //    latches the watch. Every LLM console, spinner, progress
+                //    bar and full-screen TUI repaints like this several times a
+                //    second, which also refreshes `tennis_last` inside
+                //    [`TENNIS_LAPSE`] forever: the latch never lapses while you
+                //    are using one;
+                //  * the seat is wherever the cat happened to be sitting. If
+                //    the caret is somewhere else entirely — a console whose
+                //    input row is at the bottom, a cat that settled at a prompt
+                //    near the top — the cat watches a rally it is nowhere near.
+                //
+                // MEASURED on the shipped v0.88.0 with `aterm ctl trail status`
+                // against a fixture repainting 6.7x/s with the caret 44 rows
+                // away: the pet sat still for 20.03 s of a 20 s stage (median
+                // gap 44.0 rows), and for 20.15 s at row 23.4 from a mid-screen
+                // start. A `#[track_caller]` trace on `emit`, printing the
+                // line each frame returned from, named THIS one on 704 of 900
+                // frozen frames — which is how the arm was found, after three
+                // other candidates had been fixed and measured to change
+                // nothing. That is *"not correctly following the
+                // cursor reliably … sometimes getting trapped at the top of the
+                // screen"*: the top is simply where the cat most often is when
+                // a console starts working — a fresh prompt, a `clear`, an
+                // input row near the top.
+                //
+                // So the watch keeps its whole purpose — a cat that has given
+                // up chasing a ping-pong caret sits and watches it — and gives
+                // up the one thing it should never have had: the right to hold
+                // a seat the rally has left. A rally on another row, or more
+                // than a [`POUNCE_GAP`] along this one, stands the watch down;
+                // the ordinary ladder carries the cat over and the rally
+                // re-latches it there, watching from somewhere it can see.
+                let rally_out_of_reach =
+                    (target_row - self.row).abs() >= 0.5 || (target - self.col).abs() > POUNCE_GAP;
+                if rally_out_of_reach {
+                    self.tennis = false;
+                } else if (self.clock - self.tennis_last) as f32 <= TENNIS_LAPSE {
                     self.speed = 0.0;
                     // …BUT THE SKY STILL REACHES IT (2026-09-10). The rally
                     // seat is the ONE posture that stays `Sit` and purring
@@ -12018,22 +12133,42 @@ impl PetBrain {
     /// [`Self::next_change_deadline`] — except for the two refusals that are
     /// a function of the hand alone: face-on, the tail rides the glance's
     /// clock ([`Self::tail_clock`]) and can only play inside a look, so a
-    /// beat dealt no glance offers no tail, and the swing is offered only
+    /// beat dealt no LOOK offers no tail — and a yawn is a look, exactly as
+    /// `sit_look_left` has it — and the swing is offered only
     /// when the look is long enough to hold it ([`LOOK_DUR_LONG`]).
+    /// THE TAIL'S EDGES FOR ONE BEAT — extracted from [`Self::sit_beat_edges`]
+    /// so the rule can be asserted directly. The bug this closes was precisely a
+    /// DISAGREEMENT between this decision and the one `sit_tail` actually draws
+    /// by, and a decision buried in a closure could only be tested through the
+    /// combined offer, where blink and glance edges mask it.
+    ///
+    /// THE YAWN IS A LOOK TOO. This refused on the GLANCE deal alone — "a beat
+    /// dealt no glance offers no tail" — but the tail's real fit rule is
+    /// `side_on_holds` -> [`Self::sit_look_left`], which returns `Some` for the
+    /// YAWN's own look as well as for a dealt glance. Face-on, on a beat dealt
+    /// no glance, the tail DOES play inside the yawn window and none of its
+    /// edges were offered. The coarse offer is the pet's only wake source on a
+    /// quiet prompt, so the flick was dropped and the pose held stale. Exact
+    /// hand at `settle_seed == 0`: beat 0 — `% 3 == 0` (no glance) and
+    /// `% 4 == 0` (the short flick) — one dealt hand in twelve.
+    fn sit_tail_edges(&self, beat: i64, swing_fits: bool) -> &'static [f32] {
+        if self.sit_front && !self.sit_yawn() && self.beat_deal(beat, 3) == 0 {
+            return &[];
+        }
+        match self.beat_deal(beat, 4) {
+            0 => &TAIL_EDGES_FLICK,
+            1 => &TAIL_EDGES_DOUBLE,
+            2 if swing_fits => &TAIL_EDGES_SWING,
+            _ => &[],
+        }
+    }
+
     fn sit_beat_edges(&self, soon: &mut Soonest) {
         let since = self.quiet - SIT_AFTER;
         let (period, at) = self.tail_clock();
         let swing_fits = !self.sit_front || self.look_dur() >= 7.0 * TAIL_SWING;
         Self::offer_beats(soon, since, period, at, |beat| {
-            if self.sit_front && self.beat_deal(beat, 3) == 0 {
-                return &[];
-            }
-            match self.beat_deal(beat, 4) {
-                0 => &TAIL_EDGES_FLICK,
-                1 => &TAIL_EDGES_DOUBLE,
-                2 if swing_fits => &TAIL_EDGES_SWING,
-                _ => &[],
-            }
+            self.sit_tail_edges(beat, swing_fits)
         });
         let blink_period = BLINK_PERIOD + BLINK_PERIOD_STEP * f32::from((self.settle_seed / 2) % 3);
         Self::offer_beats(soon, since, blink_period, BLINK_AT, |beat| {
@@ -12226,6 +12361,70 @@ fn first_px_step(
 
 #[cfg(test)]
 mod tests {
+
+    /// A YAWNING SEAT'S TAIL IS OFFERED ITS EDGES.
+    ///
+    /// `sit_tail_edges` refused on the GLANCE deal alone, but the tail's real
+    /// fit rule is `side_on_holds` -> `sit_look_left()`, which returns `Some`
+    /// for the YAWN's own look too. Face-on on a beat dealt no glance the tail
+    /// played inside the yawn window and none of its edges were offered — and
+    /// the coarse offer is the pet's only wake source on a quiet prompt, so the
+    /// flick was dropped and the pose held stale.
+    ///
+    /// Asserted on the DECISION rather than through `sit_beat_edges`, which also
+    /// carries blink and glance edges: two earlier attempts to prove it through
+    /// the combined offer passed under mutation, because those other streams
+    /// supply a soonest edge either way and `beat_deal` varies with the beat, so
+    /// a search over the window keeps finding a beat that was dealt a glance.
+    ///
+    /// `beat_deal(b, n) == (b + seed) % n`, so at seed 0 beat 0 is the exact
+    /// hand: `% 3 == 0` deals no glance and `% 4 == 0` is the short flick —
+    /// one dealt hand in twelve.
+    #[test]
+    fn a_yawning_seat_is_offered_its_tail_edges() {
+        let mut brain = PetBrain::default();
+        brain.force_seed(0);
+        brain.sit_front = true;
+        assert_eq!(
+            brain.beat_deal(0, 3),
+            0,
+            "fixture: beat 0 is dealt NO glance"
+        );
+        assert_eq!(
+            brain.beat_deal(0, 4),
+            0,
+            "fixture: and it is the short flick"
+        );
+
+        // Inside the yawn window.
+        brain.quiet = brain.loaf_after() - YAWN_DUR / 2.0;
+        assert!(brain.sit_yawn(), "fixture: this seat is yawning");
+        assert_eq!(
+            brain.sit_tail_edges(0, true),
+            &TAIL_EDGES_FLICK,
+            "a yawn is a look: the tail plays, so its edges must be offered"
+        );
+
+        // NEGATIVE CONTROL — the refusal still refuses. Outside the yawn window
+        // the same face-on seat on the same no-glance beat has no look at all,
+        // and must still offer nothing; without this the fix could be "always
+        // offer", which would wake the frame lane on every quiet beat.
+        brain.quiet = brain.loaf_after() - YAWN_DUR * 4.0;
+        assert!(!brain.sit_yawn(), "fixture: now outside the yawn window");
+        assert!(
+            brain.sit_tail_edges(0, true).is_empty(),
+            "a beat dealt no look still offers no tail"
+        );
+
+        // And the rule is face-on only: side-on the tail rides its own clock.
+        brain.sit_front = false;
+        assert_eq!(
+            brain.sit_tail_edges(0, true),
+            &TAIL_EDGES_FLICK,
+            "side-on never took the glance refusal"
+        );
+    }
+
     use super::*;
 
     /// THE SPECIES CONTRACT: every cat pose the brain can choose has a dog
@@ -12559,6 +12758,7 @@ mod tests {
 
     fn sense(now: Instant, caret: Option<(u16, u16)>) -> PetSense {
         PetSense {
+            caret_drawn: true,
             now,
             caret,
             wrapped: false,
@@ -13207,6 +13407,7 @@ mod tests {
     /// A sense at an arbitrary cell size — `sense` is the 10 × 20 fixture.
     fn sense_cells(now: Instant, caret: Option<(u16, u16)>, cell_w: u16, cell_h: u16) -> PetSense {
         PetSense {
+            caret_drawn: true,
             cell_w,
             cell_h,
             ..sense(now, caret)
@@ -18196,6 +18397,7 @@ mod tests {
     #[test]
     fn a_ghost_reaches_its_door_on_a_wide_pane() {
         let wide = |now: Instant, caret: Option<(u16, u16)>| PetSense {
+            caret_drawn: true,
             cols: 200,
             ..sense(now, caret)
         };
@@ -20379,12 +20581,14 @@ mod tests {
             }
         }
         let wide = |now: Instant, caret: Option<(u16, u16)>| PetSense {
+            caret_drawn: true,
             cols: 200,
             ..sense(now, caret)
         };
         /// Wake and settle a fresh pet on the 200-column pane.
         fn awake_wide(pet: &mut PetBrain, start: Instant, row: u16, col: u16) -> Instant {
             let wide = |now: Instant, caret: (u16, u16)| PetSense {
+                caret_drawn: true,
                 cols: 200,
                 ..sense(now, Some(caret))
             };

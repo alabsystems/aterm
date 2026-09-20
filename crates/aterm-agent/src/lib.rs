@@ -824,7 +824,18 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        supervise's loop for a harness that wakes its agent once per
                        stdout line (a background monitor, a supervisor process).
                        Approvals are supervise's, and each prints `APPROVED
-                       seq=<n> <command>`; --notes gets supervise's lines. A
+                       seq=<n> <command>`; --notes gets supervise's lines. Each
+                       decision is ALSO told to the worker's window as it is
+                       printed — `aterm ctl @sid story <verb> [<text>]` through
+                       a client of its own, one per journaled APPROVED,
+                       DISMISSED, RECONNECTED, TIMEOUT, EXIT, `EVENT context`
+                       and `EVENT compacted` line (approved dismissed
+                       reconnected warned compacted timeout exit; never the
+                       command, and an APPROVED is told bare) — so the presence
+                       band under the window's tab bar reads `✓ approved` for
+                       three seconds and its `◇ quiet` summary counts the
+                       approvals; the printed lines are byte-identical with or
+                       without a host that knows the verb. A
                        review point prints ONE line and the loop KEEPS WATCHING:
                          EVENT <phase> seq=<n> <summary>
                        the summary being, for a prompt, `kind=<k> classify=
@@ -913,16 +924,36 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        backoff covers that; a reset read as more than 8 days
                        off is misread and extends nothing) plus 10 min is
                        stretched to that, `EXTEND until=<UTC> reset=<text>`
-                       printed once a reset. The episode ends when the worker
-                       answers again — a point after it was read busy (your
-                       turn after the reset), or a box — the attention cleared
-                       (`meta unset attention`; on the wire `meta set
-                       attention ''` is a usage error) and `CLEARED seq=<n> …`
-                       journaled; its point prints as ever. With --resume the
-                       loop PROBES the worker itself: at the reset — or
-                       sooner, when the screen leaves the notice with no busy
-                       spell (the `/login` of another account, the `/model`
-                       output) — ONE turn (`turn idle=600 timeout=2500
+                       printed once a reset. Claude Code's auto-continue
+                       notice (`⚠ Usage limit reached · continuing
+                       automatically at 1:50pm · esc to cancel`, measured
+                       2026-09-17; later `continuing shortly`) names that time
+                       as its reset (`reset=1:50pm`; `shortly` is a minute
+                       off) and STAYS on the screen while the worker resumes
+                       under it — a busy status row or footer under it reads
+                       busy, never limited. The episode ends when the worker
+                       works again: after that notice, at the FIRST busy read
+                       (not at the resumed turn's point, which a background
+                       shell kept fourteen hours off the day it was measured);
+                       after a notice naming a reset, when the worker answers
+                       — a point after it was read busy (your turn after the
+                       reset), or a box — since a retry may hit the wall
+                       again. Either way the attention is cleared (`meta
+                       unset attention`; on the wire `meta set attention ''`
+                       is a usage error) and `CLEARED seq=<n> …` journaled;
+                       a point prints as ever. The wall again after that busy
+                       read, before the worker has answered (the retry's
+                       spinner, then `continuing shortly`), is the same
+                       episode opened again: the attention set again, no
+                       second mail (`ESCALATED … mail=skipped: the retry hit
+                       the wall again, the episode of seq=<m>`), the probe's
+                       backoff standing. With --resume the loop PROBES
+                       the worker itself: at the reset (a minute past the
+                       time an auto-continue notice names: Claude Code's own
+                       continuation goes first) — or sooner, when the screen
+                       leaves the notice with no busy spell (the `/login` of
+                       another account, the `/model` output) — ONE turn
+                       (`turn idle=600 timeout=2500
                        Manager's watcher: the usage limit should have reset.
                        Answer with one line: can you work now, and what was
                        the last thing you completed?`), only at an idle
@@ -1103,7 +1134,11 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        on a time axis and the fabric's mail on a fourth, turns
                        as bars, the whole line on hover, and the same rows as a
                        table under it. --out PATH writes it there, created
-                       0600, and prints the path instead. --since takes Unix
+                       0600, and prints the path instead — the window's LEDGER
+                       KEY (⇧⌘L on macOS, Ctrl+Shift+L elsewhere; `open_ledger`
+                       in `[keybindings]`) runs exactly `ledger @<focused sid>
+                       --format html --out <a 0600 file in the temp dir>` and
+                       opens the file in the browser. --since takes Unix
                        milliseconds or a time word (`2026-09-14`,
                        `2026-09-14T10:30`, with `Z` or `±HH:MM`; a bare date or
                        time is local) and drops everything before it. With no

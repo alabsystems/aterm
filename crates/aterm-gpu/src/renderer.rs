@@ -3758,6 +3758,43 @@ const DECO_GLYPHS: [aterm_render::DecoGlyph; 8] = [
 const _: () = assert!(DECO_GLYPHS.len() == aterm_render::UNDERCURL_SPRITE);
 const _: () = assert!(DECO_GLYPHS.len() + 1 == aterm_render::DECO_ATLAS_SPRITES);
 
+/// THE SUB-TEXEL TIE BIAS for a NEAREST-sampled sprite axis.
+///
+/// The CPU stamps (`aterm_render`'s `stamp_cat_quad` / `stamp_free_sprite`)
+/// resolve the NEAREST source index in EXACT INTEGERS —
+/// `s = floor(((2·d + 1)·src) / (2·dst))`, mirrored as `src − 1 − s` when
+/// `flip_x` — while this path hands the sampler a float `uv` window and lets
+/// the hardware floor it. Those agree everywhere EXCEPT where a dest pixel's
+/// centre lands EXACTLY on a texel boundary, i.e. where
+/// `T = (2d+1)·src / (2·dst)` is a whole number. There the f32 can land on
+/// either side of the integer, and the two backends read DIFFERENT TEXELS:
+/// unflipped, `T − ε` floors one texel low; flipped, the continuous mirror
+/// `floor(src − T)` is a whole texel off from the CPU's `src − 1 − floor(T)`
+/// for EVERY tie. Ties are not exotic — an even integer downscale ties on
+/// every column, and otherwise one column in `2·dst / gcd(src, 2·dst)`.
+///
+/// MEASURED on a 40×40 pet tile scaled by its pose (the shipped cursor pet's
+/// breath and stretch scale the DEST rect against a fixed bake):
+/// 150 % → 719 of 3600 sprite pixels differed, worst channel delta 253;
+/// 50 % flipped → all 400 differed. 1:1 (`src == dst`) measured 0, which is
+/// why the existing 1:1 parity pins never saw this.
+///
+/// Biasing the window by a quarter of the minimum pixel-centre spacing
+/// (`1 / (2·dst)` texels — `T` is a rational with denominator dividing
+/// `2·dst`) resolves every tie the CPU's way and CANNOT move any other
+/// sample: the bias is half the smallest gap to the next integer, and it is
+/// orders of magnitude larger than the interpolator's f32 error. At 1:1 there
+/// are no ties at all (`T = d + 0.5`), so every 1:1 sprite — every cat, every
+/// rain tile, every resting pet frame — stays BYTE-IDENTICAL.
+///
+/// Returned in NORMALIZED uv units; add it to `u0`/`v0`, or SUBTRACT it when
+/// the window is mirrored (`flip_x`), so the bias always pushes the sample in
+/// the direction the CPU's `floor` rounds.
+#[inline]
+fn uv_tie_bias(dest_px: u16, atlas_px: f32) -> f32 {
+    0.25 / (f32::from(dest_px.max(1)) * atlas_px)
+}
+
 /// Atlas column index of a sprite (inverse of [`DECO_GLYPHS`]).
 fn deco_sprite_index(g: aterm_render::DecoGlyph) -> usize {
     match g {
@@ -19932,19 +19969,59 @@ impl GpuRenderer {
         fn build_sprites(
             dst: &mut Vec<GlyphInstance>,
             quads: &[aterm_core::render::SpriteQuad],
-            saw: f32,
-            sah: f32,
+            rows: usize,
+            // The UPLOADED atlas's texel dims — the bound the source rects are
+            // checked against and the basis the uv normalizes over.
+            (atlas_w, atlas_h): (u32, u32),
             padf: f32,
             grid_topf: f32,
             keep: impl Fn(u16) -> bool,
         ) {
+            let (saw, sah) = (atlas_w as f32, atlas_h as f32);
             for q in quads {
                 if q.w == 0 || q.h == 0 || q.aw == 0 || q.ah == 0 || !keep(q.row) {
                     continue;
                 }
-                let (mut u0, mut du) = (q.ax as f32 / saw, q.aw as f32 / saw);
+                // SKIP A QUAD PAST THE GRID'S LAST ROW — the bound every other
+                // row-tagged stream here already applies (`glow_add`,
+                // `glow_under`, `nova_add`, `glow_halo`, `rain_add`,
+                // `fire_patch` all test `(q.row as usize) >= rows`), and the one
+                // the CPU twins enforce structurally: `build_rain_row_csr` drops
+                // a quad whose `row >= input.rows`, and the cat stamp only fires
+                // under `q.row as usize == r` for `r` in `0..rows`. Without it
+                // the sprite streams were the only ones where an out-of-grid row
+                // tag drew on the GPU and nothing on the CPU (measured: cpu 0 px,
+                // gpu 800 px). Under `RepaintScope::Full` `keep` passes
+                // everything, so it is `keep` that cannot stand in for this.
+                if q.row as usize >= rows {
+                    continue;
+                }
+                // REJECT AN OVERRUNNING SOURCE RECT, exactly as the CPU stamp
+                // does (`aterm_render::stamp_cat_quad`: "Reject a source rect
+                // that overruns the atlas (host bug)"). Without it the two
+                // backends draw DIFFERENT PICTURES from the same `RenderInput`:
+                // the CPU drops the quad, while this path emitted a uv past 1.0
+                // and the sprite sampler is ClampToEdge, so the GPU smeared the
+                // atlas's edge row/column across the whole rect. Measured on a
+                // 64x64 atlas with `ay=40, ah=34`: cpu painted 0 px, gpu painted
+                // 1360 px — identically for `cat_quads` and `rain_quads`, which
+                // share this builder. The free-sprite arm below already carries
+                // the same guard; this is its cat/rain twin.
+                //
+                // It also matters for the ORACLE: the CPU path is the one that
+                // silently absorbs host bugs of this class, so a parity run on
+                // the CPU backend cannot see them. Cast BEFORE the add —
+                // `(ax + aw)` can overflow u16 in a debug build.
+                if (q.ax as u32 + q.aw as u32) > atlas_w || (q.ay as u32 + q.ah as u32) > atlas_h {
+                    continue;
+                }
+                // Sub-texel tie bias, signed with the sampling direction — see
+                // `uv_tie_bias`. A 1:1 quad (every shipped cat and rain tile)
+                // has no ties, so this is byte-identical there.
+                let (bx, by) = (uv_tie_bias(q.w, saw), uv_tie_bias(q.h, sah));
+                let (mut u0, mut du) = (q.ax as f32 / saw + bx, q.aw as f32 / saw);
                 if q.flip_x {
-                    u0 = (q.ax as f32 + q.aw as f32) / saw;
+                    u0 = (q.ax as f32 + q.aw as f32) / saw - bx;
                     du = -(q.aw as f32) / saw;
                 }
                 dst.push(GlyphInstance {
@@ -19954,7 +20031,7 @@ impl GpuRenderer {
                         q.w as f32,
                         q.h as f32,
                     ],
-                    uv: [u0, q.ay as f32 / sah, du, q.ah as f32 / sah],
+                    uv: [u0, q.ay as f32 / sah + by, du, q.ah as f32 / sah],
                     color: [
                         ((q.tint >> 16) & 0xff) as u8,
                         ((q.tint >> 8) & 0xff) as u8,
@@ -19978,12 +20055,12 @@ impl GpuRenderer {
         // identical). Under `RepaintScope::Full` the filter passes everything.
         // A sparse-damage frame during a 2048-quad downpour thus builds and
         // uploads only the dirty rows' instances instead of the whole field.
-        if let Some((raw, rah)) = self.rain_atlas.as_ref().map(|s| (s.w as f32, s.h as f32)) {
+        if let Some((raw, rah)) = self.rain_atlas.as_ref().map(|s| (s.w, s.h)) {
             build_sprites(
                 &mut self.inst.rain_under,
                 &input.rain_quads,
-                raw,
-                rah,
+                rows,
+                (raw, rah),
                 padf,
                 grid_topf,
                 |r| row_active(usize::from(r)),
@@ -19993,12 +20070,12 @@ impl GpuRenderer {
         // build against the CAT atlas dims. The instances draw through the shared
         // src-over scene pipeline but bind the CAT atlas group, whose sampler is
         // NEAREST (bake == dest size, 1:1 — no filtering on either backend).
-        if let Some((caw, cah)) = self.cat_atlas.as_ref().map(|s| (s.w as f32, s.h as f32)) {
+        if let Some((caw, cah)) = self.cat_atlas.as_ref().map(|s| (s.w, s.h)) {
             build_sprites(
                 &mut self.inst.cat_over,
                 &input.cat_quads,
-                caw,
-                cah,
+                rows,
+                (caw, cah),
                 padf,
                 grid_topf,
                 |_| true,
@@ -20028,9 +20105,34 @@ impl GpuRenderer {
                 if s.w == 0 || s.h == 0 || s.aw == 0 || s.ah == 0 {
                     continue;
                 }
-                let (mut u0, mut du) = (s.ax as f32 / faw, s.aw as f32 / faw);
+                // REJECT AN OVERRUNNING SOURCE RECT, exactly as the CPU stamp
+                // does (`aterm_render`'s free-sprite blit: "Reject a source rect
+                // that overruns the atlas (host bug)"). Without it the two
+                // backends draw DIFFERENT PICTURES from the same `RenderInput`:
+                // the CPU drops the sprite, while this path emitted `v` past 1.0
+                // and both samplers are ClampToEdge, so the GPU smeared the
+                // atlas's bottom row across the whole rect. Measured with a
+                // 64x128 atlas and `ay=144, ah=34`: cpu painted 0 px, gpu painted
+                // 1360 px of the edge row.
+                //
+                // It also matters for the ORACLE: the CPU path is the one that
+                // silently absorbs host bugs of this class, so a parity run on
+                // the CPU backend cannot see them. Failing the same way on both
+                // is what makes the comparison meaningful. Cast BEFORE the add —
+                // `(ax + aw)` can overflow u16 in a debug build.
+                if (s.ax as u32 + s.aw as u32) > self.free_atlas.as_ref().map_or(0, |a| a.w)
+                    || (s.ay as u32 + s.ah as u32) > self.free_atlas.as_ref().map_or(0, |a| a.h)
+                {
+                    continue;
+                }
+                // Sub-texel tie bias — see `uv_tie_bias`. THIS is the stream
+                // that is scaled in the shipped build: the cursor pet's pose
+                // (breath, stretch, fold) scales the DEST rect against a
+                // fixed-size bake, so `aw != w` on most animated frames.
+                let (bx, by) = (uv_tie_bias(s.w, faw), uv_tie_bias(s.h, fah));
+                let (mut u0, mut du) = (s.ax as f32 / faw + bx, s.aw as f32 / faw);
                 if s.flip_x {
-                    u0 = (s.ax as f32 + s.aw as f32) / faw;
+                    u0 = (s.ax as f32 + s.aw as f32) / faw - bx;
                     du = -(s.aw as f32) / faw;
                 }
                 let dst = match s.z {
@@ -20044,7 +20146,7 @@ impl GpuRenderer {
                         s.w as f32,
                         s.h as f32,
                     ],
-                    uv: [u0, s.ay as f32 / fah, du, s.ah as f32 / fah],
+                    uv: [u0, s.ay as f32 / fah + by, du, s.ah as f32 / fah],
                     color: [
                         ((s.tint >> 16) & 0xff) as u8,
                         ((s.tint >> 8) & 0xff) as u8,

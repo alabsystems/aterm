@@ -597,6 +597,10 @@ impl CursorStateHandler<'_> {
         if let Some(style) = CursorStyle::from_param(mode) {
             let changed = self.modes.cursor_style != style;
             self.modes.cursor_style = style;
+            // DECSCUSR carries the blink bit too (1/3/5 blink, 2/4/6 steady), so
+            // it moves DEC mode 12 with it — otherwise `CSI ? 12 $ p` answers a
+            // stale flag while the cursor on screen blinks (or does not).
+            self.modes.cursor_blink = style.blinks();
             if changed {
                 // A cursor-shape change repaints the cursor cell without changing any
                 // cell's content; mark grid damage so `damage_epoch` advances and the

@@ -88,8 +88,12 @@ impl TerminalHandler<'_> {
         // Reset application keypad mode (DECKPAM/DECKPNM)
         self.modes.application_keypad = false;
 
-        // Reset cursor blink (mode 12) (#7284)
-        self.modes.cursor_blink = false;
+        // Reset cursor blink (mode 12) (#7284). Mode 12 is the blink bit of the
+        // cursor STYLE (see `set_cursor_blink`), and DECSTR has just restored
+        // the host-preferred default style above — so the mirror follows THAT,
+        // not a hardcoded `false` that would claim a steady cursor while the
+        // default blinks.
+        self.modes.cursor_blink = self.modes.cursor_style.blinks();
 
         // Reset VT52 mode (DECANM, mode 2) (#7284)
         self.modes.vt52_mode = false;

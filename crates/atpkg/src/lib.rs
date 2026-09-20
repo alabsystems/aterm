@@ -145,6 +145,10 @@ pub mod reroute;
 /// `<prefix>/store/trust/current`, laid, adopted, re-asserted and recorded by atpkg.
 pub mod seam;
 pub mod select;
+/// The self-update intercept (2026-09-19): `claude update|upgrade|install` and `codex
+/// update` typed on the MANAGED name are answered by the standard `aterm pkg update` —
+/// the roster, the classification and every line, pure; the verb is `cli::cmd_selfupdate`.
+pub mod selfupdate;
 pub mod shim_env;
 pub mod sig;
 /// The `softwareupdate` protocol's lane: Apple's Command Line Tools, installed

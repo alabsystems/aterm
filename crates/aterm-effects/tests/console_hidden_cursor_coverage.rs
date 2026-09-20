@@ -34,6 +34,7 @@ fn tick_with_surface(
     brain.observe_console(&input, &facts, PetPane::full(&input));
     brain.set_console_presentable(true);
     brain.tick(PetSense {
+        caret_drawn: true,
         now: *now,
         caret: input
             .cursor_visible

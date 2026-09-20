@@ -32,9 +32,13 @@ clean {
       | candidate : Owner
       | nobody : Owner
 
-    -- The phases run_handoff_worker drives, plus the failure state.
+    -- The phases run_handoff_worker drives, plus the failure state. launched is
+    -- the late park lane before the park (2026-09-19): a successor that exists,
+    -- booted and dialled, while the outgoing process still owns and reads every
+    -- session -- it holds nothing until the post-park transfer.
     inductive Phase where
       | idle : Phase
+      | launched : Phase
       | parked : Phase
       | transferred : Phase
       | proved : Phase
@@ -43,6 +47,7 @@ clean {
       | lost : Phase
 
     inductive Event where
+      | launch : Event
       | park : Event
       | transfer : Event
       | prove : Event
@@ -51,6 +56,7 @@ clean {
 
     def owner : Phase -> Owner
       | Phase.idle => Owner.outgoing
+      | Phase.launched => Owner.outgoing
       | Phase.parked => Owner.outgoing
       | Phase.transferred => Owner.outgoing
       | Phase.proved => Owner.outgoing
@@ -68,6 +74,9 @@ clean {
     -- and every pre-Commit failure rolls back to the outgoing process, which is
     -- what HandoffWorkerCleanup exists to guarantee.
     def step : Phase -> Event -> Phase
+      | Phase.idle, Event.launch => Phase.launched
+      | Phase.launched, Event.park => Phase.parked
+      | Phase.launched, Event.fail => Phase.rolledBack
       | Phase.idle, Event.park => Phase.parked
       | Phase.parked, Event.transfer => Phase.transferred
       | Phase.transferred, Event.prove => Phase.proved

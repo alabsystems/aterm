@@ -397,13 +397,21 @@ except that a review point prints one line and the loop keeps going.
   `kind=control` (a limited manager still reads its inbox later) and journaled `ESCALATED …`
   — once an episode — and it does NOT exit: a `--max-s` that would end before the reset the
   notice names is stretched to 10 min past it (`EXTEND until=<UTC> reset=<text>`, once).
-  With `--resume "$RULES"` it probes the worker at the reset (or as soon as the screen leaves
-  the notice: a `/login`, a `/model` line) with ONE fixed question, prints `EVENT resumed
-  seq=<n> <its line>` on the answer, restates `$RULES` as one turn and prints `EVENT
-  rebriefed seq=<n>`; `EVENT still-limited seq=<n> <why>` means it will try again in 10 min,
-  then 30. It never invents work: the LAST DIRECTIVE IS YOURS TO RESEND — the journal and
-  `aterm ctl "@$SID" history` show it. Without `--resume`, decide per the human's policy —
-  wait for `reset=`, switch with `/model`, or escalate — and never keep driving into the wall.
+  Claude Code's auto-continue notice (`⚠ Usage limit reached · continuing automatically at
+  1:50pm · esc to cancel`, or `continuing shortly`) names that time as its reset
+  (`reset=1:50pm`, `reset=shortly` a minute off) and stays on the screen while the worker
+  resumes under it: the first busy read closes the episode and clears the attention (the
+  journal's `CLEARED …`), no point needed — and the wall again before it answers (a retry
+  that hit it) is the same episode, the attention set again, you mailed once. With
+  `--resume "$RULES"` it probes the worker at
+  the reset (a minute past an auto-continue time: Claude Code goes first; or as soon as the
+  screen leaves the notice: a `/login`, a `/model` line) with ONE fixed question, prints
+  `EVENT resumed seq=<n> <its line>` on the answer, restates `$RULES` as one turn and prints
+  `EVENT rebriefed seq=<n>`; `EVENT still-limited seq=<n> <why>` means it will try again in
+  10 min, then 30. It never invents work: the LAST DIRECTIVE IS YOURS TO RESEND — the journal
+  and `aterm ctl "@$SID" history` show it. Without `--resume`, decide per the human's policy
+  — wait for `reset=`, switch with `/model`, or escalate — and never keep driving into the
+  wall.
 - **A worker without Claude Code's composer** (a build, a REPL) gets an EVENT each time
   its output pauses for 2 s and its last rows changed — for a build you are only waiting
   on, `aterm drive await-turn` or `aterm ctl "@$SID" await block` is the better tool.

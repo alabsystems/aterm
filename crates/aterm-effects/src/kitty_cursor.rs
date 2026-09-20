@@ -93,6 +93,12 @@ const REVIVE_GATE: f32 = 0.35;
 /// Fade-in / fade-out durations (seconds).
 const FADE_IN: f32 = 0.35;
 const FADE_OUT: f32 = 0.75;
+
+/// How far the goodbye must have faded before the exit flourish's BAKED HEAD is
+/// swapped in — see [`CatFrame::render_look`]. A quarter of [`FADE_OUT`] is
+/// ~190 ms, by which point the cat is visibly dimmer, so the swap reads as part
+/// of the departure instead of as a one-frame glitch at full opacity.
+const EXIT_FACE_FADE: f32 = 0.25;
 /// Total wall-clock time of the classic cursor kitty's off-glass line-fold
 /// seam. Fourteen to eighteen 60 Hz samples are enough to read both the leave
 /// and arrive beats, while a sparse frame past the bound lands immediately
@@ -428,10 +434,42 @@ impl CatFrame {
     /// to the exit flourishes, which own their own faces.
     #[must_use]
     pub fn render_look(&self) -> KittyLook {
+        // THE GOODBYE FACE WAITS FOR THE GOODBYE TO BE VISIBLE.
+        //
+        // `begin_fade_out_at` rolls the flourish the instant the LOW crossing is
+        // observed, so `exit` goes non-Plain while alpha is still ~255 and
+        // nothing has faded. The revive is cheap on purpose — one key after a
+        // >=0.35 s pause carries momentum past `REVIVE_GATE` — and it resets
+        // `exit` to `Plain`. A key landing in the very next frame therefore
+        // produced ONE emitted frame wearing the flourish head at full opacity,
+        // between two frames wearing the ordinary one:
+        //
+        //     alpha=255 exit=Plain     variant=28
+        //     alpha=254 exit=HeartMeow variant=15   <- one frame, full opacity
+        //     alpha=255 exit=Plain     variant=28
+        //
+        // A frame that disagrees with BOTH its neighbours is what a flash IS.
+        // Holding the FACE until the fade has visibly progressed means any frame
+        // showing it is already dimmed, so a revive reads as the cat fading back
+        // in rather than as a head swapping and swapping back. The flourish's
+        // own fx still animate from `fade_out` as before; only the baked head
+        // waits.
+        //
+        // The `Startled` reaction shares the S121 art but is NOT an exit, so it
+        // keeps its own arm ahead of the gate and is unaffected.
+        let flourish_face_earned = self.fade_out >= EXIT_FACE_FADE;
         let variant = match (self.exit, self.reaction) {
-            (CatExit::StarWink, _) | (_, CatReaction::Startled) => CatGlyphId::S121,
-            (CatExit::HeartMeow, _) => CatGlyphId::S115,
-            _ if self.sing > 0.33 => CatGlyphId::S115,
+            (_, CatReaction::Startled) => CatGlyphId::S121,
+            (CatExit::StarWink, _) if flourish_face_earned => CatGlyphId::S121,
+            (CatExit::HeartMeow, _) if flourish_face_earned => CatGlyphId::S115,
+            // THE ONE SPELLING OF THE SINGING-FACE THRESHOLD. This read
+            // `self.sing > 0.33` while `static_frame` below read `>= 0.33` and
+            // `companion::sing_face_live` — the documented custody law, and the
+            // only one with a doc comment — reads `>= 0.33`. Three spellings of
+            // one number, two of them disagreeing at exactly the boundary. The
+            // law owns it now; the predicate also had no caller before this,
+            // which is how the two inline copies were free to drift.
+            _ if crate::companion::sing_face_live(self.sing) => CatGlyphId::S115,
             (_, CatReaction::Celebrate) => CatGlyphId::SpecManeki,
             _ => return self.look,
         };
@@ -1504,7 +1542,7 @@ impl CursorCat {
             // open-mouth meow head is a different baked head, and blinking
             // through a song reads as a glitch rather than as breathing.
             EyesFrame::Blink
-        } else if self.sing > 0.33 || self.disp >= HAPPY_GATE {
+        } else if crate::companion::sing_face_live(self.sing) || self.disp >= HAPPY_GATE {
             // Singing is sung with happy eyes (over the open-mouth meow head
             // `render_look` swaps in — the same gate value).
             EyesFrame::Happy
@@ -1597,7 +1635,20 @@ impl CursorCat {
         // the first half of wind-down can sample 1.0 -> 0.49 directly while
         // the caret-fed resident finishes readying behind the opaque still.
         // The riff is host policy and plays independently if sound is on.
-        if self.sing >= 0.33 {
+        //
+        // AND IT MUST HAVE BEEN SUMMONED. The drive alone is not the licence:
+        // `set_singing` summons only once `run_keys >= MIN_RUN_KEYS`, because an
+        // armed celebration "may bypass the 1.5 s dwell, but it still owes the
+        // independent sixteen-event travel floor" — its own words. The detector
+        // arms at `SING_ARM_REPEATS` repeats, and from cold it arms FIRST,
+        // because `run_keys` only builds once momentum is already at `CAT_BAND`.
+        // In that window `sing >= 0.33` while the machine is still `Hidden`, and
+        // this arm returned alpha 255 with no state test at all — so reduced
+        // motion drew a cat the machine calls hidden, at full opacity, that the
+        // animated `frame` correctly draws at alpha 0. Measured from cold: 33
+        // unearned drawn frames. Testing the state here is what makes the two
+        // motion paths agree about whether a cat exists.
+        if crate::companion::sing_face_live(self.sing) && !matches!(self.state, State::Hidden) {
             return CatFrame {
                 alpha: 255,
                 exit: CatExit::Plain,
@@ -2699,6 +2750,113 @@ mod tests {
             back.alpha
         );
         assert!(c.is_active());
+    }
+
+    /// THE GOODBYE FACE NEVER APPEARS AT FULL OPACITY, so a revive one frame
+    /// later cannot produce a head that swaps and swaps back.
+    ///
+    /// `begin_fade_out_at` rolls the flourish the instant the LOW crossing is
+    /// observed, while alpha is still ~255. The revive is cheap by design — one
+    /// key after a pause carries momentum past `REVIVE_GATE` — and resets `exit`
+    /// to `Plain`. A key in the very next frame therefore yielded ONE emitted
+    /// frame wearing the flourish head at full opacity between two wearing the
+    /// ordinary one, which is exactly what a flash is: a frame that disagrees
+    /// with BOTH its neighbours.
+    ///
+    /// `roll_exit` is a per-cat xorshift and only 2 rolls in 5 are a flourish,
+    /// so the trials vary the key count to move the RNG state and the test
+    /// ASSERTS that a flourish was actually observed. Without that assertion
+    /// this passes on a run where the roll never came up — which is how the
+    /// first version of it passed under mutation while checking nothing.
+    #[test]
+    fn the_exit_flourish_head_never_shows_at_full_opacity() {
+        let mut saw_flourish = 0u32;
+        let mut saw_plain_head = 0u32;
+        for keys in 120..160u64 {
+            let mut c = CursorCat::default();
+            let t = Instant::now();
+            for i in 0..keys {
+                c.on_key(t + Duration::from_millis(i * 60), true);
+            }
+            assert!(c.is_active(), "the run summons the cat");
+            let last = t + Duration::from_millis((keys - 1) * 60);
+            let low_crossing = last
+                + Duration::from_secs_f32(
+                    crate::typing_momentum::TYPING_MOMENTUM_TAU * (c.momentum(last) / LOW).ln(),
+                );
+            for step in 0..120u32 {
+                let now = low_crossing + Duration::from_millis(u64::from(step) * 16);
+                let f = c.frame(now);
+                let swapped = f.render_look().variant != f.look.variant;
+                if matches!(f.exit, CatExit::HeartMeow | CatExit::StarWink) && swapped {
+                    saw_flourish += 1;
+                    // VISIBLY dimmed, not merely "not literally 255". The
+                    // defect emitted the flourish head at alpha 254, which is
+                    // indistinguishable from full opacity — an `alpha < 255`
+                    // assertion accepts it, and the first version of this test
+                    // did exactly that and passed under mutation. At the gate
+                    // (a quarter through a 0.75 s fade) alpha is ~191, so 200 is
+                    // the honest bound: comfortably above what the fix
+                    // guarantees, far below what the bug produced.
+                    assert!(
+                        f.alpha <= 200,
+                        "the flourish head appeared while the cat was still at \
+                         full brightness (alpha {}, fade_out {}) — a revive in \
+                         the next frame swaps it straight back, which is the \
+                         one-frame flash",
+                        f.alpha,
+                        f.fade_out
+                    );
+                } else if f.alpha > 0 && !swapped {
+                    saw_plain_head += 1;
+                }
+            }
+        }
+        // ANTI-VACUITY, both directions: the walk emitted ordinary frames, AND
+        // it really did reach the flourish whose opacity is the subject.
+        assert!(
+            saw_plain_head > 0,
+            "the goodbye walks emitted no ordinary frames at all"
+        );
+        assert!(
+            saw_flourish > 0,
+            "no trial ever rolled a flourish, so the opacity assertion above \
+             never ran — this test would be checking nothing"
+        );
+    }
+
+    /// REDUCED MOTION DRAWS ONLY A CAT THE MACHINE HAS SUMMONED. The static
+    /// celebration arm returned `alpha: 255` on drive alone, with no state test,
+    /// while `set_singing` refuses to summon until the sixteen-event travel
+    /// floor is met — so from cold there is a window where the drive is up, the
+    /// machine is `Hidden`, the animated `frame` draws nothing and the
+    /// reduced-motion `static_frame` drew a fully opaque cat.
+    #[test]
+    fn reduced_motion_never_draws_a_cat_the_machine_calls_hidden() {
+        let mut c = CursorCat::default();
+        let t = Instant::now();
+        // Drive the celebration WITHOUT earning the travel floor: raise `sing`
+        // directly, exactly as an armed detector would, and take no keys.
+        let mut unearned = 0u32;
+        for step in 0..60u32 {
+            let now = t + Duration::from_millis(u64::from(step) * 16);
+            c.set_singing(
+                now,
+                SingSync {
+                    drive: 1.0,
+                    beat: 0.0,
+                },
+            );
+            let f = c.static_frame(now);
+            if f.alpha > 0 && !c.is_active() {
+                unearned += 1;
+            }
+        }
+        assert_eq!(
+            unearned, 0,
+            "reduced motion drew {unearned} frame(s) of a cat the machine \
+             reports inactive"
+        );
     }
 
     /// REGRESSION: a collection hello owns an absolute hold deadline. If the

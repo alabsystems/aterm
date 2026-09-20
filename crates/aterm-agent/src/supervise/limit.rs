@@ -27,6 +27,19 @@
 //!   `Session::refresh_reset`): the same text read again after a probe is
 //!   the same reset, not one a span later.
 //!
+//! A third, the auto-continue notice (measured 2026-09-17 13:50: `⚠ Usage
+//! limit reached · continuing automatically at 1:50pm · esc to cancel`,
+//! then `continuing shortly`), names no reset; it says when Claude Code goes
+//! on BY ITSELF, which is the same clock: `aterm_phase` hands over the time
+//! after `continuing automatically at ` (`1:50pm`, a bare clock time: today's,
+//! or tomorrow's by the rule above) or the word `shortly`, read as a minute
+//! from now ([`SHORTLY`]) — so the budget stretches past it as for any reset,
+//! and the probe is scheduled [`SHORTLY`] past it (`run.rs`'s
+//! `Session::arm_probe_at_reset`: Claude Code's own continuation goes
+//! first). The phrases themselves parse too. Such a notice is over the
+//! moment the worker is read busy ([`resumes_by_itself`]): the continuation
+//! IS the worker working, and the row stays on the screen while it does.
+//!
 //! The zone's offset comes from the caller ([`reset_at`]'s `zone_offset`):
 //! in production [`zone_offset_s`], which asks `date` under `TZ=<zone>` for
 //! the zone's offset TODAY — right for a reset within the week unless a DST
@@ -64,13 +77,29 @@ pub enum ResetSpec {
 /// a half hours passed, not eleven and a half ahead.
 const SAME_DAY: i64 = 19 * 3600;
 
-/// Read the reset out of the notice's text after `resets ` / `reset at `.
+/// What `continuing shortly` is read as: a minute from the read. Claude Code
+/// says it when its retry is imminent; the probe, this long past the reset
+/// again, finds the worker working (the busy read closed the episode first,
+/// and no probe goes) or the notice still up (the backoff takes over).
+pub const SHORTLY: Duration = Duration::from_secs(60);
+
+/// Read the reset out of the notice's text after `resets ` / `reset at ` —
+/// or the auto-continue notice's time (`continuing automatically at 1:50pm`,
+/// or `1:50pm` as `aterm_phase` hands it over) or word (`continuing
+/// shortly`, `shortly`: [`SHORTLY`] from now).
 pub fn parse_reset(text: &str) -> Option<ResetSpec> {
     let text = text.trim().trim_end_matches('.').trim();
     let lower = text.to_ascii_lowercase();
+    if lower == "shortly" || lower == "continuing shortly" {
+        return Some(ResetSpec::In(SHORTLY));
+    }
     if let Some(rest) = lower.strip_prefix("in ") {
         return parse_span(rest).map(ResetSpec::In);
     }
+    let text = match lower.strip_prefix("continuing automatically at ") {
+        Some(rest) => text[text.len() - rest.len()..].trim(),
+        None => text,
+    };
     let (body, zone) = match text.find('(') {
         Some(i) => {
             let zone = text[i + 1..].trim_end_matches(')').trim();
@@ -106,6 +135,19 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
         minute,
         zone,
     })
+}
+
+/// Whether the notice says Claude Code goes on by itself — `continuing
+/// automatically at …` / `continuing shortly` — so that the worker read
+/// BUSY after it is the continuation, and the episode is over then, the
+/// notice row on the screen or not. A notice naming a reset (`resets Sep 19
+/// at 11am`) says no such thing: a busy spell after it is someone's turn
+/// (the manager's retry, a human's, the probe), which may hit the wall
+/// again, and the episode ends when the worker answers on a point that is
+/// not the notice.
+pub fn resumes_by_itself(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("continuing automatically") || lower.contains("continuing shortly")
 }
 
 /// `3h`, `2h 30m`, `45m`, `3 hours`, `1h30m`, `90 minutes` → a span.
@@ -427,6 +469,94 @@ mod tests {
         ] {
             assert_eq!(parse_reset(bad), None, "{bad:?}");
         }
+    }
+
+    /// The auto-continue notice's two shapes (measured 2026-09-17): the time
+    /// after `continuing automatically at ` — as `aterm_phase` hands it over
+    /// (`1:50pm`) and as the phrase — is a bare clock time, today's when
+    /// ahead or just passed, tomorrow's once today's is long gone, am and pm
+    /// alike; `continuing shortly` (and the `shortly` handed over) is a
+    /// minute from now. The predicate that tells such a notice from one
+    /// naming a reset reads the words, not the time.
+    #[test]
+    fn the_auto_continue_shapes_are_a_time_today_or_tomorrow_or_a_minute() {
+        let one_fifty = ResetSpec::At {
+            date: None,
+            hour: 13,
+            minute: 50,
+            zone: None,
+        };
+        assert_eq!(parse_reset("1:50pm"), Some(one_fifty.clone()));
+        assert_eq!(
+            parse_reset("continuing automatically at 1:50pm"),
+            Some(one_fifty.clone())
+        );
+        assert_eq!(
+            parse_reset("Continuing automatically at 11:05 am"),
+            Some(ResetSpec::At {
+                date: None,
+                hour: 11,
+                minute: 5,
+                zone: None,
+            })
+        );
+        assert_eq!(
+            parse_reset("continuing automatically at 12am"),
+            Some(ResetSpec::At {
+                date: None,
+                hour: 0,
+                minute: 0,
+                zone: None,
+            })
+        );
+        assert_eq!(parse_reset("shortly"), Some(ResetSpec::In(SHORTLY)));
+        assert_eq!(
+            parse_reset("continuing shortly"),
+            Some(ResetSpec::In(SHORTLY))
+        );
+        assert_eq!(
+            parse_reset("Continuing shortly."),
+            Some(ResetSpec::In(SHORTLY))
+        );
+        for bad in [
+            "continuing automatically at",
+            "continuing",
+            "continuing automatically at soon",
+        ] {
+            assert_eq!(parse_reset(bad), None, "{bad:?}");
+        }
+        // NOW is 08:55 local: 1:50pm is ahead today, 4 h 55 min.
+        assert_eq!(at("1:50pm") - NOW, (4 * 60 + 55) * 60);
+        assert_eq!(at("continuing automatically at 1:50pm"), at("1:50pm"));
+        // Read at 13:50:18 — as the live notice was, the time it named 18 s
+        // gone — it is today's, passed: the probe goes at once.
+        let read_at = NOW + (4 * 60 + 55) * 60 + 18;
+        assert_eq!(read_at - reset_at(&one_fifty, read_at, PDT, zones), 18);
+        // `3am` read at 23:00 is tomorrow's, four hours ahead; `11:05 am` read
+        // at 08:55 is today's, 2 h 10 min ahead.
+        let late = NOW + 14 * 3600 + 5 * 60;
+        let three = parse_reset("continuing automatically at 3am").unwrap();
+        assert_eq!(reset_at(&three, late, PDT, zones) - late, 4 * 3600);
+        assert_eq!(
+            at("continuing automatically at 11:05 am") - NOW,
+            (2 * 60 + 10) * 60
+        );
+        // A minute from now, whichever spelling.
+        assert_eq!(at("shortly"), NOW + 60);
+        assert_eq!(at("continuing shortly"), NOW + 60);
+        // The notice says the worker goes on by itself; the old ones do not.
+        assert!(resumes_by_itself(
+            "⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel"
+        ));
+        assert!(resumes_by_itself(
+            "⚠ Usage limit reached · Continuing shortly · esc to cancel"
+        ));
+        assert!(!resumes_by_itself(
+            "You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)"
+        ));
+        assert!(!resumes_by_itself(
+            "You've reached your Fable limit · resets in 3h"
+        ));
     }
 
     /// The weekly reset is placed in its zone: 11am Pacific is 18:00 UTC.

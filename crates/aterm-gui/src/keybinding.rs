@@ -167,6 +167,11 @@ pub enum Action {
     FindNext,
     /// Find PREVIOUS — the backward twin of [`Action::FindNext`].
     FindPrev,
+    /// Open the focused session's LEDGER (round 19's ledger key,
+    /// `crate::ledger_key`): runs `aterm drive ledger @<sid> --format html` and
+    /// opens the file. Default ⇧⌘L on macOS (hardcoded beside the other
+    /// Cmd-Shift chords) and Ctrl+Shift+L elsewhere; bindable everywhere.
+    OpenLedger,
 }
 
 /// Every bindable action NAME, in a stable order — the canonical discoverable
@@ -214,6 +219,7 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "toggle_fullscreen",
     "find_next",
     "find_prev",
+    "open_ledger",
 ];
 
 /// Built-in Cmd-* shortcuts hardcoded in `App::on_key` + its helpers, as
@@ -234,6 +240,7 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+w", "Close Tab"),
     ("cmd+d", "Split Vertical"),
     ("cmd+shift+d", "Split Horizontal"),
+    ("cmd+shift+l", "Open Session Ledger"),
     ("cmd+shift+]", "Next Tab"),
     ("cmd+shift+[", "Prev Tab"),
     ("cmd+shift+enter", "Toggle Pane Zoom"),
@@ -366,6 +373,7 @@ impl Action {
             "fullscreen" | "toggle_fullscreen" => Action::ToggleFullscreen,
             "find_next" => Action::FindNext,
             "find_prev" | "find_previous" => Action::FindPrev,
+            "open_ledger" => Action::OpenLedger,
             _ => return None,
         })
     }
@@ -856,6 +864,9 @@ impl Keybindings {
         // and still bindable via `toggle_about`.
         ("ctrl+shift+a", "select_all"),
         ("ctrl+shift+p", "open_palette"),
+        // The ledger key (round 19): the focused session's `aterm drive ledger`
+        // as HTML, opened in the browser — ⇧⌘L on macOS.
+        ("ctrl+shift+l", "open_ledger"),
         // F11 full-screen (keyboard audit #3): the chord every Linux/Windows
         // full-screen surface answers (GNOME/KDE convention, Windows Terminal
         // default). It does shadow the raw F11 a TUI app could receive — the

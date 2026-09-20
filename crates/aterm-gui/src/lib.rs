@@ -83,6 +83,7 @@ mod app_conn_drag;
 /// and the raise/disconnect selection acts. The pure overlay model lives in
 /// [`connection_map`].
 mod app_connection_map;
+mod app_fabric_menu;
 mod app_input;
 mod app_introspect;
 mod app_kitty;
@@ -97,6 +98,7 @@ mod app_native;
 #[cfg(a11y_tree)]
 mod app_native_accessibility;
 mod app_palette;
+mod app_presence;
 mod app_rename;
 mod app_render;
 mod app_search;
@@ -117,6 +119,9 @@ mod app_window;
 mod appkit;
 #[cfg(test)]
 mod artifact_transaction_conformance;
+/// The ledger key (round 19): ⇧⌘L runs `aterm drive ledger` for the focused
+/// session and opens the HTML.
+mod ledger_key;
 // `mod bench_knobs;` was here, with NO cfg — so ATERM_GATHER_SINK,
 // ATERM_PARSE_SINK, ATERM_CAST_TAP and ATERM_FLOOD_QUIET were live in every
 // shipped aterm despite the module's own header calling them "bench instruments
@@ -408,6 +413,7 @@ mod trail_audio;
 // crate-root alias keeps every `crate::predict::*` call site reading unchanged.
 pub(crate) use aterm_predict as predict;
 mod prefs;
+mod presence;
 mod proxy;
 /// A6: the idempotency key at the PTY seam — `send|key|feed-bin|turn … id=<key>`,
 /// a per-session per-producer high-water mark, and an in-doubt outcome that is
@@ -3304,6 +3310,13 @@ struct RepaintKey {
     /// sibling `*_fp` holds). The bars carry no time-driven decoration: a live
     /// bar moves only with its data, a holding bar only at its fold.
     status_bars_fp: u64,
+    /// Fingerprint of this window's PRESENCE ([`presence::WindowView::fp`]): the
+    /// rim state, the band row's words and the one 300 ms ripple step. **`0` on
+    /// a quiet window** (no rim, no row, no ripple) — the FL-1 idle invariant,
+    /// pinned by `presence_fp_is_zero_over_a_thousand_idle_frames`. No clock is
+    /// read unless a ripple is live; the steady rim and row move only with a
+    /// fact (a lease, a hold, mail, a status revision).
+    presence_fp: u64,
     /// Fingerprint of the drag-to-connect WIRE on this window ([`conn_drag`],
     /// design §3.2): the tracked cursor + target, so each motion step of a live
     /// connection drag re-presents even though it dirties no grid cell. `0`
@@ -3522,6 +3535,20 @@ enum Wake {
     /// toolbar push + in-grid fingerprint/redraw). Posted only on an ACTUAL
     /// change, so it runs at `meta set` rate, never per frame or per output.
     MetaChanged { session: u64 },
+    /// A session's DRIVE LEASE changed hands (`turn` begin/settle, `lease`
+    /// acquire/release) — posted beside the lease writes in
+    /// `control_session.rs`, keyed by the fabric sid (the control thread has
+    /// no local id). `submitted` marks a turn's verified submit keypress: the
+    /// presence rim's one ripple edge. Runs at lease rate, never per frame.
+    LeaseChanged {
+        session: aterm_session::SessionId,
+        submitted: bool,
+    },
+    /// A session's FABRIC endpoint changed (a delivery, a hold transition, a
+    /// post landing, `inbox seen`, a link report) — posted beside every
+    /// `changed.notify_all()` in `fabric.rs`, so the presence band moves exactly
+    /// when a parked `await inbox` would.
+    FabricChanged { session: aterm_session::SessionId },
     /// The bounded smart-title worker finished its one in-flight model request.
     /// The result stays in its single-slot channel; the UI only performs a
     /// nonblocking generation/config-checked poll.
@@ -3813,6 +3840,23 @@ enum Wake {
     /// already crossed its destructor-free process-exit point of no return.
     #[cfg_attr(not(unix), allow(dead_code))]
     ActivateCommittedHandoff { expected: Vec<(u64, i32, i32)> },
+    /// The late park's cue (2026-09-19): the handoff worker has launched the
+    /// successor and is holding its rendezvous claim (`dialer_pid` names the
+    /// kernel-attested dialer), or has found it must fork instead and is
+    /// waiting for the park either way. The main thread parks when its gate
+    /// admits and sends the capture; until then every reader is live.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    UpdateHandoffAwaitingPark {
+        attempt_id: u64,
+        dialer_pid: Option<u32>,
+    },
+    /// The worker is about to revoke a held, UNGRANTED successor and is WAITING
+    /// for this to be handled before it does. Handling it closes the park gate
+    /// for good and, if a park had already landed, resumes its readers — the
+    /// successor holds no descriptor, so both are exact, and the user never pays
+    /// the stand-down's grace, kill and reap as a frozen terminal.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    UpdateHandoffStandingDown { attempt_id: u64 },
     /// Control startup finished reserving its service resources. This local
     /// fact can unblock ProofReady but never releases the Commit reader gate.
     ControlPrepared,
@@ -3984,6 +4028,19 @@ enum Wake {
     ReadSessionStatus {
         session: u64,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
+    /// `aterm ctl story <verb> [<text>]` (control socket, Owner-only): the
+    /// watcher's decision for the target session — one story point on its
+    /// presence slot, and the band's phase slot reads the verb for three
+    /// seconds ([`App::tell_story`]). The verb is one of the closed set the
+    /// control thread already checked (`presence::StoryVerb::TOLD_WORDS`) and
+    /// the text is bounded there too; the reply is the point's seq. A
+    /// main-thread hop because the slot is `App` state.
+    Story {
+        session: u64,
+        verb: presence::StoryVerb,
+        text: String,
+        reply: std::sync::mpsc::Sender<Result<u64, &'static str>>,
     },
     /// `sessions` (control socket): every hosted session's window membership
     /// ([`App::session_window_rows`]) — ONE hop for the whole roster, so the
@@ -4180,6 +4237,13 @@ enum Wake {
     /// on this thread, which is the whole point. Boxed: the payload carries the
     /// document text.
     DocumentAdmitted(Box<app_documents::DocumentAdmissionOutcome>),
+    /// An `aterm fabric …` child the Fabric menu ran (round 19: Fabric Status…,
+    /// Turn Fabric On/Off…) finished on its worker thread: its output is in the
+    /// file the payload names, and `App::complete_fabric_cli` opens that file
+    /// as a Markdown tab on the window that asked and says how the command
+    /// ended. The child ran with THIS instance's control socket; it never ran
+    /// on the event loop.
+    FabricCli(Box<app_fabric_menu::FabricCliOutcome>),
     /// The multi-line paste SHEET was answered (macOS). The pastejacking confirmation
     /// is a window sheet rather than an app-modal `NSAlert` so it cannot block the
     /// event loop. It does NOT follow that the sheet reliably receives Return: an
@@ -7183,7 +7247,16 @@ impl BackendSlot {
 pub enum Lease {
     /// The in-flight `turn`'s HARD lease (identified by its turn id). Hard-blocks
     /// every other connection's write verbs — the exclusivity `turn` guarantees.
-    Turn(u64),
+    /// `driver` is WHO issued it: the source of the edge the turn came over
+    /// (an edge-scoped connection's token names its grantee, and only that
+    /// session could have typed this turn), or `None` for a turn over the
+    /// Owner token or the bridge — the CLI, a human at another instance's
+    /// keyboard, the embedded operator — which no session can be credited
+    /// with. The presence band's hand slot (`◂ manager · turn 41`) and `status
+    /// hand=turn:<id>:<holder>` read it from HERE, never from whichever write
+    /// edge happens to stand in the session's table: round 19's review measured
+    /// every Owner-token turn credited to a manager whose edge merely existed.
+    Turn { id: u64, driver: Option<SessionId> },
     /// An explicit COOPERATIVE lease held by a raw driver via the `lease` verb:
     /// a client-chosen `holder` name and a `now_us`-clock expiry. Mutually exclusive
     /// with any other lease and self-expiring; advisory for raw writes (see the
@@ -7198,7 +7271,7 @@ impl Lease {
     #[must_use]
     pub fn write_block_turn(&self) -> Option<u64> {
         match self {
-            Lease::Turn(id) => Some(*id),
+            Lease::Turn { id, .. } => Some(*id),
             Lease::Drive { .. } => None,
         }
     }
@@ -7208,7 +7281,7 @@ impl Lease {
     #[must_use]
     pub fn is_live(&self, now_us: u64) -> bool {
         match self {
-            Lease::Turn(_) => true,
+            Lease::Turn { .. } => true,
             Lease::Drive { expires_us, .. } => *expires_us > now_us,
         }
     }
@@ -7219,7 +7292,7 @@ impl Lease {
     #[must_use]
     pub fn driving_token(&self, now_us: u64) -> Option<String> {
         match self {
-            Lease::Turn(id) => Some(id.to_string()),
+            Lease::Turn { id, .. } => Some(id.to_string()),
             Lease::Drive { holder, expires_us } if *expires_us > now_us => {
                 Some(format!("lease:{holder}"))
             }
@@ -10565,6 +10638,11 @@ struct WindowState {
     /// `(status_bars fingerprint, cols, palette key)` the cached bar rows were
     /// painted for; `None` before the first paint.
     last_bars_key: Option<(u64, usize, u64)>,
+    /// This window's PRESENCE view ([`presence::WindowView`]): the rim, the band
+    /// row (committed rows, words, painted cache), the story watermark and the
+    /// ripple — every field the frame path reads is plain data, rebuilt only
+    /// on a fact change (`App::refresh_presence_window`).
+    presence: presence::WindowView,
     /// Resident strip-row buffer pool. Each present the strip splice pushes `strip`
     /// leading rows onto `input_scratch.cells`; the next `cell_frame_into` refill
     /// truncates the surplus TAIL rows (the ones the prior splice shifted below the
@@ -12327,6 +12405,7 @@ impl WindowState {
             cached_strip_rows: Vec::new(),
             cached_bar_rows: Vec::new(),
             last_bars_key: None,
+            presence: presence::WindowView::default(),
             strip_row_pool: Vec::new(),
             strip_titles_scratch: Vec::new(),
             strip_metadata_scratch: Vec::new(),
@@ -13386,6 +13465,11 @@ struct PendingUpdateHandoff {
     park_at: std::time::Instant,
     /// When the successor's adoption proof arrived (its first present).
     proof_ready_at: Option<std::time::Instant>,
+    /// Whether an aterm window with an OS surface had keyboard focus AT THE
+    /// PARK (`App::any_os_window_focused`): the one input to whether the parent
+    /// activates the successor at Commit (2026-09-19). Sampled here, not at the
+    /// launch — under the late park the two are seconds or minutes apart.
+    activate_at_commit: bool,
     /// Set by the main-thread final-admission gate when it REJECTED this
     /// attempt for an activity-shaped reason (session/layout/epoch drift,
     /// deferred teardown, a session death, or an undrainable OS input queue).
@@ -13401,6 +13485,75 @@ struct PendingUpdateHandoff {
 /// killed/reaped that child and the event-loop lane has rolled the overlap back.
 /// Whole-application intent dominates individual closes; `CleanQuitReady` means
 /// confirmation and document barriers completed before the handoff began.
+/// One attempt on the LAUNCHED lane between its launch and its park (2026-09-19,
+/// the late park): the successor is booting or holding its rendezvous claim,
+/// every reader of this process is live, and nothing has been granted. The
+/// in-flight guard reads it beside [`PendingUpdateHandoff`]; the completion
+/// reducer clears it. `dialled` is set by `Wake::UpdateHandoffAwaitingPark`,
+/// and the park gate re-runs from the event loop at `park_retry_at` until the
+/// park lands or the hold cap stands the attempt down.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct HandoffPrelaunch {
+    attempt_id: u64,
+    /// The attempt nonce, minted before the launch so the launch environment
+    /// could name the manifest the worker writes after the park.
+    nonce: String,
+    mode: native_updater_service::ApplyMode,
+    apply_attempt: Option<native_updater_service::ApplyAttemptTicket>,
+    same_image: Option<app_update_handoff::SameImageHandoff>,
+    target_build: u64,
+    target_commit: String,
+    cancel: std::sync::mpsc::SyncSender<()>,
+    /// A typed stand-down for the worker holding the successor.
+    #[cfg(unix)]
+    stand_down: std::sync::mpsc::SyncSender<app_update_handoff::HandoffStandDown>,
+    /// The answer to `Wake::UpdateHandoffStandingDown`, which the worker waits
+    /// for before it revokes.
+    #[cfg(unix)]
+    stand_down_ack: std::sync::mpsc::SyncSender<()>,
+    /// Where the park's product goes.
+    #[cfg(unix)]
+    transfer: std::sync::mpsc::SyncSender<app_update_handoff::HandoffTransferJob>,
+    #[cfg(unix)]
+    arbiter: HandoffAttemptArbiter,
+    launched_at: Instant,
+    dialled: Option<DialledSuccessor>,
+    park_retry_at: Option<Instant>,
+    /// How many times this attempt's park has missed its freeze budget. Each
+    /// miss re-parks on the ladder's next rung without giving the booted
+    /// successor back; past `PRELAUNCH_MAX_PARK_MISSES` it stands down.
+    park_misses: u8,
+    /// Set once this thread told the worker to stand down; the completion is
+    /// then the only thing left to wait for.
+    stood_down: bool,
+    /// A deferred teardown merged in from the parked record when the readers
+    /// were released ahead of a stand-down, replayed by the completion.
+    teardown: DeferredHandoffTeardown,
+    revoked_by_activity: bool,
+}
+
+/// The worker's cue that the park may be taken: the dialer's pid (`None` when
+/// the worker forks instead) and when the cue arrived.
+#[derive(Clone, Copy, Debug)]
+struct DialledSuccessor {
+    pid: Option<u32>,
+    at: Instant,
+}
+
+/// The facts the completion reducer reads from whichever attempt record(s) a
+/// returned handoff leaves behind — see `reduce_returned_handoff_completion`.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct ReturnedHandoffRecord {
+    mode: native_updater_service::ApplyMode,
+    apply_attempt: Option<native_updater_service::ApplyAttemptTicket>,
+    same_image: Option<app_update_handoff::SameImageHandoff>,
+    teardown: DeferredHandoffTeardown,
+    revoked_by_activity: bool,
+    /// The parked live set, present iff the readers are parked and must be
+    /// rolled back by this completion.
+    parked_live: Option<Vec<(u64, i32, i32)>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum DeferredHandoffMutation {
     ExitSession(u64),
@@ -13489,6 +13642,13 @@ fn fold_auto_apply_deadline(
 ///
 /// Kept as one pure production guard so Tier-1 exercises the exact predicate
 /// used by `about_to_wait`.
+///
+/// AN UNCOMMITTED HANDOFF CANDIDATE PROVES NO HEALTH (2026-09-19): a successor
+/// that has presented but whose handoff the outgoing process has not committed
+/// may still be rejected and killed — its first present is not this build's
+/// proof of a healthy launch, and confirming it would disarm the trial sentinel
+/// (and run the rollback GC) for a build that then never took over. The
+/// checkpoint waits for `Wake::ActivateCommittedHandoff` to clear the flag.
 #[must_use]
 fn should_dispatch_boot_health_confirmation(
     headless: bool,
@@ -13497,13 +13657,14 @@ fn should_dispatch_boot_health_confirmation(
     already_dispatched: bool,
     retry_due: bool,
     has_os_window: bool,
+    incoming_handoff_pending: bool,
 ) -> bool {
     let checkpoint = if headless {
         headless_ready
     } else {
         first_present_done && has_os_window
     };
-    checkpoint && !already_dispatched && retry_due
+    checkpoint && !already_dispatched && retry_due && !incoming_handoff_pending
 }
 
 /// A USER metadata change can affect two independent surfaces: the in-grid tab
@@ -14184,6 +14345,13 @@ struct App {
     /// live-PTY set.
     /// See the methods just above `about_to_wait` for the full protocol.
     handoff_ready: Option<seamless::ReadySignal>,
+    /// When this successor CLAIMED its handoff — the instant the descriptors
+    /// arrived over the rendezvous. Under the late park the outgoing terminal is
+    /// frozen from just before that claim until Commit, so `claim->proof` is the
+    /// half of the freeze this process owns (its GUI boot to its first present),
+    /// and the parent's `park->proof` is the whole of it. Neither number is
+    /// derivable from the other's log, so this process reports its own.
+    handoff_claimed_at: Option<Instant>,
     /// Parent-to-child phase-2 authority. The incoming child may prove adoption
     /// and paint while this is present, but adopted PTY readers remain disabled
     /// until its exact Commit wire arrives.
@@ -14696,6 +14864,26 @@ struct App {
     /// the PTY was told about and the rows the compose reserves can never differ
     /// mid-frame.
     status_bar_rows: u16,
+    /// PRESENCE (round 19): one slot per live session — who drives it, its
+    /// agent phase, hold, mail, link — folded from the session's own leaf locks
+    /// at change rate (`app_presence.rs`) and projected per window into
+    /// `WindowState::presence` (the rim, the band row, the chip level).
+    presence: app_presence::PresenceTable,
+    /// What the LEDGER KEY (⇧⌘L, `ledger_key`) last composed: the session and
+    /// the command, kept so a test or a menu row can read what the key did.
+    last_ledger_plan: Option<ledger_key::LedgerPlan>,
+    /// The View ▸ Presence Band / Rim bits AS APPLIED (round 19): seeded from
+    /// `[presence]`, flipped at the click, re-adopted on every config reload.
+    /// Read by the presence projection (`refresh_presence_window`), the palette
+    /// checkmarks and the native menu's stamped state.
+    presence_band_on: bool,
+    presence_rim_on: bool,
+    /// What the Fabric menu last asked `aterm fabric` to do — the plan, kept
+    /// for the tests and for `chrome`-side reads (headless composes only).
+    last_fabric_plan: Option<app_fabric_menu::FabricPlan>,
+    /// The last file the Fabric menu opened as a tab (Inbox…, Fabric Status…),
+    /// for the tests.
+    last_menu_document: Option<std::path::PathBuf>,
     /// The tab-status observer's FOREGROUND-JOB oracle
     /// ([`crate::quit_safety::JobProbe`]). On unix it is a per-fd `tcgetpgrp`
     /// and holds nothing; on WINDOWS the same question costs a system-wide
@@ -14748,6 +14936,11 @@ struct App {
     /// While present, second manual/debug applies are rejected and clean quit is
     /// deferred until the proof completion returns to the main thread.
     pending_update_handoff: Option<PendingUpdateHandoff>,
+    /// The launched lane's attempt between its launch and its park (the late
+    /// park, 2026-09-19): a successor booting or holding its claim while every
+    /// reader here is live. Read beside `pending_update_handoff` by the
+    /// in-flight guard; cleared by the completion reducer.
+    update_handoff_prelaunch: Option<HandoffPrelaunch>,
     /// The one-shot provenance self-repair latch ([`crate::provenance_repair`]): whether
     /// this process may ask to be replaced by itself because it is provenance-TRACKED
     /// while the bundle it runs from is clean. Measured OFF the event loop, consumed at
@@ -15165,6 +15358,15 @@ impl App {
         self.windows
             .values()
             .any(|ws| ws.focused && ws.os_window.is_some())
+    }
+
+    /// Whether an overlap handoff is in flight in EITHER of its shapes: parked
+    /// (`pending_update_handoff`) or prelaunched with every reader live
+    /// (`update_handoff_prelaunch`). The one predicate the apply entry, the
+    /// clean-quit deferral and the automatic lane's "work active" read, so a
+    /// second attempt can never launch beside a held successor.
+    pub(crate) fn update_handoff_in_flight(&self) -> bool {
+        self.pending_update_handoff.is_some() || self.update_handoff_prelaunch.is_some()
     }
 
     fn update_apply_hands_off_keys(&self, now: Instant) -> bool {
@@ -17081,6 +17283,9 @@ impl App {
         // after EVERY tab mutation (open / close / switch / detach / migrate), so the
         // native segments always track app state. A no-op off macOS / with no toolbar.
         self.refresh_window_tabs(wid);
+        // PRESENCE follows the window's FRONT session: a tab switch, a split, a
+        // migration all land here, so the rim and band re-project here.
+        self.refresh_presence_window(wid);
     }
 
     /// Mount native leaves in visible tab trees and suspend every hidden view.
@@ -17305,6 +17510,10 @@ impl App {
         // point so Split/Open Session grey out over native whole tabs.
         menu::set_active_tab_is_terminal(focused_session.is_some());
         menu::set_rename_surface_available(self.can_rename_session(front));
+        // The Fabric menu's halt pair and the View ▸ Presence checkmarks read
+        // their live state the same way (round 19).
+        self.publish_front_hold(front);
+        menu::set_presence_toggles(self.presence_band_on(), self.presence_rim_on());
         let next_active = focused_session.and_then(|session| {
             self.pool.get(session).map(|live| control::ActiveSession {
                 term: live.term.clone(),
@@ -17686,6 +17895,7 @@ impl App {
             seamless_adopt: Vec::new(),
             pending_conn_carry: Vec::new(),
             handoff_ready: None,
+            handoff_claimed_at: None,
             handoff_commit: None,
             handoff_reader_gate: None,
             handoff_control_preparation: None,
@@ -17755,6 +17965,12 @@ impl App {
             level_up: None,
             status_bars: status_bars::StatusBars::default(),
             status_bar_rows: 0,
+            presence: app_presence::PresenceTable::default(),
+            last_ledger_plan: None,
+            presence_band_on: true,
+            presence_rim_on: true,
+            last_fabric_plan: None,
+            last_menu_document: None,
             update_bar_before_install: None,
             landed_row_pending: None,
             job_probe: crate::quit_safety::JobProbe::default(),
@@ -17766,6 +17982,7 @@ impl App {
             auto_apply_physical_retry: None,
             handoff_preverified: std::sync::Arc::default(),
             pending_update_handoff: None,
+            update_handoff_prelaunch: None,
             provenance_repair: crate::provenance_repair::RepairPosture::default(),
             provenance_repair_verdict: std::sync::Arc::new(std::sync::Mutex::new(None)),
             operator_control: None,
@@ -18799,7 +19016,7 @@ impl App {
     #[cfg(any(feature = "a11y-appkit", a11y_tree))]
     fn grid_snapshot(&self, id: WindowId) -> Option<accessibility::AccessibleSnapshot> {
         let ws = self.windows.get(&id)?;
-        let strip = usize::from(self.chrome_rows());
+        let strip = usize::from(self.chrome_rows(id));
         let cells = ws.input_scratch.cells.get(strip..).unwrap_or(&[]);
         let cursor = ws.input_scratch.cursor_visible.then_some((
             ws.input_scratch.cursor_row.saturating_sub(strip),
@@ -20002,6 +20219,14 @@ impl App {
                 return;
             }
             // The Commit waiter exists before ProofReady can become observable.
+            // THE HALF THIS PROCESS OWNS, reported by the process that paid it.
+            if let Some(claimed_at) = self.handoff_claimed_at {
+                aterm_log::info!(
+                    "overlap handoff: claim->proof {} ms — this successor's own boot to its \
+                     first present, inside the outgoing process's freeze",
+                    claimed_at.elapsed().as_millis()
+                );
+            }
             if !ready.signal_proof(proof) {
                 self.handoff_degraded = true;
                 self.stop_prepared_handoff_readers(&reader_gate);
@@ -20577,6 +20802,8 @@ impl ApplicationHandler<Wake> for App {
             // freezes the count (`settle_status_bars`).
             let bars_settled = self.settle_status_bars(now);
             let bars_folded = self.sync_status_bar_rows() || bars_settled;
+            // PRESENCE: the band's `since` figures and a finished ripple.
+            let presence_dirty = self.presence_tick(now);
             for (id, ws) in self.windows.iter_mut() {
                 // Flash over: repaint the normal (un-inverted) frame.
                 let mut dirty = ws.bell_flash.expire(now);
@@ -20781,6 +21008,7 @@ impl ApplicationHandler<Wake> for App {
             if bars_folded {
                 to_redraw.extend(self.windows.keys().copied());
             }
+            to_redraw.extend(presence_dirty);
             let native_preview_phase_ms =
                 u64::try_from(self.lat_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
             for wid in native_preview_due {
@@ -20975,6 +21203,19 @@ impl ApplicationHandler<Wake> for App {
         if self.sync_status_bar_rows() {
             self.request_redraw_all_windows();
         }
+        // THE LATE PARK'S GATE, re-run while a prelaunched attempt waits for a
+        // quiet moment (the deadline fold below arms the wake).
+        #[cfg(unix)]
+        if let Some(retry_at) = self
+            .update_handoff_prelaunch
+            .as_ref()
+            .and_then(|prelaunch| prelaunch.park_retry_at)
+        {
+            let now = Instant::now();
+            if now >= retry_at {
+                self.try_park_for_prelaunched_successor(now);
+            }
+        }
         // SEAMLESS CONNECTION RE-MINT (design §1.4#6): once the restore above has
         // drained — every handed-off shell placed AND registered — re-establish
         // the carried tokenless triples through the one kind-bounded mint helper.
@@ -21136,6 +21377,7 @@ impl ApplicationHandler<Wake> for App {
             self.boot_health_confirmation_retry_at
                 .is_none_or(|retry_at| now >= retry_at),
             self.windows.values().any(|ws| ws.os_window.is_some()),
+            self.incoming_handoff_pending,
         ) {
             match self.request_native_boot_health_confirmation() {
                 app_native::NativeUpdateDispatch::Queued => {
@@ -21179,6 +21421,18 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline_owner,
                 candidate,
                 metrics::DeadlineOwner::BootHealth,
+            );
+        }
+        if let Some(retry_at) = self
+            .update_handoff_prelaunch
+            .as_ref()
+            .and_then(|prelaunch| prelaunch.park_retry_at)
+        {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                retry_at,
+                metrics::DeadlineOwner::HandoffPark,
             );
         }
         // Iterate the windows in place (no per-wake Vec<WindowId> snapshot, no
@@ -21745,6 +21999,17 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::LevelUp,
             );
         }
+        // PRESENCE: the band's `since` text ticks (1 s while it shows seconds,
+        // 1 min after) and the turn-submit ripple steps — only while a row or a
+        // ripple is up; a quiet desktop folds nothing here (`presence_fp == 0`).
+        if let Some(d) = self.presence_deadline(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                d,
+                metrics::DeadlineOwner::Presence,
+            );
+        }
         // The status bars wake the loop exactly once per bar: at the fold of a
         // bar holding a terminal outcome. A live bar folds nothing (its next paint
         // arrives with its next `Wake::PkgProgress` / `Wake::UpdateProgress`), and
@@ -22005,6 +22270,8 @@ impl ApplicationHandler<Wake> for App {
         // not before them.
         for changed in self.observe_session_statuses(Instant::now()) {
             self.refresh_session_status_chrome(changed);
+            // A status REVISION moved: the presence classifier's one gate.
+            self.refresh_presence_session(changed, false);
         }
         // The observer asks for a deadline only while one is actually owed
         // (a candidate serving its dwell, or Running aging into Quiet), so an
@@ -22354,6 +22621,7 @@ impl ApplicationHandler<Wake> for App {
                 // the fan-out below runs at transition rate, not at burst rate.
                 for changed in self.observe_session_statuses(std::time::Instant::now()) {
                     self.refresh_session_status_chrome(changed);
+                    self.refresh_presence_session(changed, false);
                 }
                 // BULK SCROLLBACK MAINTENANCE IS FORBIDDEN HERE. A successful
                 // try-lock does not bound the eviction done while holding it;
@@ -22513,9 +22781,20 @@ impl ApplicationHandler<Wake> for App {
             // window) for one edit.
             Wake::MetaChanged { session } => {
                 self.refresh_meta_dependent_chrome(session);
+                // `meta set role|attention` moves the presence band's first two slots.
+                self.refresh_presence_session(session, false);
                 // A `meta set title` is exactly how the operator names itself
                 // and clears/raises `⚠` escalations — refresh the bar icon.
                 self.refresh_operator_status_item();
+            }
+            // PRESENCE: a lease moved, or the fabric endpoint changed. Both are
+            // change-rate wakes keyed by the fabric sid; the refresh re-reads the
+            // session's leaf facts and re-projects every window showing it.
+            Wake::LeaseChanged { session, submitted } => {
+                self.on_presence_wake(&session, submitted);
+            }
+            Wake::FabricChanged { session } => {
+                self.on_presence_wake(&session, false);
             }
             // A session's reader thread confirmed it is live (first loop iteration).
             // Flip its registry handle `Spawning -> Alive` (the async-spawn path).
@@ -22860,7 +23139,12 @@ impl ApplicationHandler<Wake> for App {
             // HERE and reply with the text lines. A dropped receiver (dead client)
             // just makes send() fail; ignore.
             Wake::ReadChrome { reply } => {
-                let lines = self.read_native_chrome();
+                let mut lines = self.read_native_chrome();
+                // Round 19: what the human sees of PRESENCE — the rim state,
+                // the level and the band row's words — on every platform, after
+                // the native chrome. An agent reads the window's story here
+                // instead of inferring it from a screenshot.
+                lines.push(self.presence_chrome_line());
                 let _ = reply.send(lines);
             }
             // The front window's ACTIVE-tab pane layout — a pure read of the
@@ -23247,6 +23531,8 @@ impl ApplicationHandler<Wake> for App {
                 self.finish_native_boot_health_confirmation(confirmed, Instant::now());
             }
             Wake::UpdateHandoffFinished(completion) => {
+                // The presence rows were frozen for Commit; re-sync them now.
+                self.refresh_presence_all_windows();
                 self.finish_update_handoff(el, completion);
                 // A status-bar row change is DEFERRED while a handoff is pending
                 // (`sync_status_bar_rows`: a re-grid mid-handoff reads as a
@@ -23255,6 +23541,23 @@ impl ApplicationHandler<Wake> for App {
                 self.sync_status_bars();
             }
             Wake::ControlPrepared => self.maybe_signal_handoff_ready(),
+            Wake::UpdateHandoffAwaitingPark {
+                attempt_id,
+                dialer_pid,
+            } => {
+                #[cfg(unix)]
+                self.on_update_handoff_awaiting_park(attempt_id, dialer_pid);
+                #[cfg(not(unix))]
+                aterm_log::warn!(
+                    "ignored unix-only handoff park cue for attempt {attempt_id} ({dialer_pid:?})"
+                );
+            }
+            Wake::UpdateHandoffStandingDown { attempt_id } => {
+                #[cfg(unix)]
+                self.answer_prelaunched_stand_down(attempt_id);
+                #[cfg(not(unix))]
+                aterm_log::warn!("ignored unix-only handoff stand-down for attempt {attempt_id}");
+            }
             Wake::ActivateCommittedHandoff { mut expected } => {
                 self.incoming_handoff_pending = false;
                 // Everything typed into the revealed window while we waited for Commit
@@ -23987,6 +24290,20 @@ impl ApplicationHandler<Wake> for App {
             Wake::ReadSessionStatus { session, reply } => {
                 let _ = reply.send(self.session_status_record(session));
             }
+            // `aterm ctl story`: the watcher's decision reaches the band. A
+            // dropped receiver (dead client) just makes send() fail; ignore.
+            Wake::Story {
+                session,
+                verb,
+                text,
+                reply,
+            } => {
+                let result = self.tell_story(session, verb, &text);
+                if let Ok(seq) = result {
+                    aterm_log::info!("story {session}: {verb:?} seq={seq}");
+                }
+                let _ = reply.send(result);
+            }
             Wake::ReadSessionWindows { reply } => {
                 let _ = reply.send(self.session_window_rows());
             }
@@ -24131,6 +24448,7 @@ impl ApplicationHandler<Wake> for App {
             // in words the user can act on. A completion for a window that has
             // since closed (or a superseded ticket) is dropped with the log line
             // only; nobody is waiting for it.
+            Wake::FabricCli(outcome) => self.complete_fabric_cli(*outcome),
             Wake::DocumentAdmitted(outcome) => match self.complete_document_admission(*outcome) {
                 Ok(_) => {}
                 Err(rejected @ app_documents::DocumentAdmissionRejected::Dropped(_)) => {
@@ -24429,6 +24747,11 @@ impl ApplicationHandler<Wake> for App {
                 // output burst as its own echo — which under a flood would make
                 // the instrument publish its best numbers at the terminal's worst
                 // moment, the failure class this audit round exists to stop.
+                // THE FOLD LAW (presence): the human ACTED in this window. Folds
+                // the band only while the session is calm; never on focus alone.
+                if event.state == winit::event::ElementState::Pressed {
+                    self.note_human_acted(wid);
+                }
                 let echo = self.echo_probe_open(wid, None);
                 self.on_key(wid, event);
                 self.echo_probe_close(echo);
@@ -24467,6 +24790,9 @@ impl ApplicationHandler<Wake> for App {
             // long as the pointer is away. See `App::on_cursor_left`.
             WindowEvent::CursorLeft { .. } => self.on_cursor_left(wid),
             WindowEvent::MouseInput { state, button, .. } => {
+                if state == winit::event::ElementState::Pressed {
+                    self.note_human_acted(wid);
+                }
                 self.on_mouse_input(wid, state, button);
                 // A tab-strip click closing the last tab sets the clicked window's
                 // `pending_close`; escalate whichever window carries the flag (the
@@ -27106,6 +27432,18 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // human waits on (design §4 already calls this "a parked background
             // thread"). Undeclared it ran at DEFAULT, the typing band.
             crate::qos::set_self(crate::qos::Role::Background);
+            // AN UNCOMMITTED HANDOFF CANDIDATE RUNS NO PASS (2026-09-19): a
+            // successor waits here until the outgoing process has committed to
+            // it — a pass from a process the parent may still reject would
+            // contend with the parent's own lane at the store lock for nothing,
+            // and under the late park the candidate may hold for a while.
+            if aterm_update::wait_while_uncommitted_handoff_candidate(
+                aterm_update::UNCOMMITTED_CANDIDATE_HOLD_BOUND,
+            ) {
+                aterm_log::info!(
+                    "atpkg lane: the launch passes waited for this handoff to be committed"
+                );
+            }
             // THE ONE READER (`pkg_check`), shared with the session lane: it caps
             // the knob at the park's clock range (a raw parse accepted a value that
             // panicked `Instant + Duration` at the first park and ended the loop
@@ -29379,6 +29717,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // cost is logged by the image that pays it, from `aterm-update`'s
     // `install.rs` ("applied update … in N ms … → re-launching").
     let boot_apply_at = std::time::Instant::now();
+    // THE SNAPSHOT THE FORGIVE IS MEASURED AGAINST (2026-09-19, review round 1).
+    // The two refusals below hand this launch's counted boot-trial back, and
+    // under the late park that is the ROUTINE end of an attempt (the outgoing
+    // process stands a held successor down whenever the terminal never goes
+    // quiet, a teardown arrives, or its park misses), not the rare give-up it
+    // was. `check_boot_health` does not always count: `launch_is_burst`
+    // suppresses the count when the sentinel already stands above zero inside
+    // the burst window, so a successor booting seconds after a genuinely CRASHED
+    // candidate of the same build would have given back the crash's launch — the
+    // one signal the sentinel exists to keep. Take the count before the apply and
+    // forgive only a launch that provably moved, exactly as the parent does.
+    let trial_launches_before_boot =
+        aterm_update::trial_launch_count(build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0));
     let boot_apply = if incoming_exec_fds.blocks_boot_apply() {
         aterm_update::ApplyOutcome::NotApplicable
     } else {
@@ -29404,9 +29755,27 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // second is exactly the finding that would justify moving this work, and the
     // arm below is silent about it by design.
     if incoming_exec_fds.parent_pid().is_some() {
+        // WHOSE TIME THIS SPENDS depends on the lane, and the sentence used to
+        // name only one of them. On the FORK lane the outgoing process parked
+        // before it spawned, so every millisecond here is frozen terminal. Under
+        // the LATE PARK it is the opposite: this runs before the dial, with every
+        // one of the outgoing process's readers live, which is the whole point of
+        // moving the park — so reporting it as freeze would send the next reader
+        // of this log after the wrong second.
+        // The rendezvous is the late park's marker and it is macOS-only, like the
+        // launched lane itself; every other unix has only the fork lane, where
+        // the park always precedes the spawn.
+        #[cfg(target_os = "macos")]
+        let late_park = handoff_rendezvous::rendezvous_present();
+        #[cfg(not(target_os = "macos"))]
+        let late_park = false;
+        let lane = if late_park {
+            "with the outgoing process's readers still LIVE (the late park; before the dial)"
+        } else {
+            "with the outgoing process's readers parked"
+        };
         aterm_log::info!(
-            "update apply (boot): {boot_apply:?} in {} ms — this ran with the outgoing \
-             process's readers still parked",
+            "update apply (boot): {boot_apply:?} in {} ms — this ran {lane}",
             boot_apply_at.elapsed().as_millis(),
         );
     }
@@ -29476,6 +29845,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // it rolls back with its readers intact — this is the same fail-closed shape
     // as the malformed-handoff refusal above, and it is what makes a late dial (one
     // that arrives after the parent gave up and unlinked the socket) safe.
+    // When this successor's rendezvous claim was GRANTED, on the lane that has
+    // one. `None` on the fork lane (no rendezvous) and off macOS.
+    let mut handoff_claimed_at: Option<std::time::Instant> = None;
     #[cfg(target_os = "macos")]
     let out_of_band_handoff = handoff_rendezvous::rendezvous_present();
     #[cfg(not(target_os = "macos"))]
@@ -29492,23 +29864,47 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let device_proof_term = false;
     #[cfg(target_os = "macos")]
     if out_of_band_handoff {
-        /// How long this process will wait on its own dial. Short because every
-        /// slow part is already behind us — the parent is holding the listener
-        /// open and answers immediately, or it has given up and the connect fails
-        /// at once.
-        const CLAIM_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        /// How long this process will wait on the DIAL itself — connect, uid
+        /// check, the claim write. Short because the parent is holding the
+        /// listener open and answers immediately, or it has given up and the
+        /// connect fails at once.
+        const CLAIM_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        /// How long this process will HOLD its claim waiting for the grant (the
+        /// one descriptor message). THE HOLD (2026-09-19, the late park): the
+        /// outgoing process accepts this dial with every one of its readers still
+        /// live and grants only once it has parked — at once for an explicit
+        /// apply, at the next quiet moment for the automatic lane, bounded by its
+        /// own hold cap (120 s) and its worker's backstop (4 min). Longer than
+        /// both, so the parent is always the one that ends a hold — by EOF, which
+        /// this side reads at once and exits on.
+        const GRANT_HOLD_BUDGET: std::time::Duration = std::time::Duration::from_secs(5 * 60);
         // Read, do not consume: `seamless::take_incoming` owns clearing this, and
         // consuming it here would leave that call unable to authenticate the
         // manifest it is about to read.
         let nonce = std::env::var("ATERM_SEAMLESS_NONCE").unwrap_or_default();
-        match handoff_rendezvous::claim_incoming(&nonce, std::time::Instant::now() + CLAIM_BUDGET) {
+        let dialled_at = std::time::Instant::now();
+        #[allow(unused_assignments)]
+        match handoff_rendezvous::claim_incoming(
+            &nonce,
+            handoff_rendezvous::ClaimDeadlines {
+                dial: dialled_at + CLAIM_DIAL_BUDGET,
+                grant: dialled_at + GRANT_HOLD_BUDGET,
+            },
+        ) {
             Ok(claimed) => {
                 aterm_log::info!(
                     "overlap handoff: claimed {} PTY(s) plus the readiness and Commit channels \
-                     over the rendezvous; this successor owns a launchd application job of its own",
-                    claimed.session_count()
+                     over the rendezvous after holding the dial {} ms; this successor owns a \
+                     launchd application job of its own",
+                    claimed.session_count(),
+                    dialled_at.elapsed().as_millis()
                 );
                 claimed.publish();
+                // THE INSTANT THE FREEZE BECOMES THIS PROCESS'S PROBLEM. Under
+                // the late park the outgoing terminal froze just before this
+                // grant; everything from here to the proof is this successor's
+                // own boot, and it is the residual the next train attacks.
+                handoff_claimed_at = Some(std::time::Instant::now());
             }
             Err(error) => {
                 // Both destinations deliberately: a launchd-launched app leaves
@@ -29522,15 +29918,20 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 crate::logging::stderr_line!(
                     "aterm-gui: overlap handoff could not be claimed: {error}"
                 );
-                // This launch COUNTED a boot-trial launch for its build moments ago
-                // (`check_boot_health`, inside the boot apply above), and it is now
-                // exiting BY RULE — the outgoing process gave up before the transfer
-                // — not crashing. Give the launch back here, in the one process that
-                // knows it observed it (a parent-side forgive could race ahead of the
-                // observation); left counted, three such pre-transfer failures on a
-                // busy machine revert and permanently poison a healthy build.
-                aterm_update::forgive_trial_launch(
+                // This launch may have COUNTED a boot-trial launch for its build
+                // moments ago (`check_boot_health`, inside the boot apply above),
+                // and it is now exiting BY RULE — the outgoing process gave up
+                // before the transfer — not crashing. Give THAT launch back here,
+                // in the one process that knows it observed it (a parent-side
+                // forgive could race ahead of the observation); left counted,
+                // three such pre-transfer failures on a busy machine revert and
+                // permanently poison a healthy build. IF IT MOVED, and only then:
+                // `launch_is_burst` can suppress the count, and forgiving a
+                // launch this process did not observe erases an earlier, real
+                // crash of the same build.
+                aterm_update::forgive_trial_launch_if_advanced(
                     build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                    trial_launches_before_boot,
                 );
                 return;
             }
@@ -29641,10 +30042,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         crate::logging::stderr_line!(
             "aterm-gui: incoming fixed-socket handoff has no matching endpoint ownership; preserving the parent"
         );
-        // Boot apply has already observed this candidate's trial launch. An
+        // Boot apply may have observed this candidate's trial launch. An
         // intentional refusal before transfer is not a crash of the build;
-        // return the observation just as the rendezvous refusal above does.
-        aterm_update::forgive_trial_launch(build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0));
+        // return the observation — if there was one — just as the rendezvous
+        // refusal above does.
+        aterm_update::forgive_trial_launch_if_advanced(
+            build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+            trial_launches_before_boot,
+        );
         // Only this uncommitted candidate exits. Its parent retains every PTY.
         unsafe { libc::_exit(74) }
     }
@@ -30633,6 +31038,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         }
     };
     let proxy: EventLoopProxy<Wake> = event_loop.create_proxy();
+    // PRESENCE wakes ride this proxy from the control and bridge threads.
+    presence::install_proxy(proxy.clone());
     // A window on Wayland gets the loop's own clipboard (see `clipboard_wayland`):
     // the seat that receives input is the only one the compositor lets set a
     // selection. X11 and headless launches leave the X11 backend in charge.
@@ -31653,6 +32060,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // leaf's). Empty on a normal launch. `apply_pending_restore` drains it.
         seamless_adopt,
         pending_conn_carry: seamless_conn_carry,
+        // Stamped where the descriptors arrived, so `claim->proof` measures this
+        // successor's own boot rather than anything the parent did. Read BEFORE
+        // the signal is moved into the struct below.
+        handoff_claimed_at: handoff_claimed_at.filter(|_| handoff_ready.is_some()),
         handoff_ready,
         handoff_commit,
         handoff_reader_gate,
@@ -31761,6 +32172,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             Instant::now(),
         ),
         status_bar_rows: carried_status_bar_rows,
+        presence: app_presence::PresenceTable::default(),
+        last_ledger_plan: None,
+        presence_band_on: config.presence_band_enabled(),
+        presence_rim_on: config.presence_rim_enabled(),
+        last_fabric_plan: None,
+        last_menu_document: None,
         update_bar_before_install: None,
         landed_row_pending: None,
         job_probe: crate::quit_safety::JobProbe::default(),
@@ -31772,6 +32189,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         auto_apply_physical_retry: None,
         handoff_preverified: std::sync::Arc::default(),
         pending_update_handoff: None,
+        update_handoff_prelaunch: None,
         provenance_repair: crate::provenance_repair::RepairPosture::default(),
         provenance_repair_verdict: std::sync::Arc::new(std::sync::Mutex::new(None)),
         operator_control: operator_control.clone(),
@@ -32598,6 +33016,7 @@ mod overlap_handoff_tests {
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
             park_at: std::time::Instant::now(),
             proof_ready_at: None,
+            activate_at_commit: false,
             attempt_id: 7,
             nonce: None,
             live: live.clone(),
@@ -34355,6 +34774,7 @@ mod multi_window_tests {
         let frame = ws
             .cursor_pet
             .tick_static_capture(aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
                 now,
                 caret: Some((4, 12)),
                 rows: 24,
@@ -39448,6 +39868,8 @@ mod early_out_tests {
             // No status bar in these unit frames — the hidden sentinel keeps the
             // key byte-identical to the no-bar path.
             status_bars_fp: 0,
+            // No presence in these unit frames (the quiet sentinel).
+            presence_fp: 0,
             // No connection drag in these unit frames (the no-drag sentinel).
             conn_wire_fp: 0,
             // Fixed OS appearance in these unit frames (a flip is exercised by
@@ -40146,6 +40568,7 @@ mod tests {
                 app.boot_health_confirmation_dispatched,
                 true,
                 app.windows.values().any(|ws| ws.os_window.is_some()),
+                app.incoming_handoff_pending,
             )
         }
 
@@ -40250,6 +40673,7 @@ mod tests {
         let pet = ws
             .cursor_pet
             .tick_static_capture(aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
                 now,
                 caret: Some((0, 0)),
                 rows: 24,

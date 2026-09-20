@@ -85,6 +85,10 @@ pub(crate) struct TabRenameEdit {
     /// Which editor is on screen. Set at begin from what actually presented, and
     /// never re-derived: an edit that nothing presents is refused, not stored.
     pub surface: RenameSurface,
+    /// WHICH metadata field the editor writes: the TITLE pin (Rename Session…,
+    /// the double-click) or the ROLE (Window ▸ Set Role…, round 19). Fixed at
+    /// begin; the commit writes exactly this field through the typed API.
+    pub field: MetaField,
     /// The in-grid field's text. Seeded from the pin (EMPTY when unpinned) and
     /// mutated only through [`crate::app_search::apply_field_edit`], the same
     /// reducer the find bar's query runs on.
@@ -169,6 +173,20 @@ impl App {
     }
 
     pub(crate) fn begin_session_rename(&mut self, window: WindowId, tab: TabId) -> bool {
+        self.begin_session_meta_edit(window, tab, MetaField::Title)
+    }
+
+    /// [`Self::begin_session_rename`] for any presentation FIELD: the same
+    /// editor over `tab`, seeded with the field's stored value and placeheld
+    /// with the resolved label (title) or the field's own name (role), writing
+    /// that field on commit. Round 19's Window ▸ Set Role… is
+    /// `MetaField::Role` here; the pin paths pass `MetaField::Title`.
+    pub(crate) fn begin_session_meta_edit(
+        &mut self,
+        window: WindowId,
+        tab: TabId,
+        field: MetaField,
+    ) -> bool {
         let Some(index) = self.tab_index_for_id(window, tab) else {
             aterm_log::info!("rename dropped: tab {tab} no longer exists in its window");
             return false;
@@ -184,12 +202,13 @@ impl App {
             .windows
             .get(&window)
             .and_then(|ws| ws.rename_edit.as_ref())
-            .map(|edit| (edit.session, edit.tab));
-        // Same session AND same chip ⇒ nothing to do. Compared as a whole so a
-        // session shown on a different tab still re-presents (the editor has to
-        // move); a repeat double-click on the tab already being edited does not
-        // close-and-reopen the field under the user's caret.
-        if live == Some((session, tab)) {
+            .map(|edit| (edit.session, edit.tab, edit.field));
+        // Same session AND same chip AND same field ⇒ nothing to do. Compared
+        // as a whole so a session shown on a different tab still re-presents
+        // (the editor has to move) and a Set Role… over an open rename settles
+        // the rename first; a repeat double-click on the tab already being
+        // edited does not close-and-reopen the field under the user's caret.
+        if live == Some((session, tab, field)) {
             return true;
         }
         // Replacing a different live edit SETTLES it rather than dropping it:
@@ -209,14 +228,19 @@ impl App {
                 ctx.meta
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .presentation_value("title")
+                    .presentation_value(field.wire_name())
             })
             .unwrap_or_default();
-        let placeholder = self
-            .tab_titles(window)
-            .get(index)
-            .cloned()
-            .unwrap_or_default();
+        let placeholder = match field {
+            MetaField::Title => self
+                .tab_titles(window)
+                .get(index)
+                .cloned()
+                .unwrap_or_default(),
+            // The role has no label chain to fall back down: an empty field
+            // means "no role", and the placeholder says which field this is.
+            _ => field.wire_name().to_string(),
+        };
         // The native editor is asked FIRST — where it exists it is a real text
         // field with a real field editor, which no cell-drawn imitation matches.
         // The in-grid strip is the fallback, and it presents only when it is
@@ -249,6 +273,7 @@ impl App {
                 session,
                 tab,
                 surface,
+                field,
                 text: seed,
                 cursor,
             });
@@ -264,6 +289,16 @@ impl App {
     /// Open the editor over `window`'s ACTIVE tab — the subject convention every
     /// non-tab-context entry point uses (menu bar, palette, `invoke`, keybinding).
     pub(crate) fn begin_active_session_rename(&mut self, window: WindowId) -> bool {
+        self.begin_active_session_meta_edit(window, MetaField::Title)
+    }
+
+    /// [`Self::begin_active_session_rename`] for any field — Window ▸ Set
+    /// Role… (round 19) passes `MetaField::Role`.
+    pub(crate) fn begin_active_session_meta_edit(
+        &mut self,
+        window: WindowId,
+        field: MetaField,
+    ) -> bool {
         let Some(tab) = self
             .windows
             .get(&window)
@@ -271,7 +306,7 @@ impl App {
         else {
             return false;
         };
-        self.begin_session_rename(window, tab)
+        self.begin_session_meta_edit(window, tab, field)
     }
 
     /// Tear down the editor for `window` (platform teardown + state) without
@@ -375,10 +410,8 @@ impl App {
         // a human edit and the visible refusal is simply that the field stops
         // taking more. Compared against the TRIMMED input for the same reason the
         // native one is — otherwise a space typed mid-word would yank the caret.
-        let canonical = crate::session_timeline::sanitize_presentation_line(
-            &state.text,
-            MetaField::Title.cap(),
-        );
+        let canonical =
+            crate::session_timeline::sanitize_presentation_line(&state.text, state.field.cap());
         if state.text.trim() != canonical {
             state.text = canonical;
             state.cursor = state.cursor.min(state.text.len());
@@ -436,8 +469,15 @@ impl App {
             aterm_log::info!("rename commit dropped: session {session} is no longer being edited");
             return;
         }
+        // The field the editor was opened FOR — read off the live edit before it
+        // is torn down, so a Set Role… commit can never land on the title.
+        let field = self
+            .windows
+            .get(&window)
+            .and_then(|ws| ws.rename_edit.as_ref())
+            .map_or(MetaField::Title, |edit| edit.field);
         self.end_session_rename_editor(window);
-        match self.write_session_title_pin(session, text) {
+        match self.write_session_meta_field(session, field, text) {
             Ok(_) => {}
             Err(error) => {
                 // Unreachable through either editor — both canonicalize as the user
@@ -458,9 +498,25 @@ impl App {
     /// below re-takes `ctx.meta` per tab on this same thread and
     /// `std::sync::Mutex` is not reentrant). Only the fan-out is ours, and only
     /// on an ACTUAL change.
+    #[cfg(test)]
     pub(crate) fn write_session_title_pin(
         &mut self,
         session: u64,
+        text: &str,
+    ) -> Result<bool, MetaWriteError> {
+        self.write_session_meta_field(session, MetaField::Title, text)
+    }
+
+    /// [`Self::write_session_title_pin`] for any presentation field. A ROLE
+    /// write additionally re-projects the presence band (the role is its first
+    /// slot, and the name a driven peer's band prints for its driver) and the
+    /// operator status item — the same fan-out the `Wake::MetaChanged` arm runs
+    /// for a wire `meta set role`, called directly for the reason the title
+    /// path gives above.
+    pub(crate) fn write_session_meta_field(
+        &mut self,
+        session: u64,
+        field: MetaField,
         text: &str,
     ) -> Result<bool, MetaWriteError> {
         let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
@@ -473,12 +529,16 @@ impl App {
         } else {
             MetaEdit::Set(text)
         };
-        let changed = write_session_meta(&ctx, MetaField::Title, edit)?;
+        let changed = write_session_meta(&ctx, field, edit)?;
         if changed {
             // The record already landed (under the meta guard), so the chrome
             // cache's `high_id` gate has moved and the tooltip/context menu
             // recompose along with the label.
             self.refresh_meta_dependent_chrome(session);
+            if field != MetaField::Title {
+                self.refresh_presence_session(session, false);
+                self.refresh_operator_status_item();
+            }
             if self.subscribers.any() {
                 self.subscribers
                     .lock()

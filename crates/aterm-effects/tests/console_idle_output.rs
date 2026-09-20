@@ -91,6 +91,7 @@ impl Scene {
         let (spans, live) = self.decos.pet_ink();
         self.brain.sense_ink(0, spans, live);
         let sense = PetSense {
+            caret_drawn: true,
             now: self.now,
             caret: input
                 .cursor_visible

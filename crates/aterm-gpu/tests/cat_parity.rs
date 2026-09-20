@@ -389,3 +389,111 @@ fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
         "a settled cat (equal quads, same atlas version) must take the dirty gate"
     );
 }
+
+/// A SOURCE RECT THAT OVERRUNS THE ATLAS is refused by BOTH backends, and a
+/// quad tagged PAST THE GRID'S LAST ROW is dropped by both.
+///
+/// Both are host bugs, and the CPU is the side that silently absorbs them —
+/// `stamp_cat_quad` returns early on `ax + aw > atlas.width` (the NEAREST index
+/// math is only in-bounds when the rect is), and the per-row stamp only fires
+/// under `q.row as usize == r` for `r` in `0..rows`, while `build_rain_row_csr`
+/// drops an out-of-grid row outright. A parity run on the CPU therefore cannot
+/// see either one; the GPU had neither guard, and its samplers are
+/// ClampToEdge, so an overrunning rect SMEARED the atlas's edge row/column
+/// across the whole quad. Measured before the guards, on a 64x64 atlas with
+/// `ay = 40, ah = 34`: cpu painted 0 px, gpu painted 1360 px; with `row = 99`
+/// on a 6-row grid: cpu 0 px, gpu 800 px. Identical for `cat_quads` and
+/// `rain_quads`, which share the one GPU builder.
+///
+/// The IN-BOUNDS control in each arm is what keeps this from passing
+/// vacuously: the same quad with a legal rect must paint, and paint the same
+/// on both backends.
+#[test]
+fn a_malformed_sprite_quad_is_refused_on_both_backends() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (_, ch) = cpu.cell_size();
+    let (rows, cols) = (6usize, 16usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[?25l");
+
+    let base = term.cell_frame(rows, cols);
+    let cpu_base = cpu.render_input(&base).pixels;
+    let gpu_base = gpu.render_input(&mut win, &base, None).pixels;
+    assert_eq!(
+        max_channel_delta(&cpu_base, &gpu_base),
+        0,
+        "blank base must be byte-exact so the sprite delta is effect-only"
+    );
+
+    // `[ax, ay, aw, ah]` against the 64x64 fixture atlas: the control is legal,
+    // the other two overrun the bottom edge and the right edge.
+    let cases: [(&str, [u16; 4], u16, bool); 4] = [
+        ("in-bounds control", [2, 0, 40, 20], 3, true),
+        (
+            "source rect overruns the atlas bottom",
+            [2, 40, 40, 34],
+            3,
+            false,
+        ),
+        (
+            "source rect overruns the atlas right",
+            [40, 0, 40, 20],
+            3,
+            false,
+        ),
+        (
+            "row tagged past the last grid row",
+            [2, 0, 40, 20],
+            99,
+            false,
+        ),
+    ];
+    for (name, [ax, ay, aw, ah], row, should_paint) in cases {
+        for stream in ["cat", "rain"] {
+            let quad = SpriteQuad {
+                row,
+                x: 4,
+                y: (2 * ch) as u16,
+                w: aw,
+                h: ah,
+                ax,
+                ay,
+                aw,
+                ah,
+                tint: 0x00FF_FFFF,
+                alpha: 255,
+                flip_x: false,
+            };
+            let mut input = term.cell_frame(rows, cols);
+            if stream == "cat" {
+                input.cat_atlas = Some(Arc::new(cat_atlas(1)));
+                input.cat_quads = vec![quad];
+            } else {
+                input.rain_atlas = Some(Arc::new(cat_atlas(1)));
+                input.rain_quads = vec![quad];
+            }
+            let c = cpu.render_input(&input).pixels;
+            let g = gpu.render_input(&mut win, &input, None).pixels;
+            assert_eq!(
+                c == cpu_base,
+                !should_paint,
+                "{stream}: {name} — the CPU is the reference for what this quad may draw"
+            );
+            assert_eq!(
+                g == gpu_base,
+                !should_paint,
+                "{stream}: {name} — the GPU must draw exactly what the CPU draws, \
+                 not the ClampToEdge smear of an out-of-range rect"
+            );
+            assert_eq!(
+                max_channel_delta(&c, &g),
+                0,
+                "{stream}: {name} — CPU and GPU must land the same pixels"
+            );
+        }
+    }
+}

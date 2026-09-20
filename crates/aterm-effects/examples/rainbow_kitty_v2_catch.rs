@@ -319,6 +319,7 @@ impl Sim {
             head: 0,
         };
         let frame = pet.tick(PetSense {
+            caret_drawn: true,
             now: base,
             caret: Some((TEXT_ROW, 0)),
             wrapped: false,
@@ -421,6 +422,7 @@ impl Sim {
     fn step(&mut self) {
         self.prev = self.frame;
         self.frame = self.pet.tick(PetSense {
+            caret_drawn: true,
             now: self.now(),
             caret: Some(self.caret),
             wrapped: false,

@@ -2185,21 +2185,111 @@ pub fn native_update_overlap_handoff_model() -> Model {
             var legacy_strict_newer = 1;
             var legacy_ack = 0;
             var diagnostic_wake = 1;
+            // THE LATE PARK (2026-09-19). On the launched lane the successor
+            // exists BEFORE the parent parks: launched, booted and dialled with
+            // every reader live, holding NOTHING until the one post-park
+            // descriptor message (`granted`). Until then a revocation kills,
+            // reaps and retires the candidate with the parent's readers never
+            // stopped, and a parked parent whose capture missed may resume its
+            // readers beside the live candidate and park again — legitimately,
+            // because no descriptor has left. `granted` is the one flag both
+            // lanes share: the fork lane grants at the spawn (inheritance).
+            var launched_early = 0;
+            var granted = 0;
+            var retired = 0;
+            // A revoked successor is proven gone one of two ways, and the
+            // difference is exactly who forgives its counted trial launch: it
+            // EXITS on the closed rendezvous by its own rule (this flag), or it
+            // ignores the EOF for the whole grace and we kill it. Both reach
+            // `child_reaped`; only the second is a kill of ours.
+            var successor_exited = 0;
 
-            action SelectLegacyBridge when (phase == 0 && protocol == 0) {
+            action SelectLegacyBridge when (
+                phase == 0 && protocol == 0 && launched_early == 0
+            ) {
                 protocol = 1;
                 commit_channel = 0;
             }
-            action ParkParentReaders when (phase == 0 && parent_readers == 1) {
+            action ParkParentReaders when (
+                phase == 0 && parent_readers == 1 && failure == 0 && retired == 0
+            ) {
                 phase = 1;
                 parent_readers = 0;
                 parent_parked = 1;
             }
             action SpawnReaderlessChild when (
-                phase == 1 && parent_parked == 1 && child_live == 0
+                phase == 1 && parent_parked == 1 && child_live == 0 && launched_early == 0
             ) {
                 phase = 2;
                 child_live = 1;
+                granted = 1;
+            }
+            action LaunchSuccessorBeforePark when (
+                phase == 0 && protocol == 0 && child_live == 0 && launched_early == 0 &&
+                retired == 0 && failure == 0
+            ) {
+                child_live = 1;
+                launched_early = 1;
+            }
+            action GrantDescriptorsToBootedSuccessor when (
+                phase == 1 && parent_parked == 1 && launched_early == 1 &&
+                child_live == 1 && granted == 0 && failure == 0
+            ) {
+                phase = 2;
+                granted = 1;
+            }
+            action UnparkForRepark when (
+                phase == 1 && parent_parked == 1 && launched_early == 1 &&
+                granted == 0 && failure == 0
+            ) {
+                phase = 0;
+                parent_parked = 0;
+                parent_readers = 1;
+            }
+            action RevokeUngrantedSuccessor when (
+                phase == 0 && launched_early == 1 && child_live == 1 &&
+                granted == 0 && failure == 0
+            ) {
+                arbiter = 2;
+                failure = 1;
+            }
+            action KillUngrantedSuccessor when (
+                phase == 0 && launched_early == 1 && child_live == 1 &&
+                granted == 0 && failure == 1 && arbiter == 2 && child_killed == 0
+            ) {
+                child_live = 0;
+                descendant_live = 0;
+                child_killed = 1;
+                group_signaled = 1;
+            }
+            // THE OTHER WAY A REVOKED SUCCESSOR ENDS, and the common one: the
+            // closed rendezvous is a zero-byte `recv` it already maps to "the
+            // parent closed the rendezvous", so it forgives its own trial launch
+            // and exits before any window. Nothing of ours signalled it, so
+            // `group_signaled` stays 0 and the parent forgives nothing.
+            action SuccessorExitsOnRevoke when (
+                phase == 0 && launched_early == 1 && child_live == 1 &&
+                granted == 0 && failure == 1 && arbiter == 2 &&
+                child_killed == 0 && successor_exited == 0
+            ) {
+                child_live = 0;
+                successor_exited = 1;
+            }
+            action ReapUngrantedSuccessor when (
+                phase == 0 && launched_early == 1 && granted == 0 &&
+                child_live == 0 && child_reaped == 0 &&
+                (successor_exited == 1 || (child_killed == 1 && group_signaled == 1))
+            ) {
+                child_reaped = 1;
+            }
+            action RetireUngrantedAttempt when (
+                phase == 0 && launched_early == 1 && granted == 0 &&
+                child_reaped == 1 && retired == 0
+            ) {
+                retired = 1;
+            }
+            action SettledStandDown when (phase == 0 && retired == 1) {
+                retired = 1;
             }
             action SpawnProcessGroupDescendant when (
                 phase > 1 && phase <= 3 && child_live == 1 &&
@@ -2493,6 +2583,24 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 child_killed = 1;
                 group_signaled = 1;
             }
+            action BuggyGrantBeforePark when (
+                Buggy == 1 && phase == 0 && launched_early == 1 && child_live == 1 &&
+                granted == 0 && failure == 0
+            ) {
+                phase = 2;
+                granted = 1;
+            }
+            action BuggyReleaseReadersUngranted when (
+                Buggy == 1 && launched_early == 1 && child_live == 1 && granted == 0
+            ) {
+                child_readers = 1;
+            }
+            action BuggyRetireUngrantedWithSuccessorLive when (
+                Buggy == 1 && phase == 0 && launched_early == 1 && child_live == 1 &&
+                granted == 0 && failure == 1
+            ) {
+                retired = 1;
+            }
             action ReplayDeferredTeardown when (
                 phase == 8 && parent_resumed == 1 && teardown_allows == 0
             ) {
@@ -2578,11 +2686,19 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 } else {
                     parent_resumed == 0
                 };
+            // A REAP FOLLOWS THE SIGNAL THAT LICENSED IT — unless there was
+            // nothing to signal. The rule exists so a direct child is never
+            // `wait`ed before its process group has been swept (a `wait` reaps
+            // the group leader and destroys the pid identity the sweep needs).
+            // A successor that EXITED on the closed rendezvous was never
+            // signalled by us at all: its termination is proven by a vacant pid,
+            // there is no leader left to sweep, and requiring a signal first
+            // would mean killing a process that is already gone.
             invariant ProcessGroupSignalPrecedesDirectChildReap:
-                if child_reaped == 1 {
+                if child_reaped == 1 && successor_exited == 0 {
                     group_signaled == 1 && waited_before_group_signal == 0
                 } else {
-                    child_reaped == 0
+                    child_reaped == 0 || successor_exited == 1
                 };
             invariant GroupSignalEliminatesLiveDescendants:
                 if group_signaled == 1 {
@@ -2605,9 +2721,43 @@ pub fn native_update_overlap_handoff_model() -> Model {
             invariant FailedPreCommitChildStaysReaderless:
                 if failure == 1 && commit == 0 && legacy_ack == 0 && child_reaped == 0 {
                     child_readers == 0 &&
-                    parent_readers == if parent_resumed_early == 1 { 1 } else { 0 }
+                    parent_readers ==
+                        if parent_resumed_early == 1 { 1 } else {
+                            if granted == 0 { 1 } else { 0 }
+                        }
                 } else {
                     child_readers <= 1
+                };
+            invariant GrantRequiresParkedParent:
+                if granted == 1 && parent_resumed_early == 0 {
+                    parent_parked == 1
+                } else {
+                    granted <= 1
+                };
+            invariant UngrantedSuccessorNeverReads:
+                if granted == 0 {
+                    child_readers == 0
+                } else {
+                    granted == 1
+                };
+            invariant ReadersBesideLiveCandidateOnlyUngranted:
+                if parent_readers == 1 && child_live == 1 && parent_resumed_early == 0 {
+                    granted == 0
+                } else {
+                    parent_readers <= 1
+                };
+            // AN ATTEMPT RETIRES ONLY OVER A SUCCESSOR PROVEN GONE — which is
+            // what stops a retry launching beside a candidate that is still
+            // running. "Proven" is the reap, and the reap has two licences: the
+            // successor exited on the closed rendezvous by its own rule, or we
+            // killed it. Both leave `child_live == 0` and `child_reaped == 1`;
+            // only the second is a kill of ours.
+            invariant UngrantedRetireRequiresReap:
+                if retired == 1 {
+                    (child_killed == 1 || successor_exited == 1) &&
+                    child_reaped == 1 && granted == 0 && child_live == 0
+                } else {
+                    retired == 0
                 };
             invariant EarlyParentResumeCannotCommit:
                 if parent_resumed_early == 1 {

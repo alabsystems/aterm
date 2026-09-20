@@ -448,7 +448,7 @@ mod macos {
             icon,
             dirty,
             busy,
-            attention: false,
+            attention: crate::tab_bar::ChipLevel::Off,
             conn,
             closable: true,
             drop_target: false,
@@ -1815,7 +1815,7 @@ mod macos {
             for t in &mut mm.metadata {
                 t.dirty = f == 0;
                 t.busy = f == 1;
-                t.attention = f == 2;
+                t.attention = crate::app_presence::chip_of_attention(f == 2);
                 t.drop_target = f == 3;
                 t.closable = f != 4;
                 t.conn = None;

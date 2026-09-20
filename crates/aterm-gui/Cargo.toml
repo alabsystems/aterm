@@ -246,6 +246,10 @@ aterm-grapheme = { workspace = true }
 aterm-codec = { workspace = true }
 aterm-pty = { workspace = true }
 aterm-session = { workspace = true }
+# The worker-phase classifier (busy / prompt / question / limited / idle) the
+# presence band reads off the last rows of the screen — run only when a
+# session's status revision moves (`presence::classify`), never per frame.
+aterm-phase = { workspace = true }
 # L3 network drive: the opt-in (secure-default-OFF) TLS front-end that relays a
 # channel-bound remote driver into the local control socket (see net_listen.rs).
 aterm-net = { workspace = true }

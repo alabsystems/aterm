@@ -3024,8 +3024,14 @@ fn apply_staged_if_ready_inner(
     //    relaunching a crashing build still has to accrue attempts toward the revert
     //    (the re-exec env is only set on the FIRST post-swap launch).
     if let Some(s) = &staging
-        && let Some(outcome) =
-            check_boot_health(s, current_build, current_commit, handoff_fds, handoff_env)
+        && let Some(outcome) = check_boot_health(
+            s,
+            current_build,
+            current_commit,
+            handoff_fds,
+            handoff_env,
+            handoff_target_is_this_build,
+        )
     {
         return outcome;
     }
@@ -3576,12 +3582,59 @@ fn apply_staged_if_ready_inner(
 /// launches (a crash loop), revert to the retained OLD bundle and re-exec it.
 /// Returns `Some` only in the revert path (which normally re-exec's away and does
 /// not return); `None` to continue booting the current build.
+/// Which boot-health lane a counted launch takes ([`boot_health_lane`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootHealthLane {
+    /// Count the launch and prove the trial's rollback now (`ensure_current_trial_receipt`:
+    /// the installed bundle's identity, the retained predecessor, the receipt).
+    FullProof,
+    /// Count the launch only; the rollback proof runs at the health checkpoint.
+    CountOnly,
+}
+
+/// THE FIRST COUNTED LAUNCH OF A HANDOFF TARGET IS COUNT-ONLY (2026-09-19). The
+/// image that swapped the bundle proved both identities and recorded the receipt
+/// before it stamped the re-exec, moments ago; re-proving them here cost the
+/// 0.87.0→0.88.0 apply 430 ms of codesign inside the parked window ("update apply
+/// (boot): NotApplicable in 430 ms — this ran with the outgoing process's readers
+/// still parked"). So a launch that is the live parent's authorized handoff target
+/// (`handoff_target_is_this_build`) and the trial's first counted launch skips the
+/// proof: the launch is still counted (a crash before the checkpoint still climbs
+/// toward the revert), and the SAME proof runs at `confirm_boot_health` — after
+/// Commit, off the park — which is where a healthy trial is disarmed anyway. A
+/// second counted launch (a relaunch after a crash, a sibling cold launch inside
+/// the window) proves in full as before: degraded, never unsafe.
+fn boot_health_lane(handoff_target: bool, attempts_after_launch: u32) -> BootHealthLane {
+    if handoff_target && attempts_after_launch <= 1 {
+        BootHealthLane::CountOnly
+    } else {
+        BootHealthLane::FullProof
+    }
+}
+
+#[cfg(test)]
+mod boot_health_lane_tests {
+    use super::{BootHealthLane, boot_health_lane};
+
+    /// Only a handoff target's FIRST counted launch skips the proof; a relaunch,
+    /// a sibling launch, or any non-handoff launch proves in full.
+    #[test]
+    fn only_a_handoff_targets_first_counted_launch_is_count_only() {
+        assert_eq!(boot_health_lane(true, 0), BootHealthLane::CountOnly);
+        assert_eq!(boot_health_lane(true, 1), BootHealthLane::CountOnly);
+        assert_eq!(boot_health_lane(true, 2), BootHealthLane::FullProof);
+        assert_eq!(boot_health_lane(false, 0), BootHealthLane::FullProof);
+        assert_eq!(boot_health_lane(false, 1), BootHealthLane::FullProof);
+    }
+}
+
 fn check_boot_health(
     staging: &Staging,
     current_build: u64,
     current_commit: Option<&str>,
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    handoff_target: bool,
 ) -> Option<ApplyOutcome> {
     check_boot_health_with_lock_wait(
         staging,
@@ -3589,16 +3642,19 @@ fn check_boot_health(
         current_commit,
         handoff_fds,
         handoff_env,
+        handoff_target,
         APPLY_LOCK_WAIT,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_boot_health_with_lock_wait(
     staging: &Staging,
     current_build: u64,
     current_commit: Option<&str>,
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    handoff_target: bool,
     lock_wait: std::time::Duration,
 ) -> Option<ApplyOutcome> {
     let sentinel = boot_sentinel(staging);
@@ -3654,6 +3710,17 @@ fn check_boot_health_with_lock_wait(
         return Some(ApplyOutcome::Deferred(format!(
             "trial launch observation: {error}"
         )));
+    }
+    let attempts_after = sentinel.read_state().map_or(0, |(_, attempts)| attempts);
+    if boot_health_lane(handoff_target, attempts_after) == BootHealthLane::CountOnly
+        && !sentinel.should_revert(current_build, MAX_BOOT_ATTEMPTS)
+    {
+        crate::log(&format!(
+            "boot sentinel for build {current_build}: launch {attempts_after} counted — the \
+             first launch of the live parent's handoff target; the rollback proof runs at \
+             the health checkpoint, off the park"
+        ));
+        return Some(ApplyOutcome::NotApplicable);
     }
     let verified_rollback =
         match ensure_current_trial_receipt(staging, &b.app_root, current_build, current_commit) {

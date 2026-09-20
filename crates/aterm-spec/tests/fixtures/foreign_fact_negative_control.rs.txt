@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+//
+// NOT COMPILED. This is the NEGATIVE CONTROL for
+// `tests/foreign_facts_are_observed.rs`, and it is a `.rs.txt` on purpose: it
+// must be scanned, never built.
+//
+// It is the shipped shape of `retire_ungranted_successor` at aaf474f06 — the
+// late-park commit — reduced to the part the rule is about and otherwise
+// verbatim. The defect: `parked` is a claim about ANOTHER THREAD's state (has
+// the main thread parked its PTY readers?), it is a literal at every one of the
+// six call sites, and a branch on it decides whether the other thread is ever
+// woken. When the main thread's park landed during the worker's stand-down the
+// wake was never sent and the user's terminal stayed frozen through a 2 s
+// grace, a SIGKILL and an unbounded reap.
+//
+// The live tree finds ZERO candidates now (df183f2f9 removed the parameter and
+// made the post unconditional), so without this fixture the gate would be green
+// over an empty set and would rot unnoticed the first time someone spells the
+// premise as a `match` instead of an `if`. That is the same two-sided
+// discipline `assert_proves_and_catches` and `non_vacuity_ratchet.rs` impose:
+// a rule that cannot be shown to FIRE has not been shown to be a rule.
+
+fn retire_ungranted_successor(
+    job: &HandoffWorkerJob,
+    proxy: &winit::event_loop::EventLoopProxy<Wake>,
+    nonce: &str,
+    held: HeldSuccessor,
+    outcome: crate::UpdateHandoffOutcome,
+    detail: String,
+    parked: bool,
+) {
+    if parked {
+        let _ = proxy.send_event(Wake::UpdateHandoffUnpark {
+            attempt_id: job.attempt_id,
+        });
+    }
+    if !worker_claim_handoff_reaper(&job.arbiter) {
+        return;
+    }
+    let candidate = held.candidate;
+    let stood = stand_down_held_successor(held, STAND_DOWN_SELF_EXIT_GRACE);
+    send_warranted_handoff_failure(stood.warrant, &job.cleanup, proxy, job.current_build);
+}
+
+// The six call sites, each passing a LITERAL — which is what makes the
+// parameter a premise nobody computes rather than a fact somebody measured.
+
+fn call_site_mismatch() {
+    retire_ungranted_successor(
+        job,
+        proxy,
+        &lane,
+        held,
+        crate::UpdateHandoffOutcome::Rejected,
+        detail,
+        false,
+    );
+}
+
+fn call_site_hangup() {
+    retire_ungranted_successor(
+        job,
+        proxy,
+        &lane,
+        held,
+        crate::UpdateHandoffOutcome::ChildDied,
+        "the successor closed the rendezvous after dialling".to_string(),
+        false,
+    );
+}
+
+fn call_site_event_loop_closed() {
+    retire_ungranted_successor(
+        job,
+        proxy,
+        &lane,
+        held,
+        crate::UpdateHandoffOutcome::Rejected,
+        "event loop closed before the park".to_string(),
+        false,
+    );
+}
+
+fn call_site_hold_stand_down() {
+    retire_ungranted_successor(job, proxy, &lane, held, outcome, detail, false);
+}
+
+fn call_site_preparation_cancelled() {
+    retire_ungranted_successor(
+        job,
+        proxy,
+        &lane,
+        held,
+        crate::UpdateHandoffOutcome::ActivityRevoked,
+        "activity revoked handoff during physical preparation".to_string(),
+        true,
+    );
+}
+
+fn call_site_transfer_failed() {
+    retire_ungranted_successor(
+        job,
+        proxy,
+        &lane,
+        held,
+        crate::UpdateHandoffOutcome::Rejected,
+        format!("the handoff descriptors could not be delivered: {error}"),
+        true,
+    );
+}

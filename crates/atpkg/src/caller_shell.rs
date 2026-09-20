@@ -378,13 +378,37 @@ mod tests {
     const OUTLIVER_PROBE: &str = "caller_shell::tests::probe_parks_until_killed";
 
     /// The copy's whole job: exist, under its own name, until the parent kills it.
+    ///
+    /// NO WALL CLOCK. This parked for a flat 60 s until 2026-09-19, which quietly made
+    /// the case above depend on the parent reaching its NEXT LINE inside that minute —
+    /// the only wall-clock quantity left in it, and one nothing had measured. (The
+    /// naming itself is not the risk: measured under this suite's own parallelism the
+    /// copy is named in 20-42 us and the whole case costs 8.7-19.5 ms, against
+    /// `await_exec`'s 30 s hang guard.) A parent descheduled past the minute came back
+    /// to a probe that had exited on its own, found nothing to name, and read as the
+    /// LAW failing — a program outliving its file — when what had expired was the
+    /// fixture.
+    ///
+    /// The park is an EVENT now: the probe lives until it is killed (the normal path,
+    /// and immediate) or until its parent goes away. That second condition is also
+    /// what keeps a stray out of the process table when a parent dies without killing
+    /// it, which is strictly more than the timer ever promised.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn probe_parks_until_killed() {
         if std::env::var_os(OUTLIVER_ENV).is_none() {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        // SAFETY: `getppid` takes no arguments, reads no memory we own and cannot
+        // fail (POSIX gives it no error return).
+        let spawner = unsafe { libc::getppid() };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: as above.
+            if unsafe { libc::getppid() } != spawner {
+                return;
+            }
+        }
     }
 
     /// End to end through a REAL shell: `sh -c` / `zsh -c` / `bash -c` / `fish -c` each

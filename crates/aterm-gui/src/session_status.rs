@@ -2140,6 +2140,11 @@ impl crate::App {
         let opt = |value: Option<&str>| {
             value.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode)
         };
+        // THE ROUND-19 TAIL (design §5): `hand= level= story=`, additive after
+        // the fabric fields. Read from the presence slot the wakes keep current
+        // — plain field reads, no lock, no classifier — so the poll pays nothing
+        // it did not already pay.
+        let presence = self.presence_status_tail(session);
         let Some(status) = self.session_status.status(session) else {
             // Never classified. Distinct from `phase=unknown`, which IS a
             // classification ("evidence was looked for and none was usable").
@@ -2150,7 +2155,8 @@ impl crate::App {
                 "schema=1 sid={session} subject={} subject_source={subject_source} observed=false \
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
-                 revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} identity={identity}",
+                 revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
+                 identity={identity} {presence}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -2187,7 +2193,8 @@ impl crate::App {
             "schema=1 sid={session} subject={} subject_source={subject_source} observed=true \
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
-             conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} identity={identity}",
+             conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
+             identity={identity} {presence}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -3126,11 +3133,14 @@ mod tests {
         assert!(record.contains(" observed=false "), "the unobserved arm");
         assert!(record.contains(" hold=0 "), "{record}");
         assert!(record.contains(" fabric=absent "), "{record}");
-        // The round-13 tail: no bridge, so no ack and no age.
+        // The round-13 tail: no bridge, so no ack and no age — then `identity=`
+        // (session identities) — and after it the round-19 tail: no wake yet, so
+        // no hand, a quiet level and no story.
         assert!(
-            record.ends_with(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=-"),
+            record.contains(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=- "),
             "{record}"
         );
+        assert!(record.ends_with(" hand=- level=quiet story=0"), "{record}");
         assert!(
             record.starts_with("schema=1 "),
             "additive, not a new schema"
@@ -3155,11 +3165,12 @@ mod tests {
         assert!(!record.contains('\n'), "one line, always");
     }
 
-    /// IDENTITY (session identities, phase 1): the record's LAST field is the
-    /// agent identity the session was spawned under — the word the `sessions`
+    /// IDENTITY (session identities, phase 1): the record carries the agent
+    /// identity the session was spawned under — the word the `sessions`
     /// roster carries, from the same spawn-time field — `-` for the human's
     /// own agent config. It rides BOTH arms after `fabric_link_age_ms=`,
-    /// additive, `schema=1` unmoved.
+    /// additive, `schema=1` unmoved; round 19's presence tail (`hand=`,
+    /// `level=`, `story=`) was appended after it, the same way.
     #[test]
     fn the_status_record_carries_the_identity_after_the_fabric_tail() {
         crate::fabric::with_link_reset(
@@ -3172,7 +3183,7 @@ mod tests {
         let record = app.session_status_record(0).expect("live session");
         assert!(record.contains(" observed=false "), "the unobserved arm");
         assert!(
-            record.ends_with(" fabric_link_age_ms=- identity=-"),
+            record.contains(" fabric_link_age_ms=- identity=- hand="),
             "{record}"
         );
 
@@ -3184,7 +3195,7 @@ mod tests {
             .identity = Some("worker".to_string());
         let record = app.session_status_record(0).expect("live session");
         assert!(
-            record.ends_with(" fabric_link_age_ms=- identity=worker"),
+            record.contains(" fabric_link_age_ms=- identity=worker hand="),
             "{record}"
         );
         assert!(
@@ -3200,7 +3211,7 @@ mod tests {
         let record = app.session_status_record(0).expect("live session");
         assert!(record.contains(" observed=true "), "{record}");
         assert!(
-            record.ends_with(" fabric_link_age_ms=- identity=worker"),
+            record.contains(" fabric_link_age_ms=- identity=worker hand="),
             "{record}"
         );
         assert!(!record.contains('\n'), "one line, always");
@@ -3254,15 +3265,17 @@ mod tests {
         // `enabled=` was the LAST field when this was written, and the assertion
         // said so with `ends_with`. Four ADDITIVE fabric fields now follow it
         // (`hold=`, `fabric=`, `fabric_rtt_ms=`, `fabric_link_age_ms=`), and
-        // `identity=` (session identities) after those, which is
-        // exactly what the record's own help promises a consumer — fields are
-        // appended and never bump `schema=`. So pin the VALUE, and let the tail
-        // keep growing.
+        // `identity=` (session identities) after those, and round 19's
+        // `hand=`/`level=`/`story=` after that, which is exactly what the
+        // record's own help promises a consumer — fields are appended and never
+        // bump `schema=`. So pin the VALUE, and let the tail keep growing.
         assert!(record.contains(" enabled=false "), "{record}");
         assert!(
-            record.ends_with(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=-"),
+            record.contains(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=- "),
             "{record}"
         );
+        // Round 19 appended three more (`hand=`, `level=`, `story=`), the same way.
+        assert!(record.ends_with(" hand=- level=quiet story=0"), "{record}");
 
         assert!(
             app.session_status_record(9999).is_err(),

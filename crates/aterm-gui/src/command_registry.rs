@@ -229,7 +229,32 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // `LocalUi` (not `ConfigMutate`) for the same reason the control layer
         // classifies `meta set` as `WriteInput`: nothing durable on disk moves.
         M::RenameSession => spec("session.rename", S::Tab, A::LocalUi, C::Terminal),
+        // Same identity as the pin's face, one field over: the role is session
+        // metadata written through the same typed API (`meta set role`).
+        M::SetRole => spec("session.set_role", S::Tab, A::LocalUi, C::Terminal),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
+        // THE FABRIC MENU (round 19, SPEC19 §9). Fleet… is the map's twin until
+        // the fleet screen lands (round 20) — Owner for the same aggregated
+        // disclosure reason as `view.connections`.
+        M::Fleet => spec("view.fleet", S::App, A::Owner, C::Any),
+        // A session's mail metadata on the human's screen: Owner (the same
+        // class as the map), terminal content (the inbox is a session's).
+        M::Inbox => spec("session.inbox.open", S::Tab, A::Owner, C::Terminal),
+        // Same identity as the keybinding face (K::OpenLedger below): one
+        // command, two faces, converging on `App::open_session_ledger`.
+        M::LedgerForSession => spec("session.ledger.open", S::Tab, A::ExternalOpen, C::Terminal),
+        // The halt pair: the `hold` verb's two acts, Owner-class like the verb.
+        M::HoldSession => spec("session.hold", S::Tab, A::Owner, C::Terminal),
+        M::LiftHold => spec("session.hold.lift", S::Tab, A::Owner, C::Terminal),
+        // The three `aterm fabric` commands run as a child of this process:
+        // Owner, process-scoped, no content requirement.
+        M::FabricStatus => spec("fabric.status", S::Process, A::Owner, C::Any),
+        M::FabricOn => spec("fabric.on", S::Process, A::Owner, C::Any),
+        M::FabricOff => spec("fabric.off", S::Process, A::Owner, C::Any),
+        // The presence checkables write `[presence]` — durable config, the
+        // Serious Mode class.
+        M::TogglePresenceBand => spec("presence.band.toggle", S::Process, A::ConfigMutate, C::Any),
+        M::TogglePresenceRim => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
     }
 }
 
@@ -289,6 +314,11 @@ pub(crate) const fn keybinding_command(action: keybinding::Action) -> CommandSpe
         K::ToggleFullscreen => spec("window.fullscreen", S::Window, A::LocalUi, C::Any),
         K::FindNext => spec("view.find_next", S::View, A::LocalUi, C::Any),
         K::FindPrev => spec("view.find_previous", S::View, A::LocalUi, C::Any),
+        // The ledger key (round 19): runs `aterm drive ledger` for the tab's
+        // focused session and opens the HTML in the browser — a child process
+        // and an external open, so `ExternalOpen` like Help; the session is a
+        // terminal's.
+        K::OpenLedger => spec("session.ledger.open", S::Tab, A::ExternalOpen, C::Terminal),
     }
 }
 

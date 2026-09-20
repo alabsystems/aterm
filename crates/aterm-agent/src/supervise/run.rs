@@ -37,7 +37,22 @@
 //! with ONE guarded turn ([`Session::probe`]), says `EVENT resumed` or
 //! `EVENT still-limited`, and restates the standing rules from a file. The
 //! episode is [`Episode`]; `supervise` — one look, the manager right there —
-//! does none of it ([`Review::unattended`]).
+//! does none of it ([`Review::unattended`]). An episode ends when the worker
+//! works again: a notice that says Claude Code goes on by itself (`⚠ Usage
+//! limit reached · continuing automatically at 1:50pm · esc to cancel`,
+//! measured 2026-09-17; [`limit::resumes_by_itself`]) is over at the FIRST
+//! busy read after it, inside the wait for the turn
+//! ([`Session::await_turn_from`]) — the notice row stays on the screen while
+//! the worker resumes under it, and the turn it resumes may run for hours
+//! (measured: a background shell kept the next point fourteen hours off,
+//! the attention badge set all the while) — and one naming a reset when
+//! the worker answers on a point that is not the notice
+//! ([`Session::look`]: a busy spell after such a notice may be a retry that
+//! hits the wall again, and the notice again is the same episode). The
+//! same holds after the busy read: the wall again before the worker has
+//! answered is the retry that hit it, the SAME episode opened again
+//! ([`Retry`], [`Session::open_episode`]) — the attention set again, the
+//! manager mailed once, not once a retry.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -534,14 +549,45 @@ struct Sink<'w> {
     /// Where the journal's one warning goes (`watch`: stderr); `None` sends
     /// it to `out` (`supervise`, whose lines are stderr already).
     warn: Option<&'w mut (dyn Write + Send + 'w)>,
+    /// `watch`'s story lane: the worker's window is told what the loop
+    /// decided, one `ctl story` per journaled line that carries a decision
+    /// ([`story_of`]). `None` (`supervise`, and a `watch` without one) tells
+    /// nothing.
+    teller: Option<Teller<'w>>,
+}
+
+/// The client `watch` tells the worker's window its story through — a
+/// SECOND connection, like the mail lane's, so the loop's own client keeps its
+/// outage books to itself — and the session the story is about.
+struct Teller<'w> {
+    ctl: &'w mut (dyn Ctl + Send + 'w),
+    sid: Option<String>,
 }
 
 impl Sink<'_> {
-    /// Record `line` in the journal (its warning to `warn`, else to `out`).
+    /// Record `line` in the journal (its warning to `warn`, else to `out`),
+    /// and tell the window the story it carries, if any. The post is
+    /// best-effort: a host without the `story` verb (an older aterm) answers
+    /// `ERR unknown verb`, a lost connection answers nothing, and neither
+    /// changes a printed line — the journal's order is the story's order.
     fn record(&mut self, line: &str, turn: Option<u64>) {
         match self.warn.as_deref_mut() {
             Some(w) => self.journal.record(line, turn, w),
             None => self.journal.record(line, turn, self.out),
+        }
+        if let Some(teller) = &mut self.teller
+            && let Some((verb, text)) = story_of(line)
+        {
+            let mut args: Vec<&str> = Vec::with_capacity(4);
+            if let Some(sid) = &teller.sid {
+                args.push(sid.as_str());
+            }
+            args.push("story");
+            args.push(verb);
+            if !text.is_empty() {
+                args.push(&text);
+            }
+            let _ = teller.ctl.call(&args);
         }
     }
 
@@ -550,6 +596,56 @@ impl Sink<'_> {
         self.record(line, turn);
         emit(self.out, line)
     }
+}
+
+/// The `aterm ctl story <verb> [<text>]` a printed line is told to the
+/// worker's window as, `None` for a line that carries no decision (an
+/// `EVENT idle`, a `MAIL` row, a `RECONNECT` the loop is still riding out).
+/// The closed set is the GUI's (`approved dismissed reconnected timeout exit
+/// compacted warned`); the text is the human-facing part of the line and
+/// NEVER the command — an `APPROVED seq=<n> <command>` line is told as bare
+/// `approved`, because the band carries no command text on any surface. The
+/// text is cut to the wire's 96 bytes at a character boundary, so the post is
+/// never refused for length.
+pub fn story_of(line: &str) -> Option<(&'static str, String)> {
+    const MAX: usize = 96;
+    let cut = |s: &str| -> String {
+        if s.len() <= MAX {
+            return s.to_string();
+        }
+        let mut end = MAX;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    };
+    let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+    Some(match word {
+        "APPROVED" => ("approved", String::new()),
+        "DISMISSED" => (
+            "dismissed",
+            cut(rest.split_once(" seq=").map_or(rest, |(w, _)| w)),
+        ),
+        "RECONNECTED" => ("reconnected", cut(rest)),
+        "TIMEOUT" => ("timeout", String::new()),
+        "EXIT" => ("exit", cut(rest)),
+        "EVENT" => {
+            let (phase, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+            match phase {
+                "compacted" => ("compacted", String::new()),
+                // `EVENT context seq=<n> <v>% until auto-compact`: the reading.
+                "context" => (
+                    "warned",
+                    cut(&format!(
+                        "context {}",
+                        tail.split_once(' ').map_or(tail, |(_, v)| v)
+                    )),
+                ),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// What the shared loop ([`Session::drive`]) carries from one look to the
@@ -611,9 +707,18 @@ pub struct Resume {
 }
 
 /// A limit episode: from the `EVENT limited` that opened it until the worker
-/// answers again ([`Session::limit_before`], [`Session::limit_after`]).
+/// works again ([`Session::limit_before`], [`Session::limit_after`],
+/// [`Session::limit_on_busy`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Episode {
+    /// The read the `EVENT limited` that opened the episode was of — the
+    /// escalation's seq; an episode opened again after a busy read
+    /// ([`Retry`]) keeps the first one's.
+    seq: u64,
+    /// The notice says Claude Code goes on by itself
+    /// ([`limit::resumes_by_itself`]): the first busy read after it is the
+    /// continuation, and closes the episode ([`Session::limit_on_busy`]).
+    resumes_itself: bool,
     /// The reset the notice named, Unix seconds (`None`: it named none the
     /// watcher could read).
     reset_unix: Option<i64>,
@@ -629,6 +734,24 @@ struct Episode {
     failed: usize,
     /// `EXTEND` was said for this reset.
     extended: bool,
+}
+
+/// An episode closed at a busy read ([`Session::limit_on_busy`]), kept
+/// until the worker answers on a point that is not the notice
+/// ([`Session::look`], [`Session::settle_probe`]). The wall again before
+/// that — the retry's spinner, then `continuing shortly` (the round-20
+/// review: three mails for three notices in a row) — is round 17's retry
+/// that hit the wall: the same episode, opened again with what it kept
+/// ([`Session::open_episode`]): the attention set again, no second mail,
+/// the probe's backoff standing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Retry {
+    /// [`Episode::seq`] of the episode that closed.
+    seq: u64,
+    /// [`Episode::failed`], carried: a backoff in force stands.
+    failed: usize,
+    /// [`Episode::probe_at`], carried with it.
+    probe_at: Option<Instant>,
 }
 
 /// What one probe came to ([`Session::probe`]).
@@ -675,6 +798,31 @@ trait Review {
     /// loop's to handle ([`Session::limit_before`]). `supervise` stops at
     /// the limited point with the manager right there, and does none of it.
     fn unattended(&self) -> bool;
+}
+
+/// `await-turn` ([`Session::await_turn`]): no loop around the wait — nothing
+/// is said, noted or handled; a limit is the caller's.
+struct Alone;
+
+impl Review for Alone {
+    fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn review(
+        &mut self,
+        _turn: &Turn,
+        _report: Option<ReportBrief>,
+        _fold: Option<Fold>,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn say(&mut self, _line: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn note(&mut self, _line: &str) {}
+    fn unattended(&self) -> bool {
+        false
+    }
 }
 
 /// `supervise`: the first review point ends the loop, and is its result; an
@@ -889,6 +1037,9 @@ pub struct Session<'a, C: Ctl> {
     resume: Option<Resume>,
     /// The limit episode in progress, if any.
     limit: Option<Episode>,
+    /// The episode a busy read closed, until the worker answers
+    /// ([`Retry`]): the notice again before that opens it again.
+    retry: Option<Retry>,
     /// The rules are owed at the next idle point with nothing typed: the
     /// episode closed on a point the rules could not be sent at (a box up,
     /// a draft in the composer).
@@ -927,6 +1078,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             manager: None,
             resume: None,
             limit: None,
+            retry: None,
             rebrief_due: false,
             clock: None,
             local_offset: None,
@@ -1171,7 +1323,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             let remaining = deadline.saturating_duration_since(Instant::now());
             // `--context-warn` is the loops' (`drive` arms it): `await-turn`
             // has no context line to say.
-            match self.await_turn_from(remaining, gone_first, &mut moved, &mut |_| Ok(())) {
+            match self.await_turn_from(remaining, gone_first, &mut moved, &mut Alone) {
                 Ok(turn) => return Ok(turn),
                 Err(Fail::Lost(why)) => {
                     let rode = self.ride_out(why, deadline, &mut |line| {
@@ -1197,15 +1349,17 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// owns the flag, so what was read before a lost connection is not lost
     /// with it. Every read before the deadline is shown to the context
     /// indicator's watch ([`Self::watch_context`]), a busy one included — a
-    /// worker compacts in the middle of a turn — and what it has to say goes
-    /// to `say` as the read comes; a read at or after the deadline is not
-    /// shown to it, so it says nothing then.
+    /// worker compacts in the middle of a turn — and what it has to say is
+    /// said through `review` as the read comes; a read at or after the
+    /// deadline is not shown to it, so it says nothing then. Unattended, a
+    /// busy read is shown to the limit episode too ([`Self::limit_on_busy`]):
+    /// a notice that said the worker would go on by itself is over at it.
     fn await_turn_from(
         &mut self,
         timeout: Duration,
         gone_first: bool,
         saw_busy: &mut bool,
-        say: &mut dyn FnMut(&str) -> Result<(), String>,
+        review: &mut dyn Review,
     ) -> Result<Turn, Fail> {
         let deadline = Instant::now() + timeout;
         let mut first = gone_first;
@@ -1233,7 +1387,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             first = false;
             let screen = self.screen()?;
             if Instant::now() < deadline {
-                self.watch_context(&screen, say)?;
+                self.watch_context(&screen, &mut |line| review.say(line))?;
             }
             let mut phase = worker_phase(&screen.rows);
             // No composer frame and the screen never held still: a build's or a
@@ -1258,6 +1412,11 @@ impl<'a, C: Ctl> Session<'a, C> {
                     && m.busy_at.is_none()
                 {
                     m.busy_at = Some(Instant::now());
+                }
+                // Unattended: the worker works — a notice that said it
+                // would go on by itself is over.
+                if review.unattended() {
+                    self.limit_on_busy(screen.seq, review)?;
                 }
             }
             if Instant::now() >= deadline {
@@ -1392,6 +1551,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             out: log,
             journal,
             warn: None,
+            // `supervise` returns to a manager who decides; only `watch`, the
+            // loop that decides by itself, tells the window.
+            teller: None,
         });
         let end = self.run_loop(
             opts,
@@ -1539,7 +1701,23 @@ impl<'a, C: Ctl> Session<'a, C> {
         lane: Option<&mut L>,
         out: &mut (dyn Write + Send),
     ) -> u8 {
-        self.watch_with(opts, lane, out, &mut std::io::stderr())
+        self.watch_with(opts, lane, None::<&mut NoLane>, out, &mut std::io::stderr())
+    }
+
+    /// [`Self::watch_mail`] with the STORY lane (`teller`: a second client
+    /// the loop tells the worker's window its decisions through — `aterm ctl
+    /// @<sid> story <verb> [<text>]` for every journaled line that carries
+    /// one, in the journal's order, never the command; see [`story_of`]).
+    /// The printed lines are byte-identical with or without it: a story is a
+    /// side channel, and a host that lacks the verb changes nothing here.
+    pub fn watch_telling<L: Ctl + Send, S: Ctl + Send>(
+        &mut self,
+        opts: &SuperviseOpts,
+        lane: Option<&mut L>,
+        teller: Option<&mut S>,
+        out: &mut (dyn Write + Send),
+    ) -> u8 {
+        self.watch_with(opts, lane, teller, out, &mut std::io::stderr())
     }
 
     /// [`Self::watch`], a journal's one warning said to `warn`. With
@@ -1551,23 +1729,29 @@ impl<'a, C: Ctl> Session<'a, C> {
         out: &mut (dyn Write + Send),
         warn: &mut (dyn Write + Send),
     ) -> u8 {
-        self.watch_with(opts, None::<&mut NoLane>, out, warn)
+        self.watch_with(opts, None::<&mut NoLane>, None::<&mut NoLane>, out, warn)
     }
 
-    /// [`Self::watch_to`] with the mail lane.
-    fn watch_with<L: Ctl + Send>(
+    /// [`Self::watch_to`] with the mail lane and the story lane.
+    fn watch_with<L: Ctl + Send, S: Ctl + Send>(
         &mut self,
         opts: &SuperviseOpts,
         lane: Option<&mut L>,
+        teller: Option<&mut S>,
         out: &mut (dyn Write + Send),
         warn: &mut (dyn Write + Send),
     ) -> u8 {
         let allow = opts.allow();
         let journal = Journal::open(opts.journal.as_deref(), self.sid.as_deref(), warn);
+        let sid = self.sid.clone();
         let sink = Mutex::new(Sink {
             out,
             journal,
             warn: Some(warn),
+            teller: teller.map(|ctl| Teller {
+                ctl: ctl as &mut (dyn Ctl + Send),
+                sid,
+            }),
         });
         let end = self.run_loop(
             opts,
@@ -1655,7 +1839,9 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// did is said. The context watch's lines (`--context-warn`,
     /// [`Self::watch_context`]) are said as the turn's reads come, ahead of
     /// all of it. Unattended (`watch`), a limit episode is looked at around
-    /// the point: before it is reported ([`Self::limit_before`]: a point
+    /// the point: in the wait for the turn ([`Self::limit_on_busy`]: a busy
+    /// read closes the episode of a notice that said the worker would go
+    /// on by itself), before it is reported ([`Self::limit_before`]: a point
     /// that ends the episode, or one the probe takes instead), after
     /// ([`Self::limit_after`]: the escalation and the budget's extension on
     /// a limited point, the rebrief on an idle one), and in the wait for
@@ -1670,8 +1856,6 @@ impl<'a, C: Ctl> Session<'a, C> {
         review: &mut dyn Review,
     ) -> Result<Option<End>, Fail> {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        // The context watch speaks as the reads come, mid-turn included.
-        let mut say = |line: &str| review.say(line);
         // A screen the hold read past its point still showing a point is
         // this look's turn; one busy again is awaited as any turn is.
         let carried = state
@@ -1684,9 +1868,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 screen,
                 timed_out: false,
             },
-            None => {
-                self.await_turn_from(remaining, state.gone_first, &mut state.moved, &mut say)?
-            }
+            None => self.await_turn_from(remaining, state.gone_first, &mut state.moved, review)?,
         };
         // A read since the last point saw the worker busy: it worked.
         let worked = std::mem::take(&mut state.moved);
@@ -1703,7 +1885,10 @@ impl<'a, C: Ctl> Session<'a, C> {
         // a probe's late answer), or a box up — before anything is pressed:
         // an auto-approved read is work too ([`Self::close_episode`]; with
         // `--resume` and a rules file the rebrief is owed at the next idle
-        // point, [`Self::limit_after`]).
+        // point, [`Self::limit_after`]). A busy spell that ends on the
+        // notice again is a retry that hit the wall: the same episode. (A
+        // notice that said the worker would go on by itself closed at the
+        // busy read already, [`Self::limit_on_busy`].)
         if review.unattended()
             && self.limit.is_some()
             && !matches!(turn.phase, Phase::Limited { .. })
@@ -1714,8 +1899,13 @@ impl<'a, C: Ctl> Session<'a, C> {
             } else {
                 "a box is up: it is working"
             };
-            self.close_episode(&turn, why, review)?;
+            self.close_episode(turn.screen.seq, why, review)?;
             self.rebrief_due = self.rules().is_some();
+        }
+        // The worker answered on a point that is not the notice: an episode
+        // a busy read closed is over for good ([`Retry`]).
+        if review.unattended() && !matches!(turn.phase, Phase::Limited { .. }) {
+            self.retry = None;
         }
         if let Some(command) = self.stray.take()
             && stray_digit(&turn.screen, "1")
@@ -2580,12 +2770,25 @@ impl<C: Ctl> Session<'_, C> {
     /// (only the screen leaving the notice triggers one then). After a
     /// failed probe the backoff stands: the notice printed again (a retry's,
     /// an outage's re-report of the point) never brings the probe forward
-    /// of it — only a later reset moves it, later.
+    /// of it — only a later reset moves it, later. A notice that says Claude
+    /// Code goes on by itself at that time ([`Episode::resumes_itself`])
+    /// gets the probe [`limit::SHORTLY`] after it, not at it: Claude Code's
+    /// own continuation goes first — a probe typed as it starts would be
+    /// queued behind the resumed turn and answered later, for nothing — and
+    /// the worker read busy in the meantime closes the episode with no
+    /// probe at all ([`Self::limit_on_busy`]).
     fn arm_probe_at_reset(&mut self) {
         if self.resume.is_none() {
             return;
         }
-        let at = self.limit.as_ref().and_then(|ep| ep.reset_unix);
+        let at = self.limit.as_ref().and_then(|ep| {
+            let grace = if ep.resumes_itself {
+                i64::try_from(limit::SHORTLY.as_secs()).unwrap_or(0)
+            } else {
+                0
+            };
+            ep.reset_unix.map(|unix| unix + grace)
+        });
         let at = at.map(|unix| self.instant_of(unix));
         if let Some(ep) = self.limit.as_mut() {
             ep.probe_at = match (at, ep.probe_at) {
@@ -2678,14 +2881,15 @@ impl<C: Ctl> Session<'_, C> {
         ))
     }
 
-    /// After a point was reported. A limited point opens the episode —
-    /// the escalation ([`Self::escalate`]), once — or, the notice again
-    /// (a retry's), refreshes it ([`Self::refresh_reset`]: other text
-    /// naming a later reset is the one waited for; the same text is the
-    /// same reset); then the probe is armed for the reset — a backoff in
-    /// force stands — and the budget stretched past it ([`Self::extend`]).
-    /// An idle point with nothing typed gets the rebrief the episode's
-    /// close left owed ([`Self::rebrief`]).
+    /// After a point was reported. A limited point opens the episode
+    /// ([`Self::open_episode`]: the escalation, once — or the same episode
+    /// again after a busy read closed it) — or, the notice again (a
+    /// retry's) with the episode open, refreshes it ([`Self::refresh_reset`]:
+    /// other text naming a later reset is the one waited for; the same text
+    /// is the same reset); then the probe is armed for the reset — a
+    /// backoff in force stands — and the budget stretched past it
+    /// ([`Self::extend`]). An idle point with nothing typed gets the rebrief
+    /// the episode's close left owed ([`Self::rebrief`]).
     fn limit_after(
         &mut self,
         point: &Turn,
@@ -2698,17 +2902,7 @@ impl<C: Ctl> Session<'_, C> {
             if self.limit.is_some() {
                 self.refresh_reset(reset.as_deref());
             } else {
-                let reset_text = reset.clone().unwrap_or_else(|| "-".to_string());
-                let reset_unix = self.reset_unix(reset.as_deref());
-                let text = format!("limited: {} reset={}", one_line(message), reset_text);
-                self.escalate(point.screen.seq, &text, review)?;
-                self.limit = Some(Episode {
-                    reset_unix,
-                    reset_text,
-                    probe_at: None,
-                    failed: 0,
-                    extended: false,
-                });
+                self.open_episode(point.screen.seq, message, reset.as_deref(), review)?;
             }
             self.arm_probe_at_reset();
             return self.extend(deadline, review);
@@ -2719,6 +2913,37 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
+    /// A limited point with no episode open: the episode opens on it. A
+    /// new one is escalated ([`Self::escalate`]). One a busy read closed
+    /// and the worker has not answered since ([`Retry`]) is the retry that
+    /// hit the wall again — the SAME episode, opened again: the attention
+    /// set again (the worker is at the wall), no second mail, its seq and
+    /// the probe's backoff carried, the reset the notice names now (`EXTEND`
+    /// owed for a later one, as for any retry's notice).
+    fn open_episode(
+        &mut self,
+        seq: u64,
+        message: &str,
+        reset: Option<&str>,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        let reset_text = reset.map_or_else(|| "-".to_string(), str::to_string);
+        let reset_unix = self.reset_unix(reset);
+        let text = format!("limited: {} reset={}", one_line(message), reset_text);
+        let retry = self.retry.take();
+        self.escalate(seq, &text, retry.as_ref().map(|r| r.seq), review)?;
+        self.limit = Some(Episode {
+            seq: retry.as_ref().map_or(seq, |r| r.seq),
+            resumes_itself: limit::resumes_by_itself(message),
+            reset_unix,
+            reset_text,
+            probe_at: retry.as_ref().and_then(|r| r.probe_at),
+            failed: retry.map_or(0, |r| r.failed),
+            extended: false,
+        });
+        Ok(())
+    }
+
     /// The escalation, once an episode: `meta set attention limited:
     /// <message> reset=<when>` on the worker (cut to the server's 256 bytes;
     /// aterm's menu bar badges a set attention), the same text posted from
@@ -2726,14 +2951,26 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`Self::set_manager`]; skipped, and said so, with none), and one
     /// journal line, `ESCALATED seq=<n> attention=<reply> mail=<reply>`,
     /// with the server's first word for each — a refusal is recorded, never
-    /// the loop's end.
-    fn escalate(&mut self, seq: u64, text: &str, review: &mut dyn Review) -> Result<(), Fail> {
+    /// the loop's end. The same episode opened again (`again`: the seq of
+    /// the escalation it keeps, [`Retry`]) sets the attention and posts
+    /// nothing: `mail=skipped: the retry hit the wall again, the episode of
+    /// seq=<m>`.
+    fn escalate(
+        &mut self,
+        seq: u64,
+        text: &str,
+        again: Option<u64>,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
         let attention = fit_bytes(text, ATTENTION_BYTES);
         let r = self.call(&["meta", "set", "attention", &attention])?;
         let attention_said = reply_word(&r);
-        let mail_said = match self.manager.clone() {
-            None => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
-            Some(to) => {
+        let mail_said = match (again, self.manager.clone()) {
+            (Some(of), _) => {
+                format!("skipped: the retry hit the wall again, the episode of seq={of}")
+            }
+            (None, None) => "skipped: no --inbox and no $ATERM_PARENT_SESSION_ID".to_string(),
+            (None, Some(to)) => {
                 let to = format!("to={to}");
                 let r = self.call(&["post", &to, "kind=control", text])?;
                 reply_word(&r)
@@ -2747,17 +2984,58 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The episode is over: the attention cleared (`meta unset attention` —
     /// on the wire `meta set attention ''` is a usage error, measured) and
-    /// journaled as `CLEARED seq=<n> attention=<reply> <why>`.
-    fn close_episode(&mut self, at: &Turn, why: &str, review: &mut dyn Review) -> Result<(), Fail> {
+    /// journaled as `CLEARED seq=<n> attention=<reply> <why>`, `seq` the
+    /// read it closed on.
+    fn close_episode(&mut self, seq: u64, why: &str, review: &mut dyn Review) -> Result<(), Fail> {
         if self.limit.take().is_none() {
             return Ok(());
         }
         let r = self.call(&["meta", "unset", "attention"])?;
         review.note(&format!(
-            "CLEARED seq={} attention={} {why}",
-            at.screen.seq,
+            "CLEARED seq={seq} attention={} {why}",
             reply_word(&r)
         ));
+        Ok(())
+    }
+
+    /// A busy read, inside the wait for a turn ([`Self::await_turn_from`]),
+    /// with an episode open whose notice said Claude Code would go on by
+    /// itself ([`Episode::resumes_itself`]): this is it going on. The
+    /// episode closes here and now — `CLEARED seq=<n> … the worker works
+    /// again` at the busy read's seq, the attention unset — not at the next
+    /// review point, which the turn it resumed may keep hours off (measured
+    /// 2026-09-17: a background shell ran fourteen hours under the notice,
+    /// the badge set all the while); the notice row still on the screen
+    /// changes nothing. With `--resume` and a rules file the rebrief is owed
+    /// at the next idle point ([`Self::limit_after`]). An episode whose
+    /// notice named a reset is not touched: a busy spell after it may be a
+    /// retry that hits the wall again ([`Self::look`]). The closed episode
+    /// is kept ([`Retry`]) until the worker answers on a point that is not
+    /// the notice: this busy may be the retry that hits the wall again
+    /// (`continuing shortly` in a moment), and the notice again is then the
+    /// same episode, opened again with no second mail
+    /// ([`Self::open_episode`]). A probe's answer awaited changes nothing
+    /// (the round-20 review: with the probe pending, the continuation ran
+    /// its hours under the notice with the episode open and the badge set):
+    /// the worker works, whichever turn it is on; an answer then says
+    /// `EVENT resumed` on an episode already closed, the notice again opens
+    /// it again with the backoff ([`Self::settle_probe`]).
+    fn limit_on_busy(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
+        let Some(ep) = self.limit.as_ref().filter(|ep| ep.resumes_itself) else {
+            return Ok(());
+        };
+        let retry = Retry {
+            seq: ep.seq,
+            failed: ep.failed,
+            probe_at: ep.probe_at,
+        };
+        self.close_episode(
+            seq,
+            "the worker works again: the notice said it would continue by itself",
+            review,
+        )?;
+        self.retry = Some(retry);
+        self.rebrief_due = self.rules().is_some();
         Ok(())
     }
 
@@ -2924,6 +3202,20 @@ impl<C: Ctl> Session<'_, C> {
             });
         }
         self.mail_turn_boundary();
+        self.await_probe_answer(from, deadline, review)
+    }
+
+    /// The probe's answer, awaited ([`Self::probe`]) with the loop's own
+    /// waits: a busy read on the way is shown to the episode as any is
+    /// ([`Self::limit_on_busy`]) — the worker works, on the probe's turn
+    /// or on Claude Code's own continuation, which the probe could not
+    /// tell apart and which may run for hours.
+    fn await_probe_answer(
+        &mut self,
+        from: &Turn,
+        deadline: Instant,
+        review: &mut dyn Review,
+    ) -> Result<Probed, Fail> {
         let answer_window = self.answer_window;
         let window = || answer_window.min(deadline.saturating_duration_since(Instant::now()));
         let mut until = Instant::now() + window();
@@ -2931,7 +3223,6 @@ impl<C: Ctl> Session<'_, C> {
         let mut saw_busy = false;
         let mut first = true;
         let mut last = from.clone();
-        let mut say = |line: &str| review.say(line);
         loop {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -2940,7 +3231,7 @@ impl<C: Ctl> Session<'_, C> {
                     why: no_answer,
                 });
             }
-            let turn = self.await_turn_from(left, first, &mut saw_busy, &mut say)?;
+            let turn = self.await_turn_from(left, first, &mut saw_busy, review)?;
             first = false;
             // A turn timed out was read busy as the window ran out: the
             // answer is on its way, and waited for — until the budget.
@@ -2986,14 +3277,17 @@ impl<C: Ctl> Session<'_, C> {
 
     /// What the probe came to, said and set up for the next look. An answer
     /// prints `EVENT resumed seq=<n> <its line>`, closes the episode
-    /// ([`Self::close_episode`]) and, with a rules file, restates the rules
-    /// ([`Self::rebrief`]) — at once on an idle answer with nothing typed,
-    /// else at the next such point; a box is the manager's, carried to the
-    /// next look. A failure prints `EVENT still-limited seq=<n> <why>`,
-    /// counts against the backoff ([`PROBE_BACKOFF`]: the next probe 10
-    /// min away, then 30, never before a later reset the notice named) and
-    /// looks at the budget again ([`Self::extend`]); the point it ended on
-    /// is not reported again.
+    /// ([`Self::close_episode`]; one a busy read closed already stays
+    /// closed, for good: [`Retry`]) and, with a rules file, restates the
+    /// rules ([`Self::rebrief`]) — at once on an idle answer with nothing
+    /// typed, else at the next such point; a box is the manager's, carried
+    /// to the next look. A failure prints `EVENT still-limited seq=<n>
+    /// <why>` — the notice again after a busy read closed the episode opens
+    /// it again, the same one ([`Self::open_episode`]) — counts against the
+    /// backoff ([`PROBE_BACKOFF`]: the next probe 10 min away, then 30,
+    /// never before a later reset the notice named) and looks at the budget
+    /// again ([`Self::extend`]); the point it ended on is not reported
+    /// again.
     fn settle_probe(
         &mut self,
         probed: Probed,
@@ -3010,7 +3304,8 @@ impl<C: Ctl> Session<'_, C> {
                     turn.screen.seq,
                     event_summary(&turn, allow)
                 ))?;
-                self.close_episode(&turn, "resumed", review)?;
+                self.close_episode(turn.screen.seq, "resumed", review)?;
+                self.retry = None;
                 self.rebrief_due = self.rules().is_some();
                 if turn.phase == Phase::Prompt {
                     state.handed = None;
@@ -3027,8 +3322,12 @@ impl<C: Ctl> Session<'_, C> {
                     "EVENT still-limited seq={} {why}",
                     turn.screen.seq
                 ))?;
-                if let Phase::Limited { reset, .. } = &turn.phase {
-                    self.refresh_reset(reset.as_deref());
+                if let Phase::Limited { message, reset } = &turn.phase {
+                    if self.limit.is_some() {
+                        self.refresh_reset(reset.as_deref());
+                    } else {
+                        self.open_episode(turn.screen.seq, message, reset.as_deref(), review)?;
+                    }
                 }
                 let now_unix = self.now_unix();
                 let backoff = self.probe_backoff.clone();
@@ -5395,6 +5694,134 @@ mod tests {
         let log = String::from_utf8(log).expect("utf-8");
         assert_eq!(log, "DISMISSED survey seq=101\n");
         assert_eq!(m.presses(), ["@s-1 key if=^●.How.is.Claude.doing 0"]);
+    }
+
+    /// Round 19: what a printed line is told to the window as. The command
+    /// never travels (an APPROVED is told bare), a line that carries no
+    /// decision is told nothing, and the text is cut to the wire's 96 bytes
+    /// at a character boundary.
+    #[test]
+    fn story_of_maps_the_journal_lines_onto_the_closed_verb_set_without_the_command() {
+        let told = |l: &str| story_of(l).map(|(v, t)| format!("{v}|{t}"));
+        assert_eq!(
+            told("APPROVED seq=41 rm -rf target").as_deref(),
+            Some("approved|"),
+            "never the command"
+        );
+        assert_eq!(
+            told("DISMISSED survey seq=101").as_deref(),
+            Some("dismissed|survey")
+        );
+        assert_eq!(
+            told("RECONNECTED after 812 ms").as_deref(),
+            Some("reconnected|after 812 ms")
+        );
+        assert_eq!(told("TIMEOUT").as_deref(), Some("timeout|"));
+        assert_eq!(
+            told("EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)").as_deref(),
+            Some("exit|session gone (await seq 102 failed: aterm-ctl: ERR exited)")
+        );
+        assert_eq!(told("EVENT compacted seq=9").as_deref(), Some("compacted|"));
+        assert_eq!(
+            told("EVENT context seq=9 12% until auto-compact").as_deref(),
+            Some("warned|context 12% until auto-compact")
+        );
+        for none in [
+            "EVENT idle seq=102 ⏺ Done.",
+            "EVENT prompt seq=3 kind=bash classify=read-only command=ls",
+            "EVENT turn seq=5 report=7 rows=12 done",
+            "EVENT survey seq=7 dismiss with: aterm ctl @s-1 key 0",
+            "RECONNECT lost socket",
+            "MAIL id=3 off=1 from=s-2 kind=report len=40",
+            "",
+        ] {
+            assert_eq!(told(none), None, "{none:?}");
+        }
+        let long = format!("EXIT {}é", "x".repeat(95));
+        let (_, text) = story_of(&long).expect("an exit");
+        assert_eq!(
+            text.len(),
+            95,
+            "cut BEFORE the 2-byte char that would cross 96"
+        );
+        assert!(text.is_char_boundary(text.len()));
+    }
+
+    /// Round 19: `watch` tells the worker's window its story — one `@sid story
+    /// <verb> [<text>]` per journaled decision, through the teller's client,
+    /// in the journal's order — and the PRINTED lines are byte-identical to a
+    /// watch without one (the `dismiss_surveys` case above, verbatim). The
+    /// session's own client sees no story request: the lane is a second
+    /// connection.
+    #[test]
+    fn watch_tells_the_window_its_story_through_the_teller_and_prints_the_same_lines() {
+        let mut m = Mock::new(true, vec![with_survey(idle_screen()), idle_screen()]);
+        m.vanish_after = Some(1);
+        let mut teller = Mock::new(true, Vec::new());
+        let opts = SuperviseOpts {
+            dismiss_surveys: true,
+            ..auto(30, None)
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut warn: Vec<u8> = Vec::new();
+        let code = Session::new(&mut m, Some("@s-1".to_string())).watch_with(
+            &opts,
+            None::<&mut NoLane>,
+            Some(&mut teller),
+            &mut out,
+            &mut warn,
+        );
+        let lines: Vec<String> = String::from_utf8(out)
+            .expect("utf-8")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "DISMISSED survey seq=101",
+                "EVENT idle seq=102 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ],
+            "byte-identical to the watch without a teller"
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            teller.requests,
+            [
+                "@s-1 story dismissed survey",
+                "@s-1 story exit session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ],
+            "{:?}",
+            teller.requests
+        );
+        assert!(
+            m.requests.iter().all(|r| !r.contains("story")),
+            "the session's own client carries no story: {:?}",
+            m.requests
+        );
+        assert!(warn.is_empty(), "{}", String::from_utf8_lossy(&warn));
+
+        // An approval is told bare — the command stays in the journal.
+        let mut m = Mock::new(true, vec![bash_one_row(), idle_screen()]);
+        m.vanish_after = Some(1);
+        let mut teller = Mock::new(true, Vec::new());
+        let opts = auto(30, None);
+        let mut out: Vec<u8> = Vec::new();
+        let mut warn: Vec<u8> = Vec::new();
+        let _ = Session::new(&mut m, Some("@s-1".to_string())).watch_with(
+            &opts,
+            None::<&mut NoLane>,
+            Some(&mut teller),
+            &mut out,
+            &mut warn,
+        );
+        let printed = String::from_utf8(out).expect("utf-8");
+        assert!(printed.starts_with("APPROVED seq="), "{printed}");
+        assert_eq!(
+            teller.requests.first().map(String::as_str),
+            Some("@s-1 story approved")
+        );
     }
 
     /// A guarded `0` that finds no survey row — it left between the read and
@@ -8898,5 +9325,616 @@ mod tests {
                 "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
             ]
         );
+    }
+
+    // ---- the auto-continue notice (round 20) ------------------------------
+
+    /// The notice's text as measured 2026-09-17 13:50 on the live worker; the
+    /// rows around it are reconstructed, never copied from a transcript.
+    const AUTO_TEXT: &str =
+        "⚠ Usage limit reached · continuing automatically at 1:50pm · esc to cancel";
+    const SHORTLY_TEXT: &str = "⚠ Usage limit reached · continuing shortly · esc to cancel";
+    const AUTO_SPINNER: &str = "✶ Deliberating… (4s · ↑ 1.2k tokens · esc to interrupt)";
+    fn auto_transcript() -> Vec<String> {
+        rows(&["⏺ Bash(./run.sh --queue 8)", "  ⎿  queued 8 runs", ""])
+    }
+    /// The wait: the notice alone in the live zone, nothing busy under it.
+    fn auto_waiting(notice: &str) -> Vec<String> {
+        let mut r = auto_transcript();
+        r.push(notice.to_string());
+        r.extend(composer("  ⏵⏵ auto mode on (shift+tab to cycle)"));
+        r
+    }
+    /// The three rows of the live defect: the notice still up, a spinner
+    /// status row under it, the busy footer.
+    fn auto_resumed() -> Vec<String> {
+        let mut r = auto_transcript();
+        r.extend(rows(&[AUTO_TEXT, AUTO_SPINNER, ""]));
+        r.extend(composer(
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · 2 shells",
+        ));
+        r
+    }
+    /// The turn it resumed, over: the notice above the transcript is history.
+    fn auto_done() -> Vec<String> {
+        let mut r = auto_transcript();
+        r.extend(rows(&[
+            AUTO_TEXT,
+            "⏺ All 8 runs are in.",
+            "",
+            "✻ Worked for 3m 2s · done 2:10 PM",
+            "",
+        ]));
+        r.extend(composer("  ? for shortcuts"));
+        r
+    }
+
+    /// The live defect, fixed: the auto-continue notice reads limited (its
+    /// `1:50pm` the reset, so the budget stretches to ten minutes past it),
+    /// and the FIRST busy read after it — the notice row still on the
+    /// screen over the spinner — closes the episode there and then:
+    /// `CLEARED` at that read's seq, the attention unset, before the point
+    /// the resumed turn ends on; with a rules file the rules follow at that
+    /// idle point, `EVENT rebriefed` after it, and no probe goes.
+    #[test]
+    fn an_auto_continue_notice_closes_at_the_first_busy_read_and_the_rules_follow() {
+        let (rdir, rules) = rules_file("auto-continue");
+        let (jdir, path) = journal_file("auto-continue");
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                auto_waiting(AUTO_TEXT),
+                auto_resumed(),
+                auto_done(),
+            ],
+        );
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_resume(Some(Resume {
+                rules: Some(rules.clone()),
+            }));
+        });
+        assert_eq!(
+            lines,
+            [
+                format!("EVENT limited seq=102 message={AUTO_TEXT} reset=1:50pm"),
+                // 1:50pm Pacific is 20:50Z; ten minutes past it.
+                "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
+                "EVENT idle seq=104 ⏺ All 8 runs are in.".to_string(),
+                "EVENT rebriefed seq=104".to_string(),
+                "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)".to_string(),
+            ],
+            "{:#?}",
+            m.requests
+        );
+        assert_eq!(count(&m, "meta set attention"), 1);
+        assert_eq!(count(&m, "meta unset attention"), 1);
+        assert_eq!(
+            count(&m, "turn"),
+            1,
+            "the rules, no probe: {:?}",
+            m.requests
+        );
+        assert!(
+            m.requests
+                .iter()
+                .any(|r| r == &format!("turn idle=600 timeout=2500 {RULES_LINE}"))
+        );
+        let (records, _) = journal_records(&path);
+        let cleared: Vec<(Option<u64>, &str)> = records
+            .iter()
+            .filter(|r| r.kind == "cleared")
+            .map(|r| (r.seq, r.summary.as_str()))
+            .collect();
+        assert_eq!(
+            cleared,
+            [(
+                Some(103),
+                "attention=OK the worker works again: the notice said it would continue by itself"
+            )],
+            "closed at the busy read, before the idle point: {records:#?}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind.as_str(), r.phase.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("event", "limited"),
+                ("escalated", "-"),
+                ("extend", "-"),
+                ("cleared", "-"),
+                ("event", "idle"),
+                ("event", "rebriefed"),
+                ("exit", "-"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&rdir);
+        let _ = std::fs::remove_dir_all(&jdir);
+    }
+
+    /// `continuing shortly` is a reset a minute off: the line says
+    /// `reset=shortly`, the budget stretches to eleven minutes from now,
+    /// and the probe is armed a minute past the minute — not sent at the
+    /// point.
+    #[test]
+    fn a_continuing_shortly_notice_is_a_reset_a_minute_off() {
+        let mut m = Mock::new(true, vec![busy_screen(), auto_waiting(SHORTLY_TEXT)]);
+        m.vanish_after = Some(2);
+        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_resume(Some(Resume { rules: None }));
+        });
+        assert_eq!(
+            lines,
+            [
+                format!("EVENT limited seq=102 message={SHORTLY_TEXT} reset=shortly"),
+                // TEST_NOW is 15:55:00Z: a minute, then the ten-minute grace.
+                "EXTEND until=2026-09-17T16:06:00Z reset=shortly".to_string(),
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)".to_string(),
+            ],
+            "{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            count(&m, "turn"),
+            0,
+            "the probe waits for the minute and its grace"
+        );
+        assert_eq!(
+            m.requests
+                .iter()
+                .find(|r| r.starts_with("meta set attention"))
+                .map(String::as_str),
+            Some(format!("meta set attention limited: {SHORTLY_TEXT} reset=shortly").as_str())
+        );
+    }
+
+    /// The probe after an auto-continue notice goes a minute PAST the time
+    /// it named, not at it — Claude Code's own continuation first: read at
+    /// 13:50:18, as the live notice was, no probe goes. Read at 13:51:30 it
+    /// goes at once, and its turn, read busy under the notice still up,
+    /// closes the episode at that read as any busy read does (the probe
+    /// cannot tell its own turn from Claude Code's continuation, and the
+    /// continuation may run for hours): `CLEARED … the worker works again`
+    /// at the busy read's seq, the attention unset once; the answer then
+    /// says `EVENT resumed` on the closed episode, and the rules follow.
+    #[test]
+    fn the_probe_after_an_auto_continue_notice_goes_a_minute_past_its_time() {
+        // 13:50:18 PDT: 1:50pm is 18 s gone, the probe is armed for 13:51.
+        let read_at = TEST_NOW + (4 * 60 + 55) * 60 + 18;
+        let mut m = Mock::new(true, vec![busy_screen(), auto_waiting(AUTO_TEXT)]);
+        m.vanish_after = Some(2);
+        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_clock(read_at, PDT);
+            s.set_resume(Some(Resume { rules: None }));
+        });
+        assert_eq!(
+            lines,
+            [
+                format!("EVENT limited seq=102 message={AUTO_TEXT} reset=1:50pm"),
+                "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)".to_string(),
+            ],
+            "{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            count(&m, "turn"),
+            0,
+            "the probe is a minute past 1:50pm: {:?}",
+            m.requests
+        );
+        // 13:51:30 PDT: the minute is past, the probe goes at once.
+        let (rdir, rules) = rules_file("auto-probe");
+        let (jdir, path) = journal_file("auto-probe");
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                auto_waiting(AUTO_TEXT),
+                auto_resumed(),
+                auto_done(),
+            ],
+        );
+        m.vanish_after = Some(2);
+        m.turn_releases = Some(1);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_clock(read_at + 72, PDT);
+            s.set_resume(Some(Resume {
+                rules: Some(rules.clone()),
+            }));
+        });
+        assert_eq!(
+            lines,
+            [
+                format!("EVENT limited seq=102 message={AUTO_TEXT} reset=1:50pm"),
+                "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
+                "EVENT resumed seq=104 ⏺ All 8 runs are in.".to_string(),
+                "EVENT rebriefed seq=104".to_string(),
+                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)".to_string(),
+            ],
+            "{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            count(&m, "turn"),
+            2,
+            "the probe, the rules: {:?}",
+            m.requests
+        );
+        assert!(m.requests.iter().any(|r| r == &probe_request()));
+        assert_eq!(count(&m, "meta unset attention"), 1);
+        let (records, _) = journal_records(&path);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind.as_str(), r.phase.as_str(), r.seq))
+                .collect::<Vec<_>>(),
+            [
+                ("event", "limited", Some(102)),
+                ("escalated", "-", Some(102)),
+                ("extend", "-", None),
+                ("probe", "sent", Some(102)),
+                ("cleared", "-", Some(103)),
+                ("event", "resumed", Some(104)),
+                ("event", "rebriefed", Some(104)),
+                ("exit", "-", None),
+            ],
+            "the busy read under the probe closed the episode: {records:#?}"
+        );
+        assert_eq!(
+            records[4].summary,
+            "attention=OK the worker works again: the notice said it would continue by itself"
+        );
+        let _ = std::fs::remove_dir_all(&rdir);
+        let _ = std::fs::remove_dir_all(&jdir);
+    }
+
+    /// Round 17's rule stands for a notice that names a reset: a busy spell
+    /// after it closes nothing by itself — the retry may hit the wall again,
+    /// and the notice again is the same episode: one escalation, no
+    /// `CLEARED`, the attention still set.
+    #[test]
+    fn a_reset_notice_is_not_closed_by_a_busy_read_alone() {
+        let (dir, path) = journal_file("limit-busy-then-notice");
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                weekly_limited(),
+                busy_screen(),
+                weekly_retried(),
+            ],
+        );
+        m.vanish_after = Some(3);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_resume(Some(Resume { rules: None }));
+        });
+        assert_eq!(
+            lines,
+            [
+                format!("EVENT limited seq=102 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
+                format!("EXTEND until=2026-09-19T18:10:00Z reset={WEEKLY_RESET}"),
+                format!("EVENT limited seq=104 message={WEEKLY_TEXT} reset={WEEKLY_RESET}"),
+                "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)".to_string(),
+            ],
+            "{:#?}",
+            m.requests
+        );
+        assert_eq!(count(&m, "meta set attention"), 1, "once an episode");
+        assert_eq!(
+            count(&m, "meta unset attention"),
+            0,
+            "the episode is open still"
+        );
+        let (records, _) = journal_records(&path);
+        assert!(records.iter().all(|r| r.kind != "cleared"), "{records:#?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The round-20 review: a continuation that hits the wall again — the
+    /// retry's spinner, then `continuing shortly` — closes the episode at
+    /// the busy read and finds the notice again. That is round 17's retry
+    /// that hit the wall: the SAME episode, opened again — the attention set
+    /// again (the worker is at the wall), `ESCALATED` journaled with the
+    /// mail skipped, the probe's backoff carried — and the manager is mailed
+    /// ONCE, not once a retry (measured by the review: three mails for three
+    /// notices in a row). The worker answering on a point that is not the
+    /// notice ends it for good; a notice after that is a new episode.
+    #[test]
+    fn a_retry_that_hits_the_wall_again_is_the_same_episode_and_mails_once() {
+        let (dir, path) = journal_file("auto-retry");
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                auto_waiting(AUTO_TEXT),
+                auto_resumed(),
+                auto_waiting(SHORTLY_TEXT),
+                auto_resumed(),
+                auto_waiting(SHORTLY_TEXT),
+            ],
+        );
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_manager(Some("@s-9".to_string()));
+            s.set_resume(Some(Resume { rules: None }));
+        });
+        assert_eq!(
+            lines,
+            [
+                format!("EVENT limited seq=102 message={AUTO_TEXT} reset=1:50pm"),
+                "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
+                format!("EVENT limited seq=104 message={SHORTLY_TEXT} reset=shortly"),
+                format!("EVENT limited seq=106 message={SHORTLY_TEXT} reset=shortly"),
+                "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)".to_string(),
+            ],
+            "{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            (
+                count(&m, "meta set attention"),
+                count(&m, "meta unset attention"),
+                count(&m, "post to=@s-9 kind=control"),
+            ),
+            (3, 2, 1),
+            "the badge follows the wall; the manager is mailed once: {:#?}",
+            m.requests
+        );
+        assert_eq!(count(&m, "turn"), 0, "no probe: {:?}", m.requests);
+        let (records, _) = journal_records(&path);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind.as_str(), r.seq, r.summary.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "event",
+                    Some(102),
+                    &*format!("message={AUTO_TEXT} reset=1:50pm")
+                ),
+                ("escalated", Some(102), "attention=OK mail=OK"),
+                ("extend", None, "until=2026-09-17T21:00:00Z reset=1:50pm"),
+                (
+                    "cleared",
+                    Some(103),
+                    "attention=OK the worker works again: the notice said it would continue by itself"
+                ),
+                (
+                    "event",
+                    Some(104),
+                    &*format!("message={SHORTLY_TEXT} reset=shortly")
+                ),
+                (
+                    "escalated",
+                    Some(104),
+                    "attention=OK mail=skipped: the retry hit the wall again, the episode of seq=102"
+                ),
+                (
+                    "cleared",
+                    Some(105),
+                    "attention=OK the worker works again: the notice said it would continue by itself"
+                ),
+                (
+                    "event",
+                    Some(106),
+                    &*format!("message={SHORTLY_TEXT} reset=shortly")
+                ),
+                (
+                    "escalated",
+                    Some(106),
+                    "attention=OK mail=skipped: the retry hit the wall again, the episode of seq=102"
+                ),
+                (
+                    "exit",
+                    None,
+                    "session gone (await seq 106 failed: aterm-ctl: ERR exited)"
+                ),
+            ],
+            "{records:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // The worker answered in between: the notice after that is a new
+        // episode, mailed again.
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                auto_waiting(AUTO_TEXT),
+                auto_resumed(),
+                auto_done(),
+                busy_screen(),
+                auto_waiting(SHORTLY_TEXT),
+            ],
+        );
+        m.vanish_after = Some(2);
+        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_manager(Some("@s-9".to_string()));
+            s.set_resume(Some(Resume { rules: None }));
+        });
+        assert_eq!(
+            (
+                count(&m, "meta set attention"),
+                count(&m, "meta unset attention"),
+                count(&m, "post to=@s-9 kind=control"),
+            ),
+            (2, 1, 2),
+            "{lines:#?}\n{:#?}",
+            m.requests
+        );
+    }
+
+    /// The round-20 review: the probe typed on the notice a minute past its
+    /// time, and Claude Code's own continuation running for hours after it
+    /// (the live fourteen-hour turn, on the probe's path). The busy read
+    /// closes the episode as it does with no probe pending — `CLEARED` at
+    /// that read, the attention unset — instead of holding it open while
+    /// the answer window starts over at every busy read until the budget
+    /// (measured by the review: seven busy reads, no `CLEARED`, the badge
+    /// set to the end).
+    #[test]
+    fn a_pending_probe_does_not_hold_the_episode_open_while_the_continuation_runs() {
+        let (dir, path) = journal_file("auto-probe-long");
+        // 13:51:30 PDT: the minute past 1:50pm is gone, the probe goes at once.
+        let read_at = TEST_NOW + (4 * 60 + 55) * 60 + 90;
+        let mut m = Mock::new(
+            true,
+            vec![busy_screen(), auto_waiting(AUTO_TEXT), auto_resumed()],
+        );
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(6);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_clock(read_at, PDT);
+            s.set_resume(Some(Resume { rules: None }));
+            s.set_probe_timing(&[Duration::from_secs(600)], Duration::from_millis(60));
+        });
+        assert!(
+            m.requests.iter().any(|r| r == &probe_request()),
+            "{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            count(&m, "meta unset attention"),
+            1,
+            "the worker was read busy under the notice: the episode closes; lines {lines:#?}\n{:#?}",
+            m.requests
+        );
+        let (records, _) = journal_records(&path);
+        let cleared: Vec<(Option<u64>, &str)> = records
+            .iter()
+            .filter(|r| r.kind == "cleared")
+            .map(|r| (r.seq, r.summary.as_str()))
+            .collect();
+        assert_eq!(
+            cleared,
+            [(
+                Some(103),
+                "attention=OK the worker works again: the notice said it would continue by itself"
+            )],
+            "{records:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe's own turn hitting the wall: typed a minute past the time,
+    /// read busy under the notice (the episode closes at that read), then
+    /// the notice again — `EVENT still-limited`, and the SAME episode opened
+    /// again: the attention set again, no second mail, `EXTEND` for the
+    /// later reset it names (`shortly`, a minute past the probe's read: ten
+    /// minutes past that is past the first stretch), the backoff on, and
+    /// the notice re-read at the next look escalates nothing more.
+    #[test]
+    fn the_probe_hitting_the_wall_after_the_busy_read_opens_the_same_episode_again() {
+        let (dir, path) = journal_file("auto-probe-wall");
+        let read_at = TEST_NOW + (4 * 60 + 55) * 60 + 90;
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                auto_waiting(AUTO_TEXT),
+                auto_resumed(),
+                auto_waiting(SHORTLY_TEXT),
+            ],
+        );
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(3);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_manager(Some("@s-9".to_string()));
+            s.set_clock(read_at, PDT);
+            s.set_resume(Some(Resume { rules: None }));
+            s.set_probe_timing(&[Duration::from_secs(600)], Duration::from_millis(60));
+        });
+        assert_eq!(
+            lines,
+            [
+                format!("EVENT limited seq=102 message={AUTO_TEXT} reset=1:50pm"),
+                "EXTEND until=2026-09-17T21:00:00Z reset=1:50pm".to_string(),
+                format!("EVENT still-limited seq=104 message={SHORTLY_TEXT} reset=shortly"),
+                "EXTEND until=2026-09-17T21:02:30Z reset=shortly".to_string(),
+                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)".to_string(),
+            ],
+            "{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            (
+                count(&m, "meta set attention"),
+                count(&m, "meta unset attention"),
+                count(&m, "post to=@s-9 kind=control"),
+                count(&m, "turn"),
+            ),
+            (2, 1, 1, 1),
+            "{:#?}",
+            m.requests
+        );
+        let (records, _) = journal_records(&path);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.kind.as_str(), r.seq, r.summary.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "event",
+                    Some(102),
+                    &*format!("message={AUTO_TEXT} reset=1:50pm")
+                ),
+                ("escalated", Some(102), "attention=OK mail=OK"),
+                ("extend", None, "until=2026-09-17T21:00:00Z reset=1:50pm"),
+                ("probe", Some(102), ""),
+                (
+                    "cleared",
+                    Some(103),
+                    "attention=OK the worker works again: the notice said it would continue by itself"
+                ),
+                (
+                    "event",
+                    Some(104),
+                    &*format!("message={SHORTLY_TEXT} reset=shortly")
+                ),
+                (
+                    "escalated",
+                    Some(104),
+                    "attention=OK mail=skipped: the retry hit the wall again, the episode of seq=102"
+                ),
+                ("extend", None, "until=2026-09-17T21:02:30Z reset=shortly"),
+                (
+                    "exit",
+                    None,
+                    "session gone (await seq 105 failed: aterm-ctl: ERR exited)"
+                ),
+            ],
+            "{records:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

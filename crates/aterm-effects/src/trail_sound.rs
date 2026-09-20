@@ -14555,9 +14555,28 @@ mod tests {
             let plain = peak(voice, false);
             let cap = peak(voice, true);
             let db = 20.0 * (cap / plain).log10();
+            // THE MUSIC BOX'S WINDOW MOVED 2026-09-19 (owner, on v0.88.0:
+            // "shift key needs the tones that I specified (higher tone,
+            // brighter tones when using shifted keys, louder first word
+            // capitalized"). This fixture's one key is a session's first —
+            // a capital OPENING A WORD — and on the music box that capital
+            // now carries `rainbow_kitty_v2::WORD_CAPITAL_GAIN` (+3.0 dB) over
+            // the shared +2.6: exact weight +5.6 dB, measured +5.52 at this
+            // seed. Its window is the weight ± the crest's seeded wander
+            // (+3.5..+7.5, the 1.9 dB of slack the music box's own pin
+            // `a_capital_rings_and_out_peaks_its_plain_self_by_its_weight`
+            // allows); the bus limiter's −14 dBFS knee is the cap over it.
+            // The v1 palettes are untouched and keep tier 4's ceiling.
+            let music_box = matches!(
+                voice,
+                SoundVoice::Style
+                    | SoundVoice::RainbowKittyV2
+                    | SoundVoice::Of(GlowStyle::RainbowKitty)
+            );
+            let window = if music_box { 3.5..=7.5 } else { 1.5..=5.5 };
             assert!(
-                (1.5..=5.5).contains(&db),
-                "{voice:?}: a capital must be LOUDER than its plain self by 1.5-5.5 dB \
+                window.contains(&db),
+                "{voice:?}: a capital must be LOUDER than its plain self by {window:?} dB \
                  (plain {plain}, shifted {cap}: {db:+.2} dB)"
             );
         }

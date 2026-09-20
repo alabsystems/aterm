@@ -278,14 +278,30 @@ pub(crate) fn cargo_driver() -> &'static CargoDriver {
 ///
 /// Only ever SETS an unset variable — a driver the parent chose is never
 /// overridden — and does so at the top of a gate verb, before any thread
-/// exists, which is what makes the edition-2024 `unsafe` sound.
+/// exists, which is the single-threaded-startup justification the mutation
+/// needs.
+///
+/// The write goes through [`aterm_log::env::set`], the workspace's ONE
+/// lock-scoped env helper, and not through a bare `std::env::set_var`. Two
+/// reasons, and the first is the lint: the Trust toolchain's `env_mutation`
+/// fires on a raw mutation wherever it sits, so under the gate's
+/// `tippy --workspace --all-targets -- -D warnings` a raw call here is a hard
+/// red (measured on the owner's Intel Mac 2026-09-19: the lint lane failed
+/// exit 101 on this one line, the lane's first red since 2026-09-17). The
+/// second is the reason the lint exists: a lock only serializes the mutators
+/// that SHARE it, so the useful lock is the one every crate in the binary
+/// already links, which is `aterm-log`'s — a private lock in xtask would be
+/// theatre, as that module's own docs say. Being the one lock, it also bounds
+/// this write against a `read` taken through the same module anywhere else in
+/// the process.
+///
+/// What the helper does NOT buy is safety against a `getenv` in a C library on
+/// another thread, so the startup ordering above is still load-bearing and is
+/// still the real argument.
 pub(crate) fn export_driver_as_cargo() -> &'static CargoDriver {
     let driver = cargo_driver();
     if std::env::var_os("CARGO").is_none_or(|c| c.is_empty()) {
-        // SAFETY: xtask's gate verbs run sequentially on the main thread and
-        // spawn no threads before this point; no other thread can be reading
-        // the environment while it is written.
-        unsafe { std::env::set_var("CARGO", &driver.program) };
+        aterm_log::env::set("CARGO", &driver.program);
     }
     driver
 }

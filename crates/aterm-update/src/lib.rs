@@ -1008,6 +1008,33 @@ pub fn is_uncommitted_handoff_candidate() -> bool {
     UNCOMMITTED_CANDIDATE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Block the calling background thread while this process is an UNCOMMITTED
+/// handoff candidate, up to `bound`; `true` when it waited at all. A successor
+/// that has not been committed may still be rejected by the outgoing process
+/// (2026-09-19): nothing it does before Commit may reach the network, the store
+/// or the ledger — no update check, no toolchain pass — because those would be
+/// the acts of a process that is about to be killed, beside a parent that is
+/// still the owner. Polled, not signalled: the flag is cleared on the main thread
+/// at `Wake::ActivateCommittedHandoff`, and a 50 ms cadence is far inside any
+/// hold. The bound outlasts the late park's grant budget so a candidate the
+/// parent never answered (it stands down by EOF and exits) can never spin.
+pub fn wait_while_uncommitted_handoff_candidate(bound: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    let mut waited = false;
+    while is_uncommitted_handoff_candidate() && started.elapsed() < bound {
+        waited = true;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    waited
+}
+
+/// The bound on [`wait_while_uncommitted_handoff_candidate`] for the two
+/// background lanes a successor starts at boot: longer than the successor's own
+/// grant-hold budget, so the lanes start only after Commit or after the
+/// candidate has already been told to exit.
+pub const UNCOMMITTED_CANDIDATE_HOLD_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
 /// Consecutive unconfirmed launches after which a freshly-swapped build is
 /// auto-reverted to its predecessor and marked failed.
 ///
@@ -1579,6 +1606,14 @@ pub fn spawn_background_check_with_source(
             // is logged once, not every cycle.
             let mut announced_installed: Option<u64> = None;
             let mut unverifiable_installed: Option<(u64, String)> = None;
+            // AN UNCOMMITTED CANDIDATE CHECKS NOTHING (2026-09-19): a handoff
+            // successor holds this thread until the outgoing process has
+            // committed to it — a check from a process the parent may still
+            // reject is a wasted request at best, and at worst the stage it
+            // finds is read by two processes with two opinions of it.
+            if wait_while_uncommitted_handoff_candidate(UNCOMMITTED_CANDIDATE_HOLD_BOUND) {
+                log("update checks waited for this handoff to be committed before the first");
+            }
             loop {
                 let Some(source) = source_provider() else {
                     if interval == 0 {

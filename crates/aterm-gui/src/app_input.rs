@@ -5721,8 +5721,28 @@ impl App {
                             // cue. `glyph_shifted` itself is left alone: it
                             // also feeds `note_typed_glyph`'s VISUAL `shifted`
                             // above, and the visuals were not asked to move.
+                            //
+                            // …AND THE LITERAL-TEXT PATH ASKS THE GLYPH TOO
+                            // (2026-09-19; owner, on v0.88.0: "shift key
+                            // needs the tones that I specified"). A press
+                            // the keymap could not encode reaches here as
+                            // `InputEvent::Text` — `typed` is `None` and
+                            // there are no modifier bits — so a capital
+                            // committed that way (a dead-key / layout
+                            // fallback, `option_as_meta = false`) clicked
+                            // as lowercase. One committed uppercase glyph
+                            // is a capital; a longer IME run is a phrase,
+                            // not a key, and stays unshifted.
+                            let committed_capital = ime.is_some_and(|text| {
+                                let mut glyphs = text.chars();
+                                matches!(
+                                    (glyphs.next(), glyphs.next()),
+                                    (Some(ch), None) if ch.is_uppercase()
+                                )
+                            });
                             let click_shifted = (glyph_shifted
-                                || typed.is_some_and(char::is_uppercase))
+                                || typed.is_some_and(char::is_uppercase)
+                                || committed_capital)
                                 && !spacebar;
                             if click_audible
                                 && ws.cursor_glow.cue_keystroke_shifted(
@@ -9483,6 +9503,19 @@ impl App {
                     let _ = self.migrate_active_tab_to_next_window();
                     return true;
                 }
+                // Cmd-Shift-L: THE LEDGER KEY (round 19) — the focused session's
+                // `aterm drive ledger @sid --format html`, opened in the browser.
+                // The default chord for `Action::OpenLedger` (keybinding parity);
+                // no other Cmd-Shift chord used `L`.
+                "l" | "L" => {
+                    // The chord has no `wid`: the ledger is the FRONT window's
+                    // focused session, as every other chord here acts on the
+                    // front window.
+                    if let Some(wid) = self.frontmost_window {
+                        self.open_session_ledger(wid);
+                    }
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -11162,6 +11195,8 @@ impl App {
             Action::FindPrev => {
                 let _ = self.search_find_again(false);
             }
+            // The ledger key: the same method the hardcoded ⇧⌘L calls.
+            Action::OpenLedger => self.open_session_ledger(wid),
             // Same verb + same find gate as the menu's SelectAll arm: the find
             // bar borrows the terminal selection for its match highlight, so
             // under an open find this is deliberately inert rather than wrong.
@@ -11299,7 +11334,7 @@ impl App {
         // sit above the band, so the frame row is the band row plus the chrome
         // height (the same shift the prepends apply to the cells themselves).
         let frame_cell = (
-            (cur.0.saturating_add(off.0)) as usize + usize::from(self.chrome_rows()),
+            (cur.0.saturating_add(off.0)) as usize + usize::from(self.chrome_rows(wid)),
             (cur.1.saturating_add(off.1)) as usize,
         );
         self.report_ime_cursor_area_frame(wid, frame_cell);
@@ -11784,6 +11819,56 @@ impl App {
                 if let Err(e) = self.open_connection_map() {
                     aterm_log::info!("connection map: {e}");
                 }
+            }
+            // THE FABRIC MENU (round 19, SPEC19 §9; the App side lives in
+            // `app_fabric_menu.rs`). Fleet… opens the connection map until the
+            // fleet screen exists (round 20) — the row's help says so.
+            MenuAction::Fleet => {
+                if let Err(e) = self.open_connection_map() {
+                    aterm_log::info!("fleet (the connection map until round 20): {e}");
+                }
+            }
+            // The rest act on the FRONT window — the "front tab is the
+            // subject" convention every other bar action uses.
+            MenuAction::Inbox => {
+                if let Some(wid) = self.frontmost_window {
+                    self.open_session_inbox_tab(wid);
+                }
+            }
+            MenuAction::LedgerForSession => {
+                if let Some(wid) = self.frontmost_window {
+                    self.open_session_ledger(wid);
+                }
+            }
+            MenuAction::HoldSession | MenuAction::LiftHold => {
+                if let Some(wid) = self.frontmost_window {
+                    self.menu_hold(wid, action == MenuAction::HoldSession);
+                }
+            }
+            MenuAction::FabricStatus | MenuAction::FabricOn | MenuAction::FabricOff => {
+                use crate::app_fabric_menu::FabricVerb;
+                let verb = match action {
+                    MenuAction::FabricOn => FabricVerb::On,
+                    MenuAction::FabricOff => FabricVerb::Off,
+                    _ => FabricVerb::Status,
+                };
+                if let Some(wid) = self.frontmost_window {
+                    self.run_fabric_cli(wid, verb);
+                }
+            }
+            // Window ▸ Set Role…: the pin's editor over the active tab, one
+            // field over (`meta role`).
+            MenuAction::SetRole => {
+                if let Some(wid) = self.frontmost_window {
+                    let _ = self.begin_active_session_meta_edit(
+                        wid,
+                        crate::session_timeline::MetaField::Role,
+                    );
+                }
+            }
+            // View ▸ Presence Band / Rim: flip the live bit and persist it.
+            MenuAction::TogglePresenceBand | MenuAction::TogglePresenceRim => {
+                self.user_toggle_presence(action);
             }
             MenuAction::CloseTab => {
                 // Same rule as Cmd-W: close the frontmost window's active tab; when
@@ -12305,6 +12390,7 @@ mod forwarded_release_handoff_activity_tests {
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
             park_at: std::time::Instant::now(),
             proof_ready_at: None,
+            activate_at_commit: false,
             attempt_id: 1,
             nonce: None,
             live: Vec::new(),
@@ -13086,6 +13172,82 @@ mod local_repeat_behavior_tests {
         assert_eq!(after.line, before.line);
         assert_eq!(after.col, before.col + 1);
         assert!(app.take_local_repeat_release(wid, physical));
+    }
+}
+
+#[cfg(test)]
+mod ledger_key_tests {
+    //! Round 19, item 6: THE LEDGER KEY. ⇧⌘L with a session focused composes
+    //! `aterm drive ledger @<sid> --format html --out <file>` for THAT session
+    //! (headless: composed, not launched); the chord is in the documented
+    //! built-in roster, no other built-in chord uses it, and the bindable
+    //! `open_ledger` action does the same thing.
+
+    use crate::keybinding::{Action, BUILTIN_CMD_CHORDS, Chord};
+    use crate::{App, WindowId};
+    use winit::event::{ElementState, KeyEvent};
+    use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr};
+
+    fn shift_l() -> KeyEvent {
+        KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(KeyCode::KeyL),
+            Key::Character(SmolStr::new("L")),
+            None,
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+        )
+    }
+
+    #[test]
+    fn cmd_shift_l_composes_the_focused_sessions_ledger_command() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let sid = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(sid));
+        app.frontmost_window = Some(wid);
+        let stable = app
+            .pool
+            .get(sid)
+            .expect("stub pooled")
+            .ctx
+            .self_id
+            .as_str()
+            .to_string();
+        assert!(app.last_ledger_plan.is_none());
+
+        // The hardcoded chord.
+        let fired =
+            app.on_key_super_shift_chord(ModifiersState::SUPER | ModifiersState::SHIFT, &shift_l());
+        assert!(fired, "⇧⌘L is consumed, never typed into the PTY");
+        let plan = app.last_ledger_plan.clone().expect("a plan was composed");
+        assert_eq!(plan.sid, stable);
+        assert_eq!(plan.argv[..2], ["drive", "ledger"]);
+        assert_eq!(plan.argv[2], format!("@{stable}"));
+        assert_eq!(plan.argv[3..6], ["--format", "html", "--out"]);
+        assert_eq!(plan.argv[6], plan.out.to_string_lossy());
+
+        // Without Shift it is not the ledger key (Cmd-L is nothing).
+        app.last_ledger_plan = None;
+        assert!(!app.on_key_super_shift_chord(ModifiersState::SUPER, &shift_l()));
+        assert!(app.last_ledger_plan.is_none());
+
+        // The bindable action is the same method.
+        app.dispatch_action(wid, Action::OpenLedger);
+        assert_eq!(
+            app.last_ledger_plan.as_ref().map(|p| p.sid.as_str()),
+            Some(stable.as_str())
+        );
+        assert_eq!(Action::parse("open_ledger"), Some(Action::OpenLedger));
+
+        // Documented, and alone on its chord.
+        let chord = Chord::parse("cmd+shift+l").expect("parses");
+        let rows: Vec<&(&str, &str)> = BUILTIN_CMD_CHORDS
+            .iter()
+            .filter(|(c, _)| Chord::parse(c).ok().as_ref() == Some(&chord))
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1, "Open Session Ledger");
     }
 }
 
@@ -23834,6 +23996,7 @@ mod homecoming_rate_law_tests {
         let ws = app.windows.get_mut(&wid).expect("window");
         for step in 0..100u64 {
             let frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
                 now: t + Duration::from_millis(100 * step),
                 caret: Some((5, 10)),
                 rows: 24,

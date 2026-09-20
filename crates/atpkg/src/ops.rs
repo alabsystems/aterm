@@ -14,6 +14,39 @@ use std::path::{Path, PathBuf};
 use crate::Layout;
 use crate::store::ToolName;
 
+// TEST-ONLY: how many times THIS THREAD has listed `bin/` through `read_bin_dir`.
+//
+// Thread-local, not a global: the test harness runs each `#[test]` on its own thread, so a
+// counter per thread is exactly "what this test's pass did" and cannot be corrupted by
+// whatever is running beside it. Plain `//`, not `///`: a doc comment on a macro invocation
+// is `unused_doc_comments`, which this crate's gate takes as an error.
+#[cfg(test)]
+thread_local! {
+    static BIN_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// TEST-ONLY: the listing count since [`reset_bin_scans`].
+#[cfg(test)]
+pub(crate) fn bin_scans() -> usize {
+    BIN_SCANS.with(std::cell::Cell::get)
+}
+
+/// TEST-ONLY: start counting from zero.
+#[cfg(test)]
+pub(crate) fn reset_bin_scans() {
+    BIN_SCANS.with(|n| n.set(0));
+}
+
+/// List `bin/` — the ONE door every scan in this module and in [`crate::activate`] goes
+/// through, so the test counter above measures all of them and a pass's cost is a number a
+/// test can pin rather than a thing to reason about. Byte-identical to the
+/// `std::fs::read_dir(layout.bin_dir())` it replaced outside `cfg(test)`.
+pub(crate) fn read_bin_dir(layout: &Layout) -> io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    BIN_SCANS.with(|n| n.set(n.get().saturating_add(1)));
+    std::fs::read_dir(layout.bin_dir())
+}
+
 /// Resolve `tool` to the store path its `bin/<tool>` shim points at, if installed
 /// (`atpkg which`). Returns the raw symlink target (e.g.
 /// `…/store/<program>/<build>/bin/<tool>`), or `None` when there is no shim.
@@ -43,6 +76,74 @@ pub fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
     let shim = layout.shim(&ToolName::new(tool)?);
     let target = crate::platform::resolve_shim(&shim)?;
     Some(crate::compat::route_for_shim(&shim, &target).unwrap_or(target))
+}
+
+/// ONE listing of `bin/`, resolved ONCE: per entry, the logical [`ToolName`] its file name
+/// spells and the target its shim forwards to.
+///
+/// Every READING pass over `bin/` asks those same two questions of every entry, and each
+/// used to open the directory again and re-read every shim file to answer them. The
+/// six-hourly reconcile (`cli::reconcile_aliases`) did it once to find the programs and then
+/// twice more PER PROGRAM — `active_tools` and the prune — so a twelve-program machine paid
+/// twenty-five listings, each resolving every shim in the directory, per pass and again on
+/// the launch path. The readers now share one photograph.
+///
+/// **NOT FOR A PREDICATE THAT DELETES.** A snapshot is a photograph, and between the capture
+/// and a later decision the directory can change — this pass's own writes, a concurrent
+/// install — so a stale target is exactly how a deleting predicate acquires a blast radius
+/// wider than the one it was reviewed with. Every site that REMOVES a file
+/// ([`crate::activate::prune_stale_shims`], [`crate::activate::undo_activation`],
+/// [`crate::activate::sweep_agents_dir`]) therefore keeps listing the directory itself, at
+/// the moment it decides, and none of them is given one of these. This type serves the
+/// readers only.
+pub(crate) struct BinScan {
+    entries: Vec<BinEntry>,
+}
+
+/// One `bin/` entry as [`BinScan`] read it.
+struct BinEntry {
+    /// The logical name, `None` for an entry no [`ToolName`] admits (a name
+    /// [`crate::store::shim_allowed`] refuses, or one that is not UTF-8) — the same entries
+    /// the per-site scans skipped.
+    tool: Option<ToolName>,
+    /// What the shim forwards to, `None` for a tombstone, a pending stub, or anything
+    /// unresolvable.
+    target: Option<PathBuf>,
+}
+
+impl BinScan {
+    /// Photograph `bin/` now. An unreadable directory is an EMPTY scan — the answer every
+    /// one of these scans already gave for one.
+    pub(crate) fn capture(layout: &Layout) -> Self {
+        let mut entries = Vec::new();
+        let Ok(listing) = read_bin_dir(layout) else {
+            return Self { entries };
+        };
+        for e in listing.flatten() {
+            entries.push(BinEntry {
+                tool: e
+                    .file_name()
+                    .to_str()
+                    .and_then(crate::store::ToolName::from_shim_file),
+                // resolve_shim, NOT `read_link`: on Windows a shim is a `.cmd` regular file
+                // that `read_link` Errs on — the reason every scan here already used it.
+                target: crate::platform::resolve_shim(&e.path()),
+            });
+        }
+        Self { entries }
+    }
+
+    /// The resolved target of every entry that has one, in listing order.
+    fn targets(&self) -> impl Iterator<Item = &Path> {
+        self.entries.iter().filter_map(|e| e.target.as_deref())
+    }
+
+    /// Every entry that both names a tool and resolves, in listing order.
+    fn tools(&self) -> impl Iterator<Item = (&ToolName, &Path)> {
+        self.entries
+            .iter()
+            .filter_map(|e| Some((e.tool.as_ref()?, e.target.as_deref()?)))
+    }
 }
 
 /// Parse `(program, build)` out of a shim target like
@@ -134,7 +235,7 @@ pub(crate) fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u6
 /// ([`crate::activate::Aliases`]) — so they are left out: a sysroot dev link that had to
 /// cover `alab-trustc` would abort on every checkout, and a link is what this feeds.
 pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> {
-    let shims = std::fs::read_dir(layout.bin_dir()).ok()?;
+    let shims = read_bin_dir(layout).ok()?;
     let mut out = Vec::new();
     for shim in shims.flatten() {
         let Some(target) = crate::platform::resolve_shim(&shim.path()) else {
@@ -156,14 +257,19 @@ pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> 
 }
 
 pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
+    active_builds_in(&BinScan::capture(layout))
+}
+
+/// [`active_builds`] over a `bin/` listing already taken — for a pass that asks this and
+/// [`active_tools_in`] of the same directory and must not re-read it for each.
+///
+/// The `presence` stat below is deliberately NOT part of the snapshot: it is the one answer
+/// here that a photograph must not carry, because "is the store still there" is exactly what
+/// goes stale, and this map is required to agree with [`crate::gc::live_builds`].
+#[must_use]
+pub(crate) fn active_builds_in(scan: &BinScan) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
-    let Ok(shims) = std::fs::read_dir(layout.bin_dir()) else {
-        return out;
-    };
-    for shim in shims.flatten() {
-        let Some(target) = crate::platform::resolve_shim(&shim.path()) else {
-            continue;
-        };
+    for target in scan.targets() {
         // A shim that NAMES a build is not the same as a build that is there.
         // `resolve_shim` reads the stub's target, and `program_build_of_target`
         // parses the program and build out of that PATH — neither touches the
@@ -183,10 +289,10 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
         // an admin laid down and this user may execute but not stat read as deleted,
         // and `list`, `which` and Settings ▸ Packages all reported a working toolchain
         // missing. `presence` keeps the third answer apart ([`crate::store::Presence`]).
-        if crate::store::presence(&target).is_absent() {
+        if crate::store::presence(target).is_absent() {
             continue;
         }
-        if let Some((program, build)) = program_build_of_target(&target) {
+        if let Some((program, build)) = program_build_of_target(target) {
             // Last write wins. The tools of one program USUALLY agree, and where they do not
             // the winner is `read_dir` order — see the doc comment: never make a destructive
             // decision from this number.
@@ -213,7 +319,14 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
 /// program exposes" never treats an alias as a tool of its own.
 #[must_use]
 pub fn active_tools(layout: &Layout, program: &str, build: u64) -> Vec<ToolName> {
-    active_names(layout, program, build, false)
+    active_names_in(&BinScan::capture(layout), program, build, false)
+}
+
+/// [`active_tools`] over a `bin/` listing already taken. See [`BinScan`] for why no caller
+/// that DELETES is given one.
+#[must_use]
+pub(crate) fn active_tools_in(scan: &BinScan, program: &str, build: u64) -> Vec<ToolName> {
+    active_names_in(scan, program, build, false)
 }
 
 /// The `alab-<tool>` ALIAS names whose `bin/` shims currently point into
@@ -222,32 +335,23 @@ pub fn active_tools(layout: &Layout, program: &str, build: u64) -> Vec<ToolName>
 /// rollback verb's policy probe). Sorted; empty when the program has no aliases laid.
 #[must_use]
 pub fn active_aliases(layout: &Layout, program: &str, build: u64) -> Vec<ToolName> {
-    active_names(layout, program, build, true)
+    active_names_in(&BinScan::capture(layout), program, build, true)
 }
 
 /// The shared scan behind [`active_tools`] (`aliases == false`) and [`active_aliases`]
 /// (`true`).
-fn active_names(layout: &Layout, program: &str, build: u64, aliases: bool) -> Vec<ToolName> {
+fn active_names_in(scan: &BinScan, program: &str, build: u64, aliases: bool) -> Vec<ToolName> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
-        return out;
-    };
-    for e in entries.flatten() {
-        // resolve_shim, NOT std::fs::read_link: on Windows a shim is a `.cmd` regular file
-        // (read_link Errs on it), so a raw read_link returns [] and a rollback/tombstone
-        // pass would re-point nothing. resolve_shim reads the symlink on Unix and parses the
-        // `.cmd` on Windows — matching active_builds() above.
-        let Some(target) = crate::platform::resolve_shim(&e.path()) else {
-            continue;
-        };
-        if let Some((p, b)) = program_build_of_target(&target)
+    // The scan resolved each entry with `resolve_shim`, NOT `std::fs::read_link`: on Windows
+    // a shim is a `.cmd` regular file (read_link Errs on it), so a raw read_link would list
+    // nothing and a rollback/tombstone pass would re-point nothing.
+    for (tool, target) in scan.tools() {
+        if let Some((p, b)) = program_build_of_target(target)
             && p == program
             && b == build
-            && let Some(name) = e.file_name().to_str()
-            && let Some(tool) = ToolName::from_shim_file(name)
             && tool.is_alias() == aliases
         {
-            out.push(tool);
+            out.push(tool.clone());
         }
     }
     out.sort();
@@ -255,7 +359,11 @@ fn active_names(layout: &Layout, program: &str, build: u64, aliases: bool) -> Ve
 }
 
 /// List installed `(program, build)` pairs by walking `store/<program>/<build>/`
-/// (`atpkg list`). Sorted by program then build. Non-numeric build dirs are ignored.
+/// (`atpkg list`). Sorted by program then build.
+///
+/// A build directory is recognised by [`crate::store::parse_build_name`] — the store's own
+/// canonical rule, the one the delete paths use — so a name this manager never wrote
+/// (`+19/`, `019/`) is not an installed build.
 #[must_use]
 pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
     let mut out = Vec::new();
@@ -283,8 +391,23 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
             for b in builds.flatten() {
                 let bname_os = b.file_name();
                 let bname_str = crate::call1(std::ffi::OsString::as_os_str, &bname_os);
+                // THE STORE'S CANONICAL RECOGNISER, not a bare `u64::from_str`, which
+                // accepts a leading `+` and any number of leading zeros. The producer
+                // writes neither (`crate::dec_u64` renders a canonical decimal), so those
+                // spellings are somebody else's directories — the same rule
+                // `stage_scratch_of` and gc's partial arm were tightened to on 2026-09-17,
+                // and this was the last reader still reading them loosely.
+                //
+                // It is not a reporting detail. The number is parsed off ONE directory's
+                // name and every consumer then addresses ANOTHER — `Layout::build_dir`
+                // renders the canonical spelling — so the completeness gate below vouched
+                // for `+19/` while `gc`'s reclaim loop, whose candidates come from here,
+                // acted on `19/`. A `+19/` beside a real build 17 took the rollback slot
+                // from it (`reclaimable_with_provisional` keeps the highest installed
+                // build below the live one) and 17 was deleted to keep a build number that
+                // did not exist.
                 if let Some(n) = crate::call1(std::ffi::OsStr::to_str, bname_str)
-                    .and_then(|s| s.parse::<u64>().ok())
+                    .and_then(crate::store::parse_build_name)
                 {
                     // Only COMPLETE builds count. A build dir left partial by a crash
                     // mid-extract has no completeness marker; counting it as installed
@@ -687,6 +810,46 @@ mod tests {
         assert_eq!(
             list_installed(&l),
             vec![("ay".into(), 18), ("ny".into(), 9), ("ny".into(), 10)]
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// THE LISTING OBEYS THE STORE'S OWN STRICT RECOGNISER. `u64::from_str` accepts a
+    /// leading `+` and any number of leading zeros; the producer writes neither
+    /// ([`crate::dec_u64`] renders a canonical decimal), so `+19/` and `019/` are somebody
+    /// else's directories — and every canonical recogniser around the delete paths already
+    /// refuses them ([`crate::store::parse_build_name`], and through it `stage_scratch_of`
+    /// and gc's partial arm, 2026-09-17).
+    ///
+    /// Left lenient here this was never merely cosmetic, because the number is parsed off
+    /// ONE directory's name and then used to address ANOTHER: [`Layout::build_dir`] renders
+    /// the canonical spelling, so the completeness gate vouched for `+19/` while every
+    /// consumer went on to act on `19/`. See
+    /// `a_marker_bearing_lookalike_cannot_displace_the_rollback_target` in [`crate::gc`]
+    /// for the reclaim that cost a real build.
+    #[test]
+    fn list_installed_reads_only_the_canonical_build_name() {
+        let l = layout("canonical-build-names");
+        install(&l, "ay", 18);
+        for lookalike in ["+19", "019"] {
+            let dir = l.prefix.join("store").join("ay").join(lookalike);
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::write(
+                dir.join("bin").join(tool("ay").exe_file()),
+                b"#!/bin/true\n",
+            )
+            .unwrap();
+            crate::store::mark_build_ready(&dir).unwrap();
+            assert!(
+                crate::store::build_is_complete(&dir),
+                "{lookalike} must look every bit as complete as a real build, or the \
+                 fixture proves nothing"
+            );
+        }
+        assert_eq!(
+            list_installed(&l),
+            vec![("ay".into(), 18)],
+            "a build-number lookalike is not an installed build"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }

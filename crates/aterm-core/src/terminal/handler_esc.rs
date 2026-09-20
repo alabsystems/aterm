@@ -506,6 +506,8 @@ impl TerminalHandler<'_> {
         // modes back to CursorStyle::default(), but the host's configured default must
         // survive RIS (host preference, not app state, like the policy flags above).
         self.modes.cursor_style = *self.default_cursor_style;
+        // Mode 12 mirrors the style's blink bit (see `set_cursor_blink`).
+        self.modes.cursor_blink = self.modes.cursor_style.blinks();
 
         // Fire callbacks for state that changed and has UI side-effects.
         if old_cursor_style != self.modes.cursor_style {

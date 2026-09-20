@@ -281,6 +281,7 @@ impl BrainRig {
     /// not host work, so it stays inside.)
     fn tick(&mut self) -> PetFrame {
         self.brain.tick(PetSense {
+            caret_drawn: true,
             now: self.now,
             caret: black_box(self.caret),
             rows: ROWS,

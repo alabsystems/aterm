@@ -22898,27 +22898,31 @@ pub struct RibbonVertex {
     /// is exactly the "soft tall smear with no crisp baseline strip" the
     /// owner rejected; the strip is a NARROW element whatever the body above
     /// it looks like, so its span travels with the vertex. Below the spine
-    /// the lift still melts over [`RIBBON_LIFT_DN_SHARE`] of the reach.
+    /// the lift still melts over [`RIBBON_LIFT_DN_MELT`] of the reach.
     pub lift_span: f32,
 }
 
 /// The share of the downward reach the spine's lift melts over — inside the
 /// next row's ink-free top margin (§4: the glyph band starts `0.22` of a cell
 /// below the cell top; the reach is `0.25..0.29`), with zero slope at its end.
-pub const RIBBON_LIFT_DN_SHARE: f32 = 0.6;
-
-/// The share of the reach the lift's DOWNWARD melt actually spans — narrower
-/// than [`RIBBON_LIFT_DN_SHARE`] since 2026-08-31: at 0.6 the strip's
-/// \>=75%-of-peak zone measured six device rows against the 2-4 px crisp
-/// bar. 0.45 is the narrowest melt whose steeper underside still fits the
-/// composited per-row ledge budget beside the body's own melt (0.35
-/// measured a 38/255 median-column row delta against the 34 budget). Still
-/// C1 at its end, still inside the next row's ink-free top margin.
+///
+/// THE ONE SPELLING. This was 0.6 under the name `RIBBON_LIFT_DN_SHARE` until
+/// 2026-08-31, when it narrowed to 0.45: at 0.6 the strip's \>=75%-of-peak zone
+/// measured six device rows against the 2-4 px crisp bar. 0.45 is the narrowest
+/// melt whose steeper underside still fits the composited per-row ledge budget
+/// beside the body's own melt (0.35 measured a 38/255 median-column row delta
+/// against the 34 budget). Still C1 at its end.
+///
+/// The old constant OUTLIVED that change — kept at 0.6, referenced by no code,
+/// and still named as the law by three doc sites while the profile below read
+/// this one. Nothing moved on glass, because both rasterizers call the single
+/// `ribbon_lift_profile`; what was wrong was every doc that told a reader where
+/// the lift ends. One number, one name.
 pub const RIBBON_LIFT_DN_MELT: f32 = 0.45;
 
 /// **THE LIFT'S TRANSVERSE PROFILE** — `1.0` at the spine, exactly `0.0` at
 /// the producer-named strip span above it ([`RibbonVertex::lift_span`]) and at
-/// [`RIBBON_LIFT_DN_SHARE`] of the reach below it, C¹ at all three. Total: a
+/// [`RIBBON_LIFT_DN_MELT`] of the reach below it, C¹ at all three. Total: a
 /// span that is not positive, or a non-finite `d`, is `0.0`.
 #[inline]
 #[must_use]

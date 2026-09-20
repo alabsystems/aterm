@@ -106,10 +106,99 @@ pub fn under_protected_root(home: &Path, path: &Path) -> bool {
         .any(|(lib, domain)| first == *lib && second == *domain)
 }
 
+/// Whether `path` lies at or under a FILE PROVIDER domain specifically — iCloud
+/// Drive (`Library/Mobile Documents`) or a third-party sync provider
+/// (`Library/CloudStorage`).
+///
+/// Narrower than [`under_protected_root`] on purpose. The `$HOME` folders and
+/// `/Volumes` are classes a held Full Disk Access grant reaches, so refusing
+/// them would block ordinary work the owner has already consented to once. The
+/// file-provider domains are the one class the design records as **not**
+/// reliably covered by that grant (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md`
+/// §3.4, and `NEVER_COVERED` in the `privacy` verb): an access there can raise
+/// `"aterm" wants to access files managed by "iCloud Drive"` no matter what the
+/// owner has granted.
+///
+/// That matters wherever a path can arrive from INSIDE a session, because a
+/// consent dialog a program can raise in aterm's name is a consent surface an
+/// agent controls — the same rule that fences the warm-up and `tccutil reset`
+/// to the Security panel.
+///
+/// Purely lexical, per component, like its sibling. Shares [`LIBRARY_DOMAINS`],
+/// so the two predicates cannot drift.
+#[must_use]
+pub fn under_file_provider_domain(home: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(home) else {
+        return false;
+    };
+    let mut components = rest.components().filter_map(|component| match component {
+        Component::Normal(name) => Some(name),
+        _ => None,
+    });
+    let (Some(first), Some(second)) = (components.next(), components.next()) else {
+        return false;
+    };
+    LIBRARY_DOMAINS
+        .iter()
+        .any(|(lib, domain)| first == *lib && second == *domain)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The FILE PROVIDER predicate is strictly narrower than its sibling: it
+    /// answers `true` for the two sync domains and `false` for every other
+    /// protected root, because those are reached by a held Full Disk Access
+    /// grant and these are not.
+    #[test]
+    fn only_the_file_provider_domains_are_named_by_the_narrow_predicate() {
+        let home = PathBuf::from("/Users//someone");
+        let provider = [
+            "/Users//someone/Library/Mobile Documents",
+            "/Users//someone/Library/Mobile Documents/com~apple~CloudDocs/notes.md",
+            "/Users//someone/Library/CloudStorage",
+            "/Users//someone/Library/CloudStorage/SomeProvider-someone/notes.md",
+        ];
+        for p in provider {
+            assert!(
+                under_file_provider_domain(&home, Path::new(p)),
+                "{p} is a file-provider domain"
+            );
+            assert!(
+                under_protected_root(&home, Path::new(p)),
+                "{p} is also protected at large"
+            );
+        }
+        // Protected, but NOT file-provider: a held grant reaches these, so the
+        // narrow predicate must not claim them or it would refuse ordinary work.
+        let protected_elsewhere = [
+            "/Users//someone/Documents/notes.md",
+            "/Users//someone/Desktop/notes.md",
+            "/Users//someone/Downloads/a/b",
+            "/Users//someone/Pictures/x",
+            "/Volumes/External/notes.md",
+        ];
+        for p in protected_elsewhere {
+            assert!(
+                !under_file_provider_domain(&home, Path::new(p)),
+                "{p} is protected but is not a file-provider domain"
+            );
+        }
+        // Per component, never a string prefix, and `~/Library` alone is neither.
+        for p in [
+            "/Users//someone/Library",
+            "/Users//someone/Library/CloudStoragex/a",
+            "/Users//someone/Library/Application Support/aterm",
+            "/Users//other/Library/CloudStorage/x",
+            "/Users//someone",
+        ] {
+            assert!(
+                !under_file_provider_domain(&home, Path::new(p)),
+                "{p} must not match"
+            );
+        }
+    }
 
     /// The predicate, as a table: every root the design names answers `true`, and the
     /// shapes that merely resemble one answer `false`.

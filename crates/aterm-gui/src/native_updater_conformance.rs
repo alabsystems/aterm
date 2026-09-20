@@ -380,7 +380,9 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
 
     assert!(state["trial"] == 1 && state["first_present_done"] == 0);
     assert!(
-        !crate::should_dispatch_boot_health_confirmation(false, false, false, false, true, true),
+        !crate::should_dispatch_boot_health_confirmation(
+            false, false, false, false, true, true, false
+        ),
         "negative control: a live OS window is not evidence that any content presented"
     );
     assert!(
@@ -402,18 +404,31 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
     let presented = model.successors("PresentInstalledUi", &state)[0].clone();
     assert_exact_model_action(&model, "PresentInstalledUi", &state, &presented);
     assert!(crate::should_dispatch_boot_health_confirmation(
-        false, false, true, false, true, true,
+        false, false, true, false, true, true, false,
     ));
     assert!(
-        !crate::should_dispatch_boot_health_confirmation(false, false, true, true, true, true),
+        !crate::should_dispatch_boot_health_confirmation(
+            false, false, true, false, true, true, true
+        ),
+        "an uncommitted handoff candidate proves no health: its parent may still reject it \
+         (2026-09-19), so the present it made is not this build's healthy launch"
+    );
+    assert!(
+        !crate::should_dispatch_boot_health_confirmation(
+            false, false, true, true, true, true, false
+        ),
         "the same present cannot enqueue a second confirmation"
     );
     assert!(
-        !crate::should_dispatch_boot_health_confirmation(true, false, true, false, true, false),
+        !crate::should_dispatch_boot_health_confirmation(
+            true, false, true, false, true, false, false
+        ),
         "headless proves health at the control-socket boundary, not on glass"
     );
     assert!(
-        crate::should_dispatch_boot_health_confirmation(true, true, false, false, true, false),
+        crate::should_dispatch_boot_health_confirmation(
+            true, true, false, false, true, false, false
+        ),
         "a bound control socket (or none configured) is the headless health proof"
     );
     let proved = model.successors("ProveInstalledHealth", &presented)[0].clone();
@@ -704,13 +719,24 @@ fn real_auto_intent_survives_manual_check_collision_and_unsuccessful_attempts() 
     assert_exact_model_action(&model, "Attempt", &modeled, &attempting);
     modeled = attempting;
 
-    let accepted = model.successors("AttemptAccepted", &modeled)[0].clone();
+    // THE PARK IS ITS OWN STEP between the attempt and its acceptance
+    // (2026-09-19, the late park): the attempt starts by launching the
+    // successor with every reader live, and only a parked attempt can be
+    // accepted — `AcceptedRequiresParkedReaders`.
+    let parked = model.successors("ParkReaders", &modeled)[0].clone();
+    assert_exact_model_action(&model, "ParkReaders", &modeled, &parked);
+    assert!(
+        model.successors("AttemptAccepted", &modeled).is_empty(),
+        "an unparked attempt cannot be accepted"
+    );
+    let accepted = model.successors("AttemptAccepted", &parked)[0].clone();
     assert_eq!(
         finish(AttemptResult::Accepted),
         AttemptDisposition::Complete
     );
-    assert_exact_model_action(&model, "AttemptAccepted", &modeled, &accepted);
+    assert_exact_model_action(&model, "AttemptAccepted", &parked, &accepted);
     assert_eq!(accepted["accepted"], 1);
+    assert!(model.check_invariant("AcceptedRequiresParkedReaders", &accepted));
 
     assert_eq!(finish(AttemptResult::Blocked), AttemptDisposition::Retry);
     let retryable = model.successors("AttemptDidNotReplace", &modeled)[0].clone();
@@ -784,20 +810,187 @@ fn real_auto_intent_bounds_activity_deferral_instead_of_waiting_forever() {
     );
     let attempted = model.successors("Attempt", &closed)[0].clone();
     assert_exact_model_action(&model, "Attempt", &closed, &attempted);
-    assert_eq!(attempted["parked"], 1);
-    assert!(model.check_invariant(
-        "AutomaticAttemptRequiresQuietOrClosedGraceWindow",
-        &attempted
-    ));
+    assert_eq!(
+        attempted["parked"], 0,
+        "the attempt STARTS by launching the successor; nothing is parked yet"
+    );
+
+    // THE PARK IS ITS OWN GATED STEP (2026-09-19, the late park). The launch
+    // above cost the user nothing — every reader stayed live through the
+    // successor's swap and boot — and this is the step they feel.
+    let parked = model.successors("ParkReaders", &attempted)[0].clone();
+    assert_exact_model_action(&model, "ParkReaders", &attempted, &parked);
+    assert_eq!(parked["parked"], 1);
+    assert!(model.check_invariant("AutomaticAttemptRequiresQuietOrClosedGraceWindow", &parked));
 
     // Negative control: parking with neither a quiet machine nor a closed window
     // is the unsafe shape the invariant exists to reject.
-    let mut unbounded = attempted.clone();
+    let mut unbounded = parked.clone();
     unbounded.insert("grace_expired", 0);
     assert!(!model.check_invariant(
         "AutomaticAttemptRequiresQuietOrClosedGraceWindow",
         &unbounded
     ));
+}
+
+/// THE REAL PARK GATE, bound to the model step it implements (2026-09-19).
+///
+/// `Attempt` is the LAUNCH and is gated by the poll policy (the test above);
+/// `ParkReaders` is the freeze and is gated by `prelaunch_park_admitted`. Bind
+/// the shipping predicate to the model's guard over every combination of the
+/// facts the model can express, so a rule that drifts out of one of them fails
+/// here rather than on a user's terminal.
+#[test]
+fn real_park_gate_admits_exactly_the_model_s_reader_park() {
+    use crate::app_update_handoff::{
+        ParkGate, ParkGateFacts, prelaunch_hold_cap, prelaunch_park_admitted,
+    };
+    let model = native_update_auto_intent_model();
+    // Walk to the Attempting phase (launched, nothing parked) the way the
+    // reducer does: a stage lands while idle, the quiet epoch elapses, attempt.
+    let mut state = model.init_state();
+    for action in ["StageWakeIdle", "QuietElapsed", "Attempt"] {
+        let next = model.successors(action, &state)[0].clone();
+        assert_exact_model_action(&model, action, &state, &next);
+        state = next;
+    }
+    assert_eq!(state["phase"], 3);
+    assert_eq!(state["parked"], 0);
+
+    // The model's two facts, over both automatic modes and both ways of being
+    // admissible. `held_for` is zero throughout: the cap is the OTHER gate and
+    // has its own enumeration in `app_update_handoff::park_gate_tests`.
+    for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+        for quiet in [false, true] {
+            for grace_expired in [false, true] {
+                let mut modeled = state.clone();
+                modeled.insert("quiet", i64::from(quiet));
+                modeled.insert("grace_expired", i64::from(grace_expired));
+                let model_parks = !model.successors("ParkReaders", &modeled).is_empty();
+                assert_eq!(
+                    model_parks,
+                    quiet || grace_expired,
+                    "the model's guard is quiet-or-past-grace"
+                );
+                // The shipping predicate, given the same two facts and a machine
+                // that is otherwise calm. `AutomaticPastGrace` past its grace
+                // needs no quiet epoch; `Automatic` does.
+                let real = prelaunch_park_admitted(
+                    ParkGateFacts {
+                        mode,
+                        quiet,
+                        hands_off_keys: true,
+                        output_quiet: true,
+                        focused: true,
+                        masters_quiet: true,
+                        held_for: std::time::Duration::ZERO,
+                    },
+                    prelaunch_hold_cap(mode),
+                ) == ParkGate::Park;
+                let admissible = match mode {
+                    ApplyMode::Automatic => quiet,
+                    // The past-grace lane reaches the park only once its grace
+                    // has closed (its entry gate), and there it parks on a calm
+                    // machine whether or not the quiet epoch has elapsed.
+                    _ => true,
+                };
+                assert_eq!(real, admissible, "{mode:?} quiet={quiet}");
+                // And where the model refuses, the real gate must refuse too for
+                // the lane the model is describing.
+                if mode == ApplyMode::Automatic {
+                    assert_eq!(
+                        real,
+                        model_parks && quiet,
+                        "the quiet automatic lane and the model agree exactly"
+                    );
+                }
+            }
+        }
+    }
+
+    // NEGATIVE CONTROL: the mutant parks with neither fact, and the invariant
+    // catches it — which is what makes the guard above a claim about the code
+    // rather than a restatement of it.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut busy = state.clone();
+    busy.insert("quiet", 0);
+    busy.insert("grace_expired", 0);
+    assert!(
+        model.successors("ParkReaders", &busy).is_empty(),
+        "the healthy model never parks a busy terminal"
+    );
+    let parked = buggy.successors("ParkReaders", &busy)[0].clone();
+    assert!(!buggy.check_invariant("AutomaticAttemptRequiresQuietOrClosedGraceWindow", &parked));
+    // And the shipping gate refuses the same state on both automatic lanes.
+    for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+        assert!(matches!(
+            prelaunch_park_admitted(
+                ParkGateFacts {
+                    mode,
+                    quiet: false,
+                    hands_off_keys: true,
+                    output_quiet: false,
+                    focused: true,
+                    masters_quiet: true,
+                    held_for: std::time::Duration::ZERO,
+                },
+                prelaunch_hold_cap(mode),
+            ),
+            ParkGate::Wait(_)
+        ));
+    }
+}
+
+/// The hold cap and the re-park, bound to the model steps that describe them:
+/// a terminal that never goes quiet stands the attempt down with its intent
+/// retained and no reader ever stopped, and a park that missed its budget
+/// resumes the readers and is gated afresh.
+#[test]
+fn real_hold_cap_and_repark_match_the_model_s_unparked_states() {
+    let model = native_update_auto_intent_model();
+    let mut state = model.init_state();
+    for action in ["StageWakeIdle", "QuietElapsed", "Attempt"] {
+        state = model.successors(action, &state)[0].clone();
+    }
+    // The machine goes busy during the hold: the park waits.
+    let busy = model.successors("HoldActivity", &state)[0].clone();
+    assert_exact_model_action(&model, "HoldActivity", &state, &busy);
+    assert_eq!(busy["quiet"], 0);
+    assert!(
+        model.successors("ParkReaders", &busy).is_empty(),
+        "no park while the terminal is busy"
+    );
+    // It never goes quiet: the cap stands the attempt down, intent retained.
+    let stood_down = model.successors("HoldCapStandsDown", &busy)[0].clone();
+    assert_exact_model_action(&model, "HoldCapStandsDown", &busy, &stood_down);
+    assert_eq!(stood_down["phase"], 2, "back to Ready, not ManualOnly");
+    assert_eq!(stood_down["intent"], 1, "the intent survives a hold cap");
+    assert_eq!(stood_down["parked"], 0, "no reader was ever stopped");
+    assert!(model.check_invariant("UnsuccessfulAttemptRetainsIntent", &stood_down));
+
+    // Or it goes quiet again and the park lands, misses its budget, and is
+    // gated afresh — with the readers back both times.
+    let quiet_again = model.successors("HoldQuietElapsed", &busy)[0].clone();
+    assert_exact_model_action(&model, "HoldQuietElapsed", &busy, &quiet_again);
+    let parked = model.successors("ParkReaders", &quiet_again)[0].clone();
+    assert_eq!(parked["parked"], 1);
+    let reparked = model.successors("ReparkAfterMissedBudget", &parked)[0].clone();
+    assert_exact_model_action(&model, "ReparkAfterMissedBudget", &parked, &reparked);
+    assert_eq!(reparked["parked"], 0, "the readers resumed");
+    assert_eq!(reparked["accepted"], 0, "nothing was granted");
+    assert!(
+        !model.successors("ParkReaders", &reparked).is_empty(),
+        "and the re-park is gated afresh on a still-quiet machine"
+    );
+
+    // NO ACCEPTANCE WITHOUT A PARK: the unparked state cannot commit.
+    assert!(
+        model.successors("AttemptAccepted", &reparked).is_empty(),
+        "a Commit over a screen nobody froze is unreachable"
+    );
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let unparked_accept = buggy.successors("AttemptAccepted", &reparked)[0].clone();
+    assert!(!buggy.check_invariant("AcceptedRequiresParkedReaders", &unparked_accept));
 }
 
 #[test]

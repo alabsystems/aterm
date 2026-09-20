@@ -525,7 +525,9 @@ impl TerminalHandler<'_> {
     /// - `?12h` (set): cursor blinks
     /// - `?12l` (reset): cursor steady
     fn decrqss_cursor_blink(&self) -> String {
-        if self.modes.cursor_blink {
+        // The blink bit of the cursor STYLE — the fact the renderer acts on.
+        // See `set_cursor_blink` (handler_dec_refinement.rs).
+        if self.modes.cursor_style.blinks() {
             "?12h".to_string()
         } else {
             "?12l".to_string()

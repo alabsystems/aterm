@@ -518,6 +518,10 @@ pub(crate) enum ChromeMessage {
     ToolchainStatus,
     /// aterm's own self-update status band ([`crate::status_bars::Lane::Update`]).
     UpdateStatus,
+    /// The PRESENCE band ([`crate::status_bars::Lane::Presence`], round 19): who is
+    /// driving this window's session, its phase, its mail, its link — one row under
+    /// the tab strip, spoken as one sentence ("driven by manager, turn 41").
+    PresenceStatus,
 }
 
 impl ChromeMessage {
@@ -525,7 +529,8 @@ impl ChromeMessage {
     /// the window. Exhaustive by construction: a new variant that is not listed here is
     /// never published, and [`ChromeMessage::from_node`] would not round-trip it, which
     /// is what the slot round-trip test checks.
-    pub(crate) const ORDER: [Self; 5] = [
+    pub(crate) const ORDER: [Self; 6] = [
+        Self::PresenceStatus,
         Self::ToolchainStatus,
         Self::UpdateStatus,
         Self::PasteConfirm,
@@ -541,6 +546,7 @@ impl ChromeMessage {
             Self::ConfigWarning => 2,
             Self::ToolchainStatus => 3,
             Self::UpdateStatus => 4,
+            Self::PresenceStatus => 5,
         }
     }
 
@@ -564,9 +570,11 @@ impl ChromeMessage {
     const fn politeness(self) -> Live {
         match self {
             Self::PasteConfirm => Live::Assertive,
-            Self::Notice | Self::ConfigWarning | Self::ToolchainStatus | Self::UpdateStatus => {
-                Live::Polite
-            }
+            Self::Notice
+            | Self::ConfigWarning
+            | Self::ToolchainStatus
+            | Self::UpdateStatus
+            | Self::PresenceStatus => Live::Polite,
         }
     }
 
@@ -585,6 +593,8 @@ impl ChromeMessage {
                     Role::Status
                 }
             }
+            // The band never draws a meter: a status line, whatever the row says.
+            Self::PresenceStatus => Role::Status,
         }
     }
 }
@@ -1969,11 +1979,21 @@ mod tests {
     #[test]
     fn message_ids_round_trip_are_stable_and_are_never_read_as_a_tab() {
         let snap = live_grid(2, 20, b"hi", None);
+        assert_eq!(
+            ChromeMessage::ORDER.len(),
+            6,
+            "the presence band is the sixth message"
+        );
         for kind in ChromeMessage::ORDER {
             let id = NodeId(MESSAGE_BASE + kind.slot());
             assert_eq!(ChromeMessage::from_node(id), Some(kind));
             assert_eq!(tab_index_for(id), None, "{kind:?} is not a tab");
         }
+        assert_eq!(
+            ChromeMessage::from_node(NodeId(MESSAGE_BASE + ChromeMessage::PresenceStatus.slot())),
+            Some(ChromeMessage::PresenceStatus),
+            "the band's slot round-trips"
+        );
         assert_eq!(
             ChromeMessage::from_node(NodeId(MESSAGE_BASE + 99)),
             None,

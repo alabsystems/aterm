@@ -337,6 +337,26 @@ impl App {
         intent: crate::DeferredHandoffTeardown,
     ) -> bool {
         if self.pending_update_handoff.is_none() {
+            // A HELD SUCCESSOR WITH NOTHING PARKED IS NO BARRIER (2026-09-19, the
+            // late park): it holds no descriptor, so nothing the teardown does
+            // can strand a session. The intent proceeds now.
+            //
+            // THROUGH THE TYPED STAND-DOWN, not a raw cancel poke (review round
+            // 1): the poke reaches the worker, but the park GATE is main-thread
+            // state and would have stayed armed — so the next 20 ms tick could
+            // freeze every reader onto a successor this very call had just
+            // cancelled. `stand_down_prelaunched_successor` shuts the gate and
+            // falls back to the poke by itself.
+            if self.update_handoff_prelaunch.is_some() {
+                self.note_update_handoff_activity();
+                self.stand_down_prelaunched_successor(
+                    crate::app_update_handoff::HandoffStandDown {
+                        outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
+                        detail: "a destructive intent arrived while the successor held its claim"
+                            .to_string(),
+                    },
+                );
+            }
             return false;
         }
         // This is commit revocation, not just a wake hint. Some native/control
@@ -1184,7 +1204,7 @@ impl App {
         // first `resumed` attach reaches this function.
         let startup_attach_entry = Instant::now();
         // The window holds the terminal grid PLUS the tab-strip rows at the top PLUS
-        // independent configured top and base bottom padding. `window_frame_px`
+        // independent configured top and base bottom padding. `window_frame_px_for`
         // folds in both; with both zero this is the original `rows * ch`. Chrome headroom
         // is deliberately 0 here — no NSWindow exists yet to
         // measure a titlebar band; the post-attach `set_head` + size recompute
@@ -1193,13 +1213,13 @@ impl App {
             let (cw, ch) = seed_cell_px(self.font_px);
             let pad = self.cfg_pad_for_scale(1.0);
             let vertical_pad = pad.saturating_add(self.cfg_pad_top_for_scale(1.0));
-            let total_rows = rows.saturating_add(self.chrome_rows());
+            let total_rows = rows.saturating_add(self.chrome_rows(wid));
             PhysicalSize::new(
                 (cols as usize * cw + pad.saturating_mul(2)) as u32,
                 (total_rows as usize * ch + vertical_pad) as u32,
             )
         } else {
-            self.window_frame_px(rows, cols)
+            self.window_frame_px_for(wid, rows, cols)
         };
         let attrs = Window::default_attributes()
             .with_title("aterm")
@@ -1520,7 +1540,7 @@ impl App {
                 })
                 .flatten();
             if let Some((cell_w, cell_h)) = cached {
-                // The exact-frame twin of `window_frame_px` (`frame_size` +
+                // The exact-frame twin of `window_frame_px_for` (`frame_size` +
                 // `visible_frame_height`), computed from the CACHED cell
                 // metrics because the backend that owns the live derivation is
                 // precisely what has not joined yet. Any drift between this
@@ -1538,11 +1558,11 @@ impl App {
                     .round()
                     .max(0.0) as usize
                     + self.synthetic_strip_head_px(scale, cell_h);
-                let total_rows = rows.saturating_add(self.chrome_rows()) as usize;
+                let total_rows = rows.saturating_add(self.chrome_rows(wid)) as usize;
                 // THE SHARED LAW, not a second copy of it. `frame_size_px` is what
                 // `Renderer::frame_size` itself is, and `visible_frame_height` is the
                 // same top-pad crop `Backend::frame_size` applies over it — so this
-                // prediction and the post-join `window_frame_px` below differ ONLY in
+                // prediction and the post-join `window_frame_px_for` below differ ONLY in
                 // where the cell box came from (cached here, live there). Open-coding
                 // the arithmetic is what would let the two drift, and the `head` term
                 // is exactly the one a synthetic tab band makes non-zero.
@@ -1756,7 +1776,7 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.metrics = crate::MetricsView::applied(self.font_px, pad, pad_top, head);
         }
-        size = self.window_frame_px(rows, cols);
+        size = self.window_frame_px_for(wid, rows, cols);
         let _ = window.request_inner_size(size);
         // (L1) The warm-launch contract, verified: the frame revealed BEFORE
         // the join must equal the frame the joined backend just derived, so the
@@ -2189,9 +2209,9 @@ impl App {
         }
         // Re-tune the shared backend to THIS window's live scale before deriving
         // the target frame — a `ScaleFactorChanged` may have landed since attach
-        // and `window_frame_px` reads the backend's current cell metrics.
+        // and `window_frame_px_for` reads the backend's current cell metrics.
         self.apply_window_scale(wid);
-        let intended = self.window_frame_px(settle.rows, settle.cols);
+        let intended = self.window_frame_px_for(wid, settle.rows, settle.cols);
         // THE SETTLE'S SUBJECT IS THE GRID, NOT THE PIXEL COUNT. Asking for
         // `size == intended` is the same question only while the frame law's
         // output is representable on the wire, and at a FRACTIONAL scale it is
@@ -4454,7 +4474,7 @@ mod tests {
             corrections: budget,
             corrected: false,
         });
-        app.window_frame_px(rows, cols)
+        app.window_frame_px_for(wid, rows, cols)
     }
 
     #[cfg(target_os = "linux")]

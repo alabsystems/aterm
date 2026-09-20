@@ -405,6 +405,17 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     if verb == Some("__pending") {
         return cmd_pending(args.get(1), args.get(2..).unwrap_or(&[]));
     }
+    // The HIDDEN self-update verb ([`crate::selfupdate`], 2026-09-19): what an agent
+    // program's `agents/` twin execs when its FIRST argument is one of the vendor's own
+    // self-update verbs (`claude update|upgrade|install`, `codex update`). Same
+    // discipline as `__pending` — unlisted, dispatched before the match so the roster
+    // scraper sees only real verbs, and BEFORE the help edge and the store lock: it never
+    // mutates the store itself — the CHILD it spawns does, `update <program>` through
+    // this very dispatch edge, lock and all — and it must answer while a pass HOLDS the
+    // lock, when its answer is "that pass is doing this work".
+    if verb == Some(crate::selfupdate::HIDDEN_VERB) {
+        return cmd_selfupdate(&args[1..]);
+    }
     // The HIDDEN landing verb ([`crate::landing`], 2026-09-16): what an agent program's
     // `agents/` twin execs while a NEWER build of that program is landing. Same
     // discipline as `__pending` — unlisted, dispatched before the match, and BEFORE the
@@ -963,7 +974,7 @@ pub fn pending_passthrough(
 /// with the arguments verbatim (on Windows, where nothing can `exec`, the `.cmd` shim runs
 /// as a child with inherited stdio and its real exit code is this process's; 2026-09-17).
 /// Every ending of the wait runs the tool: a landed build, the expired bound
-/// ([`crate::landing::WAIT_SECS_ENV`]), a failed pass, a stale marker, a prefix that is
+/// ([`crate::landing::WAIT_SECS`], a constant), a failed pass, a stale marker, a prefix that is
 /// not landing at all, or Ctrl-C — SIGINT on Unix, a console control handler on Windows
 /// ([`landing_wait_in_process`]): either stops the wait; neither kills the command.
 /// ONE EXCEPTION, on Windows only: arming that handler is best-effort
@@ -998,10 +1009,7 @@ fn cmd_landing(rest: &[String]) -> ExitCode {
             None => return ExitCode::from(1),
         },
     };
-    let max_wait = crate::landing::wait_secs_from_env(
-        std::env::var_os(crate::landing::WAIT_SECS_ENV).as_deref(),
-    );
-    landing_wait_in_process(&layout, tool.as_str(), max_wait);
+    landing_wait_in_process(&layout, tool.as_str(), crate::landing::WAIT_SECS);
     // The CURRENT `bin/<program>` shim — never the `agents/` twin, whose prelude would
     // hand over here again. Re-resolved now: after a landing it is the new build's.
     // `platform::exec_or_run` is the `exec(2)` on Unix; on Windows (where the shim is
@@ -1015,6 +1023,289 @@ fn cmd_landing(rest: &[String]) -> ExitCode {
         command.get_program().to_string_lossy()
     );
     ExitCode::from(126)
+}
+
+/// `atpkg __selfupdate <program> [<prefix>] -- [args…]` — the hidden verb an agent
+/// program's `agents/` twin execs when the user's FIRST argument is one of the vendor's
+/// own self-update verbs ([`crate::selfupdate`], 2026-09-19; owner: *"aterm reports that
+/// these packages are automatically managed by atpkg to keep to the latest version (and
+/// then does a check to make sure that they are updated and then actually updates) via
+/// the standard pkg manager"*). The operands are [`crate::landing::HandOver`]'s, with one
+/// addition: a program operand that starts with `-` (`atpkg __selfupdate --help`) is the
+/// usage line, exit 2 — non-mutating by design, not by the accident of a refused name.
+///
+/// In order, each ending pinned in-process by `cmd_selfupdate_refuses_forwards_and_never_takes_the_lock`
+/// and at the process edge by `tests/selfupdate_intercept.rs`:
+/// 1. usage exit 2; not a tool name exit 2; the layout from the prefix operand (so no
+///    `HOME` is needed — `env -i`, launchd) else [`layout`] (exit 1 with its line);
+/// 2. no roster row ⇒ `exec` the `bin/<program>` shim verbatim, nothing printed — a twin
+///    laid by a NEWER client against this older roster must still run the tool;
+/// 3. THE PREFIX CROSS-CHECK: when [`crate::store::resolve_configured`] resolves here
+///    (it falls back to the passwd home when `HOME` is unset) and, canonicalized, names a
+///    DIFFERENT store than the operand, refuse with exit 2 naming both — a child `update`
+///    would move THAT store, never the one this twin runs; when it cannot resolve at
+///    all, the operand layout stands;
+/// 4. [`crate::selfupdate::classify`]: help ⇒ one stderr note, then the shim verbatim
+///    (the vendor prints its own help; never mutates); pass-through ⇒ the shim verbatim,
+///    silent; otherwise on to 5 with the verdict in hand;
+/// 5. a declined shape ⇒ its line, exit 2, nothing run — never handed to the vendor's
+///    own updater, whose copy this name never runs, and with no bypass named, because
+///    there is none (owner, 2026-09-19: no environment knobs; the first cut's escape
+///    hatch is gone); a check ⇒ on;
+/// 6. the manager disabled (`ATPKG_DISABLE`, or no root key) ⇒ the disabled line, exit 1,
+///    nothing run — NOT handed to the vendor either, for the same reason; `aterm pkg
+///    doctor` says why the manager is off;
+/// 7. the announce line, flushed, then THE CHILD: the embedded co-located `atpkg` (else
+///    this executable) as `update <program> --wait-lock 1800`
+///    ([`crate::selfupdate::WAIT_LOCK_SECS`], the window's own bound — a store another
+///    pass holds is waited for, audibly: the child's `lock-waiting:` after 2 s and
+///    `lock-acquired:` when it gets the store) with `ATPKG_SPAWNER_PID` set to this pid
+///    and stdio INHERITED — the shape the window's pass uses minus its `--progress-file`
+///    — waited for as its parent for the whole wait (Ctrl-C reaches both through the
+///    foreground group and ends it; no handler, no epilogue for a signal death).
+///    The child's status, relayed with LITERAL arms so the exit-code registry
+///    (`lock::contention_exit_code_is_temp_fail_and_unshared`) reads them: 0 ⇒ nothing
+///    more, the child's own stdout line was the verdict; 2 ⇒ 2; 75 ⇒ the contended line
+///    and 75; anything else (1, a signal) ⇒ the incomplete line and 1; a spawn that
+///    fails ⇒ `could not run`, 126.
+///
+/// WHY A CHILD and not `cmd_update_one` in-process: hidden verbs are dispatched before
+/// the lock and outside [`verb_mutates_store`], so an in-process update would be an
+/// unaudited lock-taker; the `--wait-lock`/orphan statics are edge-owned; a panic would
+/// die holding the lock inside the twin's process; and the child gets the real dispatch
+/// edge and, for its own lines, bytes identical to a typed `aterm pkg update claude` —
+/// plus the `--wait-lock` lane's stdout markers a typed verb never prints (measured
+/// 2026-09-19 under a held lock: `lock-waiting:` after the 2 s grace, `lock-acquired:`
+/// when the holder lets go, `seed-busy:` at the 75 ending; [`SEED_BUSY_MARKER`] records
+/// the exception, `tests/selfupdate_intercept.rs` pins the two the contended ending
+/// prints). WHY NOT `exec` the child: the 75 and 1 epilogues are what turn "refusing to
+/// mutate the store concurrently" into "the window's pass is doing this work".
+fn cmd_selfupdate(rest: &[String]) -> ExitCode {
+    let hand_over = crate::landing::HandOver::parse(rest).filter(|h| !h.program.starts_with('-'));
+    let Some(hand_over) = hand_over else {
+        eprintln!(
+            "usage: atpkg {} <program> [<prefix>] -- [args…]",
+            crate::selfupdate::HIDDEN_VERB
+        );
+        return ExitCode::from(2);
+    };
+    let program = hand_over.program;
+    let Some(tool) = crate::store::ToolName::new(program) else {
+        eprintln!("atpkg: {program:?} is not a tool name");
+        return ExitCode::from(2);
+    };
+    let layout = match hand_over.prefix {
+        Some(prefix) => crate::store::Layout { prefix },
+        None => match layout() {
+            Some(l) => l,
+            None => return ExitCode::from(1),
+        },
+    };
+    let resolved = crate::store::resolve_configured();
+    match selfupdate_plan(
+        &layout,
+        &tool,
+        hand_over.args,
+        resolved.as_ref(),
+        manager_enabled(),
+    ) {
+        SelfUpdatePlan::Refuse(line) => {
+            eprintln!("{line}");
+            ExitCode::from(2)
+        }
+        SelfUpdatePlan::Disabled(line) => {
+            eprintln!("{line}");
+            ExitCode::from(1)
+        }
+        SelfUpdatePlan::Forward { mut command, note } => {
+            if let Some(note) = note {
+                eprintln!("{note}");
+            }
+            // The `bin/<program>` shim — never the `agents/` twin, whose block would hand
+            // over here again — with the arguments verbatim: `exec(2)` on Unix, a child
+            // with the real exit code on Windows ([`crate::platform::exec_or_run`]).
+            let err = crate::platform::exec_or_run(&mut command);
+            eprintln!(
+                "atpkg: could not run {}: {err}",
+                command.get_program().to_string_lossy()
+            );
+            ExitCode::from(126)
+        }
+        SelfUpdatePlan::Check { row, words } => selfupdate_check(
+            &layout,
+            row,
+            &words,
+            &selfupdate_child_binary(),
+            crate::selfupdate::WAIT_LOCK_SECS,
+        ),
+    }
+}
+
+/// What [`cmd_selfupdate`] decided, before anything runs or prints — the pure half of
+/// the verb, so every ending that is not the child is pinned in-process (an `exec`
+/// would replace the test process; the tests run the planned command as a child instead
+/// and read its argv off a log).
+#[derive(Debug)]
+enum SelfUpdatePlan {
+    /// One stderr line, exit 2, nothing run: the prefix cross-check, or a declined shape.
+    Refuse(String),
+    /// One stderr line, exit 1, nothing run: the manager is disabled here.
+    Disabled(String),
+    /// `exec` the `bin/<program>` shim with the arguments verbatim — after `note` when
+    /// there is one (the help note); nothing printed for a pass-through or a program
+    /// with no row.
+    Forward {
+        command: std::process::Command,
+        note: Option<String>,
+    },
+    /// Announce, then the standard update as a child ([`selfupdate_check`]).
+    Check {
+        row: &'static crate::selfupdate::Row,
+        words: String,
+    },
+}
+
+/// Steps 2–6 of [`cmd_selfupdate`], pure: the row, the prefix cross-check against what
+/// this environment `resolved` (`None` ⇒ nothing to check against), the
+/// classification, the manager's enablement. No environment is read here: `enabled` is
+/// the one fact the process supplies (`manager_enabled()`), and there is no other.
+fn selfupdate_plan(
+    layout: &crate::store::Layout,
+    tool: &crate::store::ToolName,
+    args: &[String],
+    resolved: Option<&crate::store::Layout>,
+    enabled: bool,
+) -> SelfUpdatePlan {
+    use crate::selfupdate::{self, Verdict};
+    let forward = |note: Option<String>| SelfUpdatePlan::Forward {
+        command: crate::landing::shim_command(layout, tool, args),
+        note,
+    };
+    let Some(row) = selfupdate::row_for(tool.as_str()) else {
+        return forward(None);
+    };
+    if let Some(resolved) = resolved {
+        let canon =
+            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if canon(&resolved.prefix) != canon(&layout.prefix) {
+            return SelfUpdatePlan::Refuse(selfupdate::prefix_mismatch_line(
+                row,
+                &layout.prefix,
+                &resolved.prefix,
+            ));
+        }
+    }
+    // A declined shape is simply declined (exit 2, nothing run): the vendor's own
+    // updater is never run through the managed name — the copy it installs is one this
+    // name never runs — and nobody is told about a bypass, because there is none (the
+    // first cut's environment escape hatch was removed the same day at the owner's
+    // direction). Help and a pass-through forward, with their own note or none.
+    let words = match selfupdate::classify(row, args) {
+        Verdict::Help => return forward(Some(selfupdate::help_line(row))),
+        Verdict::PassThrough => return forward(None),
+        Verdict::Declined(d) => {
+            return SelfUpdatePlan::Refuse(selfupdate::declined_line(row, &d));
+        }
+        Verdict::Check { words, .. } => words,
+    };
+    if !enabled {
+        let build = crate::ops::active_builds(layout).get(row.program).copied();
+        return SelfUpdatePlan::Disabled(selfupdate::disabled_line(row, build));
+    }
+    SelfUpdatePlan::Check { row, words }
+}
+
+/// Step 7 of [`cmd_selfupdate`]: the announce line, then the standard update as a child
+/// this process stays the parent of — `atpkg` run as `update <program> --wait-lock
+/// <bound>` ([`crate::selfupdate::child_argv`]) — and the child's status relayed with
+/// literal arms. `atpkg` is [`selfupdate_child_binary`] and `bound` is
+/// [`crate::selfupdate::WAIT_LOCK_SECS`] in production; both are PARAMETERS so the
+/// in-process test can drive the real child, against a store lock it holds itself,
+/// through a wrapper that confines it to a temp HOME, with a one-second bound — the 75
+/// ending, which no environment knob exists to shorten (and none may: owner,
+/// 2026-09-19). The active build the epilogues name is read AFTER the child, offline
+/// ([`crate::ops::active_builds`]): it is the build that STAYS.
+fn selfupdate_check(
+    layout: &crate::store::Layout,
+    row: &crate::selfupdate::Row,
+    words: &str,
+    atpkg: &std::path::Path,
+    bound: u64,
+) -> ExitCode {
+    use std::io::Write as _;
+    eprintln!("{}", crate::selfupdate::announce_line(row, words));
+    let _ = std::io::stderr().flush();
+    let status = std::process::Command::new(atpkg)
+        .args(crate::selfupdate::child_argv(atpkg, row.program, bound))
+        .env(
+            SPAWNER_PID_ENV,
+            crate::dec_u64(u64::from(std::process::id())),
+        )
+        .spawn()
+        .and_then(|mut child| child.wait());
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                crate::selfupdate::could_not_run_line(atpkg, row.program, &e)
+            );
+            return ExitCode::from(126);
+        }
+    };
+    let build = || crate::ops::active_builds(layout).get(row.program).copied();
+    match status.code() {
+        Some(0) => ExitCode::SUCCESS,
+        Some(2) => ExitCode::from(2),
+        Some(c) if c == i32::from(crate::lock::CONTENDED_EXIT) => {
+            eprintln!("{}", crate::selfupdate::contended_line(row, build(), bound));
+            ExitCode::from(crate::lock::CONTENDED_EXIT)
+        }
+        _ => {
+            eprintln!("{}", crate::selfupdate::incomplete_line(row, build()));
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// The binary [`selfupdate_check`] runs as the child: the embedded co-located `atpkg`
+/// the twin itself execs ([`crate::stub::embedded_atpkg_path`] — the binary this process
+/// IS when it came through the twin) when that is an executable regular file, else this
+/// process's own executable. The same code either way — but NOT the same dispatch: the
+/// one binary routes on its name, and under any name but `atpkg` a bare `update` is
+/// aterm's app-update lane, so [`crate::selfupdate::child_argv`] puts `pkg` ahead of the
+/// argv for the fallback's `aterm` (review, 2026-09-19: a sibling-less `aterm` spawned
+/// `aterm update claude`, got `unknown update sub-command`, exit 2, and relayed it as
+/// the check's). The fallback is reached only off the twin's path — the twin's own
+/// `[ -x "$__atpkg" ]` guarantees the embedded path from a hand-over; it covers a
+/// hand-typed hidden verb from a dev `aterm` copied out of `target/` or a bundle
+/// missing the alias symlink.
+fn selfupdate_child_binary() -> std::path::PathBuf {
+    let embedded = crate::stub::embedded_atpkg_path();
+    if is_executable_regular_file(&embedded) {
+        return embedded;
+    }
+    std::env::current_exe().unwrap_or(embedded)
+}
+
+/// A regular file with an execute bit (any execute bit, on Unix; regular is enough
+/// elsewhere) — the `[ -x ]` the twin's block asks before its own hand-over.
+fn is_executable_regular_file(path: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !md.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        md.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Set by the handler [`landing_wait_in_process`] installs for the wait's duration —
@@ -1988,11 +2279,12 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
                 // the GUI's refusal card. A lock held by another `atpkg` is the
                 // opposite: that process is doing this work right now, and the only
                 // honest thing to say about THIS pass is that it stood aside (see
-                // [`SEED_BUSY_MARKER`]). Said to the MACHINE lane only — a caller that
-                // opted into `--wait-lock`, like the `lock-waiting:` line above: a typed
-                // verb is told on stderr and keeps its stdout silent (the two-process
-                // proof pins both), and the exit code below says the same thing to
-                // every caller.
+                // [`SEED_BUSY_MARKER`]). Said to the `--wait-lock` lane only — the
+                // GUI's machine lanes, and since 2026-09-19 the self-update intercept's
+                // child, which opts in on behalf of a person who typed `claude update`
+                // — like the `lock-waiting:` line above: a typed `aterm pkg` verb is told
+                // on stderr and keeps its stdout silent (the two-process proof pins
+                // both), and the exit code below says the same thing to every caller.
                 if matches!(e, crate::lock::StoreLockError::Contended(_)) && waiter {
                     emit_marker_line_lossy(&format!(
                         "atpkg: {SEED_BUSY_MARKER}another atpkg process holds the store lock \
@@ -2224,6 +2516,29 @@ fn which_line(
                 target.display()
             ),
         };
+        // …and, for a ROSTERED agent program (2026-09-19, [`crate::selfupdate`]), one
+        // more trailing sentence: what the vendor's own self-update verb does on this
+        // name — `` `claude update` here runs `aterm pkg update claude` `` — for every
+        // rostered member whether or not its shim exports an env (codex exports none, so
+        // the fix-line alone could not carry it). Never for a shadowed row: the twin is
+        // not what runs in that shell, and the sentence would be false there. And ONLY
+        // where "here" is true (review, 2026-09-19): the laid twin must be current and
+        // carry the hand-over ([`agent_twin_intercepts`] — the `.cmd` twin never does, a
+        // twin from before the block does not until a pass re-lays it), and `agents/`
+        // must be on THIS shell's `PATH` — the same two predicates the `managed-current:`
+        // line and the shadow row already answer with. A shell whose `PATH` holds `bin/`
+        // and not `agents/` (opened before the install that introduced `agents/`; the
+        // manual names it) reaches this arm with no foreign copy ahead, runs
+        // `bin/claude`, which carries no block, and `claude update` there IS the
+        // vendor's updater — the first cut printed the sentence in exactly that shell
+        // (measured on the real binary with `PATH=<prefix>/bin:/usr/bin:/bin`).
+        if let Some(row) = crate::selfupdate::row_for(&program)
+            && agent_twin_intercepts(layout, &program, build)
+            && crate::vendor::agents_dir_on_path(&layout.prefix, path_var)
+        {
+            line.push_str(" — ");
+            line.push_str(&crate::selfupdate::which_sentence(row));
+        }
         // An AGENT PROGRAM's second line (owner decision 2026-09-10): the managed copy
         // runs because `agents/` is first on PATH, and the copies it beat — a vendor's
         // native install, a brew cask — are named so nobody has to `which -a` to learn
@@ -5975,11 +6290,19 @@ pub(crate) fn alias_fix(
 /// stand. Best-effort per program: an unwritable `bin/` is the install lane's problem to
 /// report, not this pass's to fail on.
 fn reconcile_aliases(layout: &crate::store::Layout, index: &crate::manifest::Index) {
-    for (program, build) in crate::active_builds(layout) {
+    // ONE listing of `bin/` for the whole pass, shared by the program list and every
+    // program's tool list. It is EXACT for both, not merely close: this loop lays `alab-`
+    // ALIASES and prunes, and neither touches any program's PRIMARY shims — which is all
+    // `active_tools_in` reports (it filters `is_alias()`) — so no iteration can invalidate
+    // what a later one reads here. The deleting half is not on the snapshot:
+    // `activate::reconcile_aliases` calls `prune_stale_shims`, which lists the directory
+    // ITSELF, after this pass's own writes, at the moment it decides. See `ops::BinScan`.
+    let scan = crate::ops::BinScan::capture(layout);
+    for (program, build) in crate::ops::active_builds_in(&scan) {
         if crate::linkmode::is_linked(layout, &program) {
             continue;
         }
-        let tools = crate::ops::active_tools(layout, &program, build);
+        let tools = crate::ops::active_tools_in(&scan, &program, build);
         let aliases = crate::activate::Aliases::for_program(&program, index.program(&program));
         let _ = crate::activate::reconcile_aliases(
             layout,
@@ -6030,11 +6353,15 @@ fn reconcile_shadowed(
         .as_ref()
         .map(|s| s.outcome.clone())
         .unwrap_or_default();
-    for (program, build) in crate::active_builds(layout) {
+    // One listing for this pass too, and an easier case than the alias reconcile's: this
+    // lane only reads, prints and records — nothing here writes to `bin/` or deletes from
+    // it, so the snapshot cannot go stale under its own feet.
+    let scan = crate::ops::BinScan::capture(layout);
+    for (program, build) in crate::ops::active_builds_in(&scan) {
         if crate::linkmode::is_linked(layout, &program) {
             continue;
         }
-        let shadow = crate::ops::active_tools(layout, &program, build)
+        let shadow = crate::ops::active_tools_in(&scan, &program, build)
             .into_iter()
             .find_map(|tool| {
                 crate::vendor::shadowing_binary_on_path(&layout.prefix, tool.as_str(), path_var)
@@ -7107,6 +7434,41 @@ pub(crate) fn agent_twin_current(layout: &crate::store::Layout, name: &str, buil
     crate::platform::resolve_shim(&layout.agent_shim(&tool)).is_some_and(|t| t == target)
 }
 
+/// [`agent_twin_current`] AND the twin's bytes carry the self-update hand-over
+/// ([`twin_carries_hand_over`]) — the predicate behind the `which` sentence `` `claude
+/// update` here runs `aterm pkg update claude` `` (2026-09-19). Target equality is not
+/// enough: a twin laid by an older client resolves exactly where `bin/` does and still
+/// runs the vendor's updater on `claude update` until a pass re-lays it (the dev box's
+/// own `agents/claude`, laid by the installed app, carried only the landing block when
+/// this was reviewed), and the `.cmd` twin resolves the same and carries no block at
+/// all ([`crate::platform::cmd_selfupdate_prelude`] renders the empty string, pinned).
+/// One bounded, non-link regular read; anything unreadable answers `false`, never a
+/// sentence.
+pub(crate) fn agent_twin_intercepts(layout: &crate::store::Layout, name: &str, build: u64) -> bool {
+    if !agent_twin_current(layout, name, build) {
+        return false;
+    }
+    let Some(tool) = crate::store::ToolName::new(name) else {
+        return false;
+    };
+    crate::metadata_io::read_bounded_regular(
+        &layout.agent_shim(&tool),
+        crate::platform::MAX_SHIM_BYTES,
+    )
+    .is_ok_and(|bytes| twin_carries_hand_over(&bytes))
+}
+
+/// Whether a laid twin's bytes carry the hidden verb's hand-over: the word
+/// [`crate::selfupdate::HIDDEN_VERB`] appears nowhere in a shim this crate lays EXCEPT
+/// the `sh` self-update block (`bin/` carries neither block — pinned by the activate
+/// twin test — and the `.cmd` twin renders none). Pure, so the Windows bytes are pinned
+/// from the Unix suite like every `.cmd` test.
+fn twin_carries_hand_over(bytes: &[u8]) -> bool {
+    bytes
+        .windows(crate::selfupdate::HIDDEN_VERB.len())
+        .any(|w| w == crate::selfupdate::HIDDEN_VERB.as_bytes())
+}
+
 /// The pass log's tail for an agent program with a foreign copy ahead on the PASS's own
 /// `PATH`: `a foreign copy is ahead on this pass's PATH (<path>); a tab opened on this
 /// build puts agents/ first on its own`. A fact about this process, not about any shell a user is in.
@@ -7349,11 +7711,20 @@ pub const SEED_DONE_MARKER: &str = "seed-done: ";
 /// ANOTHER `atpkg` IS ALREADY DOING THIS WORK. Printed when the store lock is
 /// CONTENDED at the dispatch edge — never for any other refusal — and only to a
 /// caller that opted into `--wait-lock` and whose parent is still there (the GUI's
-/// machine lanes, exactly like the `lock-waiting:` line): a typed verb is told on
-/// stderr and keeps its stdout silent, and the contention exit code
+/// machine lanes, exactly like the `lock-waiting:` line): a typed `aterm pkg` verb is
+/// told on stderr and keeps its stdout silent, and the contention exit code
 /// ([`crate::lock::CONTENDED_EXIT`], 75) says the same thing to every caller. That
 /// code, not this line, is what the lanes key their "deferred, never failed" verdict
-/// on; the line is the pass's own words for their log.
+/// on; the line is the pass's own words for their log. ONE caller that is not a
+/// machine lane opts in too (2026-09-19): the self-update intercept's child
+/// ([`cmd_selfupdate`], `update <program> --wait-lock 1800` with stdio inherited), so a
+/// person who typed `claude update` while a pass holds the store sees the
+/// `lock-waiting:` line on their terminal's stdout, `lock-acquired:` when the holder
+/// lets go — and, only when the whole 30 minutes run out, this line, then the
+/// intercept's own contended line on stderr — measured, and pinned in-process by
+/// `cmd_selfupdate_refuses_forwards_and_never_takes_the_lock` (the 75 lane, a 1 s
+/// bound) and at the edge by `tests/selfupdate_intercept.rs` (the wait that ends in the
+/// lock).
 ///
 /// This is the line the owner's 2026-09-11 banner needed and did not have. Two aterm
 /// processes launched sixteen seconds apart; the second one's `seed` and `update`
@@ -13690,6 +14061,91 @@ mod tests {
         }
     }
 
+    /// THE PASS LISTS `bin/` ONCE — NOT ONCE PER INSTALLED PROGRAM.
+    ///
+    /// [`reconcile_aliases`] used to open `bin/` once in `ops::active_builds` to find the
+    /// active programs, then twice more per program: once in `ops::active_tools` and once
+    /// more in `activate::prune_stale_shims`, each listing resolving EVERY entry in the
+    /// directory — so a twelve-program machine re-read every shim two dozen times per
+    /// six-hourly tick, and again on the launch path. The reading half now shares ONE
+    /// [`crate::ops::BinScan`] taken at the top of the pass.
+    ///
+    /// The residual one-per-program listing is `prune_stale_shims`, and it is DELIBERATE:
+    /// that predicate DELETES files on the user's `PATH`, so it keeps reading the directory
+    /// itself, at the moment it decides, after this pass's own writes. This test pins the
+    /// shape of the cost — `1 + N`, not `1 + 2N` — so that a future edit that moves the
+    /// prune onto a stale snapshot, or puts the shared scan back inside the loop, fails here
+    /// and has to say why. (The closing `reconcile_agents` adds none: `sweep_agents_dir`
+    /// lists `agents/` first and returns before its own `active_builds` when that directory
+    /// does not exist, which is this fixture — no agent program is installed.)
+    #[test]
+    fn the_alias_pass_lists_bin_once_and_per_program_only_where_it_deletes() {
+        let layout = temp_layout("alias-pass-scans");
+        let programs = ["pa", "pb", "pc", "pd", "pe", "pf"];
+        for p in programs {
+            let build = layout.build_dir(p, 7);
+            std::fs::create_dir_all(build.join("bin")).unwrap();
+            std::fs::write(build.join("bin").join(p), b"#!/bin/true\n").unwrap();
+            crate::activate::install_shims(
+                &layout,
+                &build,
+                std::slice::from_ref(&p.to_string()),
+                crate::activate::Aliases::Alab,
+            )
+            .unwrap();
+        }
+        let rows: Vec<(&str, bool, Option<&str>)> =
+            programs.iter().map(|p| (*p, false, None)).collect();
+        let index = index_of(&rows);
+        // Measure the STEADY STATE: the first pass lays whatever aliases are missing, the
+        // second is the six-hourly tick that finds everything already right and writes
+        // nothing. That second pass is the one whose reads this change is about.
+        reconcile_aliases(&layout, &index);
+        crate::ops::reset_bin_scans();
+        reconcile_aliases(&layout, &index);
+        let scans = crate::ops::bin_scans();
+        assert_eq!(
+            scans,
+            programs.len() + 1,
+            "one shared scan for the whole pass and one prune scan per program (it deletes) \
+             — got {scans} for {} programs",
+            programs.len()
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// THE SHADOW PASS LISTS `bin/` ONCE, whatever is installed.
+    ///
+    /// [`reconcile_shadowed`] walked the alias pass's first two listings — `active_builds`
+    /// once to find the programs, then `active_tools` for each — and unlike that pass it
+    /// only reads, prints and records: nothing in it writes to `bin/` or deletes from it,
+    /// so its whole cost is the one photograph and there is no per-program remainder to
+    /// allow for.
+    #[test]
+    fn the_shadow_pass_lists_bin_once_for_the_whole_machine() {
+        let layout = temp_layout("shadow-pass-scans");
+        for p in ["qa", "qb", "qc", "qd"] {
+            let build = layout.build_dir(p, 3);
+            std::fs::create_dir_all(build.join("bin")).unwrap();
+            std::fs::write(build.join("bin").join(p), b"#!/bin/true\n").unwrap();
+            crate::activate::install_shims(
+                &layout,
+                &build,
+                std::slice::from_ref(&p.to_string()),
+                crate::activate::Aliases::Off,
+            )
+            .unwrap();
+        }
+        crate::ops::reset_bin_scans();
+        let _ = reconcile_shadowed(&layout, 1, None);
+        let scans = crate::ops::bin_scans();
+        assert_eq!(
+            scans, 1,
+            "the shadow reconcile reads `bin/` once for the whole machine — got {scans}"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
     fn names(v: &[&str]) -> std::collections::BTreeSet<String> {
         v.iter().map(|s| (*s).to_string()).collect()
     }
@@ -13882,10 +14338,14 @@ mod tests {
         .unwrap();
         let line = which_line(&layout, "claude", Some(&agents_first)).unwrap();
         let mut lines = line.lines();
+        // (…and, since 2026-09-19, the self-update sentence closes the managed line —
+        // `crate::selfupdate`: the twin answers `claude update` with the standard
+        // update — ahead of the foreign-copies line.)
         assert_eq!(
             lines.next().unwrap(),
             format!(
-                "claude → {} → {} — managed 2026091001 — pinned by index 21",
+                "claude → {} → {} — managed 2026091001 — pinned by index 21 — `claude update` \
+                 here runs `aterm pkg update claude`",
                 layout.shim(&claude).display(),
                 crate::which(&layout, "claude").unwrap().display()
             )
@@ -13916,8 +14376,9 @@ mod tests {
         // the foreign copies are still listed — as what they are in THIS shell, on its
         // PATH, not "out-ranked" (review, 2026-09-16) — so the picture is whole.
         let no_agents = std::env::join_paths([local.clone(), layout.bin_dir()]).unwrap();
+        let shadowed = which_line(&layout, "claude", Some(&no_agents)).unwrap();
         assert_eq!(
-            which_line(&layout, "claude", Some(&no_agents)).unwrap(),
+            shadowed,
             format!(
                 "claude → {} — {}\nforeign copies on this shell's PATH: {} (2.1.267)",
                 local.join("claude").display(),
@@ -13930,6 +14391,10 @@ mod tests {
                 ),
                 local.join("claude").display()
             )
+        );
+        assert!(
+            !shadowed.contains("here runs"),
+            "the twin is not what runs in that shell, so no self-update sentence: {shadowed}"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&layout.prefix);
@@ -14972,11 +15437,358 @@ mod tests {
         assert!(line.contains("not installed"), "{line}");
     }
 
+    /// THE SELF-UPDATE VERB (2026-09-19, `crate::selfupdate`), in-process, every ending
+    /// that is not the child: usage exit 2 (a `--help` operand too — non-mutating); not a
+    /// tool name exit 2; a program with no row forwards to the `bin/` shim verbatim with
+    /// nothing printed (a twin laid by a newer roster must still run the tool); the
+    /// prefix cross-check refuses with the exact line when the store atpkg resolves here
+    /// differs from the operand, and proceeds when it agrees or cannot resolve at all;
+    /// `install stable`, `install 2.1.200` and `update --foo` are declined with the exact
+    /// lines and the fake shim never runs — and there is no escape hatch: the first cut's
+    /// environment knob was removed the same day at the owner's direction, so a declined
+    /// shape is declined whatever the environment says, and the plan has no input that
+    /// could say otherwise; `update --help` prints the help note and forwards verbatim;
+    /// the disabled manager refuses with its line, exit 1, nothing run; the hidden verb
+    /// is in no roster and takes no lock — and the store lock file never comes into
+    /// being for any of them. Then THE 75 ENDING (§8), in-process against a lock THIS
+    /// test holds: `selfupdate_check` with a ONE-SECOND bound — the parameter that
+    /// replaced the wait-bound env knob — runs the REAL dev `atpkg` (the bin beside this
+    /// test executable, through a wrapper named `atpkg` that confines it to a temp HOME
+    /// and captures its pipes) as `update claude --wait-lock 1`; the child waits its
+    /// bound at the held lock and exits 75 with its lock sentence on stderr and its
+    /// `seed-busy:` marker on stdout, and the verb relays `CONTENDED_EXIT` after a
+    /// contended line that renders the bound as `1 s`. The forward endings are pinned on
+    /// the PLAN — the command the verb would `exec`, run here as a child so its argv is
+    /// observed on a log — because an `exec` would replace the test process; the
+    /// enablement is the plan's input (production reads `manager_enabled()`) and the
+    /// child's confinement rides the wrapper, because `std::env::set_var` is a data race
+    /// in a threaded test binary (the rule `install.rs` records).
+    #[cfg(unix)]
+    #[test]
+    fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
+        use crate::selfupdate::{self, Decline};
+        let layout = temp_layout("selfupdate");
+        let other = temp_layout("selfupdate-other");
+        let claude = crate::store::ToolName::new("claude").unwrap();
+        let ay = crate::store::ToolName::new("ay").unwrap();
+        let row = selfupdate::row_for("claude").unwrap();
+        let log = layout.prefix.join("fake.log");
+        // Fake `bin/` shims that record their argv, one per line, and exit 0.
+        std::fs::create_dir_all(layout.bin_dir()).unwrap();
+        for tool in [&claude, &ay] {
+            let shim = layout.shim(tool);
+            let mut body = String::from("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '");
+            body.push_str(&log.display().to_string());
+            body.push_str("'\nexit 0\n");
+            std::fs::write(&shim, body).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let args = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let logged = || {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            text
+        };
+        // Runs a planned forward as a child (the verb would `exec` it) and answers its
+        // note and the argv the fake shim recorded.
+        let forwarded = |plan: SelfUpdatePlan| -> (Option<String>, String) {
+            match plan {
+                SelfUpdatePlan::Forward { mut command, note } => {
+                    assert!(
+                        command
+                            .get_program()
+                            .to_string_lossy()
+                            .ends_with("/bin/claude")
+                            || command.get_program().to_string_lossy().ends_with("/bin/ay"),
+                        "the bin/ shim, never the twin: {command:?}"
+                    );
+                    let out = command.output().unwrap();
+                    assert!(out.status.success(), "{out:?}");
+                    (note, logged())
+                }
+                other => panic!("expected a forward, got {other:?}"),
+            }
+        };
+        // 1. Usage and the tool-name gate, through the verb itself (nothing runs).
+        assert_eq!(cmd_selfupdate(&[]), ExitCode::from(2));
+        assert_eq!(cmd_selfupdate(&args(&["--help"])), ExitCode::from(2));
+        assert_eq!(
+            main_entry(vec!["__selfupdate".into(), "--help".into()]),
+            ExitCode::from(2),
+            "dispatched, and non-mutating"
+        );
+        assert_eq!(
+            cmd_selfupdate(&args(&["sudo", "--", "update"])),
+            ExitCode::from(2),
+            "a sensitive name is not a tool name"
+        );
+        assert_eq!(
+            cmd_selfupdate(&args(&["", "--", "update"])),
+            ExitCode::from(2)
+        );
+        // 2. No row: forwards verbatim, silent.
+        let (note, argv) = forwarded(selfupdate_plan(
+            &layout,
+            &ay,
+            &args(&["update", "--flag"]),
+            Some(&layout),
+            true,
+        ));
+        assert_eq!(note, None);
+        assert_eq!(argv, "update\n--flag\n");
+        // 3. The prefix cross-check.
+        match selfupdate_plan(&layout, &claude, &args(&["update"]), Some(&other), true) {
+            SelfUpdatePlan::Refuse(line) => assert_eq!(
+                line,
+                selfupdate::prefix_mismatch_line(row, &layout.prefix, &other.prefix)
+            ),
+            other => panic!("{other:?}"),
+        }
+        for resolved in [Some(&layout), None] {
+            match selfupdate_plan(&layout, &claude, &args(&["update"]), resolved, true) {
+                SelfUpdatePlan::Check { row: r, words } => {
+                    assert_eq!(r.program, "claude");
+                    assert_eq!(words, "update");
+                }
+                other => panic!("{resolved:?}: {other:?}"),
+            }
+        }
+        // 4. Declined shapes: the exact line, and the fake never runs. No input of the
+        // plan can turn a decline into a forward — the escape hatch is gone.
+        for (typed, decline) in [
+            (
+                &["install", "stable"][..],
+                Decline::NotAChannel {
+                    verb: "install",
+                    target: "stable",
+                },
+            ),
+            (
+                &["install", "2.1.200"],
+                Decline::Version {
+                    verb: "install",
+                    target: "2.1.200",
+                },
+            ),
+        ] {
+            for enabled in [true, false] {
+                match selfupdate_plan(&layout, &claude, &args(typed), Some(&layout), enabled) {
+                    SelfUpdatePlan::Refuse(line) => {
+                        assert_eq!(
+                            line,
+                            selfupdate::declined_line(row, &decline),
+                            "{typed:?} enabled={enabled}"
+                        );
+                    }
+                    other => panic!("{typed:?} enabled={enabled}: {other:?}"),
+                }
+            }
+        }
+        let rest = args(&["--foo"]);
+        match selfupdate_plan(
+            &layout,
+            &claude,
+            &args(&["update", "--foo"]),
+            Some(&layout),
+            true,
+        ) {
+            SelfUpdatePlan::Refuse(line) => assert_eq!(
+                line,
+                selfupdate::declined_line(
+                    row,
+                    &Decline::Shape {
+                        verb: "update",
+                        rest: &rest
+                    }
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(!log.exists(), "a declined shape runs nothing");
+        // 5. Help: the note, then the vendor's own help, verbatim — enabled or not.
+        for enabled in [true, false] {
+            let (note, argv) = forwarded(selfupdate_plan(
+                &layout,
+                &claude,
+                &args(&["update", "--help"]),
+                Some(&layout),
+                enabled,
+            ));
+            assert_eq!(
+                note.as_deref(),
+                Some(selfupdate::help_line(row).as_str()),
+                "enabled={enabled}"
+            );
+            assert_eq!(argv, "update\n--help\n", "enabled={enabled}");
+        }
+        // A pass-through shape: forwards silently.
+        let (note, argv) = forwarded(selfupdate_plan(
+            &layout,
+            &claude,
+            &args(&["--bare", "update"]),
+            Some(&layout),
+            true,
+        ));
+        assert_eq!(note, None);
+        assert_eq!(argv, "--bare\nupdate\n");
+        // 6. The manager disabled: its line, exit 1, nothing run (no active build in this
+        // layout — the fake shim names no store target — so the line says so), for
+        // every check shape.
+        for typed in [
+            &["update"][..],
+            &["upgrade"],
+            &["install"],
+            &["install", "latest", "--force"],
+        ] {
+            match selfupdate_plan(&layout, &claude, &args(typed), Some(&layout), false) {
+                SelfUpdatePlan::Disabled(line) => {
+                    assert_eq!(line, selfupdate::disabled_line(row, None), "{typed:?}");
+                }
+                other => panic!("{typed:?}: {other:?}"),
+            }
+        }
+        assert!(!log.exists(), "nothing ran under a disabled manager");
+        // 7. The verb is machinery, not vocabulary, and takes no lock of its own.
+        assert!(!dispatch_roster().contains(&selfupdate::HIDDEN_VERB));
+        assert!(!verb_mutates_store(selfupdate::HIDDEN_VERB));
+        assert_eq!(usage_of(selfupdate::HIDDEN_VERB), None);
+        assert!(
+            !layout.store_lock().exists() && !other.store_lock().exists(),
+            "no ending above touches the store lock — only the child does"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&other.prefix);
+        // 8. THE 75 ENDING, against a lock THIS test holds. The child is the real dev
+        // `atpkg`, run through a wrapper named `atpkg` (so `child_argv` hands it the argv
+        // verbatim) that records that argv, pins HOME to a temp directory — the default
+        // prefix under that HOME is the layout whose lock is held here, and the registry
+        // is a local directory, so no real store and no network — and captures the
+        // child's two pipes to files this lane reads back. A one-second bound: the
+        // parameter that replaced the env knob, and inside the 2 s announcement grace,
+        // so the child prints no `lock-waiting:` line, only its `seed-busy:` terminal.
+        let home =
+            std::env::temp_dir().join(format!("atpkg-main-selfupdate-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let held = crate::store::Layout {
+            prefix: crate::store::default_prefix(&home),
+        };
+        assert!(
+            held.prefix.starts_with(&home),
+            "the default prefix sits under the temp HOME: {}",
+            held.prefix.display()
+        );
+        let guard = crate::lock::try_lock_store(&held).expect("this test holds the store lock");
+        let dev_atpkg = dev_atpkg_binary();
+        let wrapper_dir = home.join("wrapper");
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        let wrapper = wrapper_dir.join("atpkg");
+        let child_argv = home.join("child.argv");
+        let child_out = home.join("child.stdout");
+        let child_err = home.join("child.stderr");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexport HOME='{}' \
+                 XDG_CONFIG_HOME='{}' ATPKG_REGISTRY='dir:{}' ATPKG_BUNDLED_SEED=off\n\
+                 unset ATPKG_DISABLE\nexec '{}' \"$@\" >'{}' 2>'{}'\n",
+                child_argv.display(),
+                home.display(),
+                home.join("config").display(),
+                home.join("registry").display(),
+                dev_atpkg.display(),
+                child_out.display(),
+                child_err.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let code = selfupdate_check(&held, row, "update", &wrapper, 1);
+        let elapsed = started.elapsed();
+        drop(guard);
+        let child_stdout = std::fs::read_to_string(&child_out).unwrap_or_default();
+        let child_stderr = std::fs::read_to_string(&child_err).unwrap_or_default();
+        let shown = format!("child stdout:\n{child_stdout}\nchild stderr:\n{child_stderr}");
+        assert_eq!(
+            code,
+            ExitCode::from(crate::lock::CONTENDED_EXIT),
+            "the child's 75 relayed: {shown}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&child_argv).unwrap_or_default(),
+            "update\nclaude\n--wait-lock\n1\n",
+            "the standard update with the test's own bound"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(1)
+                && elapsed < std::time::Duration::from_secs(20),
+            "the child waited its bound and no longer: {elapsed:?}\n{shown}"
+        );
+        let lock = held.store_lock().display().to_string();
+        assert!(
+            child_stderr.lines().any(|l| {
+                l.starts_with("atpkg: another atpkg process holds the store lock at")
+                    && l.contains(&lock)
+            }),
+            "the child's own lock sentence names the held lock: {shown}"
+        );
+        assert!(
+            child_stdout.lines().any(|l| l
+                == format!(
+                    "atpkg: {SEED_BUSY_MARKER}another atpkg process holds the store lock \
+                     \u{2014} that pass is doing this work and this one stood aside"
+                )),
+            "the wait lane's terminal marker, on stdout: {shown}"
+        );
+        assert!(
+            !child_stdout.contains(LOCK_WAITING_MARKER),
+            "a 1 s wait ends inside the 2 s announcement grace: {shown}"
+        );
+        assert!(
+            selfupdate::contended_line(row, None, 1)
+                .contains("held the store for the whole 1 s wait"),
+            "the contended line the verb printed renders the bound it passed"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The dev `atpkg` binary beside this test executable — `target/<profile>/atpkg`,
+    /// two levels up from `deps/` — which `targo --unverified test -p atpkg` builds for
+    /// the integration lanes before any test runs. LOUD when absent: a lane that drives
+    /// the real child against a held lock must not pass on a fake one.
+    #[cfg(unix)]
+    fn dev_atpkg_binary() -> std::path::PathBuf {
+        let exe = std::env::current_exe().expect("this test executable");
+        let candidate = exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|dir| dir.join("atpkg"))
+            .expect("target/<profile>/deps/<test> has a profile directory");
+        assert!(
+            is_executable_regular_file(&candidate),
+            "no dev atpkg binary at {} — `targo --unverified test -p atpkg` builds it (the \
+             integration lanes need it too); this lane drives the real child against a \
+             lock it holds",
+            candidate.display()
+        );
+        candidate
+    }
+
     /// DESIGN S7 on the `which` surface: a managed shim that exports its manifest's
     /// `shim_env` answers with the canonical state and ONE trailing sentence —
     /// `self-update off (DISABLE_AUTOUPDATER=1)` — never inside the state; a foreign copy
     /// ahead on PATH runs WITHOUT the env, so the SHADOWED answer carries no such line;
-    /// and a plain shim never earns it.
+    /// and a plain shim never earns it. AND (2026-09-19, `crate::selfupdate`) a rostered
+    /// agent program's line ends with `` `claude update` here runs `aterm pkg update
+    /// claude` `` whether or not the shim exports an env — codex, which exports none,
+    /// gets it too — while a shadowed row and a non-agent program get no such sentence.
+    /// "Here" is shell-local, so the sentence is withheld (review, 2026-09-19) in a shell
+    /// whose `PATH` has `bin/` and not `agents/` (that shell runs `bin/claude`, which
+    /// carries no block — the first cut pinned the sentence in exactly that shell), when
+    /// the twin is not laid at all, and when the laid twin is yesterday's landing-only
+    /// twin (it resolves where `bin/` does and still runs the vendor's updater until a
+    /// pass re-lays it).
     #[cfg(unix)]
     #[test]
     fn which_names_the_self_update_switch_as_a_trailing_fix_line() {
@@ -15009,12 +15821,14 @@ mod tests {
             "up to date".into(),
         );
         let shim = layout.shim(&crate::store::ToolName::new("claude").unwrap());
-        let managed_only = std::env::join_paths([layout.bin_dir()]).unwrap();
+        // The aterm-tab shape: agents/ first, so the twin — laid with its block by
+        // `install_tools_env` — is what `claude update` runs here.
+        let agents_first = std::env::join_paths([layout.agents_dir(), layout.bin_dir()]).unwrap();
         assert_eq!(
-            which_line(&layout, "claude", Some(&managed_only)).unwrap(),
+            which_line(&layout, "claude", Some(&agents_first)).unwrap(),
             format!(
                 "claude → {} → {} — managed 2026082701 — pinned by index 41 — self-update off \
-                 (DISABLE_AUTOUPDATER=1)",
+                 (DISABLE_AUTOUPDATER=1) — `claude update` here runs `aterm pkg update claude`",
                 shim.display(),
                 crate::which(&layout, "claude").unwrap().display()
             )
@@ -15022,6 +15836,23 @@ mod tests {
         assert_eq!(
             shim_env_fix(&shim).as_deref(),
             Some("self-update off (DISABLE_AUTOUPDATER=1)")
+        );
+        // NEGATIVE CONTROL — a shell whose PATH has bin/ and not agents/ (opened before
+        // the install that introduced agents/; the manual's own case): no foreign copy
+        // ahead, so the managed arm answers, and `claude update` typed there execs
+        // `bin/claude` — no block, `DISABLE_AUTOUPDATER=1` only — i.e. the vendor's
+        // updater. The sentence would be false, so it is withheld; everything else on
+        // the line is unchanged.
+        let bin_only = std::env::join_paths([layout.bin_dir()]).unwrap();
+        assert_eq!(
+            which_line(&layout, "claude", Some(&bin_only)).unwrap(),
+            format!(
+                "claude → {} → {} — managed 2026082701 — pinned by index 41 — self-update off \
+                 (DISABLE_AUTOUPDATER=1)",
+                shim.display(),
+                crate::which(&layout, "claude").unwrap().display()
+            ),
+            "no agents/ on this PATH: `claude update` here is the vendor's"
         );
         // A foreign copy ahead on PATH: it runs, without the env — no fix-line about it.
         let local = layout
@@ -15057,7 +15888,49 @@ mod tests {
             "the system copy runs without the env: nothing to say about self-update"
         );
         assert!(!line.contains("self-update"), "{line}");
-        // A plain shim (no env declared) earns no fix-line.
+        assert!(
+            !line.contains("here runs"),
+            "a shadowed row never claims the twin answers the verb: {line}"
+        );
+        // NEGATIVE CONTROLS on the twin itself, agents/ first on PATH both times: the twin
+        // deleted (agents/ unmakeable, a lane that failed) — `bin/claude` runs; and
+        // yesterday's LANDING-ONLY twin (laid by the installed app's older atpkg; it
+        // resolves exactly where bin/ does, so `agent_twin_current` alone would pass it)
+        // — `claude update` there is the vendor's updater until a pass re-lays the
+        // block. Neither earns the sentence; the rest of the managed line stands.
+        let claude_tool = crate::store::ToolName::new("claude").unwrap();
+        let twin = layout.agent_shim(&claude_tool);
+        let target = crate::which(&layout, "claude").unwrap();
+        std::fs::remove_file(&twin).unwrap();
+        let no_twin = which_line(&layout, "claude", Some(&agents_first)).unwrap();
+        assert!(
+            no_twin.ends_with(" — pinned by index 41 — self-update off (DISABLE_AUTOUPDATER=1)"),
+            "{no_twin}"
+        );
+        assert!(!no_twin.contains("here runs"), "no twin laid: {no_twin}");
+        let landing_only = crate::platform::landing_prelude(
+            "claude",
+            &layout.prefix,
+            &layout.landing_marker(&claude_tool),
+            &crate::stub::embedded_atpkg_path(),
+        );
+        crate::platform::install_twin_to_env(&twin, &target, &env, &landing_only).unwrap();
+        assert!(
+            agent_twin_current(&layout, "claude", 2026082701),
+            "the landing-only twin resolves where bin/ does — target equality is not enough"
+        );
+        assert!(!agent_twin_intercepts(&layout, "claude", 2026082701));
+        let stale = which_line(&layout, "claude", Some(&agents_first)).unwrap();
+        assert!(
+            stale.ends_with(" — pinned by index 41 — self-update off (DISABLE_AUTOUPDATER=1)"),
+            "{stale}"
+        );
+        assert!(
+            !stale.contains("here runs"),
+            "a twin without the block: {stale}"
+        );
+        // A plain shim (no env declared) earns no fix-line — and still the sentence
+        // (`install_tools` re-lays the twin, block and all, through `reconcile_agents`).
         crate::activate::install_tools(
             &layout,
             &build,
@@ -15065,14 +15938,125 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
+        assert!(agent_twin_intercepts(&layout, "claude", 2026082701));
         assert_eq!(shim_env_fix(&shim), None);
+        let plain = which_line(&layout, "claude", Some(&agents_first)).unwrap();
+        assert!(!plain.contains("self-update"), "{plain}");
         assert!(
-            !which_line(&layout, "claude", Some(&managed_only))
-                .unwrap()
-                .contains("self-update")
+            plain.ends_with(
+                " — pinned by index 41 — `claude update` here runs `aterm pkg update claude`"
+            ),
+            "{plain}"
         );
+        // codex: no shim_env at all, so no fix-line — and the sentence, its own verb.
+        let codex_build = layout.build_dir("codex", 2026091901);
+        std::fs::create_dir_all(codex_build.join("bin")).unwrap();
+        std::fs::write(codex_build.join("bin/codex"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            codex_build.join("bin/codex"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::activate::install_tools(
+            &layout,
+            &codex_build,
+            &[crate::store::ToolName::new("codex").unwrap()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
+        record_status(
+            &layout,
+            "codex",
+            crate::ProgramStatus {
+                installed_build: Some(2026091901),
+                state: crate::state::managed(2026091901, 41),
+                tree_root: String::new(),
+            },
+            "up to date".into(),
+        );
+        let codex_shim = layout.shim(&crate::store::ToolName::new("codex").unwrap());
+        assert_eq!(shim_env_fix(&codex_shim), None);
+        assert_eq!(
+            which_line(&layout, "codex", Some(&agents_first)).unwrap(),
+            format!(
+                "codex → {} → {} — managed 2026091901 — pinned by index 41 — `codex update` \
+                 here runs `aterm pkg update codex`",
+                codex_shim.display(),
+                crate::which(&layout, "codex").unwrap().display()
+            )
+        );
+        // A non-agent program: no sentence, whatever its env.
+        let ay_build = layout.build_dir("ay", 18);
+        std::fs::create_dir_all(ay_build.join("bin")).unwrap();
+        std::fs::write(ay_build.join("bin/ay"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            ay_build.join("bin/ay"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::activate::install_tools_env(
+            &layout,
+            &ay_build,
+            &[crate::store::ToolName::new("ay").unwrap()],
+            crate::activate::Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        let ay_line = which_line(&layout, "ay", Some(&agents_first)).unwrap();
+        assert!(ay_line.contains("self-update off"), "{ay_line}");
+        assert!(!ay_line.contains("here runs"), "{ay_line}");
         let _ = std::fs::remove_dir_all(&local);
         let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The predicate behind the `which` sentence, over the bytes every twin renderer
+    /// lays (pure, cfg-free, so the Windows shape is pinned from here like every `.cmd`
+    /// test): the `sh` twin WITH the block carries the hand-over; the landing-only `sh`
+    /// twin, the `bin/` shim and the `.cmd` twin — whose self-update prelude renders the
+    /// empty string, so on Windows `claude update` is the vendor's — do not. That last
+    /// case is what keeps `aterm pkg which claude` from claiming `here runs …` on a
+    /// Windows host by construction (review, 2026-09-19).
+    #[test]
+    fn the_hand_over_predicate_reads_the_sh_block_and_never_the_cmd_twin_or_bin() {
+        use std::path::Path;
+        let prefix = Path::new("/Users//u/Library/Application Support/aterm/pkg");
+        let marker = Path::new("/Users//u/Library/Application Support/aterm/pkg/landing/claude");
+        let atpkg = Path::new("/Applications/aterm.app/Contents/MacOS/atpkg");
+        let target = Path::new(
+            "/Users//u/Library/Application Support/aterm/pkg/store/claude/2026091902/bin/claude",
+        );
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        let verbs = crate::selfupdate::verbs_of("claude");
+        let mut with_block = crate::platform::sh_selfupdate_prelude("claude", prefix, atpkg, verbs);
+        let landing = crate::platform::sh_landing_prelude("claude", prefix, marker, atpkg);
+        with_block.push_str(&landing);
+        assert!(twin_carries_hand_over(
+            crate::platform::sh_shim_content_twin(target, &env, None, &with_block).as_bytes()
+        ));
+        assert!(!twin_carries_hand_over(
+            crate::platform::sh_shim_content_twin(target, &env, None, &landing).as_bytes()
+        ));
+        assert!(!twin_carries_hand_over(
+            crate::platform::sh_shim_content_env(target, &env).as_bytes()
+        ));
+        let cmd_prefix = Path::new("C:\\Program Files (x86)\\aterm\\pkg");
+        let cmd_marker = Path::new("C:\\Program Files (x86)\\aterm\\pkg\\landing\\claude");
+        let cmd_atpkg = Path::new("C:\\Program Files (x86)\\aterm\\app\\atpkg.exe");
+        let cmd_target = Path::new(
+            "C:\\Program Files (x86)\\aterm\\pkg\\store\\claude\\2026091601\\bin\\claude.exe",
+        );
+        let mut cmd_prelude =
+            crate::platform::cmd_selfupdate_prelude("claude", cmd_prefix, cmd_atpkg, verbs);
+        cmd_prelude.push_str(&crate::platform::cmd_landing_prelude(
+            "claude", cmd_prefix, cmd_marker, cmd_atpkg,
+        ));
+        assert!(
+            !twin_carries_hand_over(
+                crate::platform::cmd_shim_content_twin(cmd_target, &env, &cmd_prelude).as_bytes()
+            ),
+            "the .cmd twin renders no block, so the sentence is never claimed on Windows"
+        );
+        assert!(!twin_carries_hand_over(b""));
     }
 
     /// SYSTEM SATISFACTION: a `system = "gh"` member with `gh` on PATH outside the prefix is
@@ -16643,10 +17627,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_same_directory_under_another_spelling_is_the_real_home() {
-        let t = std::env::temp_dir().join("atpkg-same-directory-test");
+        // PID-SCOPED, like every other temp fixture in this crate. These two paths
+        // were fixed strings until 2026-09-19, so any second run of this suite on the
+        // same machine — the normal condition on a tree several sessions share, and
+        // the reason this case failed only "under the full suite" — raced this one on
+        // one directory and one symlink name: the loser found the link already there
+        // and panicked in `symlink(...).unwrap()`, or had its directory removed from
+        // under the assertions. Nothing about the law under test is shared, so
+        // nothing about its fixture needs to be.
+        let t =
+            std::env::temp_dir().join(format!("atpkg-same-directory-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         std::fs::create_dir_all(&t).unwrap();
-        let link = std::env::temp_dir().join("atpkg-same-directory-link");
+        let link =
+            std::env::temp_dir().join(format!("atpkg-same-directory-link-{}", std::process::id()));
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&t, &link).unwrap();
         assert!(same_directory(&link, &t), "a symlink to it is it");

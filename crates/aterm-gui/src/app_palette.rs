@@ -56,6 +56,9 @@ fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Ac
         M::NextTab => K::NextTab,
         M::PrevTab => K::PrevTab,
         M::RenameSession => K::RenameSession,
+        // The Fabric menu's ledger row and the ledger key run the same method
+        // (`App::open_session_ledger`), so the row shows the chord that fires it.
+        M::LedgerForSession => K::OpenLedger,
         _ => return None,
     })
 }
@@ -158,6 +161,12 @@ impl App {
         let can_rename = self
             .frontmost_window
             .is_some_and(|wid| self.can_rename_session(wid));
+        // The front session's standing hold (round 19, the Fabric menu's halt
+        // pair) — read from the session's own fabric leaf, the same fact the
+        // presence band prints, so the palette and the band never disagree.
+        let front_hold = self
+            .frontmost_window
+            .and_then(|wid| self.front_hold_fact(wid));
         // Accelerator hints for menu rows (keyboard audit #6): the resolved
         // chord for every menu action bound in the EFFECTIVE keybinding table,
         // deduped by action (a command listed in two menus shows one truth).
@@ -200,6 +209,9 @@ impl App {
             // same predicate Settings ▸ Wallpaper's button asks, and stay grey
             // wherever the dialog genuinely cannot open.
             local_file_picker_available: crate::menu::local_file_picker_available(),
+            front_hold,
+            presence_band: self.presence_band_on(),
+            presence_rim: self.presence_rim_on(),
             staged,
             staged_trouble,
             realized,

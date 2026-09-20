@@ -504,6 +504,79 @@ pub(crate) fn band_colors(theme: Theme) -> BandColors {
     }
 }
 
+/// The PRESENCE tones (round 19, `crate::presence`): the rim's three hues and
+/// the story dot, as theme tokens. Owner's picks on the approved mocks: teal
+/// for DRIVE (a peer's hand is on the keyboard), amber for WAIT (a human should
+/// look), red for STOP (held, or at a limit), violet for a STORY (something
+/// happened while you were away). Light and dark are the mocks' own pairs;
+/// each is contrast-floored against the band, at the floor its surface owes:
+/// [`presence_tones`] at the 3:1 non-text floor a rim and a chip's dot share,
+/// [`presence_inks`] at WCAG AA 4.5:1 for the WORDS the band paints in them
+/// (`◂ manager · turn 41`, `⊘ hold review`, the phase under Success) — the
+/// same floor every other ink on that row is held to. One hue family, two
+/// floors: the 3:1 rim ink read 3.4:1 as the hold's bold text on the default
+/// dark theme (round 19's review, `adv4`), the faintest words on the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PresenceTones {
+    pub drive: [u8; 3],
+    pub wait: [u8; 3],
+    pub stop: [u8; 3],
+    pub story: [u8; 3],
+}
+
+/// The presence hues as TEXT inks on the band: [`presence_tones`]' hues held
+/// to the AA 4.5:1 text floor against the band they print on. What
+/// [`crate::status_bars::paint_presence_row`] paints the hand and phase slots
+/// in; the rim keeps the 3:1 tones. Under a forced HC palette the three text
+/// inks are already `WINDOWTEXT` on `BTNFACE` (15:1 or better on every stock
+/// scheme); `COLOR_HIGHLIGHT` — a FILL the OS never meant as ink — is the one
+/// that can need the lift, and as the words of `◂ manager · turn 41` it gets
+/// the text floor like the rest.
+pub(crate) fn presence_inks(theme: Theme) -> PresenceTones {
+    let t = presence_tones(theme);
+    let bar_bg = band_colors(theme).bar_bg;
+    const AA: f64 = 4.5;
+    PresenceTones {
+        drive: ensure_contrast(t.drive, bar_bg, AA),
+        wait: ensure_contrast(t.wait, bar_bg, AA),
+        stop: ensure_contrast(t.stop, bar_bg, AA),
+        story: ensure_contrast(t.story, bar_bg, AA),
+    }
+}
+
+/// The presence tones for `theme` — or, under an OS-forced chrome palette, the
+/// HC vocabulary's own words for them. High Contrast discards hue as a channel,
+/// so DRIVE is `COLOR_HIGHLIGHT` (a peer has this window: the "selected"
+/// meaning is the honest one) and WAIT / STOP / STORY collapse onto the one
+/// text ink — the band says which in words, and a hold's rim is still twice as
+/// thick with its wash, so the states stay distinguishable without a hue.
+pub(crate) fn presence_tones(theme: Theme) -> PresenceTones {
+    if let Some(hc) = forced_chrome() {
+        let ink = forced_ink(hc.window_text, hc.btn_face);
+        return PresenceTones {
+            // `COLOR_HIGHLIGHT` is a FILL in the HC vocabulary (the selected
+            // tab's), so as an ink or a rim it is floored like every other.
+            drive: forced_ink(hc.highlight, hc.btn_face),
+            wait: ink,
+            stop: ink,
+            story: ink,
+        };
+    }
+    let c = band_colors(theme);
+    let light = bg_is_light(rgb(theme.bg));
+    let (drive, wait, stop, story) = if light {
+        (0x001E_9A8A, 0x00B7_811A, 0x00C7_3F2C, 0x006A_5FD0)
+    } else {
+        (0x002F_B7A6, 0x00E0_A83A, 0x00E0_533F, 0x008B_7FE6)
+    };
+    PresenceTones {
+        drive: ensure_contrast(rgb(drive), c.bar_bg, 3.0),
+        wait: ensure_contrast(rgb(wait), c.bar_bg, 3.0),
+        stop: ensure_contrast(rgb(stop), c.bar_bg, 3.0),
+        story: ensure_contrast(rgb(story), c.bar_bg, 3.0),
+    }
+}
+
 /// Build one render cell for compact chrome.
 pub(crate) fn cell(ch: char, fg: [u8; 3], bg: [u8; 3], bold: bool, seam: bool) -> RenderCell {
     RenderCell {

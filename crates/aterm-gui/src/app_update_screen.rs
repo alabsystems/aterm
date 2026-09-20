@@ -1088,7 +1088,7 @@ impl App {
         let (x, y) = self.window_to_frame(wid, x, y);
         let (px, py) = (x as f32 - pad, y as f32 - top);
         let Some(hit) =
-            crate::notice::notice_hit(n, &geom, now, motion, self.notice_clear_rows(), px, py)
+            crate::notice::notice_hit(n, &geom, now, motion, self.notice_clear_rows(wid), px, py)
         else {
             return false;
         };
@@ -1189,8 +1189,8 @@ impl App {
     /// status bars own the first [`Self::chrome_rows`] rows of the terminal area, and
     /// the card is not allowed to cover chrome the user clicks (or reads). One
     /// accessor so the painter and the hit test cannot disagree about where the card is.
-    pub(crate) fn notice_clear_rows(&self) -> f32 {
-        f32::from(self.chrome_rows())
+    pub(crate) fn notice_clear_rows(&self, wid: crate::WindowId) -> f32 {
+        f32::from(self.chrome_rows(wid))
     }
 }
 

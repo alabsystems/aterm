@@ -756,3 +756,89 @@ fn settled_translucent_cat_quad_inside_dirty_band_stays_byte_stable() {
         );
     }
 }
+
+/// THE SCALED free sprite samples the SAME TEXEL on both backends.
+///
+/// v1 free sprites were specified as the cat's NEAREST-1:1 regime, and every
+/// pin above builds `aw == w` sprites — so nothing covered the SCALED arm that
+/// the shipped cursor pet actually takes: `word_decorations`' pet emitter sets
+/// `w: dest_w, aw: nat_w` with `dest_w = round(nat_w · pose.scale_x)`, and the
+/// pose scale is a DRAW-TIME transform against a fixed-size bake (the breath,
+/// the waking stretch, the sit fold), so `aw != w` on most animated frames.
+///
+/// The CPU stamp resolves the source index in exact integers
+/// (`floor(((2·d + 1)·aw) / (2·w))`, mirrored as `aw − 1 − s` under `flip_x`);
+/// the GPU hands the sampler a float uv window. Those agree everywhere except
+/// where a dest pixel's centre lands EXACTLY on a texel boundary — which is
+/// every column of an even integer downscale, and one column in
+/// `2·w / gcd(aw, 2·w)` otherwise. Measured on this fixture BEFORE
+/// `uv_tie_bias`: 150 % → 719 of 3600 sprite pixels differed at a worst
+/// channel delta of 253; 50 % flipped → all 400 differed; 1:1 → 0, which is
+/// exactly why the 1:1 pins never saw it.
+///
+/// The sweep covers both signs of scale, the tie-free ratios (80 %, 120 %,
+/// 200 %) and the tie-dense ones (50 %, 90 %, 150 %), each with and without
+/// `flip_x` — the two directions the bias must be signed for.
+#[test]
+fn free_scaled_sprite_samples_the_same_texel_as_the_cpu() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (rows, cols) = (8usize, 20usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process(b"\x1b[?25l");
+
+    // A pet-shaped bake: one fixed 40x40 tile, drawn at the pose's dest size.
+    let (nat_w, nat_h) = (40u16, 40u16);
+    let mut scaled_seen = 0usize;
+    for pct in [100u32, 50, 80, 90, 95, 105, 110, 112, 120, 125, 150, 200] {
+        for flip in [false, true] {
+            let dest =
+                |n: u16| -> u16 { ((f64::from(n) * f64::from(pct) / 100.0).round() as u16).max(1) };
+            let (dw, dh) = (dest(nat_w), dest(nat_h));
+            if dw != nat_w {
+                scaled_seen += 1;
+            }
+            let mut input = term.cell_frame(rows, cols);
+            input.free_atlas = Some(Arc::new(free_atlas(1)));
+            input.free_sprites = vec![FreeSprite {
+                x: 20,
+                y: 20,
+                w: dw,
+                h: dh,
+                ax: 8,
+                ay: 8, // the atlas's OPAQUE half: a wrong texel is a colour, not a blend
+                aw: nat_w,
+                ah: nat_h,
+                tint: 0x00FF_FFFF,
+                alpha: 255,
+                flip_x: flip,
+                z: FreeZ::OverText,
+                sampler: FreeSampler::Nearest,
+            }];
+            let c = cpu.render_input(&input);
+            let g = gpu.render_input(&mut win, &input, None);
+            // Non-vacuity: the sprite must actually be on the glass.
+            let mut bare = input.clone();
+            bare.free_sprites.clear();
+            assert_ne!(
+                cpu.render_input(&bare).pixels,
+                c.pixels,
+                "scale {pct}% flip={flip}: the sprite painted nothing — the pin would be vacuous"
+            );
+            let delta = max_channel_delta(&c.pixels, &g.pixels);
+            assert!(
+                delta <= 2,
+                "scale {pct}% flip={flip} (dest {dw}x{dh} from {nat_w}x{nat_h}): the GPU \
+                 NEAREST sample diverged from the CPU stamp — max per-channel delta {delta} \
+                 > 2. A pixel-centre tie resolved the other way; see `uv_tie_bias`."
+            );
+        }
+    }
+    assert!(
+        scaled_seen >= 16,
+        "the sweep must actually exercise the SCALED arm (saw {scaled_seen} scaled cases)"
+    );
+}

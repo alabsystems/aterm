@@ -48,10 +48,10 @@ impl Terminal {
     ///
     /// let mut term = Terminal::new(24, 80);
     ///
-    /// // Create new configuration (cursor_blink=true differs from terminal default false)
+    /// // Create new configuration: a STEADY bar, where the terminal's power-on
+    /// // cursor is a blinking block — both the shape and the blink move.
     /// let mut config = TerminalConfig::default();
     /// config.cursor_style = CursorStyle::SteadyBar;
-    /// config.cursor_blink = true;
     ///
     /// // Apply and check what changed
     /// let changes = term.apply_config(&config);
@@ -105,15 +105,24 @@ impl Terminal {
         // Cursor style. apply_config is host configuration (not an app escape), so it
         // also persists the DEFAULT — otherwise a config-set cursor would revert to
         // BlinkingBlock on the next RIS/DECSTR (parity with set_default_cursor_style).
+        //
+        // `config.cursor_style` CARRIES THE BLINK: `CursorStyle` names a shape and
+        // a blink together, and the blink the renderer acts on — and that DEC
+        // mode 12 reports — is that bit (see `set_cursor_blink`). So the style is
+        // applied verbatim and `modes.cursor_blink` follows it below; the caller
+        // states the blink by choosing `Blinking*`/`Steady*`, which is what the
+        // GUI's config resolver already does.
         self.default_cursor_style = config.cursor_style;
         if self.modes.cursor_style != config.cursor_style {
             self.modes.cursor_style = config.cursor_style;
             changes.push(ConfigChange::CursorStyle);
         }
 
-        // Cursor blink
-        if self.modes.cursor_blink != config.cursor_blink {
-            self.modes.cursor_blink = config.cursor_blink;
+        // Cursor blink — the blink BIT of the style applied just above, not a
+        // second flag beside it. Kept as a mirror so `TerminalModes::cursor_blink`
+        // and DEC mode 12 cannot drift from the cursor the user is looking at.
+        if self.modes.cursor_blink != self.modes.cursor_style.blinks() {
+            self.modes.cursor_blink = self.modes.cursor_style.blinks();
             changes.push(ConfigChange::CursorBlink);
         }
 

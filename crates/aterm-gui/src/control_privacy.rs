@@ -71,13 +71,36 @@ const SERVICES: &[&str] = &[
     "removable-volumes",
     "app-data",
     "file-provider-domains",
+    // The three promptable classes Full Disk Access does NOT subsume, each with
+    // its own System Settings pane (`Privacy_Photos`, the media library, and App
+    // Management). They were absent from this roster until 2026-09-19, so the
+    // verb could not report them even as `uncovered` — and a service the posture
+    // verb cannot name is one an agent reading the verb concludes cannot happen.
+    // Not hypothetical: the reference machine already carries
+    // `kTCCServiceMediaLibrary | com.aterm.aterm | auth_value=2`, so a media
+    // library dialog has been answered for aterm at least once, and §3.4's
+    // 2026-09-07 amendment recorded it as the fifth of five prompts in six
+    // seconds. They are NOT folder rows: `folder_names` stays the four
+    // `Folder::ALL` items plus the two volume classes.
+    "media-library",
+    "photos",
+    "app-bundles",
 ];
 
 /// The service classes Full Disk Access does NOT reliably cover, by the
 /// design's own record (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.4:
 /// EPERM despite FDA has been reported under `~/Library/CloudStorage` /
 /// FileProvider domains). Always `uncovered`, measured or not.
-const NEVER_COVERED: &[&str] = &["file-provider-domains"];
+const NEVER_COVERED: &[&str] = &[
+    "file-provider-domains",
+    // Each of these is its own consent service with its own Settings pane, and
+    // Apple's Full Disk Access rule subsumes none of them. `unmeasured` would be
+    // the wrong bucket: this is not "we have not looked", it is "the grant does
+    // not reach here", which is exactly what `uncovered` means (§3.4 amendment).
+    "media-library",
+    "photos",
+    "app-bundles",
+];
 
 /// The two volume classes that appear on the `folder` row beside the three
 /// [`Folder`] variants. They have no `$HOME`-relative path, so they carry no
@@ -750,6 +773,13 @@ pub(crate) struct PrivacySnapshot {
     install: &'static str,
     /// The canonical path this process runs from, when it can be read.
     running: Option<String>,
+    /// Whether macOS can still FIND the code this process's grants are keyed
+    /// to. `running=` above follows the vnode, so it reports the current name
+    /// of the image and looks healthy in precisely the state where the bundle
+    /// was renamed or deleted out from under a live process — which is what an
+    /// in-place apply does, and what cost the owner four and a half silent
+    /// hours on 2026-09-19.
+    anchor: aterm_containment::ImageAnchor,
     fda: FdaState,
     probe: ProbeLabel,
     probe_age_ms: Option<u128>,
@@ -761,6 +791,15 @@ pub(crate) struct PrivacySnapshot {
     protected: Vec<String>,
     warmup: &'static str,
     warmup_last_ms: Option<u128>,
+    /// Per-service folder state, in `folder_names` order, and where it came
+    /// from. Until 2026-09-19 the `folder` row was a LITERAL — every name was
+    /// emitted `unknown` with `source=none` unconditionally, in both renderers,
+    /// so a warm-up the owner asked for and an EPERM aterm observed were both
+    /// discarded before they reached the wire. The row said the same thing on
+    /// every machine in every posture, which is indistinguishable from a
+    /// measurement that happened to find nothing.
+    folders: Vec<(&'static str, &'static str)>,
+    folder_source: String,
     observer_fda: &'static str,
     observer_responsible: &'static str,
     reset_command: Option<String>,
@@ -979,9 +1018,10 @@ impl PrivacySnapshot {
         // translocated, a mounted image — is a grant that cannot apply, and
         // the owner deserves to read that on the same report as the grant.
         out.push(format!(
-            "install={} running={}",
+            "install={} running={} anchor={}",
             self.install,
-            opt(self.running.as_deref())
+            opt(self.running.as_deref()),
+            self.anchor.as_str()
         ));
         out.push(format!(
             "full_disk_access={} probe={} probe_age_ms={} fda_scope={}",
@@ -996,12 +1036,14 @@ impl PrivacySnapshot {
         out.push(format!("uncovered={}", list_or_dash(&split.uncovered)));
         out.push(format!("unmeasured={}", list_or_dash(&split.unmeasured)));
         let mut folder = String::from("folder");
-        for name in folder_names() {
+        for (name, state) in &self.folders {
             folder.push(' ');
             folder.push_str(name);
-            folder.push_str("=unknown");
+            folder.push('=');
+            folder.push_str(state);
         }
-        folder.push_str(" source=none");
+        folder.push_str(" source=");
+        folder.push_str(&self.folder_source);
         out.push(folder);
         out.push(format!(
             "prompt_possible={}",
@@ -1056,6 +1098,24 @@ impl PrivacySnapshot {
             pct_encode("settings:Privacy_FilesAndFolders"),
             opt(self.reset_command.as_deref()),
         ));
+        // A grant that cannot be VALIDATED is not a grant, and this is the one
+        // condition the rest of the report cannot show: `full_disk_access=` is
+        // the probe's answer, and the probe reads a path that follows the
+        // vnode. Say it in words, on its own row, rather than leaving a reader
+        // to notice one token on the install line.
+        if self.anchor.grant_unverifiable() {
+            out.push(format!(
+                "note {}",
+                pct_encode(
+                    "the bundle this process was launched from is no longer at that name \
+                     (anchor=displaced|deleted), so macOS cannot build a code identity for it \
+                     and NO grant keyed to that identity can match — every consent decision \
+                     for this process and for the sessions it spawned falls back to asking. \
+                     Nothing in this report above measures that. A process launched fresh from \
+                     the installed bundle is unaffected."
+                )
+            ));
+        }
         out.push(format!("note {NOTE}"));
         out
     }
@@ -1089,6 +1149,69 @@ fn folder_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Folder::ALL.iter().map(|f| f.as_str()).collect();
     names.extend_from_slice(VOLUME_ROWS);
     names
+}
+
+/// The per-service folder state, and the provenance token that qualifies it.
+///
+/// PURE, and the only place the join exists. Two sources, in strict precedence:
+///
+/// 1. **What aterm actually observed.** A warm-up row the owner asked for is an
+///    observation of *this* host's access and outranks everything, including a
+///    held grant: if the owner warmed Documents and got `EPERM`, the row says
+///    `denied` whatever the coverage rule claims.
+/// 2. **Measured coverage.** A service §7 S4 has proved a held grant suppresses
+///    becomes `covered-by-fda` — the value §3.4 reserves for exactly this and
+///    which nothing in the tree could emit before 2026-09-19. It is gated on the
+///    service being in `covers` for the CURRENT posture, so it appears only
+///    while the grant is actually held and observed.
+///
+/// Everything else is `unknown`, and `unknown` remains the default rather than a
+/// verdict: reading a folder to learn whether it is readable is the very act
+/// that raises the prompt (§3.4). The two volume classes have no `$HOME`-relative
+/// path and no warm-up row, so they can only ever be `unknown` here.
+///
+/// What this must NOT do is infer a per-folder verdict from the grant for a
+/// service S4 never measured. Documents, Desktop and Downloads stay `unknown`
+/// under a held grant, because S4 could not isolate them on the reference
+/// machine — they already carried explicit rows there.
+fn folder_state(
+    name: &str,
+    warmup: &[(Folder, crate::consent_warmup::WarmupRow)],
+    covers: &[&'static str],
+) -> &'static str {
+    if let Some((_, row)) = warmup
+        .iter()
+        .find(|(folder, _)| folder.as_str() == name)
+        .filter(|(_, row)| *row != crate::consent_warmup::WarmupRow::Unknown)
+    {
+        return row.as_str();
+    }
+    if covers.contains(&name) {
+        return "covered-by-fda";
+    }
+    "unknown"
+}
+
+/// Which sources contributed a non-`unknown` folder state, in a fixed order.
+///
+/// `none` when nothing did — the honest reading of a row that is all `unknown`,
+/// and the only value this could ever take before the row carried real state.
+fn folder_source(states: &[(&'static str, &'static str)]) -> String {
+    let mut sources: Vec<&'static str> = Vec::new();
+    if states
+        .iter()
+        .any(|(_, state)| matches!(*state, "allowed" | "denied" | "asking" | "error"))
+    {
+        sources.push("warmup");
+    }
+    if states.iter().any(|(_, state)| *state == "covered-by-fda") {
+        sources.push("fda");
+    }
+    if sources.is_empty() {
+        "none".to_string()
+    } else {
+        sources.join(",")
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -1132,9 +1255,11 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
     );
     let _ = write!(
         body,
-        "{},\"running\":{},",
+        "{},\"running\":{},{},\"grant_unverifiable\":{},",
         json_str_field("install", snapshot.install),
         json_opt(snapshot.running.as_deref()),
+        json_str_field("anchor", snapshot.anchor.as_str()),
+        snapshot.anchor.grant_unverifiable(),
     );
     let _ = write!(
         body,
@@ -1156,9 +1281,13 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         json_str_array(&split.uncovered),
         json_str_array(&split.unmeasured),
     );
-    let _ = write!(body, "\"folders\":{{\"source\":\"none\"");
-    for name in folder_names() {
-        let _ = write!(body, ",{}", json_str_field(name, "unknown"));
+    let _ = write!(
+        body,
+        "\"folders\":{{{}",
+        json_str_field("source", &snapshot.folder_source)
+    );
+    for (name, state) in &snapshot.folders {
+        let _ = write!(body, ",{}", json_str_field(name, state));
     }
     let _ = write!(
         body,
@@ -1340,16 +1469,34 @@ impl App {
 
         let mode = aterm_containment::mode_or_containment();
         let (install, running) = install_posture_once().clone();
+        // The folder row's real state. `rows()` is `&self` and does NOT drain —
+        // same discipline as `last_pass_ms()` below, because `read_privacy` may
+        // not consume a pass the Security panel has not folded yet. `covers` is
+        // computed from the SAME split `lines()` renders, so the two can never
+        // disagree about whether a service is covered.
+        let evidence = SpikeEvidence::UNMEASURED;
+        let split = covers_split(probe.state, evidence);
+        let warmup_rows = self.consent_warmup.rows();
+        let folders: Vec<(&'static str, &'static str)> = folder_names()
+            .into_iter()
+            .map(|name| (name, folder_state(name, warmup_rows, &split.covers)))
+            .collect();
+        let folder_source_token = folder_source(&folders);
         let snapshot = PrivacySnapshot {
             platform: std::env::consts::OS,
             os: os_version().map(str::to_owned),
             identity: identity.clone(),
             install,
             running,
+            // Read FRESH on every report, never memoized: the whole point is
+            // that it changes under a running process. One `current_exe` plus
+            // one `exists` on a path this process already knows — no protected
+            // location, no dialog.
+            anchor: aterm_containment::image_anchor(),
             fda: probe.state,
             probe: probe.label,
             probe_age_ms: completed_probe_age_ms(probe.label, age),
-            evidence: SpikeEvidence::UNMEASURED,
+            evidence,
             attribution_root: policy.adoption(self.instance_attribution()),
             sessions,
             containment_mode: mode.to_string().to_ascii_lowercase(),
@@ -1369,6 +1516,8 @@ impl App {
             // `&self`, and a pass that finished but whose poke has not been
             // folded yet is reported on the next read rather than made up here.
             warmup_last_ms: self.consent_warmup.last_pass_ms(),
+            folders,
+            folder_source: folder_source_token,
             observer_fda: observer_fda_value(probe.label),
             observer_responsible: observer_responsible_value(&answers),
             // The reset recipe is built from the RUNNING bundle id, never a
@@ -2131,7 +2280,26 @@ mod tests {
     /// A snapshot with no OS in it, so the wire format is a total function of
     /// data a test can name.
     fn snapshot(sessions: usize, fda: FdaState, evidence: SpikeEvidence) -> PrivacySnapshot {
+        snapshot_with_warmup(sessions, fda, evidence, &[])
+    }
+
+    /// The same snapshot, with warm-up rows, so a test can drive the folder row
+    /// through the states production reaches instead of asserting a constant.
+    fn snapshot_with_warmup(
+        sessions: usize,
+        fda: FdaState,
+        evidence: SpikeEvidence,
+        warmup: &[(Folder, crate::consent_warmup::WarmupRow)],
+    ) -> PrivacySnapshot {
+        let split = covers_split(fda, evidence);
+        let folders: Vec<(&'static str, &'static str)> = folder_names()
+            .into_iter()
+            .map(|name| (name, folder_state(name, warmup, &split.covers)))
+            .collect();
+        let folder_source = folder_source(&folders);
         PrivacySnapshot {
+            folders,
+            folder_source,
             platform: "macos",
             os: Some("26.6.2".to_string()),
             identity: SigningIdentity {
@@ -2145,6 +2313,7 @@ mod tests {
             },
             install: "installed",
             running: Some("/Applications/aterm.app/Contents/MacOS/aterm".to_string()),
+            anchor: aterm_containment::ImageAnchor::Live,
             fda,
             probe: ProbeLabel::OpenEperm,
             probe_age_ms: Some(1840),
@@ -2235,14 +2404,17 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "install=installed running=/Applications/aterm.app/Contents/MacOS/aterm"
+            "install=installed running=/Applications/aterm.app/Contents/MacOS/aterm anchor=live"
         );
         assert_eq!(
             lines[4],
             "full_disk_access=denied probe=open_eperm probe_age_ms=1840 fda_scope=unknown"
         );
         assert_eq!(lines[5], "covers=-");
-        assert_eq!(lines[6], "uncovered=file-provider-domains");
+        // Derived from NEVER_COVERED rather than spelled out, so adding a
+        // service that the grant provably does not reach cannot silently
+        // disagree with the roster it is read from.
+        assert_eq!(lines[6], format!("uncovered={}", NEVER_COVERED.join(",")));
         assert!(
             lines[7].starts_with("unmeasured=documents,"),
             "{}",
@@ -2302,7 +2474,7 @@ mod tests {
             // Unmeasured is NOT uncovered: only the permanently-uncovered class
             // is called uncovered before the measurement has run.
             assert!(
-                lines.contains(&"uncovered=file-provider-domains".to_string()),
+                lines.contains(&format!("uncovered={}", NEVER_COVERED.join(","))),
                 "{fda:?}: {lines:?}"
             );
             assert!(
@@ -2348,7 +2520,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         )));
-        assert!(lines.contains(&"uncovered=file-provider-domains".to_string()));
+        assert!(lines.contains(&format!("uncovered={}", NEVER_COVERED.join(","))));
         assert!(lines.contains(&"unmeasured=-".to_string()));
         assert!(
             lines
@@ -2360,22 +2532,101 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("fda_scope=this_process")));
     }
 
-    /// A folder's state is NEVER inferred from the grant. Testing a folder is
-    /// the act that raises the prompt, so the only honest answer before an
-    /// access was observed is `unknown` — whatever Full Disk Access says.
+    /// An UNMEASURED folder's state is never inferred from the grant. Testing a
+    /// folder is the act that raises the prompt, so the only honest answer
+    /// before an access was observed is `unknown` — whatever Full Disk Access
+    /// says.
+    ///
+    /// NARROWED 2026-09-19, not deleted. This tripwire was written when §7 S4
+    /// was unrun and no service had measured coverage; it fired on the very
+    /// commit that gave `app-data` a measurement, which is what a tripwire is
+    /// for. §3.4's rule is the one that survives: when the grant is held, ONLY
+    /// the services S4 proved covered become `covered-by-fda`, and the rest stay
+    /// `unknown`. So the ban now names the four still-unmeasured rows
+    /// explicitly rather than every row, and it would fire again the moment one
+    /// of them started reading `covered-by-fda` without its own measurement.
     #[test]
-    fn no_folder_state_is_ever_inferred_from_the_grant() {
+    fn no_unmeasured_folder_state_is_ever_inferred_from_the_grant() {
+        // Documents/Desktop/Downloads could not be isolated by S4 (the
+        // reference machine already carried explicit rows for all three), and
+        // the two volume classes were never exercised.
+        const STILL_UNMEASURED: &[&str] = &[
+            "documents",
+            "desktop",
+            "downloads",
+            "network-volumes",
+            "removable-volumes",
+        ];
         for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
             let lines = snapshot(1, fda, SpikeEvidence::UNMEASURED).lines();
             let folder = lines
                 .iter()
                 .find(|l| l.starts_with("folder "))
                 .expect("a folder row");
-            for name in folder_names() {
-                assert!(folder.contains(&format!("{name}=unknown")), "{folder}");
+            for name in STILL_UNMEASURED {
+                assert!(
+                    folder.contains(&format!("{name}=unknown")),
+                    "{name} has no measurement of its own: {folder}"
+                );
             }
-            assert!(folder.ends_with(" source=none"), "{folder}");
+            // The measured exception, and only under a held grant.
+            let expected = if fda == FdaState::Granted {
+                "app-data=covered-by-fda"
+            } else {
+                "app-data=unknown"
+            };
+            assert!(folder.contains(expected), "{fda:?}: {folder}");
+            let expected_source = if fda == FdaState::Granted {
+                " source=fda"
+            } else {
+                " source=none"
+            };
+            assert!(folder.ends_with(expected_source), "{fda:?}: {folder}");
         }
+    }
+
+    /// An observation aterm actually made outranks the coverage rule, and a
+    /// warm-up row reaches the wire at all.
+    ///
+    /// Before 2026-09-19 the `folder` row was a literal, so the owner could warm
+    /// Documents, take an `EPERM`, and the verb would still report `unknown`
+    /// with `source=none` — discarding the one observation in the whole design
+    /// that is allowed to move a folder off `unknown`.
+    #[test]
+    fn an_observed_warmup_row_outranks_the_coverage_rule_and_reaches_the_wire() {
+        use crate::consent_warmup::WarmupRow;
+        let warmed = [
+            (Folder::Documents, WarmupRow::Denied),
+            (Folder::Desktop, WarmupRow::Allowed),
+            // An observed denial for the very class the grant is measured to
+            // cover must WIN: the grant is a rule, this is a measurement of
+            // this host.
+            (Folder::AppData, WarmupRow::Denied),
+        ];
+        let lines =
+            snapshot_with_warmup(1, FdaState::Granted, SpikeEvidence::UNMEASURED, &warmed).lines();
+        let folder = lines
+            .iter()
+            .find(|l| l.starts_with("folder "))
+            .expect("a folder row");
+        assert!(folder.contains("documents=denied"), "{folder}");
+        assert!(folder.contains("desktop=allowed"), "{folder}");
+        assert!(folder.contains("app-data=denied"), "{folder}");
+        assert!(folder.contains("downloads=unknown"), "{folder}");
+        // Provenance names the warm-up; `fda` is absent because the one service
+        // the rule would have covered was overridden by an observation.
+        assert!(folder.ends_with(" source=warmup"), "{folder}");
+
+        // A row the worker has not answered yet is NOT a verdict.
+        let asking = [(Folder::Documents, WarmupRow::Asking)];
+        let lines =
+            snapshot_with_warmup(1, FdaState::Denied, SpikeEvidence::UNMEASURED, &asking).lines();
+        let folder = lines
+            .iter()
+            .find(|l| l.starts_with("folder "))
+            .expect("a folder row");
+        assert!(folder.contains("documents=asking"), "{folder}");
+        assert!(folder.ends_with(" source=warmup"), "{folder}");
     }
 
     /// `unavailable` is a THIRD value: not `off`, and not `false`. `off` is a
@@ -2598,6 +2849,123 @@ mod tests {
         );
     }
 
+    /// The three services added 2026-09-19 are on the roster, are reported
+    /// `uncovered` in EVERY posture, and are not folder rows.
+    ///
+    /// Each has its own System Settings pane and Full Disk Access subsumes none
+    /// of them, so `unmeasured` would be the wrong bucket even after §7 S4 —
+    /// this is "the grant does not reach here", not "we have not looked". The
+    /// roster was silent about all three until today, which is how a class the
+    /// owner had already been prompted for (the media library) could be
+    /// invisible to the verb an agent reads to decide whether a wall exists.
+    #[test]
+    fn the_three_services_fda_does_not_subsume_are_named_and_never_covered() {
+        for service in ["media-library", "photos", "app-bundles"] {
+            assert!(
+                SERVICES.contains(&service),
+                "{service} must be on the roster to be reportable at all"
+            );
+            assert!(
+                NEVER_COVERED.contains(&service),
+                "{service} has its own Settings pane; FDA does not subsume it"
+            );
+            assert!(
+                !folder_names().contains(&service),
+                "{service} is not a folder row: it has no $HOME-relative path"
+            );
+        }
+        // True in every posture, measured or not, granted or not — that is what
+        // separates `uncovered` from `unmeasured`.
+        for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
+            for evidence in [
+                SpikeEvidence::UNMEASURED,
+                SpikeEvidence {
+                    fda_coverage_measured: true,
+                    handoff_attribution_measured: false,
+                    fda_scope: FdaScope::ThisProcess,
+                },
+            ] {
+                let split = covers_split(fda, evidence);
+                for service in ["media-library", "photos", "app-bundles"] {
+                    assert!(split.uncovered.contains(&service), "{fda:?} {service}");
+                    assert!(!split.covers.contains(&service), "{fda:?} {service}");
+                    assert!(!split.unmeasured.contains(&service), "{fda:?} {service}");
+                }
+            }
+        }
+    }
+
+    /// A grant that cannot be VALIDATED is reported as such, on its own row.
+    ///
+    /// The defect this detects cost the owner four and a half hours on
+    /// 2026-09-19 with nothing in the posture saying so: `running=` follows the
+    /// vnode, so it names the image's current path and reads healthy in exactly
+    /// the state where the bundle was renamed or deleted under a live process.
+    /// `full_disk_access=granted` can be true at the same moment and mean
+    /// nothing, which is why the note is unconditional on the anchor rather
+    /// than folded into the probe's answer.
+    #[test]
+    fn an_unvalidatable_identity_is_reported_and_does_not_hide_behind_a_granted_probe() {
+        use aterm_containment::ImageAnchor;
+
+        // The healthy shape says so in one token and adds no note.
+        let live = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
+        let lines = live.lines();
+        assert!(
+            lines.iter().any(|l| l.ends_with(" anchor=live")),
+            "{lines:?}"
+        );
+        let healthy_notes = lines.iter().filter(|l| l.starts_with("note ")).count();
+        assert_eq!(healthy_notes, 1, "no extra note when the anchor is live");
+
+        for anchor in [ImageAnchor::Displaced, ImageAnchor::Deleted] {
+            let mut broken = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
+            broken.anchor = anchor;
+            let lines = broken.lines();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.ends_with(&format!(" anchor={}", anchor.as_str()))),
+                "{anchor:?}: {lines:?}"
+            );
+            // The probe still says granted — that is the trap, and the report
+            // must not let it stand alone.
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("full_disk_access=granted")),
+                "{anchor:?}: {lines:?}"
+            );
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with("note ")).count(),
+                2,
+                "{anchor:?}: the unvalidatable identity earns its own note"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("note ") && l.contains("no%20grant")
+                        || l.starts_with("note ") && l.contains("NO%20grant")),
+                "{anchor:?}: {lines:?}"
+            );
+        }
+
+        // The two non-faults never raise it: a dev run outside a bundle and a
+        // path that could not be read are not broken grants.
+        for benign in [ImageAnchor::NotBundled, ImageAnchor::Unknown] {
+            let mut snap = snapshot(1, FdaState::Granted, SpikeEvidence::UNMEASURED);
+            snap.anchor = benign;
+            assert_eq!(
+                snap.lines()
+                    .iter()
+                    .filter(|l| l.starts_with("note "))
+                    .count(),
+                1,
+                "{benign:?} is not a fault"
+            );
+        }
+    }
+
     /// The `--json` form carries the four sub-objects the contract names, is
     /// framed as a single body line, and escapes rather than pct-encodes.
     #[test]
@@ -2619,7 +2987,14 @@ mod tests {
         assert!(json.contains("\"prompt_possible\":true"), "{json}");
         assert!(json.contains("\"covers\":[]"), "{json}");
         assert!(
-            json.contains("\"uncovered\":[\"file-provider-domains\"]"),
+            json.contains(&format!(
+                "\"uncovered\":[{}]",
+                NEVER_COVERED
+                    .iter()
+                    .map(|s| format!("\"{s}\""))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
             "unmeasured is not uncovered: {json}"
         );
         assert!(json.contains("\"unmeasured\":[\"documents\","), "{json}");

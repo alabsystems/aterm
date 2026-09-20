@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 fn s(now: Instant, rows: u16, cols: u16, cw: u16, ch: u16, caret: Option<(u16, u16)>) -> PetSense {
     PetSense {
+        caret_drawn: true,
         now,
         caret,
         wrapped: false,

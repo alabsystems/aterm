@@ -429,13 +429,89 @@ pub(crate) fn begin_launch(
 /// flight. [`Self::wait`] blocks for it within a budget; a caller that has
 /// already met the successor another way (its rendezvous dial) polls with a
 /// short budget purely to corroborate the pid.
+/// Bring the successor to the front at COMMIT (2026-09-19). The launch itself
+/// never activates (`begin_launch(.., false)`): activation at launch time pulled
+/// focus while the outgoing window was still the one on glass — a live screen
+/// with a dead keyboard — and under the late park the successor exists for as
+/// long as the parent waits for a quiet moment. So the parent samples whether an
+/// aterm window had focus at the PARK and, at Commit, immediately before its own
+/// `_exit`, asks AppKit to activate the successor: `NSRunningApplication
+/// runningApplicationWithProcessIdentifier:`, then `-[NSApp
+/// yieldActivationToApplication:]` where AppKit answers to it (macOS 14+, the
+/// cooperative half — an app may only take activation the front app yields),
+/// then `-[NSRunningApplication activateWithOptions:]` ignoring other apps.
+/// `true` when AppKit accepted the request. Refuses `pid <= 1`. Main-thread
+/// callable, unlike `begin_launch`: Commit runs on the main thread.
+#[cfg(target_os = "macos")]
+pub(crate) fn activate_running(pid: i32) -> bool {
+    use aterm_objc::{Bool, Id, Sel, autoreleasepool, class, sel};
+    if pid <= 1 {
+        return false;
+    }
+    /// `NSApplicationActivateIgnoringOtherApps` (AppKit, `NSApplicationActivationOptions`).
+    const ACTIVATE_IGNORING_OTHER_APPS: usize = 1 << 1;
+    autoreleasepool(|_| {
+        // SAFETY: class methods on immortal AppKit classes and instance methods
+        // on live objects: `runningApplicationWithProcessIdentifier:` answers nil
+        // or an autoreleased instance valid for this pool; `sharedApplication`
+        // is this process's own NSApplication (Commit runs on the main thread,
+        // where it exists); `respondsToSelector:` is a side-effect-free query;
+        // `yieldActivationToApplication:` and `activateWithOptions:` take the
+        // instance and a bitmask by value.
+        unsafe {
+            let running_with_pid: unsafe extern "C-unwind" fn(Id, Sel, i32) -> Id =
+                aterm_objc::msg();
+            let successor = running_with_pid(
+                class(c"NSRunningApplication").as_id(),
+                sel!(runningApplicationWithProcessIdentifier:),
+                pid,
+            );
+            if successor.is_null() {
+                return false;
+            }
+            let shared: unsafe extern "C-unwind" fn(Id, Sel) -> Id = aterm_objc::msg();
+            let nsapp = shared(class(c"NSApplication").as_id(), sel!(sharedApplication));
+            if !nsapp.is_null() {
+                let responds: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Bool = aterm_objc::msg();
+                if responds(
+                    nsapp,
+                    sel!(respondsToSelector:),
+                    sel!(yieldActivationToApplication:),
+                )
+                .as_bool()
+                {
+                    let yield_to: unsafe extern "C-unwind" fn(Id, Sel, Id) = aterm_objc::msg();
+                    yield_to(nsapp, sel!(yieldActivationToApplication:), successor);
+                }
+            }
+            let activate: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Bool = aterm_objc::msg();
+            activate(
+                successor,
+                sel!(activateWithOptions:),
+                ACTIVATE_IGNORING_OTHER_APPS,
+            )
+            .as_bool()
+        }
+    })
+}
+
+/// Off macOS there is no LaunchServices successor to activate.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn activate_running(pid: i32) -> bool {
+    let _ = pid;
+    false
+}
+
 pub(crate) struct LaunchInFlight {
     #[cfg(target_os = "macos")]
     watch: LaunchWatch,
 }
 
 impl LaunchInFlight {
-    /// Block until the launch is answered or `budget` is spent.
+    /// Block until the launch is answered or `budget` is spent. A ZERO budget is a
+    /// POLL (2026-09-19): an answer already delivered is returned, otherwise
+    /// `Timeout(ZERO)` at once — the shape the handoff uses beside its proof wait,
+    /// so LaunchServices' corroboration never holds a parked terminal.
     pub(crate) fn wait(&self, budget: Duration) -> Result<LaunchedSuccessor, LaunchError> {
         #[cfg(target_os = "macos")]
         {
@@ -837,6 +913,20 @@ struct LaunchWatch {
     slot: Arc<LaunchSlot>,
 }
 
+#[cfg(all(test, target_os = "macos"))]
+impl LaunchInFlight {
+    /// A launch whose LaunchServices answer is scripted: `Some(pid)` is delivered
+    /// at once, `None` never answers — so the handoff's corroboration arms can be
+    /// driven without LaunchServices.
+    pub(crate) fn scripted(answer: Option<i32>) -> Self {
+        let watch = LaunchWatch::pending();
+        if let Some(pid) = answer {
+            watch.slot.deliver(Ok(LaunchedSuccessor { pid }));
+        }
+        Self { watch }
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl LaunchWatch {
     fn pending() -> Self {
@@ -1150,6 +1240,37 @@ mod tests {
                 remaining_budget(Duration::ZERO, Duration::ZERO),
                 None,
                 "a zero budget is already spent"
+            );
+        }
+
+        /// No AppKit is touched for an impossible pid: activation at Commit is
+        /// aimed only at a corroborated candidate.
+        #[test]
+        fn activation_refuses_an_impossible_pid_without_touching_appkit() {
+            assert!(!crate::app_launch_successor::activate_running(0));
+            assert!(!crate::app_launch_successor::activate_running(-1));
+            assert!(!crate::app_launch_successor::activate_running(1));
+        }
+
+        /// A ZERO budget is a poll: it never sleeps, answers what is already
+        /// delivered, and reports `Timeout` at once otherwise.
+        #[test]
+        fn a_zero_budget_wait_is_a_poll_that_never_sleeps() {
+            let started = Instant::now();
+            assert_eq!(
+                crate::app_launch_successor::LaunchInFlight::scripted(None).wait(Duration::ZERO),
+                Err(LaunchError::Timeout(Duration::ZERO))
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(
+                crate::app_launch_successor::LaunchInFlight::scripted(Some(7))
+                    .wait(Duration::ZERO)
+                    .map(crate::app_launch_successor::LaunchedSuccessor::pid),
+                Ok(7)
             );
         }
 

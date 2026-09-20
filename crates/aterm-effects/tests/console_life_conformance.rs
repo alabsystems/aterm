@@ -53,6 +53,7 @@ impl Fixture {
         self.brain.set_console_presentable(true);
         let cursor = self.term.cursor();
         let _ = self.brain.tick(PetSense {
+            caret_drawn: true,
             now: self.now,
             caret: Some((cursor.row, cursor.col)),
             wrapped: false,

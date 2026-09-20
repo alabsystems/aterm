@@ -1188,6 +1188,7 @@ mod cursor_fx_generation_fence_tests {
             // Clearing `free_scratch`/`pet_hit_rect` alone cannot satisfy this
             // fixture: the brain itself owns pane-local position and flight.
             let pet_sense = |at, caret| PetSense {
+                caret_drawn: true,
                 now: at,
                 caret,
                 rows: geom.rows as u16,
@@ -1501,6 +1502,7 @@ mod cursor_fx_generation_fence_tests {
         let wid = WindowId(0);
         let now = Instant::now();
         let sense = PetSense {
+            caret_drawn: true,
             now,
             caret: Some((4, 12)),
             rows: 24,
@@ -1618,6 +1620,7 @@ mod cursor_fx_generation_fence_tests {
         }
         let cat_frame = ws.cursor_cat.frame(now);
         let pet = ws.cursor_pet.tick_static_capture(PetSense {
+            caret_drawn: true,
             now,
             caret: Some((4, 12)),
             rows: 24,
@@ -1789,6 +1792,7 @@ mod cursor_fx_generation_fence_tests {
                 .on_key(now + Duration::from_millis(index * 40), true);
         }
         let pet = ws.cursor_pet.tick_static_capture(PetSense {
+            caret_drawn: true,
             now,
             caret: Some((4, 12)),
             rows: 24,
@@ -4367,6 +4371,7 @@ mod canonical_layout_scheduler_tests {
             let pet = state
                 .cursor_pet
                 .tick_static_capture(aterm_effects::kitty_pet::PetSense {
+                    caret_drawn: true,
                     now,
                     caret: Some((4, 12)),
                     rows: 24,
@@ -4603,6 +4608,7 @@ mod canonical_layout_scheduler_tests {
         {
             let ws = app.windows.get_mut(&wid).expect("headless window");
             let sense = |now, caret| aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
                 now,
                 caret,
                 rows: 24,
@@ -8135,6 +8141,7 @@ pub(crate) fn seed_resident_pet_mid_flight_for_test(
     target: (u16, u16),
 ) -> (Instant, aterm_effects::kitty_pet::PetFrame) {
     let sense = |now, caret| aterm_effects::kitty_pet::PetSense {
+        caret_drawn: true,
         now,
         caret,
         rows,
@@ -8651,6 +8658,7 @@ mod v2_companion_router_tests {
         let now = Instant::now();
         let host = HostSense {
             caret: Some((3, 7)),
+            caret_drawn: true,
             wrapped: true,
             output_burst: false,
             pointer: Some((1.5, 2.5)),
@@ -8778,6 +8786,7 @@ mod v2_companion_router_tests {
             .tick(Some((3, 40)), t1, &cfg, glow_geom(), &mut out);
         // The host's order, verbatim: the pet's own tick, then the offer.
         let host = HostSense {
+            caret_drawn: true,
             caret: Some((3, 40)),
             ..HostSense::default()
         };
@@ -8983,6 +8992,7 @@ mod resident_pet_presentation_tests {
                     &cfg,
                     reduced,
                     HostSense {
+                        caret_drawn: true,
                         caret: Some(caret),
                         ..HostSense::default()
                     },
@@ -9195,6 +9205,7 @@ mod resident_pet_presentation_tests {
         );
 
         let sense = PetSense {
+            caret_drawn: true,
             now,
             caret: Some((2, 10)),
             rows: 6,
@@ -9256,6 +9267,7 @@ mod retire_pet_without_owner_tests {
     /// able to interrupt. Returns the brain and the clock it stopped at.
     fn a_live_pet() -> (PetBrain, Instant) {
         let sense = |now, caret| PetSense {
+            caret_drawn: true,
             now,
             caret,
             rows: 24,
@@ -11723,7 +11735,28 @@ pub(crate) fn prepend_strip_rows(
     grid_top: usize,
     pool: &mut Vec<Vec<RenderCell>>,
 ) {
-    let strip = strip_rows.len();
+    prepend_strip_row_slices(
+        dst,
+        strip_rows.len(),
+        strip_rows.iter().map(Vec::as_slice),
+        cell_h,
+        grid_top,
+        pool,
+    );
+}
+
+/// [`prepend_strip_rows`] over BORROWED rows: `strip` is how many `strip_rows`
+/// yields, so a caller stacking a row from one cache above rows from another
+/// (the presence row over the bar rows) passes both without collecting them
+/// into a fresh `Vec` per frame.
+pub(crate) fn prepend_strip_row_slices<'a>(
+    dst: &mut RenderInput,
+    strip: usize,
+    strip_rows: impl Iterator<Item = &'a [RenderCell]>,
+    cell_h: usize,
+    grid_top: usize,
+    pool: &mut Vec<Vec<RenderCell>>,
+) {
     if strip == 0 {
         return;
     }
@@ -11738,12 +11771,13 @@ pub(crate) fn prepend_strip_rows(
     let blessed = dst.host_prepend_blessing();
     dst.cells.splice(
         0..0,
-        strip_rows.iter().map(|src| match pool.pop() {
+        strip_rows.map(|src| match pool.pop() {
             Some(mut buf) => {
-                buf.clone_from(src);
+                buf.clear();
+                buf.extend_from_slice(src);
                 buf
             }
-            None => src.clone(),
+            None => src.to_vec(),
         }),
     );
     // Per-row sparse / sized data: prepend empty/default rows so indices stay aligned
@@ -13462,6 +13496,7 @@ mod pet_sing_swap_tests {
             let ws = app.windows.get_mut(&wid).expect("window");
             ws.focused = true;
             ws.cursor_pet.tick(PetSense {
+                caret_drawn: true,
                 now,
                 caret: Some((4, 12)),
                 rows: 24,
@@ -13492,6 +13527,7 @@ mod pet_sing_swap_tests {
         );
         // The same brain must report actual motion again when it is enabled.
         let _ = ws.cursor_pet.tick(PetSense {
+            caret_drawn: true,
             now: now + Duration::from_millis(16),
             caret: Some((4, 50)),
             rows: 24,
@@ -13510,6 +13546,7 @@ mod pet_sing_swap_tests {
     fn reduced_song_keeps_the_full_pet_visible_and_late_cutoffs_never_blank() {
         let t0 = Instant::now();
         let sense = |now, caret| PetSense {
+            caret_drawn: true,
             now,
             caret,
             rows: 24,
@@ -13748,6 +13785,7 @@ mod pet_sing_swap_tests {
                     }
                     let caret = (4, col);
                     let frame = ws.cursor_pet.tick(PetSense {
+                        caret_drawn: true,
                         now,
                         caret: pet_caret_admitted(true, drive, reduced).then_some(caret),
                         rows: geom.rows,
@@ -14048,6 +14086,7 @@ mod pet_sing_swap_tests {
         );
 
         let sense = |now, caret| PetSense {
+            caret_drawn: true,
             now,
             caret,
             rows: 24,
@@ -25028,12 +25067,12 @@ impl App {
         // the glyphs after the top-pad tightening; X keeps `pad`.
         let pad_top = self.win_pad_top(wid);
         let head = self.win_head(wid);
-        let strip_px = usize::from(self.chrome_rows()) * ch.max(1);
+        let strip_px = usize::from(self.chrome_rows(wid)) * ch.max(1);
         let (rows16, cols16) = (
             u16::try_from(rows).unwrap_or(u16::MAX),
             u16::try_from(cols).unwrap_or(u16::MAX),
         );
-        let size = self.window_frame_px(rows16, cols16);
+        let size = self.window_frame_px_for(wid, rows16, cols16);
         (
             pad.min(u16::MAX as usize) as u16,
             (pad_top + head + strip_px).min(u16::MAX as usize) as u16,
@@ -25134,8 +25173,18 @@ impl App {
     /// window/swapchain size — every window-create / resize / grid-resize path
     /// routes through this so the chrome AND the interior padding are always
     /// accounted for in lockstep.
-    pub(crate) fn window_frame_px(&self, rows: u16, cols: u16) -> PhysicalSize<u32> {
-        self.frame_px(rows.saturating_add(self.chrome_rows()), cols)
+    /// Per WINDOW since round 19: the strip and the bars are shared, the
+    /// presence row is the window's own (`chrome_rows`), so the frame of a
+    /// window that is being created — no state yet — folds the shared rows
+    /// alone, and every later size (a settle, a driven resize, the effects
+    /// origin) folds its presence row too.
+    pub(crate) fn window_frame_px_for(
+        &self,
+        wid: WindowId,
+        rows: u16,
+        cols: u16,
+    ) -> PhysicalSize<u32> {
+        self.frame_px(rows.saturating_add(self.chrome_rows(wid)), cols)
     }
 
     /// Resolve the MOTION POLICY (W11) for a window whose focus state is
@@ -28824,6 +28873,16 @@ impl App {
                     border_a: level.border_alpha(now),
                     border_scale_q4: level.border_scale_q4(now),
                 })
+                // THE PRESENCE RIM (round 19): the third arm, below the drag
+                // target and the upgrade surge. Colour-only, change-driven, and
+                // never painted under a modal overlay (the drag rule).
+                .or_else(|| {
+                    if overlay_open {
+                        None
+                    } else {
+                        self.presence_overlay(id, now)
+                    }
+                })
         };
         HostVisualState { invert, overlay }
     }
@@ -29664,7 +29723,7 @@ impl App {
         // Chrome row count (tab strip + status bars) for the resident chrome-row
         // pool reclaim at the single-pane `cell_frame_into` refill boundary below
         // (0 when neither is up).
-        let strip_rows_n = usize::from(self.chrome_rows());
+        let strip_rows_n = usize::from(self.chrome_rows(id));
         // Visual bell: the presented frame has its RGB inverted while a flash is
         // active. The flash state machine decides "active"; `about_to_wait` wakes
         // the loop at its deadline so the normal frame returns.
@@ -30391,7 +30450,24 @@ impl App {
             // coordinate-space boundary: both engines and every cursor companion
             // are retired/suppressed immediately, never decayed over history.
             // Returning to the live bottom seeds a fresh anchor.
-            let cur = (cursor_visible && display_offset == 0).then_some((cpos.row, cpos.col));
+            //
+            // A HIDDEN CURSOR IS STILL A CARET, and this line used to say
+            // otherwise. `cursor_visible` is DECTCEM — whether the emulator
+            // PAINTS the caret — and folding it into the same `then_some` as
+            // the scrollback test told the pet "there is no caret" whenever a
+            // program hid one while it worked. Measured on the shipped v0.88.0
+            // with `aterm ctl trail status`: the pet froze wherever it stood
+            // for as long as the hide lasted (20.04 s at row 0 with the caret
+            // on row 44; 20.15 s at row 23.4 from a mid-screen start) and then
+            // crossed 28.4 cells in one frame when the cursor came back — the
+            // owner's *"shoved away as like a glitch"* and *"trapped at the
+            // top of the screen"*, from one conflation. Every progress bar,
+            // spinner, pager, editor and LLM console hides the cursor.
+            //
+            // The scrollback half is a real coordinate-space boundary and
+            // keeps the refusal; the visibility half travels as its own fact.
+            let cur = (display_offset == 0).then_some((cpos.row, cpos.col));
+            let cur_drawn = cursor_visible;
             // The whole per-frame cursor-effect pass — the MOTION POLICY fold, the
             // glow/trail config resolution, the OSC-12 live-colour rewire, the
             // ATERM_TRACE_SPAWN diagnostic, and the glow/forge/rainbow/trail ticks —
@@ -30996,6 +31072,11 @@ impl App {
                     } else {
                         None
                     },
+                    // DRAWN, not admitted: the song's law above withholds the
+                    // caret on purpose (a policy), so a withheld caret is not
+                    // a painted one either.
+                    caret_drawn: cur_drawn
+                        && pet_caret_admitted(pet_visible, sing_drive, !animate_cat),
                     wrapped: pet_wrapped,
                     output_burst: pet_burst,
                     // Pointer contact requires the last drawn body and current
@@ -31364,10 +31445,26 @@ impl App {
                                 colors,
                                 // Reduced motion pins the entry bounce flat;
                                 // the visit still presents statically.
-                                bob: if animate_cat {
-                                    ws.dog_cameo.bob(frame_started)
-                                } else {
+                                //
+                                // THE SEAM IS SPARKLE-WORDS', not the cursor
+                                // glow's. The dog is a `[sparkle_words.canine]`
+                                // summon, and `tick_cfg.reduced_motion` is the
+                                // exact fold this frame's engine was ticked
+                                // with: the user's `[sparkle_words]
+                                // reduced_motion` OR the `WordSparkles` motion
+                                // class saying this window may not animate.
+                                // This used to read `animate_cat` — the
+                                // CURSOR-GLOW class — which no `reduced_motion
+                                // = true` can ever reach, so the setting
+                                // flattened the hops in `compose_typed_dog`'s
+                                // split twin and in the ordinary single-pane
+                                // window it did nothing at all. Load shed needs
+                                // no term of its own here: `deco_suspend` folds
+                                // it and has already zeroed `dog_alpha` above.
+                                bob: if tick_cfg.reduced_motion {
                                     0.0
+                                } else {
+                                    ws.dog_cameo.bob(frame_started)
                                 },
                                 alpha: dog_alpha,
                             },
@@ -31577,21 +31674,30 @@ impl App {
                         },
                         &mut ws.free_scratch,
                     ) {
-                        robi_fp = emitted.rotate_left(13);
-                        // DISMISS-BY-CLICK hit-box, FRAME px: the emitter's
-                        // body law in ONE copy (`aterm_effects::robi::
-                        // body_px` — the same functions the emitter bakes
-                        // and places by, tested at the law) offset by the
+                        robi_fp = emitted.fp.rotate_left(13);
+                        // DISMISS-BY-CLICK hit-box, FRAME px: the rect the
+                        // emitter REALLY drew (`RobiEmission::body_px`,
+                        // resolved from the slices it stamped) offset by the
                         // effects origin (whose y is `pad_top + head +
                         // strip_px`, the same pre-splice → frame conversion
                         // the sprites take) through the pet seam's pure,
-                        // tested `pet_hit_rect_win`. One accepted transient:
-                        // a bake-miss frame re-draws `robi_last_body` at the
-                        // PREVIOUS size, so right after a resize the box can
-                        // be a whisker off — the mouse seam's slop absorbs
-                        // it.
+                        // tested `pet_hit_rect_win`.
+                        //
+                        // It is the EMITTER's answer, not `robi::body_px` at
+                        // the current geometry, for two reasons the emitter is
+                        // the only one that knows: a deferred bake re-draws the
+                        // HELD body at the previous size (the box used to be a
+                        // whisker off after a resize), and a frame that drew
+                        // only the LADDER — the shared two-bake budget spent on
+                        // the ladder plus one body slice, which is what a fresh
+                        // baker mid-climb gets after a config reload or a
+                        // font-size step — draws NO body at all. That frame
+                        // used to report "drawn" and leave a live hit-box over
+                        // empty grid, where one click writes `robi = false` and
+                        // retires him for good; `body_px: None` now clears it,
+                        // which is what the pre-evaluation clear above promises.
                         ws.robi_hit_rect = pet_hit_rect_win(
-                            aterm_effects::robi::body_px(&frame, &effect_geom),
+                            emitted.body_px,
                             (i32::from(origin_x), i32::from(origin_y)),
                         );
                     }
@@ -32103,6 +32209,9 @@ impl App {
             // The status bars: 0 when none is up — the key stays byte-identical
             // to the no-bar path (FL-1).
             let status_bars_fp = self.status_bars.fingerprint();
+            // Presence: 0 on a quiet window (no rim, no row, no ripple) — read
+            // off the borrowed window state, the same term `presence_fp` folds.
+            let presence_fp = ws.presence.fp(frame_started);
             // Drag-to-connect wire on THIS window — `0` when no drag renders
             // here (idle invariant), a cursor-tracking hash while one does.
             // (`conn_drag` is a disjoint App field from the borrowed `ws`.)
@@ -32156,6 +32265,7 @@ impl App {
                 notice_fp,
                 level_up_fp,
                 status_bars_fp,
+                presence_fp,
                 conn_wire_fp,
                 // An OS appearance flip must reach the glass: the Settings preview's
                 // auto titlebar mock splits on it and no other term moves (main.rs).
@@ -32819,6 +32929,15 @@ impl App {
                     wash_a: l.wash_alpha(frame_started),
                     border_a: l.border_alpha(frame_started),
                     border_scale_q4: l.border_scale_q4(frame_started),
+                })
+                // The presence rim — the same third arm `host_visual_state`
+                // resolves for the capture paths, so glass and `image` agree.
+                .or_else(|| {
+                    if overlay_open {
+                        None
+                    } else {
+                        self.presence_overlay(id, frame_started)
+                    }
                 })
         };
         let visuals = HostVisualState { invert, overlay };
@@ -35281,6 +35400,9 @@ impl App {
         ctx: &ComposeDecoCtx<'_>,
         focus_place: Option<PanePlace>,
     ) -> u64 {
+        // The SAME fold `redraw_window`'s dog arm reads off `tick_cfg`
+        // (`[sparkle_words] reduced_motion` OR the `WordSparkles` motion class)
+        // — one reduced-motion seam for one bounce, whichever path presents it.
         let reduced = match self.sparkle.as_ref() {
             Some(rs) if rs.cfg.canine => !ctx.animate_sparkles || rs.cfg.reduced_motion,
             _ => return 0,
@@ -36915,10 +37037,17 @@ impl App {
                     caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat)
                         && focus_pane_dims.is_some()
                     {
-                        (focus_vis && !focus_scrolled).then_some(focus_cur_pos)
+                        // `focus_vis` (DECTCEM) used to sit in this `&&` too,
+                        // so a split pane lost its caret to a repaint exactly
+                        // as the single-pane arm did. Only the scroll is a
+                        // coordinate-space refusal; see the `cur` note above.
+                        (!focus_scrolled).then_some(focus_cur_pos)
                     } else {
                         None
                     },
+                    caret_drawn: focus_vis
+                        && focus_pane_dims.is_some()
+                        && pet_caret_admitted(pet_visible, sing_drive, !animate_cat),
                     wrapped: pet_wrapped,
                     output_burst: pet_burst,
                     // The focused split pane obeys the same touch custody as
@@ -37111,6 +37240,8 @@ impl App {
         // The status bars — same term as the single-pane key: they are WINDOW
         // chrome rows over the finished composite; 0 when none is up (FL-1).
         let status_bars_fp = self.status_bars.fingerprint();
+        // Presence: the same term as the single-pane key (0 when quiet).
+        let presence_fp = self.presence_fp(wid, Instant::now());
         // Drag-to-connect wire on THIS window (same term as the single-pane key).
         let conn_wire_fp = self.conn_wire_fingerprint(wid);
         // THE ACTIVE-PANE MARK, from the pane box the loop above resolved for
@@ -37182,6 +37313,7 @@ impl App {
             notice_fp,
             level_up_fp,
             status_bars_fp,
+            presence_fp,
             conn_wire_fp,
             // Same appearance term as the single-pane key (see `RepaintKey`).
             system_dark: repaint_system_dark(self.os_appearance),
@@ -37747,7 +37879,7 @@ impl App {
         // Chrome rows, not strip rows: with the strip off (the macOS default) a
         // live status bar is still a row the capture must carry, or the
         // introspection frame drops terminal row 0 while the glass shows a bar.
-        if self.chrome_rows() == 0 {
+        if self.chrome_rows(wid) == 0 {
             // A window with no chrome still reaches the frame's chrome
             // boundary: the chrome bleed and the chrome-row register are both
             // opened by `splice_tab_strip_with`, and they are opened there for
@@ -37840,7 +37972,10 @@ impl App {
         // band tones when it has a band (the bars share that material), else the
         // bars' band tone with the seam that closes them — so a bar reaches the
         // window edges instead of floating in a theme-coloured margin.
-        let bars = usize::from(self.status_bar_rows);
+        // …plus this window's PRESENCE row, which rides the same splice above
+        // the bars (directly under the strip) and joins the same bleed.
+        let bars = usize::from(self.status_bar_rows)
+            + usize::from(self.windows.get(&wid).map_or(0, |ws| ws.presence.rows));
         // CHROME-resolved, like the strip rows themselves (`chrome_palette_theme`):
         // the gutters this fills are part of the band, and filling them from the
         // terminal theme under a forced Linux `window_theme` left a terminal-dark
@@ -38268,12 +38403,31 @@ impl App {
         }
         let cell_h = self.win_cell_size(wid).1;
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
+        // THE PRESENCE ROW (round 19) sits ABOVE the bars — directly under the
+        // tab strip — in the row its window committed (`presence.rows`), painted
+        // through its own `(seed, cols, palette)` cache and BORROWED from it
+        // below: a frame with the row up clones nothing on a cache hit. It
+        // carries the chrome's closing seam only when no bar row follows it.
+        let _ = self.presence_band_row(wid, cols, theme);
         // The committed row count is the geometry's truth; a cache painted for a
         // count the geometry has not committed yet (or has already released) is
         // trimmed to it, never allowed to shift the grid by a row it does not own.
         let committed = usize::from(self.status_bar_rows);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
+        };
+        let presence_committed = usize::from(ws.presence.rows);
+        if committed == 0 && presence_committed == 0 {
+            return;
+        }
+        let blank_presence: Vec<RenderCell>;
+        let presence_row: Option<&[RenderCell]> = if presence_committed == 0 {
+            None
+        } else if ws.presence.cached_row.len() == cols {
+            Some(ws.presence.cached_row.as_slice())
+        } else {
+            blank_presence = crate::status_bars::blank_band_row(cols, theme);
+            Some(blank_presence.as_slice())
         };
         // SYMMETRIC (2026-09-09): over-supply is trimmed, and UNDER-supply is
         // padded. The window was SIZED for `committed` rows; composing fewer
@@ -38299,9 +38453,12 @@ impl App {
         } else {
             &ws.cached_bar_rows
         };
-        prepend_strip_rows(
+        prepend_strip_row_slices(
             &mut ws.input_scratch,
-            rows,
+            usize::from(presence_row.is_some()) + rows.len(),
+            presence_row
+                .into_iter()
+                .chain(rows.iter().map(Vec::as_slice)),
             cell_h,
             grid_top,
             &mut ws.strip_row_pool,
@@ -38321,7 +38478,7 @@ impl App {
     /// [`RepaintKey`] uses, so the key term and the presented value never disagree.
     fn set_scroll_band(&mut self, wid: WindowId) {
         let strip = if self.windows.contains_key(&wid) {
-            usize::from(self.chrome_rows())
+            usize::from(self.chrome_rows(wid))
         } else {
             0
         };
@@ -39218,7 +39375,7 @@ impl App {
         let motion = self
             .motion_policy(true)
             .amplitude(crate::motion::MotionEffect::NoticePill);
-        let clear_rows = self.notice_clear_rows();
+        let clear_rows = self.notice_clear_rows(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -39919,7 +40076,7 @@ impl App {
         // frame row the menu may occupy, so measuring the strip alone would open
         // the menu ON TOP of a live status bar — chrome covering chrome, and the
         // bar it covers is the one explaining why the terminal is busy.
-        let strip = usize::from(self.chrome_rows());
+        let strip = usize::from(self.chrome_rows(wid));
         // Tint off the LIVE OSC-11 background (like `splice_config_notice` and
         // the settings panel) so the card's tones — which are derived from the
         // theme and contrast-floored against it — stay WCAG-AA legible when a
@@ -40128,7 +40285,7 @@ impl App {
     /// idempotent, so a call with the size already applied does no reconfigure.
     fn sync_gpu_surface_size(&mut self, wid: WindowId) {
         let strip = if self.windows.contains_key(&wid) {
-            usize::from(self.chrome_rows())
+            usize::from(self.chrome_rows(wid))
         } else {
             0
         };
@@ -40167,7 +40324,7 @@ impl App {
     /// the GPU backend is gone.
     pub(crate) fn headless_frame_px(&mut self, wid: WindowId) -> Option<(u32, u32)> {
         let strip = if self.windows.contains_key(&wid) {
-            usize::from(self.chrome_rows())
+            usize::from(self.chrome_rows(wid))
         } else {
             0
         };
@@ -40230,9 +40387,9 @@ impl App {
         // Request the FULL visible window size (terminal rows + the tab strip above,
         // `2·pad` horizontally, and `pad_top + pad` vertically) so on-screen
         // geometry tracks the engine.
-        // `window_frame_px` folds in the strip AND the pad; with both zero this keeps
+        // `window_frame_px_for` folds in the strip AND the pad; with both zero this keeps
         // the original request (byte-identical).
-        let size = self.window_frame_px(rows, cols);
+        let size = self.window_frame_px_for(wid, rows, cols);
         // A driven resize OWNS the geometry from here: the launch-time initial
         // frame settle must not re-assert the attach grid over it.
         #[cfg(target_os = "linux")]
@@ -46935,6 +47092,44 @@ mod key_time_click_tests {
         assert!(
             shifted_of('a', Modifiers::SHIFT),
             "`a` under Shift is the capital it always was"
+        );
+        // THE REST OF THE WIRE (2026-09-19; owner, on v0.88.0: "shift key
+        // needs the tones that I specified (higher tone, brighter tones when
+        // using shifted keys, louder first word capitalized"). The engine's
+        // three properties all hang off this one bit, so every way a shifted
+        // glyph can reach the seam is walked: a shifted MARK (`?` is `/`
+        // under Shift — `Key::Character` holds the unshifted base), a capital
+        // under Shift AND Caps Lock, and the LITERAL-TEXT path the keymap
+        // falls back to, which carries no modifier bits at all.
+        assert!(
+            shifted_of('/', Modifiers::SHIFT),
+            "`?` — `/` under Shift — is a shifted click"
+        );
+        assert!(
+            shifted_of('9', Modifiers::SHIFT),
+            "`(` — `9` under Shift — is a shifted click"
+        );
+        assert!(
+            shifted_of('a', Modifiers::SHIFT | Modifiers::CAPS_LOCK),
+            "Shift over Caps Lock is still a shifted click"
+        );
+        let mut text_shifted_of = |text: &str| -> bool {
+            let _ = app.input(wid, InputEvent::Text(text.to_string()), Source::Human);
+            app.trail_audio
+                .take_captured_for_test()
+                .iter()
+                .find(|ev| matches!(ev.kind, SoundGesture::Trail(SoundKind::Typed)))
+                .unwrap_or_else(|| panic!("committed {text:?} must click at the key"))
+                .shifted
+        };
+        assert!(
+            text_shifted_of("A"),
+            "one committed capital is a capital, whatever path carried it"
+        );
+        assert!(!text_shifted_of("a"), "a committed lowercase glyph is not");
+        assert!(
+            !text_shifted_of("Abc"),
+            "a committed RUN is a phrase, not a key: it stays unshifted"
         );
     }
 

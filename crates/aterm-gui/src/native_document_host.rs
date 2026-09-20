@@ -649,7 +649,7 @@ fn decode_utf8(mut bytes: Vec<u8>) -> Result<String, DocumentHostError> {
     String::from_utf8(bytes).map_err(|_| DocumentHostError::InvalidUtf8)
 }
 
-fn file_uri_path(uri: &str) -> Result<PathBuf, DocumentHostError> {
+pub(crate) fn file_uri_path(uri: &str) -> Result<PathBuf, DocumentHostError> {
     let rest = uri
         .strip_prefix("file://")
         .ok_or(DocumentHostError::UnsupportedScheme)?;

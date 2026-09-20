@@ -37,6 +37,7 @@ impl Scene {
             .observe_console(&input, &facts, PetPane::full(&input));
         self.brain.set_console_presentable(true);
         self.brain.tick(PetSense {
+            caret_drawn: true,
             now: self.now,
             caret: (input.cursor_visible && input.display_offset == 0)
                 .then_some((input.cursor_row as u16, input.cursor_col as u16)),

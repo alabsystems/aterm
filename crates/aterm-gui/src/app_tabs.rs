@@ -432,6 +432,7 @@ impl App {
         if dropped {
             self.retire_title_summary(session);
             self.retire_session_status(session);
+            self.retire_presence(session);
             // These caches can carry authored descriptions, generated activity,
             // cwd/title text, and debounce deadlines. The final view is the
             // lifecycle boundary: erase them immediately instead of waiting for
@@ -1138,10 +1139,19 @@ impl App {
     /// the live status bars' (`status_bar_rows`, committed by
     /// `sync_status_bar_rows`). This — never `tab_strip_rows` alone — is what
     /// every geometry law reads: the grid fit (`grid_dims_for`), the frame size
-    /// (`window_frame_px`), the pointer's cell mapping, the effects origin, the
+    /// (`window_frame_px_for`), the pointer's cell mapping, the effects origin, the
     /// accessibility snapshot. The strip painter alone still reads
     /// `tab_strip_rows`, because that is how many of these rows are ITS.
-    pub(crate) fn chrome_rows(&self) -> u16 {
+    pub(crate) fn chrome_rows(&self, wid: WindowId) -> u16 {
+        self.chrome_rows_shared()
+            .saturating_add(self.windows.get(&wid).map_or(0, |ws| ws.presence.rows))
+    }
+
+    /// The chrome rows every window shares — the strip and the status bars —
+    /// WITHOUT the per-window presence row. Only for geometry computed before
+    /// a window exists (`window_frame_px_for` at creation); every sited law reads
+    /// [`Self::chrome_rows`].
+    pub(crate) fn chrome_rows_shared(&self) -> u16 {
         self.tab_strip_rows.saturating_add(self.status_bar_rows)
     }
 
@@ -1349,6 +1359,9 @@ impl App {
         // The App-pushed drag-to-connect drop-target highlight (design §3.2)
         // rides the same snapshot to both strips.
         self.stamp_conn_drop_target(wid, &mut metadata);
+        // The presence chip level (round 19): a hollow diamond to wait, a filled
+        // one at a stop, a dot for a story — folded over the indicator bit.
+        self.stamp_presence_chips(wid, &mut metadata);
         metadata
     }
 

@@ -8327,6 +8327,7 @@ mod tests {
                 "Smart Titles",
                 "Tab Status",
                 "Window padding",
+                "Presence",
                 "Chrome",
                 "Session"
             ]

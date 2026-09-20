@@ -3756,6 +3756,68 @@ pub(crate) fn cmd_title(term: &Arc<Mutex<Terminal>>) -> String {
     format!("OK {}\n", t.title())
 }
 
+/// The usage line `story` answers every junk form with. The verb set is
+/// spelled from [`StoryVerb::TOLD_WORDS`] so the line and the parser cannot
+/// disagree.
+pub(crate) fn story_usage() -> String {
+    format!(
+        "ERR usage: story <{}> [<text>]\n",
+        crate::presence::StoryVerb::TOLD_WORDS.join("|")
+    )
+}
+
+/// The grammar of `story <verb> [<text>]`, checked on the control thread so a
+/// junk form is a usage error and never a wake: the verb is one of the CLOSED
+/// SET (design §5: `approved dismissed reconnected timeout exit compacted
+/// warned`), the text is optional, trimmed, at most
+/// [`TOLD_TEXT_MAX_BYTES`] bytes, and carries no control byte (a newline could
+/// forge a second reply line; the band would strip it, but the wire refuses
+/// it first). Pure, so every refusal is unit-tested without an event loop.
+pub(crate) fn parse_story(rest: &str) -> Result<(crate::presence::StoryVerb, String), String> {
+    use crate::presence::{StoryVerb, TOLD_TEXT_MAX_BYTES};
+    let t = rest.trim();
+    let (word, text) = t
+        .split_once(char::is_whitespace)
+        .map_or((t, ""), |(w, x)| (w, x.trim()));
+    let Some(verb) = StoryVerb::parse_told(word) else {
+        return Err(story_usage());
+    };
+    if text.len() > TOLD_TEXT_MAX_BYTES {
+        return Err(format!(
+            "ERR story: text is longer than {TOLD_TEXT_MAX_BYTES} bytes\n"
+        ));
+    }
+    if text.chars().any(char::is_control) {
+        return Err("ERR story: text carries a control character\n".to_string());
+    }
+    Ok((verb, text.to_string()))
+}
+
+/// `story <verb> [<text>]` -> `OK story=<n>`: the watcher's decision for the
+/// target session, told to its window (design §5). The write face of the
+/// presence band, beside `appnotice` for the pull-down: watcher decisions live
+/// in another process (`aterm drive watch`'s journal loop) and reach the GUI no
+/// other way. `<n>` is the story point's seq — the number `status story=`
+/// reports once it has landed, so a poller can tell its own post from an older
+/// one. The grammar is [`parse_story`]'s; the point is noted on the main thread
+/// (`Wake::Story`) because the slot is `App` state.
+pub(crate) fn cmd_story(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
+    let (verb, text) = match parse_story(rest) {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+    match control_media::call_main(proxy, |reply| Wake::Story {
+        session,
+        verb,
+        text,
+        reply,
+    }) {
+        Ok(Ok(seq)) => format!("OK story={seq}\n"),
+        Ok(Err(error)) => format!("ERR {error}\n"),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
 /// `cwd` -> `OK <working directory>\n` (the shell's directory as reported via
 /// OSC 7; empty if never reported). Lets an introspecting client know where
 /// commands will run without scraping the prompt.
@@ -7945,5 +8007,92 @@ mod offscreen_wire_tests {
         let term = Arc::new(Mutex::new(t));
         let (_, _, lines) = parse(&cmd_offscreen(&term, ""));
         assert_eq!(lines, shown[..7].to_vec());
+    }
+}
+
+#[cfg(test)]
+mod story_tests {
+    //! The `story` verb's grammar (round 19, item 5): every junk form is the
+    //! usage line, the closed set is exactly the design's seven words, and the
+    //! text cap is the wire cap.
+
+    use super::{parse_story, story_usage};
+    use crate::presence::{StoryVerb, TOLD_TEXT_MAX_BYTES};
+
+    #[test]
+    fn every_junk_form_is_the_usage_line_and_the_closed_set_parses() {
+        let usage = story_usage();
+        assert_eq!(
+            usage,
+            "ERR usage: story <approved|dismissed|reconnected|timeout|exit|compacted|warned> \
+             [<text>]\n",
+            "the usage line spells the closed set"
+        );
+        for junk in [
+            "",
+            "   ",
+            "approve",
+            "APPROVED",
+            "approved,",
+            "hold on",
+            "✓ approved",
+            "42",
+            "@s-1 approved",
+            "exited session gone",
+            "story approved",
+        ] {
+            assert_eq!(parse_story(junk), Err(usage.clone()), "{junk:?}");
+        }
+        for (word, verb) in [
+            ("approved", StoryVerb::Approval),
+            ("dismissed", StoryVerb::Dismissed),
+            ("reconnected", StoryVerb::Reconnected),
+            ("timeout", StoryVerb::Timeout),
+            ("exit", StoryVerb::Exit),
+            ("compacted", StoryVerb::Compacted),
+            ("warned", StoryVerb::Warned),
+        ] {
+            assert_eq!(parse_story(word), Ok((verb, String::new())), "{word}");
+            assert_eq!(
+                parse_story(&format!("  {word}   some text here  ")),
+                Ok((verb, "some text here".to_string())),
+                "{word}: the text is trimmed and kept whole"
+            );
+        }
+        assert_eq!(
+            StoryVerb::TOLD_WORDS.len(),
+            7,
+            "the closed set is the design's seven words"
+        );
+        for word in StoryVerb::TOLD_WORDS {
+            assert!(StoryVerb::parse_told(word).is_some(), "{word}");
+        }
+    }
+
+    #[test]
+    fn the_text_is_capped_at_the_wire_cap_and_refuses_control_bytes() {
+        let ok = "x".repeat(TOLD_TEXT_MAX_BYTES);
+        assert_eq!(
+            parse_story(&format!("exit {ok}")),
+            Ok((StoryVerb::Exit, ok.clone()))
+        );
+        let long = "x".repeat(TOLD_TEXT_MAX_BYTES + 1);
+        assert_eq!(
+            parse_story(&format!("exit {long}")),
+            Err(format!(
+                "ERR story: text is longer than {TOLD_TEXT_MAX_BYTES} bytes\n"
+            ))
+        );
+        // Bytes, not chars: a multi-byte text is measured as the wire sees it.
+        let wide = "é".repeat(TOLD_TEXT_MAX_BYTES / 2 + 1);
+        assert!(parse_story(&format!("warned {wide}")).is_err());
+        assert_eq!(
+            parse_story("exit session gone\nOK forged"),
+            Err("ERR story: text carries a control character\n".to_string())
+        );
+        assert_eq!(
+            parse_story("exit tab\there"),
+            Err("ERR story: text carries a control character\n".to_string())
+        );
     }
 }

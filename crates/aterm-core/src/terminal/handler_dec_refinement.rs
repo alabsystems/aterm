@@ -382,7 +382,31 @@ impl TerminalHandler<'_> {
         )
     )]
     fn set_cursor_blink(&mut self, enabled: bool) {
+        // DEC MODE 12 IS THE BLINK BIT OF THE CURSOR STYLE, not a second flag
+        // beside it. The rendered blink is decided from `cursor_style` alone
+        // (the frontend arms its blink clock on the `Blinking*` variants), so a
+        // mode that only moved `modes.cursor_blink` reached the code and never
+        // the glass — and `CSI ? 12 $ p` then answered a value the terminal did
+        // not hold, in both directions.
+        //
+        // This matters on the most ordinary path there is: aterm's spawn seam
+        // forces `TERM=xterm-256color`, whose terminfo spells `cnorm` as
+        // `\E[?12l\E[?25h` and `cvvis` as `\E[?12;25h` — so EVERY ncurses
+        // `curs_set()` (vim, less, htop, nano, mc, ...) asks this mode to stop
+        // or start the blink.
         self.modes.cursor_blink = enabled;
+        let style = self.modes.cursor_style.with_blink(enabled);
+        if self.modes.cursor_style != style {
+            self.modes.cursor_style = style;
+            // The same two obligations DECSCUSR discharges for a shape change:
+            // advance damage so a frontend keyed by `damage_epoch` cannot
+            // swallow a mode-only change, and tell the host its cursor moved
+            // class.
+            self.grid.damage_mut().mark_full();
+            if let Some(callback) = self.cursor_style_callback {
+                callback(style);
+            }
+        }
     }
 
     #[cfg_attr(
@@ -517,6 +541,13 @@ impl TerminalHandler<'_> {
     // Part of #7318.
 
     /// Query the current boolean state of a DEC private mode.
+    ///
+    /// THIS TABLE AND `handle_decrqm`'s ARE ONE FACT, two spellings: a mode the
+    /// terminal can report through DECRQM is a mode XTSAVE/XTRESTORE must be
+    /// able to carry, and a mode missing here makes `CSI ? Ps s` / `CSI ? Ps r`
+    /// a silent no-op that answers exactly like a working one. The pair is
+    /// walked by `xtsave_covers_every_mode_decrqm_reports`, so a mode added to
+    /// one side and forgotten here fails that test instead of shipping.
     fn query_dec_mode(&self, mode: u16) -> Option<bool> {
         Some(match mode {
             1 => self.modes.application_cursor_keys,
@@ -525,11 +556,16 @@ impl TerminalHandler<'_> {
             5 => self.modes.reverse_video,
             6 => self.modes.origin_mode,
             7 => self.modes.auto_wrap,
-            12 => self.modes.cursor_blink,
+            // Mode 12 reads the STYLE's blink bit, not the shadow flag beside
+            // it: the style is the fact the glass acts on (see
+            // `set_cursor_blink`), so a site that moves the style without the
+            // mirror still cannot make this answer lie.
+            12 => self.modes.cursor_style.blinks(),
             25 => self.modes.cursor_visible,
             40 => self.modes.deccolm_enable,
             45 => self.modes.reverse_wraparound,
             66 => self.modes.application_keypad,
+            67 => self.modes.backarrow_sends_bs,
             69 => self.modes.left_right_margin_mode,
             80 => self.modes.sixel_display_mode,
             95 => self.modes.decncsm,
@@ -543,11 +579,22 @@ impl TerminalHandler<'_> {
             1007 => self.modes.alternate_scroll,
             1015 => self.modes.mouse_encoding == MouseEncoding::Urxvt,
             1016 => self.modes.mouse_encoding == MouseEncoding::SgrPixel,
+            // The xterm keyboard private modes and the tracked-only 1045: DECRQM
+            // reports all four, so XTSAVE/XTRESTORE must be able to carry them
+            // too. They were the drift between this table and `handle_decrqm`'s
+            // — `CSI ? 1036 s` saved nothing and `CSI ? 1036 r` restored nothing,
+            // both answering OK.
+            1035 => self.modes.special_modifiers,
+            1036 => self.modes.meta_send_escape,
+            1039 => self.modes.alt_send_escape,
+            1045 => self.modes.mode_1045,
             1049 | 47 | 1047 => self.modes.alternate_screen,
             1243 => self.modes.bidi_arrow_swap,
             2004 => self.modes.bracketed_paste,
             2026 => self.modes.synchronized_output,
             2027 => self.modes.grapheme_cluster_mode,
+            2031 => self.modes.report_color_scheme,
+            2048 => self.modes.in_band_size_reports,
             2500 => self.modes.bidi_box_mirroring,
             2501 => self.modes.bidi_autodetection,
             _ => return None,

@@ -162,6 +162,14 @@ pub(crate) const EDIT_SPARKLE_BONK_DETONATION: &str = "sparkle_words.profanity.b
 /// (`Config::output_streak_warning` says so at `--validate-config` time).
 pub(crate) const EDIT_OUTPUT_STREAK_SOUND: &str = "output_streak.sound";
 
+/// PRESENCE (round 19, SPEC19 §9): the two `[presence]` leaves the View menu's
+/// checkables write — the band row under the tab bar and the colour rim. Both
+/// default ON (`Config::presence_band_enabled` / `presence_rim_enabled`); the
+/// View menu flips the live bit at the click and persists it through the one
+/// config lane by these keys (`App::queue_presence_write`).
+pub(crate) const EDIT_PRESENCE_BAND: &str = "presence.band";
+pub(crate) const EDIT_PRESENCE_RIM: &str = "presence.rim";
+
 /// THE SOUND MENU (owner ask: "add the volume and SFX menu to settings").
 ///
 /// Every config key that changes what aterm SOUNDS like, and nothing else. One
@@ -950,6 +958,20 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         label: "Output streak pip",
         kind: EditKind::Bool,
     },
+    // [presence] (round 19) — the two surfaces a window shows who is driving
+    // it on. The View menu's checkables are their primary switch; these rows
+    // keep them findable (Search / Modified) and hand-editable with the same
+    // typing the writer uses.
+    NestedLeaf {
+        key: EDIT_PRESENCE_BAND,
+        label: "Presence band",
+        kind: EditKind::Bool,
+    },
+    NestedLeaf {
+        key: EDIT_PRESENCE_RIM,
+        label: "Presence rim",
+        kind: EditKind::Bool,
+    },
 ];
 
 /// Registry lookup for a dotted nested key — `None` for top-level keys and
@@ -1202,6 +1224,14 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // names only the two decorative tables. Whoever registers the table's
     // visual keys owes them the same choice, one by one.
     EDIT_OUTPUT_STREAK_SOUND,
+    // The presence band and rim (round 19) answer a SESSION'S facts — a peer's
+    // turn lease, a hold, unread mail on the fabric — and the workbench scene
+    // has no session, no fabric and no peer to drive it; the surfaces are
+    // previewed by the thing itself (the View menu's checkables flip them
+    // live on the window you are looking at). A synthetic "driven" scene joins
+    // the preview-matrix campaign with the other live-input rows.
+    EDIT_PRESENCE_BAND,
+    EDIT_PRESENCE_RIM,
     // The typing-momentum glow answers YOUR keystroke rate and cools when you
     // stop; the workbench scene has no keystrokes to answer, so it is previewed
     // by the thing itself — type, and the cursor warms (owner, 2026-09-08). A
@@ -2387,6 +2417,10 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         // (`Config::output_streak_sound_or_default`), so the switch and the
         // engine can never start in different positions.
         EDIT_OUTPUT_STREAK_SOUND => boolean(Some(cfg.output_streak_sound_or_default()), true),
+        // The presence surfaces seed their RESOLVED state through the resolvers
+        // that own the default (both ON), the streak pip's rule.
+        EDIT_PRESENCE_BAND => boolean(Some(cfg.presence_band_enabled()), true),
+        EDIT_PRESENCE_RIM => boolean(Some(cfg.presence_rim_enabled()), true),
         // Unreachable for registered leaves — the conformance test fails any
         // NESTED_LEAVES entry that lands here (blank seed AND blank placeholder).
         _ => (None, String::new()),
@@ -2506,6 +2540,13 @@ pub(crate) fn section_of(key: &str) -> Section {
     }
     if key.starts_with("sparkle_words.") || key.starts_with("matrix_rain.") {
         return Section::Appearance;
+    }
+    // The presence band and rim are WINDOW CHROME — the row under the tab bar
+    // and the frame around the grid — so they sit with the tab strip and the
+    // tab-status badges, beside the other things a window says about its
+    // session.
+    if key.starts_with("presence.") {
+        return Section::Window;
     }
     // Robi the helper robot is a screen decoration like the two tables above.
     if key == EDIT_ROBI {
@@ -2697,6 +2738,11 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     }
     if key.starts_with("matrix_rain.") {
         return ("Matrix rain", 5);
+    }
+    // Window › the presence surfaces, beside Tab Status (both answer "what does
+    // this window say about who is driving its session").
+    if key.starts_with("presence.") {
+        return ("Presence", 2);
     }
     if key == EDIT_ROBI {
         return ("Robi the robot", 6);
@@ -3650,6 +3696,12 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "running",
             "failed",
             "session",
+        ],
+        // The presence surfaces: a user hunting them knows the WORDS the band
+        // prints ("driven", "hold", "rim", "band") or the feature's name.
+        EDIT_PRESENCE_BAND | EDIT_PRESENCE_RIM => &[
+            "presence", "band", "rim", "driving", "driven", "hold", "fabric", "manager", "worker",
+            "window",
         ],
         EDIT_TAB_CONNECTION_BADGE => &[
             "connection",

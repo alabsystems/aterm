@@ -813,8 +813,15 @@ impl GridStorage {
             if usize::from(new_cols) > self.tab_stops.len() {
                 let old_len = self.tab_stops.len();
                 self.tab_stops.resize(usize::from(new_cols), false);
-                for col in old_len..self.tab_stops.len() {
-                    self.tab_stops[col] = col > 0 && col % 8 == 0;
+                // ...unless TBC 3 erased every stop and nothing has reset them
+                // since. Seeding the every-8 default into the columns a WIDEN
+                // adds resurrected stops the application had explicitly cleared
+                // — "clear all" has to keep meaning all, at a width the grid did
+                // not have when it was asked.
+                if !self.tab_defaults_suppressed {
+                    for col in old_len..self.tab_stops.len() {
+                        self.tab_stops[col] = col > 0 && col % 8 == 0;
+                    }
                 }
             }
         }

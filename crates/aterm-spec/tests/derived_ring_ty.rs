@@ -6718,13 +6718,16 @@ fn derived_native_update_overlap_handoff_proves_and_catches_ownership_regression
     // not create a power set of semantically equivalent refusal states.  Keep
     // this focused check here so a state-space regression fails in seconds,
     // rather than several minutes into `aterm-gui::spec_xref_closure`.
-    const EXPECTED_DEAD: [&str; 6] = [
+    const EXPECTED_DEAD: [&str; 9] = [
         "CommitWithoutFreshExactProof",
         "AckInexactLegacyBridge",
         "BuggyReleaseReadersOnProof",
         "BuggyResumeParentBeforeReap",
         "BuggyWaitBeforeGroupSignal",
         "BuggyKillAfterCommitWin",
+        "BuggyGrantBeforePark",
+        "BuggyReleaseReadersUngranted",
+        "BuggyRetireUngrantedWithSuccessorLive",
     ];
     let healthy_fired =
         aterm_spec::interp::fired_actions(&aterm_spec::interp::with_buggy(&model, 0));
@@ -6971,6 +6974,118 @@ fn derived_native_update_overlap_handoff_proves_and_catches_ownership_regression
         "AtomicArbiterExcludesKillAfterCommitWin",
         &kill_after_commit_win,
     ));
+
+    // THE LATE PARK (2026-09-19): the launched lane. The successor exists before
+    // the park, holding nothing; the grant follows the park; from there the
+    // decision is the fork lane's.
+    let mut launched = model.init_state();
+    for action in [
+        "LaunchSuccessorBeforePark",
+        "ParkParentReaders",
+        "GrantDescriptorsToBootedSuccessor",
+        "ChildPaintsExactProof",
+        "MainWinsCommitArbiter",
+        "CommitModern",
+        "ReleaseModernReaders",
+    ] {
+        assert!(model.fire(action, &mut launched), "{action}: {launched:?}");
+    }
+    assert_eq!(launched.get("commit"), Some(&1));
+    assert_eq!(launched.get("child_readers"), Some(&1));
+    assert_eq!(launched.get("launched_early"), Some(&1));
+
+    // A revocation BEFORE the park kills, reaps and retires the candidate with
+    // the parent's readers never stopped: no rollback, no resume.
+    let mut stood_down = model.init_state();
+    for action in [
+        "LaunchSuccessorBeforePark",
+        "RevokeUngrantedSuccessor",
+        "KillUngrantedSuccessor",
+        "ReapUngrantedSuccessor",
+        "RetireUngrantedAttempt",
+    ] {
+        assert!(
+            model.fire(action, &mut stood_down),
+            "{action}: {stood_down:?}"
+        );
+    }
+    assert_eq!(stood_down.get("parent_readers"), Some(&1));
+    assert_eq!(stood_down.get("parent_parked"), Some(&0));
+    assert_eq!(stood_down.get("retired"), Some(&1));
+    assert!(
+        model
+            .successors("ResumeParentAfterReap", &stood_down)
+            .is_empty()
+    );
+    assert!(
+        model
+            .successors("ParkParentReaders", &stood_down)
+            .is_empty()
+    );
+    assert!(
+        model
+            .successors("LaunchSuccessorBeforePark", &stood_down)
+            .is_empty()
+    );
+
+    // A park whose capture missed resumes the readers beside the live,
+    // ungranted candidate and parks again — legitimately, since nothing left.
+    let mut reparked = model.init_state();
+    for action in [
+        "LaunchSuccessorBeforePark",
+        "ParkParentReaders",
+        "UnparkForRepark",
+        "ParkParentReaders",
+        "GrantDescriptorsToBootedSuccessor",
+        "ChildPaintsExactProof",
+        "MainWinsCommitArbiter",
+        "CommitModern",
+    ] {
+        assert!(model.fire(action, &mut reparked), "{action}: {reparked:?}");
+    }
+    assert_eq!(reparked.get("commit"), Some(&1));
+    // …and a revocation after the un-park still retires the candidate.
+    let mut unparked_then_revoked = model.init_state();
+    for action in [
+        "LaunchSuccessorBeforePark",
+        "ParkParentReaders",
+        "UnparkForRepark",
+        "RevokeUngrantedSuccessor",
+        "KillUngrantedSuccessor",
+        "ReapUngrantedSuccessor",
+        "RetireUngrantedAttempt",
+    ] {
+        assert!(
+            model.fire(action, &mut unparked_then_revoked),
+            "{action}: {unparked_then_revoked:?}"
+        );
+    }
+    assert_eq!(unparked_then_revoked.get("parent_readers"), Some(&1));
+
+    // The three laws the lane adds, each falsified by its own mutant.
+    let mut grant_before_park = buggy.init_state();
+    for action in ["LaunchSuccessorBeforePark", "BuggyGrantBeforePark"] {
+        assert!(buggy.fire(action, &mut grant_before_park));
+    }
+    assert!(!buggy.check_invariant("GrantRequiresParkedParent", &grant_before_park));
+    assert!(!buggy.check_invariant(
+        "ReadersBesideLiveCandidateOnlyUngranted",
+        &grant_before_park
+    ));
+    let mut reads_ungranted = buggy.init_state();
+    for action in ["LaunchSuccessorBeforePark", "BuggyReleaseReadersUngranted"] {
+        assert!(buggy.fire(action, &mut reads_ungranted));
+    }
+    assert!(!buggy.check_invariant("UngrantedSuccessorNeverReads", &reads_ungranted));
+    let mut retired_live = buggy.init_state();
+    for action in [
+        "LaunchSuccessorBeforePark",
+        "RevokeUngrantedSuccessor",
+        "BuggyRetireUngrantedWithSuccessorLive",
+    ] {
+        assert!(buggy.fire(action, &mut retired_live));
+    }
+    assert!(!buggy.check_invariant("UngrantedRetireRequiresReap", &retired_live));
 
     let mut scrolled_legacy = buggy.init_state();
     for action in [
