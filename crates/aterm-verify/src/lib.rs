@@ -278,6 +278,11 @@ pub struct Ctx {
     /// Variables removed from every child's inherited environment
     /// ([`exec::ExecEnv::remove_env`]).
     pub child_env_remove: Vec<&'static str>,
+    /// Variables given to every child ([`exec::ExecEnv::add_env`]): the run's
+    /// pinned git stamp and its pinned test concurrency. Resolved once, here,
+    /// so every stage of one run agrees and a wrapper cannot change what the
+    /// merge contract measured without the receipt saying so.
+    pub child_env_add: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     /// The `ATERM_VERIFY_TIMINGS` sink, when one was opened.
     pub timings: Option<exec::Timings>,
     /// The source state a snapshot's sync verified. The tripwire arms on it
@@ -327,6 +332,7 @@ impl Ctx {
             source_mode: snapshot::SourceMode::InPlace,
             notes: Vec::new(),
             child_env_remove: GATE_CHANNELS.to_vec(),
+            child_env_add: Vec::new(),
             timings: None,
             source_baseline: None,
         }
@@ -356,6 +362,82 @@ impl Ctx {
     }
 
     /// Extra `verify: …` header lines.
+    /// PIN WHAT EVERY CHILD MUST AGREE ON, once, on the main thread.
+    ///
+    /// TWO FACTS, both of which a run was previously letting each child decide
+    /// for itself, and both of which cost a measured defect:
+    ///
+    /// * THE GIT STAMP. `crates/aterm-gui/build.rs` derives the commit and the
+    ///   dev counter from git, and therefore `rerun-if-changed`s the files those
+    ///   answers come from. Those files live in the COMMON git dir, which for a
+    ///   linked worktree is the MAIN checkout's `.git` — 29 worktrees share one
+    ///   here. A `fetch`, `gc` or `pack-refs` in any of them invalidated this
+    ///   crate's compile in all of them, mid-gate (`packed-refs` mtime landed
+    ///   between two builds of one run, 2026-09-20). Resolved here and passed
+    ///   down, the build script asks git nothing and watches nothing, and the
+    ///   run's builds become reproducible as a side effect.
+    /// * TEST CONCURRENCY. The gate set `RUST_TEST_THREADS` nowhere, so it
+    ///   inherited whatever the invoking shell had. A wrapper capping it at 4
+    ///   changed what the merge contract measured without saying so, and cost
+    ///   2.17x per test on CPU-bound binaries (aterm-effects: 33.18 s uncapped,
+    ///   78.38 s capped). A contract that measures a different thing depending
+    ///   on who typed the command is not a contract. `$ATERM_VERIFY_TEST_THREADS`
+    ///   overrides, and whatever is used is recorded.
+    #[must_use]
+    pub fn with_pinned_child_facts(mut self) -> Self {
+        let git = |args: &[&str]| -> Option<String> {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&self.root)
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let commit = git(&["rev-parse", "--short=12", "HEAD"]).filter(|c| !c.is_empty());
+        let dev_commits = git(&["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
+            .and_then(|tag| git(&["rev-list", &format!("{tag}..HEAD"), "--count"]))
+            .filter(|c| !c.is_empty());
+        // BOTH OR NEITHER. The build script pins only when it has both, so half
+        // a pin would leave the watch armed while looking pinned.
+        if let (Some(commit), Some(dev)) = (commit, dev_commits) {
+            let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+            let stamp = if dirty {
+                format!("{commit}-dirty")
+            } else {
+                commit
+            };
+            self.notes.push(format!(
+                "child env: git stamp pinned to {stamp} (+{dev} since tag)"
+            ));
+            self.child_env_add
+                .push(("ATERM_BUILD_GIT_COMMIT".into(), stamp.into()));
+            self.child_env_add
+                .push(("ATERM_BUILD_DEV_COMMITS".into(), dev.into()));
+        } else {
+            self.notes.push(
+                "child env: git stamp NOT pinned (this root answers no commit) — the build \
+                 script falls back to probing git, and its watch stays armed"
+                    .to_string(),
+            );
+        }
+
+        let threads = std::env::var("ATERM_VERIFY_TEST_THREADS")
+            .ok()
+            .filter(|v| v.trim().parse::<u32>().is_ok_and(|n| n > 0))
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+                    .to_string()
+            });
+        self.notes
+            .push(format!("child env: RUST_TEST_THREADS pinned to {threads}"));
+        self.child_env_add
+            .push(("RUST_TEST_THREADS".into(), threads.into()));
+        self
+    }
+
     #[must_use]
     pub fn with_notes(mut self, notes: impl IntoIterator<Item = String>) -> Self {
         self.notes.extend(notes);
@@ -389,6 +471,7 @@ impl Ctx {
             scratch: &self.scratch,
             child_ceiling: exec::ceiling_from_env(self.env.stage_timeout.as_deref()),
             remove_env: &self.child_env_remove,
+            add_env: &self.child_env_add,
             timings: self.timings.as_ref(),
         }
     }

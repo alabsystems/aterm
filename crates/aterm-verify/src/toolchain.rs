@@ -524,6 +524,7 @@ impl Toolchain {
                     scratch,
                     child_ceiling: Some(std::time::Duration::from_secs(60)),
                     remove_env: &[],
+                    add_env: &[],
                     timings: None,
                 },
             );

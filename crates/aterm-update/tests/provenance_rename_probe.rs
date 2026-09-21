@@ -203,6 +203,69 @@ fn which_move_tags_a_clean_directory() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// WHAT THE UNTRACKED LANE DOES NOT DO: launder a tagged source.
+///
+/// It is natural to read "run the copy as a launchd job and its output is clean" as a
+/// property of the JOB. It is not. `ditto` preserves extended attributes — that is why
+/// this updater uses it rather than `cp`, so a bundle's sequestered resource forks and
+/// its codesign seal survive the copy — and `com.apple.provenance` is an extended
+/// attribute like any other. An untracked job copying a TAGGED tree therefore writes a
+/// TAGGED tree, and the lane buys nothing.
+///
+/// The lane's real property is narrower and worth stating exactly: an untracked job
+/// does not ADD the tag to output that would otherwise have been clean. Everything
+/// upstream of it still has to be clean, which is why the placement moves were worth
+/// fixing and why atpkg records `the untracked lane ran, but the first file it laid
+/// still carried com.apple.provenance` as a distinct cause.
+#[test]
+#[ignore = "measures the host's provenance behaviour; needs launchctl"]
+fn an_untracked_job_does_not_launder_a_tagged_source() {
+    let d = scratch();
+    let this_process_is_tracked = {
+        let probe = d.join("probe");
+        std::fs::write(&probe, b"x").expect("write");
+        tagged(&probe)
+    };
+
+    // Written by THIS process, so on a tracked host it is tagged — the shape a stage
+    // laid by an unfixed updater has.
+    let src = d.join("tagged-src");
+    std::fs::create_dir_all(src.join("Contents")).expect("mkdir");
+    std::fs::write(src.join("Contents/f"), b"x").expect("write");
+
+    let made = d.join("made-ditto");
+    launchd_sh(
+        "/usr/bin/ditto \"$1\" \"$2\" && : > \"$3\"",
+        &[&src, &d.join("copy"), &made],
+        &made,
+    );
+    let copy = d.join("copy");
+    let (src_tagged, copy_tagged) = (tagged(&src), tagged(&copy));
+
+    eprintln!(
+        "this test process tracked={this_process_is_tracked}\n  \
+         source written by this process       -> tagged={src_tagged}\n  \
+         ditto of it BY AN UNTRACKED JOB      -> tagged={copy_tagged}"
+    );
+
+    if this_process_is_tracked {
+        assert!(
+            src_tagged,
+            "the source starts tagged, as an unfixed stage would"
+        );
+        assert!(
+            copy_tagged,
+            "AND SO DOES THE COPY. If this ever fails the law changed: ditto would have \
+             stopped preserving the attribute, the untracked lane would launder a tagged \
+             source, and the placement fix would no longer be the only thing standing \
+             between a tracked updater and a tagged install"
+        );
+    } else {
+        eprintln!("  (untracked test process: the assertions above are vacuous)");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// Make a clean directory tree through an untracked job and hand back its path.
 fn clean_dir(d: &Path, name: &str) -> PathBuf {
     let made = d.join(format!("made-{name}"));

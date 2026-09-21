@@ -310,9 +310,16 @@ const SURFACES: &[SurfaceRow<'static>] = &[
     ),
     (
         "crates/aterm-verify/src/lib.rs",
-        "961ff9e82860b502",
-        "2026-09-19",
-        "re-read on 2026-09-18: HOOK_CLAIM (the sentence the gate prints to every clone) now names the three pushes the receipt hook admits without a receipt of their own — a tag, the release cutter's claim over origin's tip touching only CHANGELOG.md and RELEASES.ledger, and a clean automatic merge of a receipted commit onto origin's tip whose tree is byte-equal to git's own merge of its parents — beside the ATERM_PUSH_NO_GATE=1 exception; read against .githooks/pre-push (`release_claim`, `gated_merge`, `receipt_passes`, the refs/tags/* arm) and measured by tests/push_gate.rs (18 tests), which runs the shipped hook for each admission and each refusal the sentence implies",
+        "1fc43f8089a4f55c",
+        "2026-09-21",
+        "re-read on 2026-09-21: the only drift is `Ctx::with_pinned_child_facts`, added in the \
+         same change, and its doc is read against the function directly beneath it — it \
+         resolves the git stamp from `self.root` and the test-thread count, pushes both onto \
+         `child_env_add`, and pushes one note per fact; the doc's two claims are exactly those \
+         two effects, and its `both or neither` sentence matches the `if let (Some, Some)` that \
+         guards the stamp. The reason it gives (a watch on the shared common git dir \
+         invalidating this crate's compile mid-gate) is the defect `crates/aterm-gui/build.rs` \
+         records at `git_watch_paths`. Earlier: re-read on 2026-09-18: HOOK_CLAIM (the sentence the gate prints to every clone) now names the three pushes the receipt hook admits without a receipt of their own — a tag, the release cutter's claim over origin's tip touching only CHANGELOG.md and RELEASES.ledger, and a clean automatic merge of a receipted commit onto origin's tip whose tree is byte-equal to git's own merge of its parents — beside the ATERM_PUSH_NO_GATE=1 exception; read against .githooks/pre-push (`release_claim`, `gated_merge`, `receipt_passes`, the refs/tags/* arm) and measured by tests/push_gate.rs (18 tests), which runs the shipped hook for each admission and each refusal the sentence implies",
     ),
     (
         "crates/aterm-winsign/src/lib.rs",

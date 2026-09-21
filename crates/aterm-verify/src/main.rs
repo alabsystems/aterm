@@ -131,6 +131,10 @@ fn main() {
     if let Some(s) = &snap {
         ctx = ctx.in_snapshot_of(s.caller.clone(), s.tree.clone(), s.notes.clone());
     }
+    // AFTER the snapshot is chosen, because the git stamp is resolved from the
+    // root this run will actually build — and BEFORE any stage runs, because the
+    // whole point is that every child of one run is given the same answer.
+    ctx = ctx.with_pinned_child_facts();
 
     let started = Instant::now();
     let stdout = std::io::stdout();

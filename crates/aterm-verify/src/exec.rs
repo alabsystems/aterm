@@ -160,6 +160,16 @@ pub struct ExecEnv<'a> {
     /// would put every cargo child straight back into the shared, contended
     /// target dir the snapshot exists to get away from.
     pub remove_env: &'a [&'a str],
+    /// Variables ADDED to every child, after [`Self::remove_env`] and BEFORE the
+    /// stage's own [`Cmd::envs`] — so a stage that names a variable still wins.
+    ///
+    /// This is where a fact the whole run must agree on lives, resolved ONCE on
+    /// the main thread instead of by each child for itself. Two of them today:
+    /// the pinned git stamp (`ATERM_BUILD_GIT_COMMIT` / `ATERM_BUILD_DEV_COMMITS`),
+    /// which stops `aterm-gui`'s build script watching a path in the shared
+    /// common git dir, and `RUST_TEST_THREADS`, which the run must PIN rather
+    /// than inherit from whatever shell invoked it.
+    pub add_env: &'a [(OsString, OsString)],
     /// Where per-child timing rows go when `ATERM_VERIFY_TIMINGS` names a file.
     /// `None` spawns nothing extra and writes nothing.
     pub timings: Option<&'a Timings>,
@@ -493,6 +503,9 @@ fn run_untimed(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
     for k in env.remove_env {
         c.env_remove(k);
     }
+    for (k, v) in env.add_env {
+        c.env(k, v);
+    }
     for (k, v) in &cmd.envs {
         c.env(k, v);
     }
@@ -792,6 +805,7 @@ mod tests {
             scratch: dir,
             child_ceiling,
             remove_env: &[],
+            add_env: &[],
             timings: None,
         }
     }

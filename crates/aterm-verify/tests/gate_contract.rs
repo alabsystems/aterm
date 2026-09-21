@@ -2161,8 +2161,20 @@ fn no_doc_driver_is_could_not_run_on_the_doctests_row() {
 /// applied to a whole `--fast` run would put every other stub under it too — on a
 /// saturated machine that is a red row this test never meant to produce. `run_stage`
 /// drives the Test stage alone, the way the sealed-lane and atpkg-tooling cases do, so the
-/// only child under the 8 s ceiling is the one that is supposed to hang. No new row in
+/// only child under the ceiling is the one that is supposed to hang. No new row in
 /// fast-invocations.txt: no argv changed.
+///
+/// THE CEILING IS 30 s, NOT 8 (2026-09-21). Isolating the stage was not enough, because
+/// this test itself runs inside `targo test --workspace` — the merge contract saturates
+/// the machine, and under that load the stub's OTHER branch, a shell script whose whole
+/// body for this argv is `exit 0`, took longer than 8 s to be scheduled and reaped. The
+/// gate then failed with `TIMEOUT — child killed after 8.0s` naming
+/// `targo test --workspace --no-run`, which is precisely the red row the paragraph above
+/// says this test never meant to produce; a whole 45-minute gate run was spent on it.
+/// The ceiling has to clear the worst-case SCHEDULING delay for a trivial child, not just
+/// beat the hang. 30 s is ~4x the delay actually observed and still 20x under the 600 s
+/// sleep, so what the test proves is unchanged; the cost is that the hung child is waited
+/// out for 30 s instead of 8.
 #[test]
 fn a_hung_test_run_names_the_test_in_the_ladder() {
     let repo = FakeRepo::new();
@@ -2172,7 +2184,10 @@ fn a_hung_test_run_names_the_test_in_the_ladder() {
         fixture.display()
     ));
     let mut ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    ctx.env.stage_timeout = Some("8".into());
+    // One value, used for both the ceiling and the sentence the block must print, so the
+    // two cannot drift the way they just did when the ceiling was raised.
+    const CEILING_SECS: u32 = 30;
+    ctx.env.stage_timeout = Some(CEILING_SECS.to_string().into());
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|s| s.id == StageId::Test)
@@ -2180,6 +2195,7 @@ fn a_hung_test_run_names_the_test_in_the_ladder() {
     let report = stages::run_stage(&ctx, &spec);
     let block = report.render();
 
+    let ceiling_line = format!("over the {CEILING_SECS}.0s wall-clock ceiling");
     let compiled = "targo test --workspace --no-run (trustdoc)";
     let hung = "targo test --workspace --tests (trustdoc)";
     assert!(
@@ -2193,7 +2209,7 @@ fn a_hung_test_run_names_the_test_in_the_ladder() {
     assert!(tally(std::slice::from_ref(&report)).failed(), "{block}");
     for want in [
         "aterm-verify: TIMEOUT — child killed after ",
-        "over the 8.0s wall-clock ceiling",
+        ceiling_line.as_str(),
         "  child: ",
         "--unverified test --workspace --no-fail-fast --tests",
         "  test binary: unittests src/lib.rs (target/debug/deps/aterm_gui-66cafa00b6862bbd) — \

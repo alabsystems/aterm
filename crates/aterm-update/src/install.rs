@@ -80,6 +80,18 @@ const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from
 // [`rename_untagged`], which exchanges rather than renames. See its documentation for
 // why that needs no helper process, and `tests/provenance_rename_probe.rs` for the
 // measurement of each operation involved.
+//
+// AND THE LANE DOES NOT LAUNDER. It is easy to read "the copy runs as a launchd job, so
+// its output is clean" as a property of the JOB; it is not. `ditto` preserves extended
+// attributes — the reason this updater uses it at all, so the sequestered resource
+// forks and the codesign seal survive — and the provenance tag is an extended attribute
+// like any other, so an untracked job copying a TAGGED tree writes a tagged one
+// (measured 2026-09-21, `an_untracked_job_does_not_launder_a_tagged_source`). The
+// property the lane actually has is narrower: it does not ADD the tag to output that
+// would otherwise have been clean. Everything upstream of it must already be clean,
+// which is exactly why the placement moves were worth fixing, and which is the
+// condition atpkg records as "the untracked lane ran, but the first file it laid still
+// carried com.apple.provenance".
 // ---------------------------------------------------------------------------
 
 /// Whether THIS process is provenance-tracked — MEASURED, by writing a probe file into
@@ -173,44 +185,71 @@ fn process_is_tracked(scratch: &Path) -> bool {
 /// just the last.
 fn rename_untagged(from: &Path, to: &Path, scratch: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
-    {
-        let exchangeable = to.parent().is_some_and(|parent| {
-            std::fs::symlink_metadata(to).is_err()
-                && same_volume(from, parent)
-                && process_is_tracked(scratch)
-        });
-        if exchangeable {
-            // Exclusive create: never adopt a directory that raced into existence,
-            // because the check above concluded there was nothing at `to` to preserve.
-            if std::fs::DirBuilder::new().create(to).is_ok() {
-                match rename_swap(from, to) {
-                    Ok(()) => {
-                        // `from` now holds the empty directory we made, and the move HAS
-                        // happened — so this cannot fail the call. Say so in the log
-                        // rather than reporting a clean rename that left its source
-                        // name behind, which `rename(2)` never does.
-                        if let Err(error) = std::fs::remove_dir(from) {
-                            crate::warn(&format!(
-                                "moved {} to {} but could not drop the emptied \
-                                 source name ({error}); it remains an empty directory",
-                                from.display(),
-                                to.display()
-                            ));
-                        }
-                        return Ok(());
-                    }
-                    // Leave the destination exactly as absent as we found it, then let
-                    // the plain rename below produce the error the caller expects.
-                    Err(_) => {
-                        let _ = std::fs::remove_dir(to);
-                    }
-                }
-            }
-        }
+    if exchange_is_needed(from, to, scratch) && exchange_move(from, to).is_ok() {
+        return Ok(());
     }
     #[cfg(not(target_os = "macos"))]
     let _ = scratch;
     std::fs::rename(from, to)
+}
+
+/// WHETHER to exchange — the three conditions from [`rename_untagged`]'s documentation,
+/// kept apart from the mechanism so each can be read and changed on its own.
+///
+/// The volume test compares the two PARENT directories, not `from` against the
+/// destination's parent. `rename(2)`'s `EXDEV` is a property of the directory ENTRIES
+/// being moved, and [`same_volume`] resolves through symlinks: asking it about `from`
+/// would measure whatever a symlinked source POINTS at, which on a bundle laid beside a
+/// link to another disk is the wrong volume and the wrong answer. `same_volume` fails
+/// closed on a path it cannot stat, so a missing parent declines the exchange.
+#[cfg(target_os = "macos")]
+fn exchange_is_needed(from: &Path, to: &Path, scratch: &Path) -> bool {
+    let (Some(from_parent), Some(to_parent)) = (from.parent(), to.parent()) else {
+        return false;
+    };
+    std::fs::symlink_metadata(to).is_err()
+        && same_volume(from_parent, to_parent)
+        && process_is_tracked(scratch)
+}
+
+/// THE EXCHANGE itself: create the destination, swap the two entries, drop the emptied
+/// source. Assumes its caller has already decided the exchange applies.
+///
+/// Separate from [`exchange_is_needed`] so this can be tested on EVERY host. The
+/// decision depends on the test process being provenance-tracked, which is true on a
+/// developer's tagged machine and false in CI, and a mechanism that only runs where the
+/// policy happens to fire is a mechanism nothing pins.
+///
+/// `Err` means nothing moved AND nothing was left behind, so the caller can fall back to
+/// a plain rename and hand the caller's own error back.
+#[cfg(target_os = "macos")]
+fn exchange_move(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Exclusive create: never adopt a directory that raced into existence, because the
+    // decision above concluded there was nothing at `to` to preserve.
+    std::fs::DirBuilder::new().create(to)?;
+    match rename_swap(from, to) {
+        Ok(()) => {
+            // `from` now holds the empty directory we made, and the move HAS happened —
+            // so this cannot fail the call. Say so in the log rather than reporting a
+            // clean rename that left its source name behind, which `rename(2)` never
+            // does.
+            if let Err(error) = std::fs::remove_dir(from) {
+                crate::warn(&format!(
+                    "moved {} to {} but could not drop the emptied \
+                     source name ({error}); it remains an empty directory",
+                    from.display(),
+                    to.display()
+                ));
+            }
+            Ok(())
+        }
+        // Leave the destination exactly as absent as we found it, so the caller's plain
+        // rename produces the error the CALLER's error handling was written against.
+        Err(error) => {
+            let _ = std::fs::remove_dir(to);
+            Err(error)
+        }
+    }
 }
 
 /// Each copy owns a fresh private directory on the destination volume. A helper
@@ -5275,6 +5314,164 @@ staged_at = "2026-08-17T00:00:00Z"
         root
     }
 
+    /// EVERY PLACEMENT MOVE TAKES THE LANE — pinned on the source, because the cost of
+    /// missing one is invisible.
+    ///
+    /// A plain `std::fs::rename` of a bundle by a tracked process tags it, and nothing
+    /// downstream complains: the install succeeds, the bundle works, and the tag is only
+    /// discovered later as a toolchain that cannot cut a release. Eight moves were
+    /// converted to [`rename_untagged`]; a ninth added later would be silent.
+    ///
+    /// So: outside the test module, this file may contain exactly ONE `std::fs::rename`,
+    /// the fallback inside [`rename_untagged`] itself. A new one fails here and has to
+    /// say why — if it genuinely does not place a bundle, name it in this test.
+    #[test]
+    fn nothing_outside_the_lane_renames_a_bundle_into_place() {
+        let source = include_str!("install.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(before, _)| before);
+        assert!(
+            production.contains("fn rename_untagged"),
+            "the split found the production half"
+        );
+
+        let calls = production.match_indices("std::fs::rename(").count();
+        assert_eq!(
+            calls, 1,
+            "expected exactly one plain rename in the production half of install.rs — \
+             the fallback inside rename_untagged — but found {calls}. A placement move \
+             that does not take the lane hands this process's com.apple.provenance to \
+             the bundle it moves, and nothing at runtime will tell you."
+        );
+
+        // And that one is the fallback: the line after the lane's `#[cfg]` arms.
+        let lane = production
+            .split_once("fn rename_untagged")
+            .expect("the lane is here")
+            .1;
+        let lane_body = lane.split_once("\n}\n").expect("the lane ends").0;
+        assert!(
+            lane_body.contains("std::fs::rename(from, to)"),
+            "the single remaining rename is the lane's own fallback, not a stray one \
+             that merely happens to be the first match"
+        );
+    }
+
+    /// THE EXCHANGE, driven directly.
+    ///
+    /// Every `the_untagged_lane_*` test below goes through [`rename_untagged`], whose
+    /// first question is whether THIS process is provenance-tracked. On a developer's
+    /// tagged machine that is true and the exchange runs; in CI it is false and all of
+    /// them quietly measure `std::fs::rename` instead. So the mechanism is pinned here,
+    /// through [`exchange_move`], where the answer does not depend on the host.
+    #[test]
+    fn the_exchange_moves_the_payload_and_keeps_its_inode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let root = swap_root("exchange-move");
+        let from = root.join("payload");
+        std::fs::create_dir_all(from.join("Contents")).unwrap();
+        std::fs::write(from.join("Contents/body"), b"BODY").unwrap();
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let before = std::fs::metadata(&from).unwrap();
+        let (ino, mtime) = (before.ino(), before.mtime());
+
+        let to = root.join("dest");
+        exchange_move(&from, &to).expect("same-volume exchange");
+
+        assert!(!from.exists(), "the emptied source name is dropped");
+        assert_eq!(
+            std::fs::read(to.join("Contents/body")).unwrap(),
+            b"BODY",
+            "the payload arrives byte for byte"
+        );
+        let after = std::fs::metadata(&to).unwrap();
+        assert_eq!(
+            after.ino(),
+            ino,
+            "THE SAME INODE arrives at the destination — this is what lets the caller \
+             skip re-verifying a bundle it already verified, and what keeps the \
+             extended attribute it does NOT carry from being added"
+        );
+        assert_eq!(after.mtime(), mtime, "and its timestamps are its own");
+        assert_eq!(
+            after.permissions().mode() & 0o777,
+            0o750,
+            "as is its mode; the placeholder's is discarded with the placeholder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The failure arm: when the exchange cannot be made, the placeholder the attempt
+    /// created must be gone again. `Err` from this function means NOTHING MOVED and
+    /// NOTHING WAS LEFT, which is the contract [`rename_untagged`] relies on to fall
+    /// back to a plain rename and report that rename's own error.
+    #[test]
+    fn a_failed_exchange_sweeps_the_placeholder_it_created() {
+        let root = swap_root("exchange-sweep");
+        let from = root.join("absent");
+        let to = root.join("dest");
+
+        let error = exchange_move(&from, &to).expect_err("no source to exchange with");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            !to.exists(),
+            "the placeholder is swept — left behind it is an EMPTY BUNDLE at a path a \
+             later launch reads as a stage"
+        );
+        assert!(
+            !holds_a_stage(&to),
+            "and it would not read as a stage even if something did leave one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An occupied destination is refused before anything is created, so the exchange
+    /// can never silently replace bytes a plain rename would have refused.
+    #[test]
+    fn the_exchange_refuses_a_destination_that_already_exists() {
+        let root = swap_root("exchange-occupied");
+        let from = root.join("payload");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("mark"), b"1").unwrap();
+        let to = root.join("dest");
+        std::fs::create_dir(&to).unwrap();
+        std::fs::write(to.join("other"), b"2").unwrap();
+
+        let error = exchange_move(&from, &to).expect_err("the destination is taken");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(to.join("other")).unwrap(),
+            b"2",
+            "the destination's bytes are untouched"
+        );
+        assert!(from.join("mark").exists(), "and so are the source's");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The policy half, at the one edge that is decidable without a tracked process:
+    /// a path with no parent, and a destination that exists, are both refused. The
+    /// volume and tracking terms need a real second volume and a tagged process, which
+    /// the ignored probes cover.
+    #[test]
+    fn the_exchange_is_not_attempted_without_two_real_parents() {
+        let root = swap_root("exchange-policy");
+        let from = root.join("payload");
+        std::fs::create_dir_all(&from).unwrap();
+        let occupied = root.join("taken");
+        std::fs::create_dir(&occupied).unwrap();
+
+        assert!(
+            !exchange_is_needed(&from, &occupied, &root),
+            "a destination that exists is never exchanged onto"
+        );
+        assert!(
+            !exchange_is_needed(&from, Path::new("/"), &root),
+            "and neither is a destination with no parent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The untagged lane must be a drop-in for `rename`: same result, same content,
     /// same mode, same errors. Everything it changes is invisible to the caller except
     /// the extended attribute it declines to add, which only a tracked process and a
@@ -5339,10 +5536,13 @@ staged_at = "2026-08-17T00:00:00Z"
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A missing source must report ENOENT and leave NOTHING behind. The exchange
-    /// creates the destination before it can discover the source is gone, so this pins
-    /// that the placeholder is swept rather than left as an empty bundle at a path a
-    /// later launch would read.
+    /// A missing source must report ENOENT and leave NOTHING behind.
+    ///
+    /// This reaches the sweep for real. The volume test compares the two PARENTS, and
+    /// the source's parent exists even when the source does not, so the exchange is
+    /// attempted: the destination is created, `renamex_np` fails `ENOENT`, and the
+    /// placeholder has to be removed again. Left behind, it would be an empty bundle at
+    /// a path a later launch reads.
     #[test]
     fn the_untagged_lane_leaves_no_placeholder_when_the_move_cannot_happen() {
         let root = swap_root("untagged-missing");

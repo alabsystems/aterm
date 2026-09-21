@@ -46,6 +46,13 @@ const UNPINNED_UPDATE_PIN_SENTINEL: &str =
 // fixtures while build.rs uses the identical code.
 include!("src/compiler_probe.rs");
 
+/// A build fact supplied by the caller instead of probed from git. Empty is
+/// treated as absent, so `FOO=` cannot half-pin a build.
+fn pinned(key: &str) -> Option<String> {
+    println!("cargo:rerun-if-env-changed={key}");
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
     if !out.status.success() {
@@ -99,14 +106,27 @@ fn main() {
     };
     println!("cargo:rustc-env=ATERM_UPDATE_PIN_SHA256={update_pin_sha256}");
 
+    // THE PIN (2026-09-21). A caller that already knows these facts — the gate,
+    // which resolves them ONCE for the snapshot it verifies — supplies them, and
+    // this script then asks git nothing and WATCHES NOTHING. That is the whole
+    // point: see `git_watch_paths` for the defect the watch caused.
+    let pinned_commit = pinned("ATERM_BUILD_GIT_COMMIT");
+    let pinned_dev_commits = pinned("ATERM_BUILD_DEV_COMMITS");
+    let git_is_pinned = pinned_commit.is_some() && pinned_dev_commits.is_some();
+
     // Git commit (short, 12 hex) + a "-dirty" suffix when the tree isn't clean.
-    let commit =
-        run("git", &["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = run("git", &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
-    let commit = if commit != "unknown" && dirty {
-        format!("{commit}-dirty")
-    } else {
-        commit
+    let commit = match &pinned_commit {
+        Some(commit) => commit.clone(),
+        None => {
+            let commit = run("git", &["rev-parse", "--short=12", "HEAD"])
+                .unwrap_or_else(|| "unknown".into());
+            let dirty = run("git", &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+            if commit != "unknown" && dirty {
+                format!("{commit}-dirty")
+            } else {
+                commit
+            }
+        }
     };
     println!("cargo:rustc-env=ATERM_GIT_COMMIT={commit}");
 
@@ -118,18 +138,20 @@ fn main() {
     // nonzero third component is an unambiguous dev signature. "0" when git
     // or the tag is unavailable (a source-tarball build still marks DEV via
     // the release-env discriminator; only the counter degrades).
-    let dev_commits = run(
-        "git",
-        &["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"],
-    )
-    .and_then(|tag| {
+    let dev_commits = pinned_dev_commits.clone().unwrap_or_else(|| {
         run(
             "git",
-            &["rev-list", &format!("{}..HEAD", tag.trim()), "--count"],
+            &["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"],
         )
-    })
-    .map(|s| s.trim().to_string())
-    .unwrap_or_else(|| "0".into());
+        .and_then(|tag| {
+            run(
+                "git",
+                &["rev-list", &format!("{}..HEAD", tag.trim()), "--count"],
+            )
+        })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "0".into())
+    });
     println!("cargo:rustc-env=ATERM_DEV_COMMITS={dev_commits}");
 
     // Monotonic build number, epoch-scale (seconds). The updater's "apply only if
@@ -243,8 +265,17 @@ fn main() {
     // whenever `git status` refreshed the index. The index is not watched at all
     // now: the stamp needs HEAD, and the dirty flag is still computed whenever
     // the script runs (it was already stale for unstaged edits).
-    for path in git_watch_paths() {
-        println!("cargo:rerun-if-changed={}", path.display());
+    // A PINNED BUILD WATCHES NO GIT PATH AT ALL, and that is the fix rather than
+    // a side effect: the watch below names a path in the COMMON git dir, which
+    // for any linked worktree is the main checkout's `.git`. See
+    // `git_watch_paths`.
+    if git_is_pinned {
+        println!("cargo:rerun-if-env-changed=ATERM_BUILD_GIT_COMMIT");
+        println!("cargo:rerun-if-env-changed=ATERM_BUILD_DEV_COMMITS");
+    } else {
+        for path in git_watch_paths() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
@@ -290,6 +321,17 @@ fn git_abs_path(args: &[&str]) -> Option<PathBuf> {
 /// checkout both work. Only EXISTING paths are returned: cargo reruns a build
 /// script on every build while a watched path is missing. Modelled on
 /// `git_watch_paths` in crates/aterm-release/build.rs, minus the index.
+///
+/// WHAT THIS WATCH COSTS WHEN IT IS NOT PINNED (measured 2026-09-20). The paths
+/// below hang off the COMMON git dir, and for a linked worktree that is the MAIN
+/// checkout's `.git` — this machine has 29 worktrees sharing one. So a `fetch`,
+/// `gc` or `pack-refs` in ANY of them rewrites `packed-refs` and invalidates
+/// this crate's compile in ALL of them, including inside a running gate: the
+/// file's mtime landed between two builds of one gate run. The stamp really can
+/// change with those files (`git describe --tags` reads them), so the watch is
+/// not wrong — it is unpinnable from inside a build script. `ATERM_BUILD_GIT_COMMIT`
+/// and `ATERM_BUILD_DEV_COMMITS` are the answer: a caller that has already
+/// resolved the facts passes them, and then neither the probe nor this watch runs.
 fn git_watch_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let Some(git_dir) = run("git", &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from) else {
