@@ -1,53 +1,34 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! PUBLISH-LANE TARGET COVERAGE: a lane that ships an OS must ship every triple this
+//! Publish-lane target coverage: a lane that ships an OS must ship every triple this
 //! client can ask that OS for.
 //!
-//! THE CLASS THIS GUARDS. [`atpkg::TARGETS`] is the set of triples a program may carry
-//! `[[artifact]]` rows for, and a client picks the row naming `cli::current_triple`. A
-//! program with NO row for the running triple is the canonical `unavailable on <target>`
-//! state — a CLEAN, fail-closed, silent skip (§6). That is the right behaviour for a
-//! member nobody has built yet, and it is exactly what makes the defect below invisible:
-//! a publish lane that can only ever produce ONE triple does not error, does not warn,
-//! and reports "done" on the builder while an entire architecture sits unserved forever.
-//! Nothing on the builder's own machine can see it.
+//! [`atpkg::TARGETS`] is the set of triples a program may carry `[[artifact]]` rows for,
+//! and a client picks the row naming `cli::current_triple`. A program with no row for the
+//! running triple is the `unavailable on <target>` state — a clean, fail-closed, silent
+//! skip (§6). That silence is the whole problem: a lane that can only produce one triple
+//! never errors and reports "done" on the builder while an architecture sits unserved.
 //!
-//! THE LIVE INSTANCE, found 2026-09-16. `tools/linux-auto-atpkg.sh` — the whole atpkg
-//! side of the Linux lane — carried ONE Linux triple per run (first the literal
-//! `x86_64-unknown-linux-gnu`, then, from 2026-09-16, the builder's own host triple) and
-//! spelled that scalar into every decision, pack, staged asset, manifest-row check and
-//! both uploads. `aarch64-unknown-linux-gnu` has been in `TARGETS` and in
-//! `current_triple`'s `cfg` ladder the whole time, and the fleet has exactly ONE Linux
-//! builder (m17-tower, x86_64) — so an arm64 Linux box asked for a row nothing could
-//! produce, and the lane's decision table never printed the words even once.
+//! For every row of [`LANES`]:
 //!
-//! THE LAW, machine-checked here. For every row of [`LANES`]:
+//!   1. the lane declares its triples as a list (`<VAR>=(`), never a scalar;
+//!   2. it fills that list from `ATPKG_TARGETS_ALL` in `tools/atpkg-publish-lib.sh`, the
+//!      shell's copy of [`atpkg::TARGETS`], which this test holds equal to `TARGETS` for
+//!      the lane's OS — so a new triple reaches the lane by itself;
+//!   3. no other line of the lane names one of those triples literally outside a comment.
+//!      A loop over the list means nothing if a later step still spells one triple into a
+//!      path, an asset name or an upload.
 //!
-//!   1. the lane declares its triples as a LIST (`<VAR>=(`), never a scalar;
-//!   2. it FILLS that list from the shared shipped-target list rather than retyping one:
-//!      `ATPKG_TARGETS_ALL` in `tools/atpkg-publish-lib.sh` is the shell's copy of
-//!      [`atpkg::TARGETS`], and this test holds the two equal for the lane's own OS, with
-//!      more than one triple in it. Adding a Linux triple to `TARGETS` therefore reaches
-//!      the lane by itself — and fails this test until the shell copy follows;
-//!   3. no other line of the lane NAMES one of those triples literally outside a comment.
-//!      Rule 3 is the one that keeps rules 1 and 2 honest: a loop over the list means
-//!      nothing if some later step still spells one triple into a path, an asset name or
-//!      an upload.
-//!
-//! WHY IN `cargo test -p atpkg`. `tools/test-linux-auto-atpkg.sh` is the behavioural twin
-//! — it RUNS the lane against a stubbed channel and reads its decision table on both host
-//! architectures. This file is the cheap standing check that rides along with the crate's
-//! own tests on every target and every box, needs no bash, no stubs and no subprocess, and
-//! is the half that notices when the CLIENT's target list grows. Hermetic: reads committed
-//! files under `CARGO_MANIFEST_DIR` only.
+//! `tools/test-linux-auto-atpkg.sh` is the behavioural twin that runs the lane against a
+//! stubbed channel; this is the cheap text check that needs no bash and notices when the
+//! client's target list grows. Hermetic: reads committed files under `CARGO_MANIFEST_DIR`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// One shipping lane: the script, the `TARGETS` OS substring it is responsible for, and
-/// the shell array it must declare. Add a row when a lane starts shipping an OS — the
-/// rows are what makes rule 2 bite on the next triple anyone adds to `TARGETS`.
+/// One shipping lane: the script, the `TARGETS` OS substring it covers, and the shell
+/// array it must declare. Add a row when a lane starts shipping an OS.
 const LANES: &[(&str, &str, &str)] = &[("tools/linux-auto-atpkg.sh", "-linux-", "LINUX_TRIPLES")];
 
 /// The shell's copy of [`atpkg::TARGETS`], and the variable the lanes derive from.
@@ -164,8 +145,8 @@ fn a_shipping_lane_names_no_triple_outside_its_declaration() {
         let mut offenders: Vec<String> = Vec::new();
         for (n, line) in src.lines().enumerate() {
             let trimmed = line.trim_start();
-            // Comments are where this file WANTS the triples named: the prose that
-            // explains the lane has to be able to say which architectures it serves.
+            // Comments may name the triples: the prose explaining the lane has to say
+            // which architectures it serves.
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }

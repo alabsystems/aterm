@@ -3352,9 +3352,10 @@ THE FIVE VERBS YOU NEED
 
   RECEIPTS: `inbox seen <id> handled|refused|deferred` on an `ask` or `task` sends the
   SENDER a receipt — `kind=ack re=<off> verdict=<v>` in their inbox — when the fabric runs
-  with receipts on (the default `aterm fabric on` writes). It is OWED until it is on the
-  bus: a verdict given while the broker is down or the bridge is restarting is sent when
-  they are back, once — you never need to say it again. Their `post --wait-ack` returns
+  with receipts on — the default, however the bridge was set up. It is OWED until it
+  is on the bus: a verdict given while the broker is down or the bridge is restarting
+  is sent when they are back, once — you never need to say it again. Their
+  `post --wait-ack` returns
   it, their `await inbox re=<off>` latches on it. A `note` earns none, and a session that
   only `--peek`s acks nothing. A receipt counts only from the node (or principal) the ask
   went to: an `ack re=<off>` from any other arrives as `kind=note demoted=ack`, and
@@ -3426,7 +3427,11 @@ IS IT ON HERE?
   connected     a bridge is attached AND its last exchange with the broker was acked.
                 `fabric=` is the bridge's BROKER LINK, not its process: the bridge tells
                 the instance about that link on every change and after an ack that moved
-                the round trip by more than 2x — never on a timer, there is no heartbeat.
+                the round trip by more than 2x — not on a clock, and on a quiet fleet
+                there is no heartbeat. The one exception is bounded and says so: a
+                bridge that has found a presence row no instance hosts re-reads the
+                roster about once a minute until it retires it, and an answered read
+                is an ack like any other, so it reports for as long as that takes.
                 `fabric_rtt_ms=` is that last acked round trip; `fabric_link_age_ms=` is how
                 long ago it was. A large age on `connected` is a quiet link, not a dead
                 one; only the next exchange can tell, and it will.
@@ -3467,8 +3472,9 @@ WHO IS DOING WHAT — PRESENCE WITH MEANING (round 13)
     [fabric]
     presence = "meta"       # the default; "minimal" writes attention= alone and
                             # never reads a screen (the row exactly as before)
-    receipts = true         # the default `aterm fabric on` writes: an `inbox seen`
-                            # verdict on an ask/task acks the sender (R8). false is off.
+    receipts = true         # the default, with or without this line: an `inbox seen`
+                            # verdict on an ask/task acks the sender (R8). false is
+                            # off, and off means their `ask` waits out its deadline.
   `aterm link serve --presence meta|minimal` and `--receipts`/`--no-receipts` on the
   bridge's command line win over the file. A bridge that predates round 13 leaves every
   new column `-`, and one that predates round 15 sends no receipts.
@@ -5484,7 +5490,7 @@ mod tests {
         // is no heartbeat behind it.
         for needle in [
             "BROKER LINK, not its process",
-            "there is no heartbeat",
+            "on a quiet fleet\n                there is no heartbeat",
             "fabric_link_age_ms=",
             "ERR fabric stalled",
             "reason=<no-socket|refused|denied|no-ack|closed|attach|",

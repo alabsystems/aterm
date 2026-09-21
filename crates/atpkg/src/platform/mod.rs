@@ -116,9 +116,8 @@ pub enum IndexState {
     Enabled,
     /// Switched off (`mdutil -i off`, or "Indexing and searching disabled"): a setting.
     Disabled,
-    /// "Index is read-only." — mds holds the index while the volume is low on space
-    /// (measured 2026-09-16): it answers searches and takes no new entries until the
-    /// hold lifts. Not a setting, and not a reason to leave build output unmigrated.
+    /// "Index is read-only." — mds holds the index while the volume is low on space: searches
+    /// still answer, new entries do not land. Not a setting, so not a reason to skip migrating.
     ReadOnly,
 }
 
@@ -854,23 +853,15 @@ const SH_SHIM_ROUTE_NOTE: &str = "# atpkg exec root: this build ships bin/rustc 
 /// signature), and their tippy refuses to run unless the sibling `rustc` is the same file
 /// as, or byte-identical to, the selected `trustc` — "rustc-compatible sibling … is not
 /// the selected Trust compiler". The store is content-addressed and never modified, so
-/// [`crate::compat`] lays a copy-on-write CLONE of the build ([`crate::clone`]) where
-/// `rustc` holds `trustc`'s bytes, and the shim runs the tool from there. Run from that
-/// tree, `tippy` and `targo tippy` lint (measured 2026-09-16 on bundle 8595).
+/// [`crate::compat`] lays a copy-on-write clone of the build ([`crate::clone`]) where
+/// `rustc` holds `trustc`'s bytes, and the shim runs the tool from there.
 ///
-/// THE GUARD checks, at every exec, that the root stands and is whole: `R` is a regular
-/// executable file and not a symlink (every Trust frontend refuses a symlinked sibling
-/// anyway), the store file `S` it stands for still exists (a build reclaimed from the
-/// store never runs from a leftover root), and the root's marker `M` — written last,
-/// before the root was committed by `rename(2)` — is a regular file and not a symlink (a
-/// root half-way through a lay or a rebuild, or one laid as hard links before clones, has
-/// none). Any false falls through to the unchanged store `exec` — today's behaviour
-/// exactly. Every test is a `test`/`[` builtin: a handful of `stat`s, no fork. It does NOT
-/// prove bytes (no builtin can): [`crate::compat::ensure_root`] proves them when it lays
-/// the root, and `repair` and doctor re-read them at `Depth::Deep`. The guard used to be
-/// `[ 'R' -ef 'S' ]`, same device and inode, which only a hard link satisfies. A failed
-/// `exec R` after a true guard exits the shell (126) rather than falling through — the
-/// same race today's store `exec` has with `gc`.
+/// The guard checks, at every exec, that the root stands and is whole: `R` is a regular
+/// executable file and not a symlink, the store file `S` it stands for still exists (so a
+/// reclaimed build never runs from a leftover root), and the marker `M` — written last, before
+/// the `rename(2)` that commits the root — is a regular file, which a half-laid root has not.
+/// Any false falls through to the unchanged store `exec`. It proves no bytes:
+/// [`crate::compat::ensure_root`] does that when it lays the root.
 ///
 /// NOTHING THAT READS A SHIM SEES A DIFFERENCE. The env note and `export` lines stay
 /// ahead of the guard, so both `exec`s inherit them. The guard line starts with `[`, so
@@ -2283,13 +2274,10 @@ mod sh_shim_tests {
     /// POSIX mode on macOS) and by `/bin/dash` where present, with an empty environment and
     /// arguments carrying a space and both quote kinds, under a prefix whose path holds a
     /// space and a quote. Store and route are the same script, which prints the path it
-    /// was exec'd as (`$0`), so the output says which one ran: a CLONE or a byte COPY at the
-    /// route runs the route when the root's marker stands; with no marker, a marker that is
-    /// a symlink, a route that is a SYMLINK, one that is not executable, or a MISSING route,
-    /// the store path runs — today's shim. A HARD LINK is a regular file too, and the shell
-    /// cannot tell it from a clone: that is `route_for_shim`'s job, and repair's, which
-    /// rebuild such a root before a shim is ever rendered through it. The export reaches
-    /// whichever ran.
+    /// was exec'd as (`$0`), so the output says which one ran: the route when the root's
+    /// marker stands; with no marker, a symlinked marker or route, a non-executable route, or
+    /// a missing one, the store path. A hard link is a regular file too and the shell cannot
+    /// tell it from a clone — that is `route_for_shim` and repair's job.
     #[cfg(unix)]
     #[test]
     fn the_guard_runs_the_root_only_when_the_marked_root_stands() {

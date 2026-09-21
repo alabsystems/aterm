@@ -516,14 +516,11 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
         ls.lines().any(|l| l.contains(&format!(" {sid} "))),
         "and the session's presence row:\n{ls}"
     );
-    let (code, glance, err) = s.link(&["glance"]);
-    assert_eq!(code, 0, "{glance}\n{err}");
-    assert_eq!(
-        glance.trim(),
-        s.path("root/link-state/fabric/glance.json"),
-        "glance writes into the rendezvous file's state dir"
-    );
-    assert!(Path::new(glance.trim()).exists());
+    // The `--state` default had its own proof here — `aterm link glance` wrote
+    // `<state>/fabric/glance.json` and this asserted the path. Round 21 cut that
+    // subcommand with the file format nothing read; the property under test is
+    // the rendezvous file supplying flags, and the `ls` assertions above carry
+    // it.
     // A flag on the command line still wins: a wrong broker is a wrong broker.
     let (code, _, err) = s.link(&["ls", "--broker", "/tmp/atfo-nowhere.sock"]);
     assert_ne!(code, 0, "{err}");

@@ -316,12 +316,11 @@ pub fn live_builds(layout: &Layout) -> LiveSet {
     live_from_claims(&authority_claims(layout), &shim_claims(layout))
 }
 
-/// [`live_builds`]' reconciliation over claim views ALREADY READ.
+/// [`live_builds`]' reconciliation over claim views already read.
 ///
-/// Split out so a caller that needs the claim UNION as well — [`run_keeping_pinned_partials`],
-/// whose sweep guard is that union — reads `store/`, `channels/` and every `bin/` shim ONCE
-/// for both answers instead of twice per pass, and so the table below is provable without a
-/// prefix on disk. Pure: it reads nothing and decides nothing about what may be deleted.
+/// Split out so a caller needing the claim union too ([`run_keeping_pinned_partials`], whose
+/// sweep guard is that union) reads `store/`, `channels/` and every `bin/` shim once per pass
+/// instead of twice. Pure: it reads nothing and decides nothing about what may be deleted.
 fn live_from_claims(
     authority: &BTreeMap<String, BTreeSet<u64>>,
     shims: &BTreeMap<String, BTreeSet<u64>>,
@@ -463,37 +462,6 @@ struct Debris {
     scratch: Vec<(String, String, PathBuf)>,
 }
 
-/// Everything an install killed mid-extract leaves behind, across ALL programs.
-///
-/// This debris is invisible to the rest of the manager by design: [`crate::ops::list_installed`]
-/// counts only marker-bearing numeric dirs and GC reclaims only what it returns, so a
-/// half-extracted toolchain leaked gigabytes forever while `atpkg gc` printed "nothing to
-/// reclaim". `store::sweep_stage_scratch` covers the scratch half, but only for the one build a
-/// later stage happens to re-stage — once the channel pins a higher build, nothing names the
-/// old one again and its scratch sits there for good.
-///
-/// **Guarded on CLAIMS, never on the missing marker alone.** A marker-less tree is not
-/// evidence of a dead tree: `doctor` reports "active {program} build {n} store
-/// missing/incomplete" precisely because a LIVE build can lose its marker, so sweeping on the
-/// marker would delete the running toolchain — the bricking class this whole module exists to
-/// forbid. `claimed` is the union of [`authority_claims`] and [`shim_claims`], i.e. every
-/// build any `current` link or any `bin/` shim resolves into; a claimed build is skipped
-/// however partial it looks, and the honest report of that state is the divergence `doctor`
-/// already prints. Deliberately NOT gated on a [`LiveBuild`] witness: an interrupted *fresh*
-/// install has no live build at all, which is exactly the case that leaks.
-///
-/// Scratch needs no CLAIM guard. Both views parse `store/<program>/<n>` and nothing else, so no
-/// link and no shim can name a `<build>.incoming-<pid>`; and every mutating verb holds the
-/// store-wide writer lock ([`crate::lock::try_lock_store`]), so if scratch is here, the stager
-/// that owned it is gone. Gone is not the same as quiet: the untracked staging lane's
-/// extractor is a launchd job that outlives the stager which submitted it, so the sweep below
-/// stops those orphans first, exactly as [`crate::store::sweep_stage_scratch`] does.
-///
-/// It needs exactly ONE guard of its own, and for the reason the claim guard exists: a
-/// `<build>.superseded-<pid>` whose `<build>` is not there is not debris but the only copy of
-/// that build on disk — the swap window [`recover_interrupted_swaps`] could not close. Those
-/// are the `parked` pairs, measured BEFORE this pass deletes anything, and the scratch arm
-/// skips them.
 /// Whether `name` is stage scratch this manager produced: `<build>.incoming-<pid>` or
 /// `<build>.superseded-<pid>`, where `<build>` is a real build number.
 ///
@@ -522,20 +490,15 @@ fn is_stage_scratch(name: &str) -> bool {
 /// for), swept as an ordinary orphan when nothing does. That is a strictly better question
 /// than the scratch arm's, which asks nothing at all.
 ///
-/// RETURNS THE WINDOWS IT COULD NOT CLOSE: `(program, build)` for every candidate left with
-/// `<build>` absent — recovery declined to guess between two siblings, or its rename simply
-/// FAILED (EACCES, EPERM, EBUSY; only the first of those is even ambiguous). While nothing
-/// stands at `<build>`, its superseded sibling is the only copy of that build there is, and
-/// [`interrupted_debris`] must not read it as scratch. That is the guard
-/// [`crate::store::sweep_stage_scratch`] has held since 2026-09-17 and this pass did not,
-/// though it is the pass that runs at the end of every install and every update.
+/// Returns the windows it could not close: `(program, build)` for every candidate left with
+/// `<build>` absent, because recovery declined to guess between two siblings or its rename
+/// failed. While nothing stands at `<build>`, its superseded sibling is the only copy of that
+/// build there is, and [`interrupted_debris`] must not read it as scratch.
 ///
-/// MEASURED HERE, not re-derived at the scan, because the two are not the same question. By
-/// the time the scan runs, this pass's own reclaim loop has deleted the builds it retired, so
-/// "`<build>` is absent" would also be true of a stale sibling of a build reclaimed seconds
-/// ago — a genuine leftover, and sparing it would leak the disk this module exists to
-/// recover. Answered before anything is deleted, absence means the swap window and nothing
-/// else.
+/// Measured here, not re-derived at the scan: by then this pass's own reclaim loop has
+/// deleted the builds it retired, so "`<build>` is absent" would also be true of a stale
+/// sibling of a build reclaimed seconds ago — genuine leftover. Answered first, absence
+/// means the swap window and nothing else.
 fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
     let mut parked: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let Ok(programs) = std::fs::read_dir(layout.prefix.join("store")) else {
@@ -576,6 +539,34 @@ fn recover_interrupted_swaps(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>>
     parked
 }
 
+/// Everything an install killed mid-extract leaves behind, across ALL programs.
+///
+/// This debris is invisible to the rest of the manager by design: [`crate::ops::list_installed`]
+/// counts only marker-bearing numeric dirs and GC reclaims only what it returns, so a
+/// half-extracted toolchain leaked gigabytes forever while `atpkg gc` printed "nothing to
+/// reclaim". `store::sweep_stage_scratch` covers the scratch half, but only for the one build a
+/// later stage happens to re-stage — once the channel pins a higher build, nothing names the
+/// old one again and its scratch sits there for good.
+///
+/// **Guarded on CLAIMS, never on the missing marker alone.** A marker-less tree is not
+/// evidence of a dead tree: `doctor` reports "active {program} build {n} store
+/// missing/incomplete" precisely because a LIVE build can lose its marker, so sweeping on the
+/// marker would delete the running toolchain — the bricking class this whole module exists to
+/// forbid. `claimed` is the union of [`authority_claims`] and [`shim_claims`], i.e. every
+/// build any `current` link or any `bin/` shim resolves into; a claimed build is skipped
+/// however partial it looks, and the honest report of that state is the divergence `doctor`
+/// already prints. Deliberately NOT gated on a [`LiveBuild`] witness: an interrupted *fresh*
+/// install has no live build at all, which is exactly the case that leaks.
+///
+/// Scratch needs no claim guard: both views parse `store/<program>/<n>` and nothing else, so
+/// no link and no shim can name a `<build>.incoming-<pid>`, and the store-wide writer lock
+/// means the stager that owned any scratch here is gone. Gone is not quiet, though — the
+/// staging lane's extractor is a launchd job that outlives its submitter — so the sweep
+/// below stops those orphans first.
+///
+/// One guard of its own: a `<build>.superseded-<pid>` whose `<build>` is absent is not
+/// debris but the only copy of that build on disk, a swap window
+/// [`recover_interrupted_swaps`] could not close — the `parked` pairs.
 fn interrupted_debris(
     layout: &Layout,
     claimed: &BTreeMap<String, BTreeSet<u64>>,
@@ -603,23 +594,18 @@ fn interrupted_debris(
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             // The store's own strict reader ([`crate::store::parse_build_name`]): `+18/` and
-            // `018/` are not builds this manager ever wrote, and this arm SWEEPS what it
-            // accepts (a marker-less tree nothing claims). A name neither a build nor the
-            // producer's scratch shape falls through both arms and is left alone.
+            // `018/` are not builds this manager ever wrote, and this arm sweeps what it
+            // accepts. A name that is neither a build nor scratch falls through both arms.
             if let Some(build) = crate::store::parse_build_name(name) {
                 if crate::store::build_is_complete(&entry.path()) {
                     continue; // an installed build — `reclaimable` owns it
                 }
                 if crate::store::build_marks_another_slice(&entry.path()) {
-                    // A COMPLETE install of the OTHER slice of the universal binary, whose
-                    // marker `build_is_complete` refuses on purpose so THIS slice re-stages
-                    // it. That refusal is about which compiler may run, not about whether an
-                    // install ever finished — and this arm's whole premise is the latter.
-                    // Read as debris, a single `arch -x86_64` gc pass deleted the native
-                    // rollback tree (nothing claims a rollback: no `current` link, no shim)
-                    // and reported a multi-GB toolchain as an interrupted install. Re-staging
-                    // is the install path's business; this sweep's business is trees no
-                    // install ever finished writing.
+                    // A complete install of the other slice of the universal binary.
+                    // `build_is_complete` refuses it on purpose so this slice re-stages it,
+                    // but that refusal is about which compiler may run, not about whether an
+                    // install ever finished — and nothing claims a rollback tree, so reading
+                    // it as debris deletes a whole installed toolchain.
                     continue;
                 }
                 if claimed.get(&program).is_some_and(|s| s.contains(&build)) {
@@ -627,16 +613,10 @@ fn interrupted_debris(
                 }
                 out.partial.push((program.clone(), build, entry.path()));
             } else if is_stage_scratch(name) {
-                // THE ONE THING IN HERE THAT IS NOT DEBRIS. A `<build>.superseded-<pid>`
-                // whose swap window [`recover_interrupted_swaps`] could not close is the
-                // only copy of that build on disk — the outgoing tree, parked between the
-                // swap's two renames, with nothing at `<build>` at all. Sweeping it is how
-                // a survivable crash becomes a permanently deleted toolchain, which is the
-                // one outcome this module forbids; the store's own sweep has spared it
-                // since 2026-09-17. Narrow in both directions, exactly as that one is: a
-                // `<build>.incoming-<pid>` half-extract is nobody's only copy and is still
-                // swept, and a superseded sibling of a build that IS on disk is genuine
-                // leftover and is still swept.
+                // Not debris: a `<build>.superseded-<pid>` with nothing at `<build>` is the
+                // only copy of that build on disk — a swap window
+                // [`recover_interrupted_swaps`] could not close. Still swept:
+                // `.incoming-<pid>` half-extracts, and superseded siblings of a live build.
                 if let Some((build, crate::store::Scratch::Superseded)) =
                     crate::store::stage_scratch_of(name)
                     && parked.get(&program).is_some_and(|b| b.contains(&build))
@@ -753,17 +733,14 @@ pub fn run_keeping_pinned_partials(
     layout: &Layout,
     pinned_asset: &dyn Fn(&str) -> Option<String>,
 ) -> GcReport {
-    // FIRST, before any view is computed and before anything is deleted: put back any tree
-    // a swap was killed midway through, so `live_builds`/`authority_claims` see a `current`
-    // link that resolves and the sweep below reasons about a store that is whole. What it
-    // could NOT put back it names, and the debris scan spares those siblings: with nothing
-    // standing at `<build>`, the parked tree is the only copy of that build there is.
+    // First, before any view is computed and before anything is deleted: put back any tree a
+    // swap was killed midway through, so the claim views see a `current` link that resolves.
+    // What it could not put back it names, and the debris scan spares those siblings.
     let parked = recover_interrupted_swaps(layout);
-    // The two claim views, read ONCE for both of the answers below: the witness needs them
-    // to AGREE, the sweep guard needs their UNION. Asking for them twice — which is what
-    // `live_builds` plus the two calls below did — cost a second walk of `store/` and
-    // `channels/` and a second resolve of every shim in `bin/`, on a pass that runs at the
-    // end of every install and every update as well as behind `atpkg gc`.
+    // The two claim views, read once for both answers below: the witness needs them to agree,
+    // the sweep guard needs their union. Reading them twice costs a second walk of `store/`
+    // and `channels/` and a second resolve of every shim, on a pass that runs after every
+    // install and update as well as behind `atpkg gc`.
     let authority = authority_claims(layout);
     let shims = shim_claims(layout);
     let live = live_from_claims(&authority, &shims);
@@ -926,9 +903,8 @@ mod tests {
         }
     }
 
-    /// The reconciliation table, over claim views HANDED IN rather than read off a prefix —
-    /// the shape the pass uses so one gc run reads `store/`, `channels/` and `bin/` once for
-    /// both the witness and the sweep's claim union.
+    /// The reconciliation table, over claim views handed in rather than read off a prefix —
+    /// the shape the pass uses so one gc run reads `store/`, `channels/` and `bin/` once.
     #[test]
     fn live_from_claims_reconciles_the_two_views() {
         fn claims(pairs: &[(&str, &[u64])]) -> BTreeMap<String, BTreeSet<u64>> {
@@ -943,13 +919,13 @@ mod tests {
         let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[("ay", &[19])]));
         assert_eq!(build_of(&set), Some(19));
         assert!(set.diverged.is_empty());
-        // …and so does an authority whose shims are SILENT: nothing on PATH points elsewhere.
+        // …and so does an authority whose shims are silent: nothing on PATH points elsewhere.
         let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[]));
         assert_eq!(build_of(&set), Some(19));
         assert!(set.diverged.is_empty());
 
-        // Shims that CONTRADICT the authority block the witness: whatever the authority
-        // says, the disagreeing shim is what the user's next command executes.
+        // Shims that contradict the authority block the witness: whatever the authority says,
+        // the disagreeing shim is what the user's next command executes.
         let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[("ay", &[18])]));
         assert!(set.live.is_empty());
         assert_eq!(set.diverged.len(), 1);
@@ -1646,9 +1622,8 @@ mod tests {
             "18.pending-4242",
             "18incoming-4242",
             "18.incoming-42.42",
-            // `u64::from_str` accepts a leading `+` and leading zeros; the PRODUCER writes
-            // neither ([`crate::store::parse_build_name`]), so a user directory spelled
-            // this way is not ours to delete however much it looks like ours.
+            // `u64::from_str` accepts a leading `+` and leading zeros; the producer writes
+            // neither ([`crate::store::parse_build_name`]), so such a directory is not ours.
             "+18.incoming-1",
             "018.incoming-1",
             "+0.incoming-1",
@@ -1691,20 +1666,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A MARKER-BEARING LOOKALIKE MUST NOT DISPLACE THE ROLLBACK TARGET. The test above
-    /// covers the marker-LESS lookalike, which the partial arm's strict recogniser already
-    /// refused. This is the other half, and it reached a DELETE rather than a listing:
-    /// [`crate::ops::list_installed`] parsed the build number with a bare `u64::from_str`,
-    /// so a directory spelled `+19/` with a valid `+19.ready` beside it read back as
-    /// "installed build 19" — a NUMBER, addressed from then on by its canonical spelling
-    /// ([`Layout::build_dir`]), which is a different directory entirely.
-    ///
-    /// The retention rule keeps the live build and the highest installed build BELOW it
-    /// ([`reclaimable_with_provisional`]). The phantom 19 took that rollback slot from the
-    /// real build 17, and 17 — a complete toolchain the user could actually have rolled
-    /// back onto — was reclaimed for it. The lookalike itself survived every pass, being no
-    /// name this manager ever wrote, so the machine was left holding a rollback target that
-    /// did not exist and missing the one that did.
+    /// A marker-bearing lookalike must not displace the rollback target. A bare
+    /// `u64::from_str` reads `+19/` with a valid `+19.ready` beside it as "installed build
+    /// 19", a number addressed thereafter by its canonical spelling ([`Layout::build_dir`])
+    /// — a different directory entirely. The retention rule keeps the live build and the
+    /// highest installed build below it ([`reclaimable_with_provisional`]), so that phantom
+    /// takes the rollback slot from a real build, which is then reclaimed for it.
     #[test]
     fn a_marker_bearing_lookalike_cannot_displace_the_rollback_target() {
         let l = layout("lookalike-rollback-slot");
@@ -1763,20 +1730,16 @@ mod tests {
         (dir, parked)
     }
 
-    /// GC RUN FROM THE OTHER SLICE MUST NOT DELETE THE NATIVE INSTALL. `build_is_complete`
-    /// is per-slice by design — an `arch -x86_64` pass has to re-stage Intel trees rather
-    /// than inherit arm64 ones — but `false` there means only "not complete FOR ME", and
-    /// this sweep read it as "no install ever finished here". A rollback build is claimed
-    /// by nothing (no `current` link, no shim points at it), so one gc pass from the other
-    /// slice `discard_build`ed a whole installed toolchain and reported the loss as an
-    /// interrupted install.
+    /// GC run from the other slice must not delete the native install. `build_is_complete`
+    /// is per-slice by design, but its `false` means only "not complete for me" — and a
+    /// rollback build is claimed by nothing, so a sweep reading that as "no install ever
+    /// finished" discards a whole installed toolchain.
     #[test]
     fn a_build_the_other_slice_installed_is_not_an_interrupted_install() {
         let l = layout("other-slice");
         seed(&l, "ay", 18, false); // the rollback build: complete, and claimed by nothing
         seed(&l, "ay", 19, true); // ay@19 is live
-        // 18's marker as the OTHER slice wrote it: well formed, `ok` and all — simply not
-        // this slice's platform.
+        // 18's marker as the other slice wrote it: well formed, simply not our platform.
         let marker = l.prefix.join("store").join("ay").join("18.ready");
         std::fs::write(&marker, b"ok\nplatform=sparc64-solaris\n").unwrap();
         assert!(
@@ -1796,7 +1759,7 @@ mod tests {
             report.swept_partial
         );
 
-        // NON-VACUITY: a tree with no marker at all, claimed by nothing, is still swept.
+        // Non-vacuity: a tree with no marker at all, claimed by nothing, is still swept.
         let partial = seed_partial(&l, "ay", 17);
         let report = run(&l);
         assert!(
@@ -1873,29 +1836,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Recovery is NARROW on purpose: two superseded siblings give no way to tell which is
-    /// the real outgoing tree, and guessing is how live trees get deleted — so recovery
-    /// refuses to move either. WHAT THIS SWEEP THEN DID WITH THEM was the defect: it
-    /// `remove_dir_all`ed both, and while nothing stands at `<build>` those trees are the
-    /// only copies of that build on disk. The refusal bought nothing — routine
-    /// housekeeping finished what the crash started, and this pass runs at the end of
-    /// EVERY install and update. `store::sweep_stage_scratch` stopped doing it on
-    /// 2026-09-17; the identical deletion here did not.
+    /// Recovery is narrow on purpose: two superseded siblings give no way to tell which is
+    /// the real outgoing tree, so it refuses to move either — and while nothing stands at
+    /// `<build>` both are the only copies of that build on disk, so this sweep must not
+    /// delete them either.
     ///
-    /// So an ambiguous pair with `<build>` absent is REPORTED and left standing, which is
-    /// what the store-side sweep already promises: the program has no live witness (its
-    /// `current` link dangles), so it lands in `diverged` — the list `atpkg doctor`
-    /// prints — and neither tree is claimed as reclaimed disk. The guard is narrow in the
-    /// same two directions the store's is: the `<build>.incoming-<pid>` half-extract
-    /// beside them is nobody's only copy and is still swept, and a superseded sibling of a
-    /// build that IS on disk is genuine leftover and still swept (the test above).
+    /// An ambiguous pair with `<build>` absent is therefore reported and left standing: the
+    /// program has no live witness, so it lands in `diverged` (the list `atpkg doctor`
+    /// prints) and neither tree counts as reclaimed disk. Narrow in the same two directions
+    /// the store's guard is — see the `.incoming-<pid>` sibling here, and the test above.
     #[test]
     fn an_ambiguous_pair_with_the_build_absent_is_reported_and_left_standing() {
         let l = layout("swap-window-ambiguous");
         seed(&l, "ay", 19, true);
         let (build19, first) = seed_killed_mid_swap(&l, "ay", 19);
         let second = seed_scratch(&l, "ay", "19.superseded-9999");
-        // NON-VACUITY: an unverified half-extract is nobody's only copy.
+        // Non-vacuity: an unverified half-extract is nobody's only copy.
         let incoming = seed_scratch(&l, "ay", "19.incoming-4242");
 
         let report = run(&l);

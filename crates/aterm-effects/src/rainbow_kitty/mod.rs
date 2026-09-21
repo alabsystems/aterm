@@ -1917,6 +1917,10 @@ impl Engine {
             self.events.clear();
             self.pre_move = None;
             self.earned.clear();
+            // A bar banked while the style was live is a fact about a surface
+            // that is gone: dropped with the events, so re-engaging can never
+            // open on a celebration nobody is still holding a key for.
+            self.party = None;
             self.mend = None;
             self.caret_seen = None;
             self.fp = 0;
@@ -2051,6 +2055,28 @@ impl Engine {
         }
         for &(cell, at) in &self.earned {
             self.stardust.earn_hero(at, cell, &ctx, &self.ribbon);
+        }
+        // **THE PARTY** (§27) — MINTED, not banked. This field's own doc has
+        // always said the host's bar is "dealt to the meteor pool on the next
+        // `Engine::tick` against that frame's `Ctx`", and
+        // [`meteor::Meteors::party`]'s says it is "called from `Engine::tick`
+        // … with that frame's ctx". No line ever read it. So every bar of
+        // every sing-along was stored and dropped, and §27's whole star
+        // payoff — `bar_fan`, `BAR_FAN_CAP`, `BAR_RING_EVERY`, `DROP_FAN_N`,
+        // the outro — has never once been on glass. `#[derive(Debug)]` on
+        // this struct is why nothing said so: a derived read is a read, so
+        // the field was never reported dead.
+        //
+        // Here, beside `earned`, and BEFORE `meteor::emit` and
+        // `meteor::sow_into` below, so a ring bar's shockwave draws and the
+        // fan's stars reach the sky on the bar's OWN frame. Gated on
+        // `caret_known` for the reason the caret reset states in those words:
+        // a fan laid at a caret nobody has observed lands "at a cell the
+        // reset forgot the meaning of" — top-left, with no key behind it.
+        if let Some((at, n, ring)) = self.party.take()
+            && self.caret_known
+        {
+            self.meteor.party(at, n, ring, &ctx);
         }
         // **THE COMBO LADDER'S TOP RUNG** (§23's addendum "Flow state"): every
         // 64th key AFTER the first gold hero fires the one-frame caret flare
@@ -2585,6 +2611,7 @@ impl Engine {
         self.mend = None;
         self.events.clear();
         self.earned.clear();
+        self.party = None;
         self.pending_cues.clear();
         self.companion = None;
         self.paint_at = None;
@@ -2651,6 +2678,11 @@ impl Engine {
         // …with the record that indexed them.
         self.pre_move = None;
         self.earned.clear();
+        // …and a banked bar, for the SAME reason this seam forgets the caret
+        // two lines up: `reset` is the coordinate-space cut, so a party held
+        // across it would mint at `(0, 0)` in the NEW space — a fan, and
+        // every fourth bar a shockwave, in the corner, with no key behind it.
+        self.party = None;
         self.pending_cues.clear();
         self.companion = None;
         self.paint_at = None;
@@ -6186,6 +6218,100 @@ mod tests {
             assert!(matches!(cue.kind, SoundKind::Stardust { .. }));
             assert_eq!(cue.col, 5, "the glint sits at its star's column");
         }
+    }
+
+    /// **THE PARTY REACHES THE SKY** (§27). The host reports every sing-along
+    /// bar through [`Engine::party`], which banked it in a field NO LINE EVER
+    /// READ: `bar_fan`, `BAR_FAN_CAP`, `BAR_RING_EVERY`, `DROP_FAN_N` and the
+    /// outro were all proven by their own green tests in `kitty_sing` and then
+    /// thrown away at the engine door, so the star payoff of the whole
+    /// celebration had never once been on glass. `#[derive(Debug)]` is why
+    /// nothing said so — a derived read is a read, so the field was never
+    /// reported dead, and no test fired a party.
+    ///
+    /// Three-sided, because the three ways this can be wrong are a silent
+    /// no-op, a fan nobody asked for, and a fan in the corner of a space the
+    /// caret no longer means anything in.
+    #[test]
+    fn a_reported_bar_mints_its_fan_and_a_withdrawn_one_mints_nothing() {
+        let t0 = Instant::now();
+        let cfg = config();
+        let mut sc = Scratch::default();
+
+        // A. ENGAGED, caret known, sky probed: the bar is on glass.
+        let mut eng = engaged();
+        for row in 0..26u16 {
+            blank_row(&mut eng, row);
+        }
+        eng.on_event(mv((3, 5), (3, 6), Licence::Typed), t0);
+        let mut fr = sc.frame();
+        eng.tick(t0, geom(), &cfg, &mut fr);
+        let before = eng.status().stars;
+        eng.party(
+            t0 + Duration::from_millis(1),
+            crate::kitty_sing::BAR_FAN_CAP,
+            true,
+        );
+        let mut fr = sc.frame();
+        eng.tick(t0 + Duration::from_millis(2), geom(), &cfg, &mut fr);
+        let after = eng.status().stars;
+        assert!(
+            after > before,
+            "the host's bar minted NOTHING: stars {before} -> {after}"
+        );
+
+        // B. THE SAME BAR ACROSS A COORDINATE-SPACE CUT mints nothing. `reset`
+        // forgets the caret on purpose ("a cell the reset forgot the meaning
+        // of"), so a banked bar held across it would fan at (0, 0) in the NEW
+        // space with no key behind it.
+        let mut eng = engaged();
+        for row in 0..26u16 {
+            blank_row(&mut eng, row);
+        }
+        eng.on_event(mv((3, 5), (3, 6), Licence::Typed), t0);
+        let mut fr = sc.frame();
+        eng.tick(t0, geom(), &cfg, &mut fr);
+        eng.party(
+            t0 + Duration::from_millis(1),
+            crate::kitty_sing::BAR_FAN_CAP,
+            true,
+        );
+        eng.reset();
+        for row in 0..26u16 {
+            blank_row(&mut eng, row);
+        }
+        // …and the caret is LEARNED AGAIN in the new space, which is what
+        // makes this the real path rather than a restatement of C: without
+        // the clear at the `reset` seam, the stale bar would now find a
+        // known caret and fan at it, in a space it was never reported for.
+        eng.on_event(
+            mv((9, 40), (9, 41), Licence::Typed),
+            t0 + Duration::from_millis(2),
+        );
+        let before = eng.status().stars;
+        let mut fr = sc.frame();
+        eng.tick(t0 + Duration::from_millis(3), geom(), &cfg, &mut fr);
+        assert_eq!(
+            eng.status().stars,
+            before,
+            "a bar banked before a space cut fanned into the new space"
+        );
+
+        // C. A BAR WITH NO OBSERVED CARET mints nothing either — the same law
+        // `earn_hero` obeys, and the reason B is safe even if a later edit
+        // drops the `reset` clear.
+        let mut eng = engaged();
+        for row in 0..26u16 {
+            blank_row(&mut eng, row);
+        }
+        eng.party(t0, crate::kitty_sing::BAR_FAN_CAP, true);
+        let mut fr = sc.frame();
+        eng.tick(t0 + Duration::from_millis(1), geom(), &cfg, &mut fr);
+        assert_eq!(
+            eng.status().stars,
+            0,
+            "a bar laid before the caret was ever observed"
+        );
     }
 
     /// §5.4 at the seam: with NO probe data a cell is unknown, and an unknown

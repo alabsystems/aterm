@@ -374,27 +374,19 @@ impl Layout {
     /// the next pass. The durable way to drop ONE program while staying adopted is
     /// `[packages].exclude`, which the default-set planner already honours.
     ///
-    /// Existence-only, and silent on WHO adopted: that is a separate record,
+    /// Existence-only, and silent on who adopted: that is a separate record,
     /// [`Self::adopted_by_seed`].
     #[must_use]
     pub fn adopted(&self) -> PathBuf {
         self.prefix.join("adopted")
     }
 
-    /// `adopted-by-seed` — WHO adopted: present only when `atpkg seed`, the first
-    /// launch's bootstrap, created the [`Self::adopted`] marker itself. Read the way that
-    /// marker is, as EXISTENCE and never a parsed value, and read for one sentence only:
-    /// an update pass that completes the set may say "installing aterm is the consent",
-    /// naming `[packages].seed_install = false` (which the seed pass reads BEFORE it
-    /// adopts) as the switch that would have stopped it, only where this record stands
-    /// beside the marker.
-    ///
-    /// The explicit `install --default-set` clears it: running that verb is its own
-    /// consent, and it never reads the key. A marker that verb writes (after `uninstall
-    /// --all`, or on a CLI-only box with no first launch) therefore has no record, and the
-    /// seed pass, which runs on every launch, never stamps a marker it did not just create.
-    /// Cleared with `adopted`. A marker with no record, including one written before this
-    /// record existed, claims no consent beyond the uninstall.
+    /// `adopted-by-seed` — who adopted: present only when `atpkg seed`, the first launch's
+    /// bootstrap, created the [`Self::adopted`] marker itself. Existence only. It gates one
+    /// sentence: only beside this record may an update pass say "installing aterm is the
+    /// consent" and name `[packages].seed_install = false` as the switch that would have
+    /// stopped it. Cleared with `adopted`; `install --default-set` never writes one, so a
+    /// marker without a record claims no consent beyond the uninstall.
     #[must_use]
     pub fn adopted_by_seed(&self) -> PathBuf {
         self.prefix.join("adopted-by-seed")
@@ -1079,21 +1071,14 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
     }
 }
 
-/// Whether `build_dir` carries a WELL-FORMED completeness marker recording the OTHER
-/// slice of the universal binary: a build that slice finished installing — complete for
-/// it, and not for us.
+/// Whether `build_dir` carries a well-formed completeness marker recording the *other*
+/// slice of the universal binary — a finished install, complete for that slice, not for us.
 ///
-/// [`build_is_complete`] answers `false` for such a build, and that is right for the
-/// callers it was written for: this slice must re-stage the tree rather than run it
-/// ([`running_platform`] has the Rosetta hazard in full). But `false` there means only
-/// "not complete FOR ME", and a caller that reads it as "no install ever finished here"
-/// is reasoning about a different question. [`crate::gc`]'s interrupted-install sweep did
-/// exactly that, and its verdict is a `remove_dir_all`.
-///
-/// So this is the distinction, and it is deliberately as strict as the acceptance rule:
-/// an `ok` first line ([`first_line_is_ok`] — a torn or empty marker is a crash artefact,
-/// never another slice's), a platform record present ([`recorded_platform`] — an absent
-/// one is the legacy `ok\n` this slice accepts anyway), and that record not ours.
+/// [`build_is_complete`] answers `false` here too, and a caller reading that as "no install
+/// ever finished" is [`crate::gc`]'s interrupted-install sweep, whose verdict is a
+/// `remove_dir_all`. As strict as the acceptance rule: an `ok` first line
+/// ([`first_line_is_ok`]), a platform record present ([`recorded_platform`] — an absent one
+/// is the legacy `ok\n` this slice accepts anyway), and that record not ours.
 pub(crate) fn build_marks_another_slice(build_dir: &Path) -> bool {
     let Some(marker) = ready_marker_path(build_dir) else {
         return false;
@@ -1603,16 +1588,11 @@ pub(crate) enum Scratch {
     Superseded,
 }
 
-/// A store build directory's name, parsed the way this manager WRITES one: a non-empty run
-/// of ASCII digits, with no leading zero unless the name is exactly `0` ([`crate::dec_u64`]
-/// renders nothing else). `u64::from_str` on its own is LOOSER than the producer — it
-/// accepts a leading `+`, and any number of leading zeros — so `+18` and `018` read back as
-/// build 18 though nothing here ever wrote them. That mattered because these names
-/// authorize deletion inside `store/<program>/`, a directory the user can also put things
-/// in: `+20.incoming-4242/` was swept as build 20's scratch, and `+18/` was swept as a
-/// partial build, by an unguarded `remove_dir_all`. It is the same line the shape test
-/// already held for `18.incoming-drafts/`, and the same canonical-parse rule
-/// [`crate::compat`]'s own store walk uses (`.filter(|n| n.to_string() == name)`).
+/// A store build directory's name, parsed the way this manager writes one: a non-empty run
+/// of ASCII digits, no leading zero unless the name is exactly `0` ([`crate::dec_u64`]
+/// renders nothing else). `u64::from_str` is looser — `+18` and `018` read back as 18 — and
+/// these names authorize `remove_dir_all` inside `store/<program>/`, a directory the user
+/// can also put things in.
 pub(crate) fn parse_build_name(name: &str) -> Option<u64> {
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -1719,64 +1699,29 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
 /// ([`crate::stage_helper::stop_orphaned_lane_jobs`]) and recovering the swap window
 /// ([`recover_interrupted_swap`]) so a crash there does not get swept as debris.
 ///
-/// THE LOCK IS NOT, BY ITSELF, PROOF THAT NOTHING IS STILL WRITING. Every mutating verb
-/// holds the store-wide writer lock ([`crate::lock::try_lock_store`]), which is what makes
-/// another run's scratch ours to reclaim — but the untracked staging lane's extractor is a
-/// LAUNCHD job, launchd's child rather than the submitter's
-/// ([`crate::stage_helper::stage_untracked`]). A `kill -9` of the stager therefore drops
-/// the lock while its helper keeps extracting into `<build>.incoming-<the dead stager's
-/// pid>`, and the successor used to delete exactly that directory out from under it,
-/// stopping it only later, when its own lane prepared a job. So the orphaned jobs are
-/// stopped — and waited out — before a single entry is removed.
+/// The store lock alone does not prove nothing is still writing: the staging lane's
+/// extractor is a launchd job, not the submitter's child, so a `kill -9` of the stager
+/// drops the lock while its helper keeps extracting. Stop the jobs, wait, then delete.
 ///
-/// Without this sweep the scratch is INVISIBLE to reclamation — `list_installed`
-/// only counts numeric, marker-bearing dirs, and GC only reclaims what `list_installed`
-/// returns — so a killed install would strand its half-extracted tree on disk forever.
-///
-/// Non-directories at a scratch path are removed too. `remove_dir_all` fails on a regular
-/// file and GC's pass filters to directories, so such an entry was reclaimed by NEITHER
-/// sweeper — it leaked forever, and while it sat there it blocked every swap of that build
-/// by a process holding the same pid.
-///
-/// A superseded DIRECTORY is NOT swept while `<build>` is absent and the recovery above
-/// declined to move it: that is the only copy of the build on disk, and deleting it is
-/// what [`recover_interrupted_swap`] refused to risk. A directory, because that is what a
-/// swap parks and what that recovery filters on — a file or a symlink at the same name is
-/// nobody's only copy, and is still swept by the paragraph above. See the comment on the
-/// guard.
+/// Nothing else reclaims this scratch — GC only sees numeric, marker-bearing dirs — and a
+/// non-directory at a scratch path is reclaimed by neither sweeper while blocking every
+/// later swap of that build. A superseded *directory* is spared while `<build>` is absent
+/// and the recovery above declined to move it: it is the only copy of the build on disk.
 pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
-    // STOP FIRST, DELETE SECOND: a launchd-parented lane helper outlives the stager that
+    // Stop first, delete second: a launchd-parented lane helper outlives the stager that
     // submitted it, and the store lock it dropped says nothing about the helper.
     crate::stage_helper::stop_orphaned_lane_jobs();
     let recovered = recover_interrupted_swap(build_dir);
-    // WHAT A REFUSED RECOVERY WAS PROTECTING IS NOT DEBRIS. [`recover_interrupted_swap`]
-    // answers `false` for three different states, and one of them is the very state it
-    // exists for: `<build>` absent with a superseded sibling it would not move — two
-    // siblings, so which is the outgoing tree cannot be told, or a rename that simply
-    // FAILED (EACCES, EXDEV, a busy handle). The loop below then `remove_dir_all`ed the
-    // tree the refusal had just declined to gamble with, which is exactly the
-    // "a survivable crash became a permanently deleted toolchain" outcome this pair of
-    // functions is written to prevent — the refusal bought nothing.
-    //
-    // So while NOTHING stands at `<build>`, a superseded sibling is the only copy of that
-    // build there is, and it is left alone. Narrow in both directions: with `<build>`
-    // present (recovery's other `false`) the sibling is genuine leftover and is still
-    // swept, `<build>.incoming-<pid>` half-extracts are nobody's only copy and are still
-    // swept, the next stage of this build sweeps the sibling the moment `<build>` is whole
-    // again, and `crate::gc`'s pass REPORTS a genuinely ambiguous pair — as a program with no
-    // live witness, the `diverged` line `atpkg doctor` prints. It does not reclaim one: that
-    // pass holds this same guard (it did not until 2026-09-19, which is the whole of what
-    // this guard was worth while the pass that runs after every install deleted the tree
-    // anyway).
+    // Not debris: while nothing stands at `<build>`, a superseded sibling is the only copy
+    // of that build on disk — a swap window [`recover_interrupted_swap`] could not close.
+    // Still swept: a sibling of a live `<build>`, `.incoming-<pid>` half-extracts, and the
+    // sibling itself once `<build>` is whole again. `crate::gc` holds this same guard and
+    // reports an ambiguous pair as `doctor`'s `diverged` line rather than reclaiming one.
     let parked_only_copy = !recovered && std::fs::symlink_metadata(build_dir).is_err();
     for (kind, path) in scratch_siblings(build_dir) {
-        // A DIRECTORY, the predicate [`recover_interrupted_swap`] itself filters on: what a
-        // swap parks here is a tree. Written as "skip every superseded entry", this guard
-        // also spared a regular file or a symlink at that name — nobody's only copy, and
-        // the one entry NEITHER sweeper can otherwise reclaim (`remove_dir_all` fails on a
-        // file, and gc's pass scans directories only). That re-opened, three paragraphs
-        // under the doc saying this function closes it, the leak that blocks every later
-        // swap of this build by a process holding the same pid.
+        // A directory, the predicate [`recover_interrupted_swap`] filters on: a swap parks a
+        // tree. A file or symlink at that name is nobody's only copy, and the one entry
+        // neither sweeper can otherwise reclaim — so it must still be swept.
         if parked_only_copy
             && kind == Scratch::Superseded
             && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())

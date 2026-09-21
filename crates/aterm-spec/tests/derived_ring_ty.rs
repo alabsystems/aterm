@@ -55,19 +55,20 @@ use aterm_spec::derive::{
     native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
     native_save_intent_latch_model, native_settings_draft_close_model,
     native_settings_singleton_model, native_tab_identity_model, native_update_admission_model,
-    native_update_attempt_identity_model, native_update_auto_intent_model,
-    native_update_channel_scan_model, native_update_disk_transaction_model,
-    native_update_failed_mark_suppression_model, native_update_hidden_output_quiet_model,
-    native_update_menu_activation_model, native_update_overlap_handoff_model,
-    native_update_seamless_handoff_ownership_model, native_update_status_reconciliation_model,
-    native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
-    net_dial_after_grant_model, nova_phase_model, one_shot_peek_model,
-    operator_event_delivery_model, operator_fleet_fault_model, operator_leadership_model,
-    operator_resync_cursor_model, operator_wal_actuator_model, output_streak_attribution_model,
-    output_streak_episode_delivery_model, pad_absorption_model, pane_tree_model,
-    path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
-    present_retry_model, presentation_gate_model, presented_frame_tap_model, press_custody_model,
-    proxy_forward_model, rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
+    native_update_apply_ladder_model, native_update_attempt_identity_model,
+    native_update_auto_intent_model, native_update_channel_scan_model,
+    native_update_disk_transaction_model, native_update_failed_mark_suppression_model,
+    native_update_hidden_output_quiet_model, native_update_menu_activation_model,
+    native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
+    native_update_status_reconciliation_model, native_update_worker_queue_model,
+    native_updater_model, net_capability_grant_model, net_dial_after_grant_model, nova_phase_model,
+    one_shot_peek_model, operator_event_delivery_model, operator_fleet_fault_model,
+    operator_leadership_model, operator_resync_cursor_model, operator_wal_actuator_model,
+    output_streak_attribution_model, output_streak_episode_delivery_model, pad_absorption_model,
+    pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
+    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
+    presented_frame_tap_model, press_custody_model, proxy_forward_model,
+    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
     rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
     rainbow_terminus_admission_model, read_image_seq_model, recording_model, recovery_redraw_model,
     reduced_motion_companion_handoff_model, release_channel_floor_model,
@@ -5316,6 +5317,55 @@ fn derived_native_update_auto_intent_proves_and_catches_lost_stage_wake() {
     let newer = buggy.successors("ArmNewerIntent", &buggy.init_state())[0].clone();
     let stale = buggy.successors("ObserveStaleWake", &newer)[0].clone();
     assert!(!buggy.check_invariant("NewerIntentSurvivesStaleWake", &stale));
+}
+
+/// THE APPLY LADDER: a never-quiet terminal lands at the bound and activity
+/// never latches the automatic lane manual-only. The mutant is the 2026-09-20
+/// incident — a busy terminal stood down past the typing hold — and it WEDGES
+/// before landing, which is exactly what the owner's aterm did eleven times.
+#[test]
+fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stand_down() {
+    let model = native_update_apply_ladder_model();
+    assert_proves_and_catches(&model);
+
+    // The healthy ladder never wedges before landing…
+    let landed = |state: &aterm_spec::interp::State| state["landed"] == 1;
+    assert!(
+        aterm_spec::interp::find_deadlock(&model, landed).is_none(),
+        "the healthy ladder always reaches a landing"
+    );
+    // …and a busy terminal that never goes quiet lands at the bound: walk the
+    // clock with the terminal streaming and focused, keys up.
+    let mut busy = model.init_state();
+    for _ in 0..3 {
+        assert!(
+            model.successors("Park", &busy).is_empty() || busy["phase"] >= 2,
+            "no park before KeysOnly on a focused, streaming terminal: {busy:?}"
+        );
+        busy = model.successors("Advance", &busy)[0].clone();
+    }
+    assert_eq!(busy["phase"], 3);
+    let parked = model.successors("Park", &busy)[0].clone();
+    assert_eq!(parked["landed"], 1);
+    assert!(model.check_invariant("ParkedOnlyWhenTheLadderAdmits", &parked));
+
+    // The incident: the mutant stands the busy terminal down and wedges.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let wedge = aterm_spec::interp::find_deadlock(&buggy, landed)
+        .expect("the stand-down wedges the mutant before it lands");
+    assert_eq!(wedge["manual_only"], 1);
+    assert_eq!(wedge["landed"], 0);
+    assert!(!buggy.check_invariant("ActivityNeverLatchesManualOnly", &wedge));
+    // And the mutant's ruleless park is the other catch — its own dead action,
+    // never enabled at the committed config.
+    let mut mid_word = buggy.init_state();
+    mid_word.insert("keys", 0);
+    assert!(
+        model.successors("ParkWithoutTheRule", &mid_word).is_empty(),
+        "the healthy ladder has no park that skips the rule"
+    );
+    let ruleless = buggy.successors("ParkWithoutTheRule", &mid_word)[0].clone();
+    assert!(!buggy.check_invariant("ParkedOnlyWhenTheLadderAdmits", &ruleless));
 }
 
 /// A hidden tab may never present after its output wake. Its old latency sample

@@ -3,6 +3,7 @@
 //! Memory-only GUI facts for updater control requests. Durable stage reads and
 //! network work remain on the control worker; no ready marker is trusted here.
 
+use crate::native_update_auto_intent::ApplyPhase;
 use crate::native_updater_service::{StagedUpdate, UpdaterPhase};
 use crate::status_bars::ApplyPosture;
 use crate::{App, Wake};
@@ -12,6 +13,8 @@ pub(crate) struct Snapshot {
     pub(crate) repo: Option<String>,
     staged: Option<StagedUpdate>,
     posture: Option<ApplyPosture>,
+    /// Where the automatic lane stands on its ladder, for the staged build.
+    phase: Option<ApplyPhase>,
     applying: bool,
     retry_scheduled: bool,
 }
@@ -19,6 +22,7 @@ pub(crate) struct Snapshot {
 impl Snapshot {
     pub(crate) fn capture(app: &App) -> Self {
         let updater = app.native_updater_service.snapshot();
+        let now = std::time::Instant::now();
         Self {
             owner: app.config.update.as_ref().and_then(|u| u.owner.clone()),
             repo: app.config.update.as_ref().and_then(|u| u.repo.clone()),
@@ -27,11 +31,27 @@ impl Snapshot {
                 .staged
                 .as_ref()
                 .map(|s| app.apply_posture_for(s.build)),
+            phase: updater
+                .staged
+                .as_ref()
+                .map(|_| app.automatic_apply_phase(now)),
             applying: updater.phase == UpdaterPhase::Applying,
             retry_scheduled: updater
                 .staged
                 .as_ref()
                 .is_some_and(|s| app.automatic_apply_retry_scheduled(s.build)),
+        }
+    }
+
+    /// The ladder phase the automatic lane is in for the staged build —
+    /// `apply_phase=` on the wire — while that lane is the one that will apply
+    /// it (`automatic` / `automatic-idle`). Every other posture answers `None`:
+    /// a phase is a promise about WHEN the automatic lane lands, and no other
+    /// posture makes one.
+    pub(crate) fn apply_phase(&self, status: &aterm_update::UpdateStatus) -> Option<&'static str> {
+        match self.apply_posture(status) {
+            "automatic" | "automatic-idle" => self.phase.map(ApplyPhase::as_str),
+            _ => None,
         }
     }
 
@@ -197,17 +217,26 @@ mod tests {
                 generation: 1,
             }),
             posture: Some(ApplyPosture::Automatic),
+            phase: Some(ApplyPhase::PreferOutputGap),
             applying: false,
             retry_scheduled: false,
         };
         assert_eq!(snapshot.apply_posture(&status), "automatic-idle");
+        // The ladder phase rides beside an automatic posture and nowhere else.
+        assert_eq!(snapshot.apply_phase(&status), Some("prefer-output-gap"));
         snapshot.retry_scheduled = true;
         assert_eq!(snapshot.apply_posture(&status), "automatic");
+        assert_eq!(snapshot.apply_phase(&status), Some("prefer-output-gap"));
         status.staged_commit = status.staged_commit.map(|s| s.to_uppercase());
         status.staged_dmg_sha256 = status.staged_dmg_sha256.map(|s| s.to_uppercase());
         assert_eq!(snapshot.apply_posture(&status), "automatic");
         snapshot.posture = Some(ApplyPosture::ManualByConfig);
         assert_eq!(snapshot.apply_posture(&status), "manual-config");
+        assert_eq!(
+            snapshot.apply_phase(&status),
+            None,
+            "no phase is promised for a lane that will not apply by itself"
+        );
         assert_eq!(
             snapshot.apply_policy_reason(&status),
             Some("update.auto_apply=false")

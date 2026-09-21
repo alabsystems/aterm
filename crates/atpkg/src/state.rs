@@ -24,9 +24,8 @@
 //!   satisfied or installed through its protocol; the tail is the DEPENDENCY's own row,
 //!   so the line says whose act unblocks it. Deferred, retried every pass, never a fault.
 //! * `held: pinned build <N> is not published for <target>; staying on build <current>` —
-//!   an INSTALLED member whose coherence group's new pin carries no artifact for this
-//!   target (a sibling's row names the member: `held: <owner>'s pinned build …`); the tuple
-//!   stays whole on its current builds. Deferred, retried every pass, never a fault.
+//!   an installed member whose group's new pin carries no artifact for this target (a
+//!   sibling's row names it: `held: <owner>'s pinned build …`). Deferred, never a fault.
 //!
 //! Every constructor here is the ONLY place its spelling lives; the parsers beside them
 //! (`system_path`, `managed_pin`, …) read the same words back so `doctor` and `which` can
@@ -266,12 +265,10 @@ pub fn blocked_by(state: &str) -> Option<(&str, &str)> {
 }
 
 /// `held: pinned build <N> is not published for <target>; staying on build <current>` —
-/// or, on a sibling's row, `held: <owner>'s pinned build <N> is not published for <target>;
-/// staying on build <current>`. The update lane's row for an INSTALLED member whose tuple
-/// cannot move on this target because `owner`'s new pin (the row's own program when `owner`
-/// is `None`) carries no artifact for it, so the whole group stays on its current builds.
-/// A per-program DEFERRED state, not a fault: nothing downloads, and the pass that finds
-/// the build published moves the group.
+/// or `held: <owner>'s pinned build <N> …` on a sibling's row. The update lane's row for an
+/// installed member whose group cannot move on this target because `owner`'s new pin (the
+/// row's own program when `owner` is `None`) carries no artifact for it. Deferred, not a
+/// fault: the pass that finds the build published moves the group.
 #[must_use]
 pub fn held_unpublished(owner: Option<&str>, build: u64, target: &str, current: u64) -> String {
     let mut s = String::from(HELD_PREFIX);

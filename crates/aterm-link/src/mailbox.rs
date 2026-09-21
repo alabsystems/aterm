@@ -18,9 +18,9 @@
 //! ## THE QUEUES ARE BOUNDED, AND THE SHED POLICY IS BACK-PRESSURE
 //!
 //! Every other bound in this design is written down and argued (`RING_CAP`,
-//! `SENDER_QUOTA`, `OUTBOX_CAP`, `PRODUCER_CAP`, `FEED_TRIES_MAX`,
-//! `SCREEN_MAX`); this one used to be the exception, and an exception here is
-//! worse than most. Four reader threads push as fast as the broker delivers
+//! `SENDER_QUOTA`, `OUTBOX_CAP`, `PRODUCER_CAP`); this one used to be the
+//! exception, and an exception here is worse than most. The reader threads push
+//! as fast as the broker delivers
 //! while ONE consumer pays a synchronous aterm round trip per inbox record, and
 //! a record body may be up to 16 MiB. Unbounded, a co-permitted peer's burst —
 //! or a broker replaying a backlog after an outage — is bridge memory
@@ -37,9 +37,6 @@
 //!   record, so a subscription the broker sheds under its own write timeout is
 //!   redelivered in full on the next attach. Blocking restores exactly the
 //!   socket back-pressure the reader thread had removed.
-//! * `Term` — a drive record must not be dropped silently (§6.5 is the whole
-//!   rung), and a stale one must not be applied late; blocking leaves that
-//!   decision where it already is, in [`Mailbox::reset_broker_sources`].
 //! * `Event` — aterm's own push lane already has a shed policy of its own: it
 //!   coalesces and emits `GAP`, which §4.2 says is published rather than
 //!   dropped. Blocking hands the decision back to the side that can report it.
@@ -56,7 +53,7 @@
 //! running on the loop's thread. Clearing the queues on reconnect can therefore
 //! only drop what has ALREADY been pushed — the notice or record still in flight
 //! lands in the FRESH mailbox, where a `Closed` tears down a connection that was
-//! just brought up (a reconnect loop, not a retry) and a stale `Term` record is
+//! just brought up (a reconnect loop, not a retry) and a stale broker record is
 //! the late-applied keystroke [`Mailbox::reset_broker_sources`] says must not
 //! happen.
 //!
@@ -85,8 +82,6 @@ pub type Record = (u64, String, Vec<u8>);
 pub enum Item {
     /// A `/f/<F>/fleet/>` record — a halt or a barrier. FIRST, always.
     Fleet(Record),
-    /// A `/f/<F>/term/<node>/>` record — the drive face.
-    Term(Record),
     /// One `EVENT …` line off aterm's push lane.
     Event(String),
     /// A `/f/<F>/in/<node>/>` record from the durable group. LAST.
@@ -100,7 +95,6 @@ pub enum Item {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Fleet,
-    Term,
     Inbox,
     Aterm,
 }
@@ -124,12 +118,11 @@ fn record_bytes(r: &Record) -> usize {
 #[derive(Default)]
 struct Queues {
     fleet: VecDeque<Record>,
-    term: VecDeque<Record>,
     events: VecDeque<String>,
     inbox: VecDeque<Record>,
     closed: VecDeque<Source>,
     /// Resident bytes per record queue, in the order `Source` names them.
-    bytes: [usize; 3],
+    bytes: [usize; 2],
     /// The broker incarnation whose inputs are currently accepted. Bumped by
     /// [`Mailbox::reset_broker_sources`]; see the module header.
     broker_gen: u64,
@@ -137,8 +130,7 @@ struct Queues {
 
 /// Which byte counter a record source uses.
 const FLEET: usize = 0;
-const TERM: usize = 1;
-const INBOX: usize = 2;
+const INBOX: usize = 1;
 
 /// Whether one source is over a bound AND has something to shed. Both halves
 /// matter: a queue that is over the byte cap because of ONE huge record must
@@ -150,7 +142,6 @@ fn over_bound(rows: usize, bytes: usize) -> bool {
 impl Queues {
     fn is_empty(&self) -> bool {
         self.fleet.is_empty()
-            && self.term.is_empty()
             && self.events.is_empty()
             && self.inbox.is_empty()
             && self.closed.is_empty()
@@ -158,8 +149,7 @@ impl Queues {
 
     /// THE PRIORITY, in one place. A closure notice outranks everything (the
     /// connection it names is gone, so anything queued behind it is stale), then
-    /// the fleet halt, then the drive face, then aterm's own events, and the
-    /// inbox group last.
+    /// the fleet halt, then aterm's own events, and the inbox group last.
     fn take(&mut self) -> Option<Item> {
         if let Some(s) = self.closed.pop_front() {
             return Some(Item::Closed(s));
@@ -167,10 +157,6 @@ impl Queues {
         if let Some(r) = self.fleet.pop_front() {
             self.bytes[FLEET] = self.bytes[FLEET].saturating_sub(record_bytes(&r));
             return Some(Item::Fleet(r));
-        }
-        if let Some(r) = self.term.pop_front() {
-            self.bytes[TERM] = self.bytes[TERM].saturating_sub(record_bytes(&r));
-            return Some(Item::Term(r));
         }
         if let Some(e) = self.events.pop_front() {
             return Some(Item::Event(e));
@@ -242,28 +228,6 @@ impl Mailbox {
         }
         q.bytes[FLEET] += n;
         q.fleet.push_back(r);
-        drop(q);
-        self.ready.notify_all();
-    }
-
-    /// Push a drive-face record, WAITING while the drive queue is over its bound.
-    /// Generation-scoped, as [`Mailbox::push_fleet`] is — and here the stale case
-    /// is the one the module header calls out by name: a drive record from a
-    /// torn-down subscription is a keystroke that would be applied late.
-    pub fn push_term(&self, r: Record, generation: u64) {
-        let n = record_bytes(&r);
-        let mut q = self.lock();
-        while over_bound(q.term.len(), q.bytes[TERM]) {
-            if q.broker_gen != generation {
-                return;
-            }
-            q = self.wait_for_room(q);
-        }
-        if q.broker_gen != generation {
-            return;
-        }
-        q.bytes[TERM] += n;
-        q.term.push_back(r);
         drop(q);
         self.ready.notify_all();
     }
@@ -365,9 +329,8 @@ impl Mailbox {
         // fresh mailbox. See the module header.
         q.broker_gen = q.broker_gen.wrapping_add(1);
         q.fleet.clear();
-        q.term.clear();
         q.inbox.clear();
-        q.bytes = [0; 3];
+        q.bytes = [0; 2];
         q.closed.retain(|s| *s == Source::Aterm);
         drop(q);
         // A reader parked on the bound belongs to a subscription that is being
@@ -437,13 +400,12 @@ mod tests {
         }
     }
 
-    /// The full order, once: closed, fleet, term, event, inbox.
+    /// The full order, once: closed, fleet, event, inbox.
     #[test]
     fn the_priority_is_the_declared_one() {
         let mb = Mailbox::default();
         mb.push_inbox(rec(4), 0);
         mb.push_event("EVENT 1 post 1".into());
-        mb.push_term(rec(2), 0);
         mb.push_fleet(rec(1), 0);
         mb.push_closed(Source::Inbox, 0);
         let mut seen = Vec::new();
@@ -451,12 +413,11 @@ mod tests {
             seen.push(match item {
                 Item::Closed(_) => "closed",
                 Item::Fleet(_) => "fleet",
-                Item::Term(_) => "term",
                 Item::Event(_) => "event",
                 Item::Inbox(_) => "inbox",
             });
         }
-        assert_eq!(seen, ["closed", "fleet", "term", "event", "inbox"]);
+        assert_eq!(seen, ["closed", "fleet", "event", "inbox"]);
     }
 
     /// The wait is EVENT-DRIVEN: a push from another thread wakes it, and the
@@ -482,7 +443,6 @@ mod tests {
     fn a_reconnect_forgets_the_old_connections_inputs_but_not_aterms() {
         let mb = Mailbox::default();
         mb.push_fleet(rec(1), 0);
-        mb.push_term(rec(2), 0);
         mb.push_inbox(rec(3), 0);
         mb.push_event("EVENT 1 post 1".into());
         mb.push_closed(Source::Inbox, 0);
@@ -494,7 +454,6 @@ mod tests {
                 Item::Closed(Source::Aterm) => "closed-aterm",
                 Item::Closed(_) => "closed-broker",
                 Item::Fleet(_) => "fleet",
-                Item::Term(_) => "term",
                 Item::Event(_) => "event",
                 Item::Inbox(_) => "inbox",
             });
@@ -534,7 +493,6 @@ mod tests {
         // The reader the reconnect killed, waking up after it: a closure notice
         // and a record, both from the subscription that no longer exists.
         mb.push_closed(Source::Fleet, stale);
-        mb.push_term(rec(1), stale);
         mb.push_inbox(rec(2), stale);
         mb.push_fleet(rec(3), stale);
         assert!(

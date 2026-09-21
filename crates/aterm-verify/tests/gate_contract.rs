@@ -573,7 +573,7 @@ fn the_libc_oracle_driver_is_required_and_fails_closed() {
     assert!(
         failed
             .render()
-            .contains("FAIL  libc-oracle/run.sh (cross-cell ABI + native runtime)")
+            .contains("FAIL  libc-oracle/run.sh (this host's native ABI cell; the other cells are decided where they are native)")
     );
 
     repo.script(
@@ -1425,7 +1425,7 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ("skip", "gate citations (selftest: not executed)"),
             (
                 "skip",
-                "libc-oracle/run.sh (cross-cell ABI + native runtime) (selftest: not executed)"
+                "libc-oracle/run.sh (this host's native ABI cell; the other cells are decided where they are native) (selftest: not executed)"
             ),
             (
                 "skip",

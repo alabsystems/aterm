@@ -149,18 +149,29 @@ impl Grid {
         }
         let fill = self.storage.cursor_template;
         if cursor_col < right_bound {
+            // The BCE span for the truecolor side table: `clear_range_with_orphan`
+            // widens it by the wide halves it had to rewrite (see below).
+            let mut bce = cursor_col..right_bound;
             if let Some(row) = self.row_mut(cursor_row) {
                 if selective {
                     row.selective_clear_range(cursor_col, right_bound);
                 } else {
-                    row.clear_range_with(cursor_col, right_bound, fill);
+                    // xterm `ClearRight`: the orphaned wide half goes through the
+                    // same `ClearCells` as the erased span, so it receives the BCE
+                    // blank, not a default-coloured one (rect ops differ — see
+                    // `Row::clear_range_with_orphan`).
+                    bce = row.clear_range_with_orphan(cursor_col, right_bound, fill, fill);
                 }
             }
             if !selective {
                 self.storage
                     .extras
                     .clear_range(cursor_row, cursor_col, right_bound);
-                self.fill_bce_rgb_range(cursor_row, cursor_col, right_bound);
+                // A truecolor BCE cell holds only an RGB *marker*; the bytes live in
+                // the dense ring. The orphan column now carries that marker too, so
+                // the ring has to reach it or the renderer resolves a stale/absent
+                // background there.
+                self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
             }
             self.storage.mark_content_row(cursor_row);
         }
@@ -202,16 +213,19 @@ impl Grid {
         }
         let fill = self.storage.cursor_template;
         if end > start {
+            let mut bce = start..end;
             if let Some(row) = self.row_mut(cursor_row) {
                 if selective {
                     row.selective_clear_range(start, end);
                 } else {
-                    row.clear_range_with(start, end, fill);
+                    // BCE blank on the orphan, per xterm `ClearRight` (see
+                    // `erase_to_end_of_line_core`).
+                    bce = row.clear_range_with_orphan(start, end, fill, fill);
                 }
             }
             if !selective {
                 self.storage.extras.clear_range(cursor_row, start, end);
-                self.fill_bce_rgb_range(cursor_row, start, end);
+                self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
             }
             self.storage.mark_content_row(cursor_row);
         }
@@ -239,16 +253,19 @@ impl Grid {
             if cursor_col >= margins.left && cursor_col <= margins.right {
                 let start = margins.left;
                 let end = margins.right + 1;
+                let mut bce = start..end;
                 if let Some(row) = self.row_mut(cursor_row) {
                     if selective {
                         row.selective_clear_range(start, end);
                     } else {
-                        row.clear_range_with(start, end, fill);
+                        // BCE blank on the orphan, per xterm `ClearRight` (see
+                        // `erase_to_end_of_line_core`).
+                        bce = row.clear_range_with_orphan(start, end, fill, fill);
                     }
                 }
                 if !selective {
                     self.storage.extras.clear_range(cursor_row, start, end);
-                    self.fill_bce_rgb_range(cursor_row, start, end);
+                    self.fill_bce_rgb_range(cursor_row, bce.start, bce.end);
                 }
                 self.storage.mark_content_row(cursor_row);
                 return;
@@ -3439,6 +3456,304 @@ mod tests {
             char_at(&grid, 0, 6),
             'G',
             "the cell right of the region survives"
+        );
+    }
+
+    // =========================================================================
+    // Wide-orphan colour: the BCE erases vs the rectangle ops
+    // =========================================================================
+
+    /// EL 0 that bisects a wide pair must hand the orphaned half the BCE
+    /// background, not default colours.
+    ///
+    /// xterm `util.c` `ClearRight` runs its wide fixup through the SAME
+    /// `ClearInLine2` -> `ClearCells` (`screen.c`) as the erased span, and
+    /// `ClearCells` writes `' '` plus `ld->color[col] = xtermColorPair(xw)`.
+    /// The only difference between the orphan call and the main call is the
+    /// `CHARDRAWN` flag bit, which carries no colour. aterm wrote `Cell::EMPTY`
+    /// there, leaving a default-coloured hole one column left of the erase.
+    #[test]
+    fn erase_to_end_of_line_gives_the_wide_orphan_the_bce_background() {
+        use crate::{Cell, PackedColors};
+
+        let mut grid = Grid::new(2, 10);
+        grid.move_cursor_to(0, 0);
+        grid.write_wide_char_styled(
+            '中',
+            crate::PackedColor::DEFAULT_FG,
+            crate::PackedColor::DEFAULT_BG,
+            CellFlags::empty(),
+        );
+        assert!(
+            grid.cell(0, 0).unwrap().flags().contains(CellFlags::WIDE),
+            "precondition: col 0 is the wide lead"
+        );
+
+        // SGR 44 (blue background) — the BCE template an EL then erases with.
+        let fill = Cell::bce_blank(PackedColors::with_indexed_bg(4));
+        grid.set_cursor_template(fill, None);
+
+        // EL 0 from col 1: the continuation goes, orphaning the head at col 0.
+        grid.move_cursor_to(0, 1);
+        grid.erase_to_end_of_line();
+
+        let orphan = grid.cell(0, 0).unwrap();
+        assert_eq!(orphan.char(), ' ', "the orphaned lead is blanked");
+        assert_eq!(
+            orphan.colors(),
+            fill.colors(),
+            "the orphan must take the BCE background like the erased span \
+             (xterm ClearRight -> ClearCells)"
+        );
+        assert!(
+            !is_empty_at(&grid, 0, 0),
+            "a default-coloured orphan renders as a hole in the BCE run"
+        );
+    }
+
+    /// The truecolor half of the same fix: a BCE cell holds only an RGB
+    /// *marker*, the bytes live in the dense ring. `fill_bce_rgb_range` covered
+    /// the erased span only, so an orphan that now carries the marker had no
+    /// ring entry and resolved to a stale/absent background.
+    #[test]
+    fn erase_to_end_of_line_extends_the_bce_truecolor_ring_to_the_wide_orphan() {
+        use crate::{Cell, PackedColor};
+
+        let mut grid = Grid::new(2, 10);
+        grid.move_cursor_to(0, 0);
+        grid.write_wide_char_styled(
+            '中',
+            PackedColor::DEFAULT_FG,
+            PackedColor::DEFAULT_BG,
+            CellFlags::empty(),
+        );
+
+        let fill = Cell::bce_blank_from_bg(PackedColor::rgb(10, 20, 30));
+        grid.set_cursor_template(fill, Some([10, 20, 30]));
+
+        grid.move_cursor_to(0, 1);
+        grid.erase_to_end_of_line();
+
+        assert_eq!(
+            grid.bg_rgb_at(0, 1),
+            Some([10, 20, 30]),
+            "precondition: the erased span resolves its truecolor background"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 0),
+            Some([10, 20, 30]),
+            "the orphan column must resolve the same truecolor background — the \
+             cell carries only the RGB marker, so the ring has to reach it"
+        );
+    }
+
+    /// EL 1 (erase from start of line) hits the RIGHT boundary instead: the
+    /// continuation just past the erase is the orphan.
+    #[test]
+    fn erase_from_start_of_line_gives_the_wide_orphan_the_bce_background() {
+        use crate::{Cell, PackedColors};
+
+        let mut grid = Grid::new(2, 10);
+        grid.move_cursor_to(0, 4);
+        grid.write_wide_char_styled(
+            '中',
+            crate::PackedColor::DEFAULT_FG,
+            crate::PackedColor::DEFAULT_BG,
+            CellFlags::empty(),
+        );
+        assert!(
+            grid.cell(0, 5)
+                .unwrap()
+                .flags()
+                .contains(CellFlags::WIDE_CONTINUATION),
+            "precondition: col 5 is the continuation"
+        );
+
+        let fill = Cell::bce_blank(PackedColors::with_indexed_bg(4));
+        grid.set_cursor_template(fill, None);
+
+        // EL 1 erases [0, 5): the lead at col 4 goes, orphaning col 5.
+        grid.move_cursor_to(0, 4);
+        grid.erase_from_start_of_line();
+
+        let orphan = grid.cell(0, 5).unwrap();
+        assert_eq!(orphan.char(), ' ', "the orphaned continuation is blanked");
+        assert_eq!(
+            orphan.colors(),
+            fill.colors(),
+            "the right-hand orphan must take the BCE background too"
+        );
+    }
+
+    /// The truecolor half of EL 1, mirroring
+    /// `erase_to_end_of_line_extends_the_bce_truecolor_ring_to_the_wide_orphan`
+    /// on the RIGHT boundary: the orphaned continuation sits one column PAST the
+    /// erased range, so `fill_bce_rgb_range` has to run to `span.end`, not to
+    /// `end`. With the narrow span the orphan keeps the dead glyph's ring entry
+    /// and resolves its colour under a BCE marker that says otherwise.
+    #[test]
+    fn erase_from_start_of_line_extends_the_bce_truecolor_ring_to_the_wide_orphan() {
+        use crate::{Cell, PackedColor};
+
+        let (rows, cols) = (2u16, 10u16);
+        let mut grid = Grid::new(rows, cols);
+
+        // A wide glyph at cols 4-5 on its own truecolor background.
+        let dead_bg = [7u8, 8, 9];
+        grid.move_cursor_to(0, 4);
+        grid.write_wide_char_styled(
+            '中',
+            PackedColor::DEFAULT_FG,
+            PackedColor::rgb(dead_bg[0], dead_bg[1], dead_bg[2]),
+            CellFlags::empty(),
+        );
+        grid.extras_mut()
+            .set_rgb_ring_range(0, 4, 6, None, Some(dead_bg), rows, cols);
+        assert_eq!(
+            grid.bg_rgb_at(0, 5),
+            Some(dead_bg),
+            "precondition: the continuation carries the glyph's own bytes"
+        );
+
+        let bce_bg = [10u8, 20, 30];
+        let fill = Cell::bce_blank_from_bg(PackedColor::rgb(bce_bg[0], bce_bg[1], bce_bg[2]));
+        grid.set_cursor_template(fill, Some(bce_bg));
+
+        // EL 1 erases [0, 5): the lead at col 4 goes, orphaning col 5.
+        grid.move_cursor_to(0, 4);
+        grid.erase_from_start_of_line();
+
+        assert_eq!(
+            grid.bg_rgb_at(0, 4),
+            Some(bce_bg),
+            "precondition: the erased span resolves its truecolor background"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 5),
+            Some(bce_bg),
+            "the right-hand orphan must resolve the BCE truecolor background — \
+             the cell carries only the RGB marker, so the ring has to reach one \
+             column PAST the erased range or the orphan keeps the dead glyph's \
+             bytes"
+        );
+    }
+
+    /// EL 2's DECLRMM-margin branch (`erase_line_impl`) is a third erase site
+    /// with the same two halves, and it is the one a margin-using full-screen
+    /// app hits: the orphan just past the RIGHT margin takes the BCE blank, and
+    /// the ring has to follow it there.
+    #[test]
+    fn erase_line_within_margins_gives_the_wide_orphan_the_bce_background_and_ring() {
+        use crate::{Cell, PackedColor};
+
+        let (rows, cols) = (2u16, 12u16);
+        let mut grid = Grid::new(rows, cols);
+
+        // A wide glyph straddling the right margin: cols 6-7, margin at col 6.
+        let dead_bg = [7u8, 8, 9];
+        grid.move_cursor_to(0, 6);
+        grid.write_wide_char_styled(
+            '中',
+            PackedColor::DEFAULT_FG,
+            PackedColor::rgb(dead_bg[0], dead_bg[1], dead_bg[2]),
+            CellFlags::empty(),
+        );
+        grid.extras_mut()
+            .set_rgb_ring_range(0, 6, 8, None, Some(dead_bg), rows, cols);
+        assert!(
+            grid.cell(0, 7)
+                .unwrap()
+                .flags()
+                .contains(CellFlags::WIDE_CONTINUATION),
+            "precondition: col 7 is the continuation, one past the right margin"
+        );
+
+        grid.set_horizontal_margins(2, 6);
+        let bce_bg = [10u8, 20, 30];
+        let fill = Cell::bce_blank_from_bg(PackedColor::rgb(bce_bg[0], bce_bg[1], bce_bg[2]));
+        grid.set_cursor_template(fill, Some(bce_bg));
+
+        // EL 2 inside the margins erases [2, 7): the lead at col 6 goes,
+        // orphaning the continuation at col 7.
+        grid.move_cursor_to(0, 4);
+        grid.erase_line();
+
+        let orphan = grid.cell(0, 7).unwrap();
+        assert_eq!(orphan.char(), ' ', "the orphaned continuation is blanked");
+        assert_eq!(
+            orphan.colors(),
+            fill.colors(),
+            "the margin branch must give the orphan the BCE background too — \
+             xterm reaches the same ClearRight -> ClearCells here"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 6),
+            Some(bce_bg),
+            "precondition: the erased span resolves its truecolor background"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 7),
+            Some(bce_bg),
+            "the orphan past the right margin must resolve it too — the ring \
+             has to reach one column past the margin or the orphan keeps the \
+             dead glyph's bytes behind a BCE marker"
+        );
+    }
+
+    /// #7522, at the operation level: DECERA must NOT give the orphan the BCE
+    /// background. xterm routes DECERA through `screen.c` `ScrnFillRectangle`,
+    /// whose wide fixup is `Clear1Cell(ld, left - 1)` — a bare cell clear that
+    /// never touches the fill or the colour pair. The orphan is OUTSIDE the
+    /// rectangle, so colouring it would paint one column past the rect.
+    #[test]
+    fn erase_rect_keeps_the_wide_orphan_empty_under_a_bce_background() {
+        use crate::{Cell, PackedColors};
+
+        let mut grid = Grid::new(2, 10);
+        grid.move_cursor_to(0, 0);
+        grid.write_wide_char_styled(
+            '中',
+            crate::PackedColor::DEFAULT_FG,
+            crate::PackedColor::DEFAULT_BG,
+            CellFlags::empty(),
+        );
+
+        // A visible BCE template is live — the EL paths above would use it.
+        grid.set_cursor_template(Cell::bce_blank(PackedColors::with_indexed_bg(4)), None);
+
+        // DECERA over cols 1..=5: col 1 is the continuation, orphaning col 0.
+        grid.erase_rect(0, 1, 0, 5);
+
+        assert!(
+            is_empty_at(&grid, 0, 0),
+            "#7522: the orphan one column LEFT of the rect must stay Cell::EMPTY, \
+             not take the rect's fill colour"
+        );
+    }
+
+    /// #7522's original shape: DECFRA's fill carries a GLYPH, and writing it
+    /// into the orphan bled that glyph one column outside the rectangle.
+    #[test]
+    fn fill_rect_keeps_the_wide_orphan_empty() {
+        use crate::{Cell, PackedColors, StyleId};
+
+        let mut grid = Grid::new(2, 10);
+        grid.move_cursor_to(0, 0);
+        grid.write_wide_char_styled(
+            '中',
+            crate::PackedColor::DEFAULT_FG,
+            crate::PackedColor::DEFAULT_BG,
+            CellFlags::empty(),
+        );
+        grid.set_cursor_template(Cell::bce_blank(PackedColors::with_indexed_bg(4)), None);
+
+        let fill = Cell::with_style_id('X', StyleId::DEFAULT, CellFlags::empty());
+        grid.fill_rect(fill, 0, 1, 0, 5, None, None);
+
+        assert_eq!(char_at(&grid, 0, 3), 'X', "the rect itself takes the fill");
+        assert!(
+            is_empty_at(&grid, 0, 0),
+            "#7522: the DECFRA fill glyph must not bleed onto the orphan"
         );
     }
 

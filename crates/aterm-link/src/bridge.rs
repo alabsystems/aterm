@@ -40,13 +40,14 @@
 //! The broker bounds one producer at `MAX_SUBJECTS_PER_PRODUCER` = 4096, rebuilt
 //! from the log on every open, and a node's producer id is derived from an id the
 //! state dir mints once and keeps forever — so the budget does not clear on
-//! restart. This node mints one distinct subject per hosted session on each of
-//! `presence`, `ev` and `control`, plus `screen` and one per `say/<kind>`: call it
-//! three to five per session over the node's lifetime, so a long-lived instance
-//! exhausts the budget somewhere past a thousand sessions. Past the bound every
-//! publish to a NEW subject is refused, which means a newly spawned session gets
-//! no presence row, no `ev` face and no `control` row while existing sessions keep
-//! working and nothing on the bus says why.
+//! restart. This node mints one distinct subject per hosted session on
+//! `presence` and `ev`, plus one per `say/<kind>`: call it two to three per
+//! session over the node's lifetime — it was three to five before round 21 cut
+//! the `control` and `screen` faces — so a long-lived instance exhausts the
+//! budget somewhere past two thousand sessions. Past the bound every publish to
+//! a NEW subject is refused, which means a newly spawned session gets no
+//! presence row and no `ev` face while existing sessions keep working and
+//! nothing on the bus says why.
 //!
 //! DESIGN §5.2's stated mitigation — "the bridge collapses a session's `exited`
 //! presence row into an `ev` record after `--exited-keep <n>` (default 64)
@@ -74,30 +75,30 @@
 //! for, and [`Bridge::ctl_request`] turns a lane that IS lost into the closure
 //! notice the loop already knows how to act on.
 //!
-//! ## The path to a PTY, and the wall around it
+//! ## The path to a PTY: there is none
 //!
-//! Exactly one function writes to a PTY — [`Bridge::feed`] — and exactly two
-//! call it. [`Bridge::on_term_record`] is reachable only from the `term`
-//! subscription and checks §6.6's four conditions in one place;
-//! [`Bridge::on_inbox_record`] cannot reach either. That is not a comment — it
-//! is the module structure, and
-//! `no_inbox_record_ever_reaches_the_pty_and_a_stale_epoch_is_refused` in
-//! `tests/bridge_e2e.rs` is the claim over it. (The name is PINNED by
+//! NO BUS RECORD REACHES A PTY BY ANY PATH. Not "is checked before it does" —
+//! there is no function in this crate that writes to one. That is the round-21
+//! cut: the `term/in` drive face, the only thing that ever converted a record
+//! to keystrokes, is gone, and with it `feed`, `on_term_record`, the four
+//! §6.6 conditions, the holder table, the epochs' fencing role, the mirror
+//! leases and the feed journal. `no_bus_record_ever_reaches_a_pty` in
+//! `tests/bridge_e2e.rs` is the claim over it, and it is now a claim about an
+//! absence rather than about a check.
+//!
+//! (The name is PINNED by
 //! `this_modules_doc_and_unsafe_surface_match_what_it_ships`: aterm ships no
-//! evidence manifest, so a doc comment IS the claim, and this header used to
-//! cite a test that has never existed under that name — an auditor following it
-//! got `0 passed; 0 filtered out`, a green run over an empty set.)
+//! evidence manifest, so a doc comment IS the claim, and this header once
+//! cited a test that had never existed under that name — an auditor following
+//! it got `0 passed; 0 filtered out`, a green run over an empty set.)
 //!
-//! The second caller is [`Bridge::resolve_pending_feed`], and it is named here
-//! rather than buried because it is a second way a bus record becomes a
-//! keystroke. Its authority is narrower than the first's, not wider: it feeds
-//! only a record whose offset [`Bridge::on_term_record`] already journalled
-//! AFTER passing the four conditions, only under the key journalled with it, and
-//! only after re-fetching that exact offset off the bus and re-parsing its
-//! subject. The epoch is re-checked structurally (it is inside the key) and so
-//! is the hold (the endpoint's gate precedes any write); the holder and the
-//! generation are deliberately not, for the reasons written on that function.
-//! Nothing else in this crate can put an offset in that journal.
+//! THE SUBJECT STAYS RESERVED. `subject::parse_term_in` and
+//! `subject::term_filter` remain, and the node ring still carries both `term`
+//! grants, because an older node on this wire may still publish one and a
+//! fleet that forgot the shape of the subject could not tell a stranger's
+//! forgery from a peer's. Nothing in this crate parses or serves it: the
+//! filter's only in-tree reference is its own test, which is the intended
+//! end state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -108,7 +109,6 @@ use astream_broker::Record as BrokerRecord;
 
 use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
-use crate::handoff::{self, decide_control, Decision, Event as HandoffEvent};
 use crate::mailbox::{Item, Mailbox, Source};
 use crate::presence::{self, Fields, Mode, Slot};
 use crate::state::{Asked, Deadline, StateDir, ASKED_KEEP, DEADLINES_KEEP};
@@ -153,6 +153,16 @@ const ACK_DEADLINE: Duration = Duration::from_secs(5);
 /// bounds is the STALENESS of the endpoint's number on a BUSY link — a bridge
 /// acking ten records a second would otherwise re-report only on a 2x move,
 /// and `fabric_link_age_ms=` would read minutes on a link acking every 100 ms.
+///
+/// ONE BOUNDED EXCEPTION, and it is the ghost sweep ([`GHOST_SWEEP`]). Any
+/// answered broker request is an ack, so a periodic READ is a periodic report
+/// even though nothing was published — which is why the sweep runs only while
+/// it has a candidate to retire and not on a free-running clock. While one is
+/// standing this bridge does report about once a minute; when the set drains it
+/// stops, and a fleet that has never had a ghost never starts. A round-21
+/// review measured the version without that gate: every attached bridge on the
+/// fleet reported every 60 s for ever, and `fabric_link_age_ms=` could no
+/// longer exceed it.
 const LINK_REFRESH: Duration = Duration::from_secs(2);
 
 /// The least gap between two reports made because the round trip MOVED by
@@ -172,110 +182,46 @@ const LINK_MOVE_GAP: Duration = Duration::from_millis(250);
 /// and re-offering them is free because `deliver` is idempotent on `off=`.
 const REFILL_FLOOR_SPAN: u64 = 4096;
 
-/// How often an unfinished feed is re-asked from the MAIN loop.
-///
-/// The budget is [`FEED_BUDGET`], a DURATION; this is only the gap between
-/// attempts inside it, and it is deliberately the idle tick's own period so a
-/// busy bridge and a quiet one re-ask at the same rate. It is not itself a
-/// budget and it no longer has to be long enough for anything: it used to be
-/// documented as "long enough for a `turn` to finish or a hold to lift", which
-/// at 250 ms it plainly is not, and the count it multiplied into was written
-/// against a two-second cadence.
-const FEED_RETRY: Duration = Duration::from_millis(250);
-
-/// HOW LONG a `term/in` whose outcome was never obtained is re-asked for before
-/// the bridge stops asking and publishes what it knows.
-///
-/// ## A COUNT OF RETRIES IS NOT A BUDGET
-///
-/// [`FEED_TRIES_MAX`] was eight, and eight meant fourteen to sixteen seconds
-/// because `resolve_pending_feed` ran once per idle roster round (8 ×
-/// `IDLE_TICK`). Round 2 gave the retry its own [`FEED_RETRY`] deadline —
-/// correctly, because a busy bridge never reaches the idle arm — and the same
-/// eight attempts silently became 1.75 s, while both constants' docs went on
-/// saying "long enough for a hold or a lease to clear". It is the trap
-/// `DRIVEN_KEEP` and `SETTLE_QUIET` were converted away from, one block down,
-/// in the same commit: EVERY WINDOW IN THIS FILE IS A DURATION, because a count
-/// means whatever the scheduler is doing this month.
-///
-/// And the cost of getting it wrong is not a shorter wait. Exhausting the
-/// budget RETIRES the journal, and §6.5 makes the record it publishes terminal
-/// — reported, never replayed. So a keystroke the endpoint refused CLEANLY on
-/// every attempt, before a byte could move, was published to the fleet as "it
-/// may have typed and nothing can tell" and became unrecoverable, 1.75 s into
-/// a refusal that outlives that by design: `LEASE_TTL_MS` is 30 s, an `ERR
-/// busy` is a whole `turn`, and `ERR halted` is lifted by a human.
-///
-/// Forty-five seconds covers a lease TTL and a long `turn` with room to spare,
-/// and still puts the news on `ev` inside a minute. What was NOT extended is
-/// the arithmetic that ties it to a period: nothing here multiplies a count by
-/// a cadence, so [`FEED_RETRY`] can move again without moving this.
-const FEED_BUDGET: Duration = Duration::from_secs(45);
-
 /// How often the roster and the LOCAL observations are re-read.
 ///
 /// FROM A DEADLINE, NOT FROM THE IDLE ARM. It used to be `ticks % 8` where
 /// `ticks` advanced only in the mailbox's `None` branch — reachable only after a
 /// full [`IDLE_TICK`] with every queue empty — so a bridge receiving one item
-/// per 250 ms never ran it at all. The same commit that made this argument for
-/// `renew_leases`, `resolve_pending_feed` and `publish_screens` left these
-/// behind, and what starves is not bookkeeping: [`Bridge::sample_local_control`]
-/// is the ONLY producer of §6.6 row 4 (the conservative pause, which takes the
-/// keyboard from a remote holder once a human has touched the session), the only
-/// producer of row 5 (the local-lease mirror), and the only place `attention=` is
-/// re-sampled — the field `notify --on attention` and `glance` read. A peer
-/// posting four times a second is enough to hold a node in that state
-/// indefinitely.
+/// per 250 ms never ran it at all. The commit that made this argument for the
+/// other periodic duties left these behind, and what starves is not
+/// bookkeeping:
+/// [`Bridge::sample_local_control`] is the only place `attention=` is
+/// re-sampled — the field `notify --on attention` and `glance` read — and the
+/// only producer of the per-session `detail=` and `revision` the presence row
+/// carries. A peer posting four times a second is enough to hold a node in
+/// that state indefinitely. (It was also the only producer of §6.6's rows 4
+/// and 5, the conservative pause and the local-lease mirror; round 21 cut both
+/// with the drive face they decided for.)
 ///
 /// The period is the one the tick gate used to produce (8 × 250 ms), so a quiet
 /// bridge pays exactly what it paid before and a busy one now pays it too.
 const ROSTER_REFRESH: Duration = Duration::from_millis(2_000);
 
-/// How often the §6.6 row-4 observation is taken for a session a remote
-/// principal HOLDS.
+/// How often the retained presence rows under THIS node are swept for ghosts.
 ///
-/// ## A SAMPLER IS ONLY AS GOOD AS WHAT IT CAN STILL SEE
-///
-/// Row 4's evidence is an EDGE, not a level. `status revision=` advances only
-/// when aterm's classifier PUBLISHES a phase change, and a phase is only
-/// published while the thing that caused it is still true: the classifier reads
-/// a foreground-job Boolean, so `sleep 2` is `phase=running` for two seconds and
-/// `phase=idle` before and after. Nothing anywhere records that it ran. A
-/// sampler slower than the command therefore does not see the change LATE — it
-/// never sees it at all, and §9.3's structural "a human always wins" silently
-/// does not hold.
-///
-/// That is not hypothetical and it is not only about long periods. Sharing
-/// [`ROSTER_REFRESH`]'s 2 s deadline also PHASE-LOCKED this observation to the
-/// loop's other periodic duties: 2 s divides [`LEASE_RENEW`]'s 10 s exactly, so
-/// the roster arm ran in the same iteration as the lease renewal, every time,
-/// and a session was therefore sampled at the same point in every cycle. A
-/// stroboscope. A person who typed just after a renewal was invisible for the
-/// whole two seconds that followed — reproducibly, not by luck.
-///
-/// So this observation gets its own deadline at aterm's own classification
-/// interval (250 ms — the rate at which `status` can produce a NEW verdict, so a
-/// faster sampler could learn nothing more), and it visits only the sessions
-/// row 4 applies to: the HELD ones. A free session's row-4 verdict is discarded
-/// unread, and its baseline is re-taken by [`Bridge::baseline_local`] the moment
-/// a holder appears — so the cost is one `status` per HELD session per 250 ms,
-/// which is the rate [`FEED_RETRY`] and the screen face already run at, and not
-/// a per-session poll of the whole roster.
-///
-/// [`Bridge::sample_local_control`] still runs the WHOLE local sweep — the
-/// `attention=` re-read and row 5's local-lease mirror as well — on
-/// [`ROSTER_REFRESH`]. Those two are levels, not edges: they are still true when
-/// they are looked at late.
-const LOCAL_OBSERVE: Duration = Duration::from_millis(250);
+/// A minute, not [`ROSTER_REFRESH`]'s two seconds: this is a `Last` walk of a
+/// whole subtree, and the thing it looks for cannot appear between two roster
+/// rounds — a session that exits normally has its `exited` row published by
+/// `refresh_sessions` within one of those rounds. What is left for this sweep
+/// is only what NO round could have published.
+const GHOST_SWEEP: Duration = Duration::from_secs(60);
 
-/// The furthest behind the head the drive face will RESUME from.
+/// How long a `state=live` row under this node must have gone unhosted, AS
+/// OBSERVED BY THIS BRIDGE, before its presence is retired.
 ///
-/// The durable cursor (`state.rs`: `term-off`) is the resume point, and this
-/// bounds what one long absence can cost: a bridge that was down for a day comes
-/// back to a window it can walk rather than to the whole log, and the offsets it
-/// skips are NAMED in an `ev` rather than passed over silently. A3's head-resume
-/// skipped every one of them and named none.
-const TERM_RESUME_SPAN: u64 = 4096;
+/// Measured against this bridge's own sight of the roster rather than the
+/// row's `t=`, because `t=` is when the row was last WRITTEN and presence is
+/// published on change: a session that has been quietly busy for an hour has
+/// an hour-old row and is perfectly alive. Five minutes is two orders of
+/// magnitude past the two-second round that would have retired an ordinary
+/// exit, so anything still standing at the end of it was published by an
+/// incarnation that never got to say goodbye.
+const GHOST_AFTER: Duration = Duration::from_secs(300);
 
 /// The most pages one last-value walk may take before it is called a failure.
 ///
@@ -288,17 +234,6 @@ const LAST_PAGES_MAX: usize = 4096;
 
 /// How many of this node's own acked offsets the self-lane check remembers.
 const SELF_ACK_KEEP: usize = 4096;
-
-/// The TTL the `control` row's mirror lease is taken with, and how often it is
-/// RENEWED (§6.6: "renewed while the row stands"). A3 issued the acquire once
-/// and never renewed it, so after 30 s aterm's `who` stopped saying
-/// `driving=lease:fabric:<p>` and a competing local `turn` stopped answering
-/// `ERR busy` — the mirror silently lapsed while the bus row still stood.
-///
-/// The renewal is a LOCAL verb call, not a republished record: a TTL kept alive
-/// on the bus would mean a retained record per held session per period, forever.
-const LEASE_TTL_MS: u64 = 30_000;
-const LEASE_RENEW: Duration = Duration::from_millis(LEASE_TTL_MS / 3);
 
 /// The reserved TOP of an incarnation's sequence space — the will's sequence, so
 /// no ordinary publish of that incarnation can collide with it (§7).
@@ -313,8 +248,11 @@ const WILL_SEQ_LOW: u64 = 0xFFFF_FFFF;
 /// say otherwise — see [`Bridge::classify_kind`], which is where the predicate
 /// lives and argues itself. `h-` is a CAP-FORCED `<src>` segment, so a principal
 /// can only speak as a human if the broker's own grant binds it to one; the
-/// carve-out is what makes §6.6's row 1 (a human's `claim`, "granted
-/// unconditionally") reachable on a node whose operator listed nobody.
+/// carve-out is why a human's `task` or `control` arrives as itself rather than
+/// demoted on a node whose operator listed nobody. (It also made §6.6's row 1,
+/// a human's `claim` "granted unconditionally", reachable there; that row went
+/// with the drive face in round 21, but the demotion carve-out is about mail
+/// and stands on its own.)
 /// `--accept-from` therefore adds NON-human principals to the set, and adds
 /// nothing for a human who is already in it.
 ///
@@ -389,7 +327,10 @@ pub enum Attachment {
     Observer,
 }
 
-/// One sample of the LOCAL facts §6.6's last two rows are computed from.
+/// One sample of what the local instance says about a session: the `revision`
+/// the screen reader is gated on ([`crate::presence::Slot::needs_screen`]) and
+/// whether it has ever been read. It carried §6.6's last two rows until round
+/// 21 cut them with the drive face.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LocalSample {
     /// Whether `revision` is a real observation yet. THE FIRST SAMPLE IS A
@@ -400,21 +341,6 @@ struct LocalSample {
     seen: bool,
     /// The `status revision=` this bridge last observed.
     revision: u64,
-    /// When the classifier was last seen to MOVE — or, for a session that has
-    /// only ever been sampled once, when it was first looked at. A session that
-    /// has not been quiet since then is still settling from something already
-    /// accounted for — its own launch, or the keystroke before this one — and an
-    /// advance while it settles is not news. A launching session goes
-    /// `starting → idle` on its own within a second, which is exactly the burst
-    /// that would otherwise pause every freshly handed-over session.
-    ///
-    /// A CLOCK, NOT A COUNT OF SAMPLES. See [`SETTLE_QUIET`].
-    moved_at: Option<Instant>,
-    /// When the bridge applied a `term/in` whose effect on the revision has not
-    /// been observed yet. Consumed by the sample that SEES the advance — never
-    /// by the one right after the write, because the output a keystroke causes
-    /// lands after the verb returns. A clock, for [`DRIVEN_KEEP`]'s reason.
-    driven_at: Option<Instant>,
 }
 
 /// One `status` reply's three tokens the bridge reads: `revision=`, `hold=`
@@ -426,34 +352,6 @@ struct StatusSample {
     detail: String,
 }
 
-/// How long an unconsumed `driven` mark survives.
-///
-/// EVERY WINDOW IN THIS BLOCK IS A DURATION, AND IT USED TO BE A COUNT OF
-/// SAMPLES. `DRIVEN_KEEP_QUIET = 2` and `SETTLED_QUIET = 1` were counts, so what
-/// they actually meant was "two sampling periods" and "one sampling period" —
-/// numbers that lived in the SCHEDULER, not here. That coupling is silent and it
-/// is a trap: [`LOCAL_OBSERVE`] exists precisely because the observation period
-/// had to change, and changing it under a count-based rule moves every one of
-/// these windows by the same factor without a line of this file being touched.
-/// (Measured: with the windows still counted in samples, dropping the period to
-/// 250 ms shrank the settling window from ~2 s to 250 ms and the conservative
-/// pause fired on a session's own handover burst.) A rule whose meaning is a
-/// span of time says so in seconds.
-///
-/// Four seconds is the span the old two-sample rule produced at the old ~2 s
-/// period, and the reason for a span at all is unchanged: the sample immediately
-/// after a `feed-bin` routinely sees nothing yet, and clearing the mark there
-/// would pause the session on its own keystroke.
-const DRIVEN_KEEP: Duration = Duration::from_millis(4_000);
-
-/// How long a session must have been seen quiet before an advance counts as an
-/// unaccounted change. See [`DRIVEN_KEEP`] for why this is a duration.
-///
-/// One second is what the rule's own justification names — "a launching session
-/// goes `starting → idle` on its own within a second" — rather than whatever the
-/// sampling period happens to be.
-const SETTLE_QUIET: Duration = Duration::from_millis(1_000);
-
 /// TEST-ONLY fault injection, armed by `$ATERM_LINK_FAULT` — and TEST-ONLY is
 /// enforced, not merely documented: [`Fault::from_env`] reads the variable only
 /// in a build with `debug_assertions`, so a released `aterm-link serve` honours
@@ -463,7 +361,7 @@ const SETTLE_QUIET: Duration = Duration::from_millis(1_000);
 /// in every build, while `ATERM_LINK_FAULT` is on neither `ENV_DENY_VARS` nor
 /// `ENV_DENY_PREFIXES` — so it survives the PTY child-shell seam and
 /// `fabric_launch::filter_child_env`, and a prompt-injected agent inside a
-/// session could arm `kill-in-feed-window` on a nested instance's bridge and
+/// session could arm `kill-after-deliver` on a nested instance's bridge and
 /// leave every session that bridge governs held `fabric-lost`. §8.5 states the
 /// intended rule ("the deny-list keeps every fabric selector (`ATERM_LINK_*`)
 /// from surviving a hop"); the deny-list names three of the five variables, and
@@ -483,12 +381,6 @@ enum Fault {
     KillAfterDeliver,
     /// `SIGKILL` after a post's `Publish` is acked, before `outbox sent`.
     KillAfterPublish,
-    /// `SIGKILL` inside the FEED WINDOW: after the journal names the `term/in`
-    /// and its key, after `feed-bin` answered `OK`, and before the outcome is
-    /// recorded (§6.5). This is the window A3 lost a keystroke in — silently,
-    /// because its drive face resumed at the head — and the one A7 asserts
-    /// "applied ONCE" across.
-    KillInFeedWindow,
     /// LOSE THE VERB LANE, without killing the process, immediately before the
     /// first `deliver` — the failure this bridge used to be unable to see.
     ///
@@ -500,39 +392,6 @@ enum Fault {
     /// descriptor of another process — so the process closes its own, at the
     /// named point.
     LoseAtermBeforeDeliver,
-    /// Answer the FIRST `feed` with a TRANSIENT refusal without asking aterm.
-    ///
-    /// `ERR busy turn=<id>` is what a live endpoint answers while a local turn
-    /// holds the write-block lease, and it is the verdict
-    /// [`Verdict::is_final`] deliberately calls non-final: the journal is kept
-    /// with NO `ev` published so the record can be asked again. It is a REACHABLE
-    /// state and not an impossible one, which an earlier version of this doc had
-    /// backwards: only the CLAIM-FIRST order is exclusive (a `turn` started under
-    /// the bridge's live cooperative lease is refused `ERR busy lease=`), and in
-    /// the TURN-FIRST order the human's `control` claim lands anyway —
-    /// [`Bridge::acquire_lease`] records the refusal as an `ev lease-refused`
-    /// rather than failing the handoff — so the bridge drives a session whose
-    /// turn refuses every keystroke. What the fault buys is DETERMINISM: the
-    /// reply, not the state. Everything downstream of it is the shipped path.
-    RefuseFirstFeed,
-    /// Answer EVERY `feed` with the same transient refusal for as long as a
-    /// marker file (`<state>/refuse-feeds`) exists — a refusal WINDOW rather
-    /// than a single reply, and one whose length the test controls from the
-    /// observable the bridge itself writes.
-    ///
-    /// [`FEED_BUDGET`] is a span of wall clock, and the property it exists for
-    /// is that a keystroke refused CLEANLY for longer than a scheduler round is
-    /// still there when the refusal lifts. Asserting that means holding a
-    /// transient refusal open across many attempts — a real `turn` would have to
-    /// hold a session's write-block lease while the bridge holds that session's
-    /// cooperative lease for the driving human, which the design makes mutually
-    /// exclusive — and then lifting it at a point defined by the bridge's OWN
-    /// progress (`tries=` in the journal) rather than by a clock the test races.
-    /// Everything downstream of the reply is the shipped path.
-    ///
-    /// It is NOT one-shot: the window is the whole point, so it neither clears
-    /// itself nor writes `fault-fired`.
-    RefuseFeedsWhileMarked,
     /// Answer every `@<sid> status` with a REFUSAL for as long as a marker file
     /// (`<state>/fail-status`) exists, so [`Bridge::status_sample`] answers
     /// `None` — the unreadable state whose old handling folded into
@@ -582,6 +441,20 @@ enum Fault {
     /// creates, and the one honest way to stage that case is for the process to
     /// stage it itself. What follows the padding is the shipped path.
     OversizeDeliverLine,
+    /// Sweep ghost presence rows with NO patience for as long as a marker file
+    /// (`<state>/sweep-ghosts-now`) exists: [`GHOST_AFTER`] is treated as zero
+    /// and [`Bridge::retire_ghost_presence`] runs on every roster round rather
+    /// than on [`GHOST_SWEEP`].
+    ///
+    /// The two constants are five minutes and one minute, and they are those
+    /// lengths on purpose — the sweep's whole safety argument is that it waits
+    /// far longer than any ordinary exit takes to be published. A test cannot
+    /// assert about a bound by waiting it out, and a test that shortened the
+    /// bound by building a different bridge would be asserting about a bridge
+    /// nobody ships. So the marker collapses the WAIT and nothing else: which
+    /// rows qualify, the `inc=` guard, the record published and the `ev` beside
+    /// it are all the shipped path.
+    SweepGhostsAtOnceWhileMarked,
 }
 
 impl Fault {
@@ -603,14 +476,12 @@ impl Fault {
         match std::env::var("ATERM_LINK_FAULT").as_deref() {
             Ok("kill-after-deliver") => Fault::KillAfterDeliver,
             Ok("kill-after-publish") => Fault::KillAfterPublish,
-            Ok("kill-in-feed-window") => Fault::KillInFeedWindow,
             Ok("lose-aterm-before-deliver") => Fault::LoseAtermBeforeDeliver,
-            Ok("refuse-first-feed") => Fault::RefuseFirstFeed,
-            Ok("refuse-feeds-while-marked") => Fault::RefuseFeedsWhileMarked,
             Ok("fail-status-while-marked") => Fault::FailStatusWhileMarked,
             Ok("fail-post-publish-while-marked") => Fault::FailPostPublishWhileMarked,
             Ok("drop-session-exited-while-marked") => Fault::DropSessionExitedWhileMarked,
             Ok("oversize-deliver-line") => Fault::OversizeDeliverLine,
+            Ok("sweep-ghosts-at-once-while-marked") => Fault::SweepGhostsAtOnceWhileMarked,
             _ => Fault::None,
         }
     }
@@ -792,16 +663,6 @@ pub struct Config {
     /// Principals whose `task`/`control` are delivered as themselves rather than
     /// demoted to `note`.
     pub accept_from: Vec<String>,
-    /// `--screen <sid|all>`: sessions whose SCREEN is published to the bus
-    /// (§3.3's `/f/<F>/term/<node>/<sid>/screen`, "a full `DELTA screen`
-    /// snapshot, opt-in, ≤ 4/s").
-    ///
-    /// OPT-IN, and empty by default, because the log is a secrets store: §14's
-    /// second open question is exactly "`term/screen` cadence and who may hold
-    /// `ro:…/screen`", and T12 says an at-rest exfil of the log is total until
-    /// encrypt-at-rest lands. A fabric that published every screen because it
-    /// could would have decided that question by accident.
-    pub screen: Vec<String>,
     /// `--sock <path>`: hand-started observer mode.
     pub sock: Option<String>,
     /// The instance token, for observer mode only.
@@ -813,8 +674,11 @@ pub struct Config {
     pub presence: Mode,
     /// `--receipts` / `[fabric] receipts`: whether an `inbox seen <id>
     /// handled|refused|deferred` on an `ask`/`task` row publishes `kind=ack
-    /// re=<off> verdict=<v>` onto the SENDER's inbox lane (R8). Off by default
-    /// on the command line; `aterm fabric on` writes `receipts = true`.
+    /// re=<off> verdict=<v>` onto the SENDER's inbox lane (R8). ON by default
+    /// since round 21, whichever way the bridge was set up — it used to be off
+    /// here and on for a node `aterm fabric on` had configured, and with it off
+    /// nothing can release a `post --wait-ack`. `--no-receipts` and `[fabric]
+    /// receipts = false` turn it off.
     pub receipts: bool,
 }
 
@@ -824,6 +688,14 @@ pub struct Bridge {
     node: String,
     producer_id: u64,
     inc: u64,
+    /// The one incarnation of THIS node, other than its own, whose session rows
+    /// this bridge may retire: the one whose WILL it found on the node face when
+    /// it attached, which is proof that process is gone.
+    ///
+    /// `None` for "none but my own", and RE-SET on every attach rather than
+    /// filled in once — a reconnect that finds a live node row must clear an
+    /// adoption an earlier attach granted. See [`adoptable`].
+    witnessed_dead: Option<u64>,
     state: StateDir,
     caps: Vec<Cap>,
     attachment: Attachment,
@@ -839,18 +711,9 @@ pub struct Bridge {
     locals: BTreeMap<u64, String>,
     /// `sid -> epoch` (the session's public launch nonce, verbatim).
     epochs: BTreeMap<String, String>,
-    /// `sid -> the principal holding its keyboard` — the local twin of the
-    /// last-value `control` row, RESTORED from the bus on every connect
-    /// ([`Bridge::restore_control_rows`]) so a bridge restart does not silently
-    /// hand a driving human's keyboard back to nobody.
-    holders: BTreeMap<String, String>,
-    /// `sid -> the principal whose `request` is waiting on the holder` (§6.6
-    /// row 2). Carried on the `control` row as `pending=` so the holder's next
-    /// wake shows it.
-    pending: BTreeMap<String, String>,
-    /// `sid -> what the local instance last said about it`, for the two rows of
-    /// §6.6 that are LOCAL observations rather than bus events: the conservative
-    /// pause and the mirrored `lease acquire`.
+    /// `sid -> what the local instance last said about it`. Since round 21 its
+    /// whole job is gating the screen read on a moved `status revision=`; the
+    /// two §6.6 rows it was built for went with the drive face.
     local: BTreeMap<String, LocalSample>,
     /// The sessions this bridge has NEWLY seen and not yet admitted to the
     /// fabric: presence published and, above all, §6.2's ring refill run.
@@ -874,18 +737,22 @@ pub struct Bridge {
     /// roster beside the other per-sid maps, so a long disconnection cannot
     /// grow it.
     pending_admit: BTreeSet<String>,
-    /// When the mirror leases are next renewed.
-    lease_due: Instant,
-    /// When the roster, the local §6.6 observations and the halt backstop are
-    /// next re-read. See [`ROSTER_REFRESH`]: a deadline rather than a count of
-    /// idle ticks, because a busy bridge has none.
+    /// When the roster, the local observations and the halt backstop are next
+    /// re-read. See [`ROSTER_REFRESH`]: a deadline rather than a count of idle
+    /// ticks, because a busy bridge has none.
     roster_due: Instant,
-    /// When the §6.6 row-4 observation is next taken for the HELD sessions. Its
-    /// own deadline, not the roster's — see [`LOCAL_OBSERVE`].
-    observe_due: Instant,
-    /// When the next screen snapshot may be published — the ≤ 4/s bound of §3.3,
-    /// enforced by the clock rather than by how often the loop happens to idle.
-    screen_due: Instant,
+    /// When the retained presence rows under this node are next swept for
+    /// ghosts. Its own deadline for the reason every other periodic duty has
+    /// one — see [`GHOST_SWEEP`].
+    ghost_due: Instant,
+    /// `sid -> since when this bridge has seen a `state=live` row for it under
+    /// its OWN node with no local session hosting it`.
+    ///
+    /// The clock is this bridge's own observation, not the row's `t=`
+    /// ([`GHOST_AFTER`]), and it is dropped the moment the sid appears in the
+    /// roster — so a session that is merely slow to be admitted never
+    /// accumulates time here.
+    ghosts: BTreeMap<String, Instant>,
     /// `sid -> the meaning fields of its presence row` — `attention=`, `role=`,
     /// `detail=`, `phase=`, `context=`, `title=` — as last sampled, the
     /// `status revision=` the screen was last read at, and what is on the bus
@@ -895,18 +762,6 @@ pub struct Bridge {
     /// would be one record per session per period forever for no new
     /// information.
     presence: BTreeMap<String, Slot>,
-    /// When the unfinished feed is next re-asked. FROM THE LOOP, not only from
-    /// the idle arm: `ticks` advances only in the mailbox's `None` branch, so a
-    /// bridge that is receiving records never idles and never reached the retry
-    /// at all — which made the feed's budget one that could not be spent and
-    /// left a transiently-refused keystroke waiting on a quiet moment that a
-    /// busy node does not have.
-    feed_retry_due: Instant,
-    /// `sid -> the generation last published on its `screen` face`. A snapshot
-    /// is published only when the generation MOVED: a retained face republished
-    /// on a timer would put one record per session per period on an
-    /// append-forever log, forever, for no new information.
-    screen_gen: BTreeMap<String, String>,
     /// `human -> (their halt state, the reason they published)`. The fleet halt
     /// is in force iff ANY says on, and the reason the sessions are held under
     /// is the FIRST standing halter's, in principal order — deterministic, and
@@ -1032,6 +887,7 @@ impl Bridge {
             node,
             producer_id,
             inc: 0,
+            witnessed_dead: None,
             self_acked: state.self_acked(),
             deadlines: state.deadlines().into_iter().map(|d| (d.off, d)).collect(),
             asked: state.asked().into_iter().map(|a| (a.off, a.to)).collect(),
@@ -1045,17 +901,12 @@ impl Bridge {
             conn: None,
             locals: BTreeMap::new(),
             epochs: BTreeMap::new(),
-            holders: BTreeMap::new(),
-            pending: BTreeMap::new(),
             local: BTreeMap::new(),
             pending_admit: BTreeSet::new(),
-            lease_due: Instant::now() + LEASE_RENEW,
             roster_due: Instant::now() + ROSTER_REFRESH,
-            observe_due: Instant::now() + LOCAL_OBSERVE,
+            ghost_due: Instant::now() + GHOST_SWEEP,
+            ghosts: BTreeMap::new(),
             presence: BTreeMap::new(),
-            feed_retry_due: Instant::now() + FEED_RETRY,
-            screen_due: Instant::now(),
-            screen_gen: BTreeMap::new(),
             halts: BTreeMap::new(),
             halt_applied: false,
             halt_reason: String::new(),
@@ -1106,14 +957,6 @@ impl Bridge {
     /// from. Only the former ends the process.
     fn ctl_request(&mut self, line: &str) -> io::Result<Reply> {
         let reply = self.ctl.request(line);
-        note_ctl_loss(&self.ctl, &self.mailbox, reply.as_ref().err());
-        reply
-    }
-
-    /// [`Bridge::ctl_request`] with a length-prefixed body — the `feed-bin`
-    /// frame. Same loss discipline.
-    fn ctl_request_with_body(&mut self, line: &str, body: &[u8]) -> io::Result<Reply> {
-        let reply = self.ctl.request_with_body(line, body);
         note_ctl_loss(&self.ctl, &self.mailbox, reply.as_ref().err());
         reply
     }
@@ -1290,11 +1133,14 @@ impl Bridge {
     /// `<node>/<sid>` or `<node>/node`) and §10 says an applied `term/in`
     /// "leaves an `ev` record `applied re=M seq=<n>` on the SESSION's `ev`
     /// face". A3 published every one of them on the node face with the session
-    /// named only inside the pct-encoded payload, and `replay::session_of`
-    /// answers `None` for that subject — so the causal pointer §10 asks for
-    /// belonged to no partition in this crate's own consistent-cut machinery
-    /// and contributed no `CrossEdge`. A reader scoped to
-    /// `ro:/f/<F>/pub/<n>/<sid>/>` could not see its own session's `ev` either.
+    /// named only inside the pct-encoded payload — so the causal pointer §10
+    /// asks for belonged to no partition any reader could name, and a reader
+    /// scoped to `ro:/f/<F>/pub/<n>/<sid>/>` could not see its own session's
+    /// `ev` either. (The consistent-cut auditor that made the first half of
+    /// that concrete, `replay.rs`, was cut in round 21: nothing was ever built
+    /// that called it. The placement is still right, and
+    /// `a_sessions_ev_records_are_attributable_to_that_session` still pins it,
+    /// now against `subject::session_face` — the function that mints it.)
     fn publish_ev_for(&mut self, sid: Option<&str>, payload: &str) {
         let subject = self.ev_face(sid);
         let body = format!(
@@ -1315,36 +1161,6 @@ impl Bridge {
         }
     }
 
-    /// One `ev` record carrying a `re=` — the CAUSAL POINTER §10 asks an applied
-    /// `term/in` to leave behind.
-    ///
-    /// `re=` is a first-class body field (§4.1: "the offset this record
-    /// answers"), so it is a token a reader parses structurally rather than a
-    /// substring inside the pct-encoded `ev=` payload. That is what lets a reader
-    /// rebuild the fabric's causal edges from the stored bytes alone — the
-    /// aterm-seam analogue of astream's durable `caused_by`
-    /// (`term.fleet.durable-watermark`), at the watermark grade §10 gives it and
-    /// not a step higher.
-    ///
-    /// IT ANSWERS WHETHER THE RECORD LANDED, because the feed journal is retired
-    /// on the strength of it: an entry cleared after a publish that never
-    /// happened is a keystroke whose fate is on nobody's log.
-    fn publish_ev_re(&mut self, sid: Option<&str>, payload: &str, re: u64) -> bool {
-        let subject = self.ev_face(sid);
-        let body = format!(
-            "v=1 t={} re={re} ev={}",
-            crate::now_ms(),
-            crate::pct::encode(payload)
-        );
-        match self.publish(&subject, body.as_bytes()) {
-            Ok(_) => true,
-            Err(e) => {
-                eprintln!("aterm-link: could not publish ev {payload:?}: {e}");
-                false
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------
     // presence and the incarnation
     // -----------------------------------------------------------------------
@@ -1360,7 +1176,12 @@ impl Bridge {
     /// never see a `live` hidden behind a later `gone` (§7).
     fn bring_presence_up(&mut self) -> io::Result<()> {
         let subject = subject::node_face(&self.cfg.fleet, &self.node, "presence");
-        let bus_inc = {
+        // THE SAME READ ANSWERS TWO QUESTIONS. `inc=` gives the incarnation to
+        // outrank; `state=` says whether the row is a predecessor's WILL, which
+        // is the only local proof this bridge ever gets that another incarnation
+        // of this node is gone — a will is published by the broker when the
+        // connection behind it drops, and by nothing else. See [`adoptable`].
+        let (bus_inc, witnessed_dead) = {
             let conn = self
                 .conn
                 .as_mut()
@@ -1368,12 +1189,25 @@ impl Bridge {
             let started = Instant::now();
             let answer = conn.last(&subject, "", 8);
             let (rows, _) = self.observe(started, answer, Some("attach"))?;
-            rows.iter()
+            let newest = rows
+                .iter()
                 .filter(|(_, s, _)| *s == subject)
-                .filter_map(|(_, _, b)| inc_of(b))
-                .max()
-                .unwrap_or(0)
+                .filter_map(|(_, _, b)| {
+                    let (body, _) = Body::decode(b);
+                    let inc = body.unknown.get("inc")?.parse::<u64>().ok()?;
+                    Some((inc, body.unknown.get("state").cloned()))
+                })
+                .max_by_key(|(inc, _)| *inc);
+            match newest {
+                // RE-SET ON EVERY ATTACH, never merely filled in: a reconnect
+                // that finds a LIVE node row must clear an adoption an earlier
+                // attach granted, or a sibling that came up in between inherits
+                // a verdict taken before it existed.
+                Some((inc, state)) => (inc, (state.as_deref() == Some("gone")).then_some(inc)),
+                None => (0, None),
+            }
         };
+        self.witnessed_dead = witnessed_dead;
         self.inc = self.state.incarnation().max(bus_inc) + 1;
         self.state.set_incarnation(self.inc)?;
         let gone = format!(
@@ -1463,19 +1297,13 @@ impl Bridge {
         let subject = subject::session_face(&self.cfg.fleet, &self.node, sid, "presence");
         let epoch = self.epochs.get(sid).cloned().unwrap_or_else(|| "-".into());
         let hold = u8::from(self.halt_applied);
-        let holder = self
-            .holders
-            .get(sid)
-            .cloned()
-            .unwrap_or_else(|| "-".to_string());
         let gen = self.live_gen(sid).unwrap_or_else(|| "-".to_string());
         let fields = self.presence.get(sid).map_or_else(
             || Fields::default().tokens(self.cfg.presence),
             |slot| slot.fields.tokens(self.cfg.presence),
         );
         let mut body = format!(
-            "v=1 t={} inc={} epoch={epoch} gen={gen} state={state} hold={hold} \
-             holder={holder}{fields}",
+            "v=1 t={} inc={} epoch={epoch} gen={gen} state={state} hold={hold}{fields}",
             crate::now_ms(),
             self.inc
         );
@@ -1504,13 +1332,11 @@ impl Bridge {
         // bare `Reply::Status` for any header that does not start with `OK`, and
         // `Reply::rows()` answers `&[]` for a `Status` — so an `ERR …` was
         // indistinguishable from "this instance hosts nothing", and the pruning
-        // below then emptied `epochs`, `holders` and `pending`: the two maps the
-        // one path to a PTY compares against, with `holders` rebuilt ONLY by
-        // `restore_control_rows` inside an attach. Every `term/in` from the
-        // legitimate remote holder was refused `reason=holder` until the next
-        // broker reconnect, with their claim still standing on the bus — and a
-        // fleet halt arriving in that window was recorded as applied over zero
-        // sessions. Every other reply-consumer in this file already checks.
+        // below then emptied every per-sid map — `epochs`, which is the set of
+        // sids this node hosts, so the bridge forgot its whole roster until the
+        // next broker reconnect, and a fleet halt arriving in that window was
+        // recorded as applied over zero sessions. Every other reply-consumer in
+        // this file already checks.
         if !reply.ok() {
             return Err(io::Error::other(format!(
                 "aterm refused the roster: {}",
@@ -1558,27 +1384,24 @@ impl Bridge {
                 self.pending_admit.insert(sid.to_string());
             }
         }
-        // PRUNED TO THE ROSTER. `epochs` and `holders` are the two maps the one
-        // path to a PTY compares against, and A3 only ever added to them:
-        // `session-exited` removed one entry when its line arrived, and nothing
-        // reconciled either map with the roster. `holders` is also RESTORED from
-        // the bus at every attach, including rows naming sids from a previous
-        // launch, so the two maps could disagree about which sessions exist —
-        // and a drive record for a sid `holders` knew and `epochs` did not was
-        // the state the epoch fence used to pass by comparing two `None`s.
-        // Dropping both together keeps them one answer rather than two.
+        // PRUNED TO THE ROSTER. A3 only ever ADDED to these maps:
+        // `session-exited` removed an entry when its line arrived, and nothing
+        // reconciled any of them with the roster.
         //
-        // ALL SIX PER-SID MAPS, and the queue. The first fix pruned three of
-        // them and left `local`, `presence` (then `attention`) and `screen_gen` — declared in the
-        // same struct, written on the same roster round, keyed by the same
-        // sids, removed by nothing anywhere (`session-exited` drops `epochs`
-        // and `holders` only). Sids are 128-bit and never reused and the bridge
-        // is resident for the life of the instance, so those three grew with
-        // every tab ever opened. All three are pure CACHES of an observation
-        // about a live session — the last `status` sample, the last published
-        // `attention=`, the last published screen generation — so dropping a
-        // departed session's entry can lose nothing: the next holder of that
-        // sid does not exist.
+        // EVERY PER-SID MAP, and the queue — four of them now, six before round
+        // 21 took `holders` and `pending` with the drive face. The first fix
+        // pruned three and left `local`, `presence` (then `attention`) and
+        // `screen_gen`: declared in the same struct, written on the same roster
+        // round, keyed by the same sids, removed by nothing anywhere. Sids are
+        // 128-bit and never reused and the bridge is resident for the life of
+        // the instance, so those grew with every tab ever opened. Each is a
+        // pure CACHE of an observation about a live session — the last `status`
+        // sample, the last published `attention=`, the last published screen
+        // generation — so dropping a departed session's entry can lose nothing:
+        // the next holder of that sid does not exist.
+        //
+        // `every_per_sid_map_is_pruned_to_the_roster` reads the struct rather
+        // than this list, so the next map added is covered the day it is added.
         let live: BTreeSet<String> = self.locals.values().cloned().collect();
         // AND THE ROW OF A SESSION THAT LEFT IS WITHDRAWN HERE, not only by the
         // `session-exited` line.
@@ -1611,11 +1434,8 @@ impl Bridge {
             self.publish_session_presence(&sid, "exited");
         }
         self.epochs.retain(|sid, _| live.contains(sid));
-        self.holders.retain(|sid, _| live.contains(sid));
-        self.pending.retain(|sid, _| live.contains(sid));
         self.local.retain(|sid, _| live.contains(sid));
         self.presence.retain(|sid, _| live.contains(sid));
-        self.screen_gen.retain(|sid, _| live.contains(sid));
         self.pending_admit.retain(|sid| live.contains(sid));
         // AND THE DEADLINES OF SESSIONS THAT ARE GONE. A verdict for an ask
         // whose asker has exited would land on a lane nobody drains; dropping
@@ -1857,27 +1677,13 @@ impl Bridge {
                     .get(&re)
                     .is_some_and(|asker| *asker == addr.sid)
             });
-        // A `control` claim is the one inbox kind that also MOVES something: it
-        // hands the keyboard over (§6.6). It is still delivered as a row — the
-        // agent must see that the human took the wheel — and the handover
-        // happens BESIDE the delivery, never instead of it.
-        //
-        // WHICH IS WHY IT IS NOT DONE HERE. This call used to run before the
-        // line was even built, and every refusal below it — the request-line
-        // budget, an `ERR quota` from a full ring, an `ERR too large` — returns
-        // `Accounted`, so `commit_upto` moves the durable group cursor past the
-        // record and no bridge ever offers it again. The handover then happened
-        // INSTEAD of the delivery, permanently: `on_control_message` is not a
-        // classification but a mutation — it moves `holders`, publishes the
-        // last-value `control` row, re-baselines the sampler, takes aterm's
-        // mirror lease and sends `lost`/`request by=` notices — while
-        // `notify_sender_undeliverable` told the human `state=refused` for a
-        // claim that had just taken their keyboard, and the agent whose wheel
-        // moved saw no row and no `dropped=`.
-        //
-        // So the effect follows the record: it is applied only on the outcome
-        // that means the endpoint took the row.
-        let is_control = kind == "control";
+        // A `control` RECORD IS NOW AN ORDINARY INBOX ROW (round 21). It used
+        // to also MOVE something — §6.6's handover, which took the keyboard for
+        // the claimant and decided who a later `term/in` would be fed from —
+        // and that is gone with the drive face. `control` stays in
+        // `body::KINDS` and in `DEMOTE_UNLESS_ACCEPTED` because an older node
+        // on the wire still sends one and it must still arrive, and be demoted
+        // from an unlisted principal, like any other addressed kind.
         let mut line = format!(
             "deliver {} off={off} from={from} kind={kind} trust={trust}",
             addr.sid
@@ -1958,12 +1764,8 @@ impl Bridge {
             Fault::LoseAtermBeforeDeliver.fired(&self.state);
             let _ = self.ctl.get_ref().shutdown(std::net::Shutdown::Both);
         }
-        let mut delivered = false;
         let outcome = match self.ctl_request(&line) {
-            Ok(reply) if reply.ok() => {
-                delivered = true;
-                Delivery::Accounted
-            }
+            Ok(reply) if reply.ok() => Delivery::Accounted,
             Ok(reply) => {
                 // A REFUSAL IS DATA. `ERR quota` is the ring telling us one peer
                 // has had its say; the design's answer is to tell the SENDER so,
@@ -1992,10 +1794,6 @@ impl Bridge {
                 }
             }
         };
-        // THE HANDOFF, IF THE ROW LANDED. See the note above `is_control`.
-        if is_control && delivered {
-            self.on_control_message(&addr, &body, trust);
-        }
         if cut && outcome == Delivery::Accounted {
             self.publish_ev_for(
                 Some(&addr.sid),
@@ -2032,18 +1830,22 @@ impl Bridge {
     /// ## EVERY HUMAN IS ACCEPTED, and that is the same rule `hook::accepted`
     /// already implements
     ///
-    /// `--accept-from` is EMPTY by default. With no carve-out, that default made
-    /// §6.6's row 1 — an `h-*` `claim` "granted unconditionally" — unreachable:
-    /// [`Bridge::deliver_record`] decides whether a record moves the keyboard
-    /// from the CLASSIFIED kind, so a human's `control` demoted to `note` never
-    /// reached [`decide_control`] at all, `holders` was never populated, and
-    /// every following `term/in` under that claim was refused `reason=holder`.
-    /// The human away from the machine — §9.3's "answer from a phone", the whole
-    /// point of the drive face — could not take the keyboard from any node whose
-    /// operator had not pre-listed them by name. §8.4's own spelling of the
-    /// mitigation, `--accept-from h-*`, is refused at startup by
-    /// `subject::is_principal` (`*` is not in `[a-z0-9-]`), so there was no way
-    /// to express "every human" either.
+    /// `--accept-from` is EMPTY by default, so with no carve-out a human's
+    /// `task` or `control` arrived DEMOTED on every node whose operator had not
+    /// pre-listed them by name — and §8.4's own spelling of the mitigation,
+    /// `--accept-from h-*`, is refused at startup by `subject::is_principal`
+    /// (`*` is not in `[a-z0-9-]`), so there was no way to express "every
+    /// human" either.
+    ///
+    /// The case that first made this unacceptable is gone: it used to make
+    /// §6.6's row 1 — an `h-*` `claim` "granted unconditionally" — literally
+    /// unreachable, because the keyboard moved off the CLASSIFIED kind, so a
+    /// human's demoted `control` never reached the handoff table and every
+    /// following `term/in` under that claim was refused `reason=holder`. Round
+    /// 21 cut the drive face, so nothing moves a keyboard now. The rule stands
+    /// on the narrower ground it always also had: a demoted `task` is a `note`,
+    /// and a manager's human cannot hand a worker work on a node that has not
+    /// heard of them.
     ///
     /// This crate's OTHER implementation of the same policy, `hook::accepted`,
     /// has always read `owner.starts_with("h-") || listed.contains(owner)`, and
@@ -2281,7 +2083,7 @@ impl Bridge {
     /// The line is checked again here, because a line off any socket is input:
     /// a `from=` that is not a principal, a verdict that is not one of the three
     /// words, or a kind that does not wait publishes nothing — and is RETIRED
-    /// (`off=-`), as is every receipt a bridge without `--receipts` is handed,
+    /// (`off=-`), as is every receipt a bridge with receipts turned off is handed,
     /// so the queue never holds what this bridge will never send.
     ///
     /// # Errors
@@ -2901,8 +2703,9 @@ impl Bridge {
         // publish from the node fails, including the `live` presence row
         // `attach_broker` will not continue without. Sizing the ack at one subject
         // is the fail-safe direction; losing a per-barrier history is the price,
-        // and it is written here because the design file and `tui.rs`'s
-        // `/barrier` text still describe the per-barrier shape.
+        // and it is written here because the design file still describes the
+        // per-barrier shape. (`tui.rs`'s `/barrier` text did too, until round 21
+        // deleted the module.)
         //
         // AND IT IS NOT REPUBLISHED FOR HISTORY. The fleet face resubscribes
         // from offset 0 on every reconnect, and A3 kept no memory of what it had
@@ -3109,8 +2912,10 @@ impl Bridge {
     /// `hold-skipped` ev is a publish, and a publish before presence is up
     /// would run in the previous incarnation's sequence space. A halt
     /// published between the two arrives on the fleet subscription, which
-    /// resumes from zero.
-    fn read_fleet_halts(&mut self) -> Option<Vec<(u64, String, Vec<u8>)>> {
+    /// resumes at the mark THIS read returns — gap-free across the seam, so
+    /// the window between the snapshot and the subscribe is covered without
+    /// replaying the fleet's whole history to cover it (round 21).
+    fn read_fleet_halts(&mut self) -> Option<(Vec<BrokerRecord>, u64)> {
         let filter = format!("/f/{}/fleet/*/halt", self.cfg.fleet);
         let conn = self.conn.as_mut()?;
         // A WALK THAT DID NOT FINISH IS NOT AN ANSWER, and this is the one
@@ -3153,449 +2958,33 @@ impl Bridge {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // the drive face — THE ONLY PATH TO A PTY
-    // -----------------------------------------------------------------------
-
-    /// One `control` message off the inbox plane, run through §6.6's table.
+    /// ONE SAMPLE OF WHAT THE INSTANCE SAYS ABOUT EVERY SESSION IT HOSTS, on
+    /// the roster tick.
     ///
-    /// THE EPOCH IS CHECKED FIRST, and it is not a policy question: a `control`
-    /// message minted against a session that has since relaunched must never
-    /// land on its successor, whoever sent it. Only then does the message
-    /// become a [`HandoffEvent`] for [`decide_control`].
+    /// What it reads, per session: the `status` reply's `revision=` (which
+    /// gates the screen read that produces `phase=` and `context=`), its
+    /// `hold=` (reconciled against this bridge's own view, the one thing that
+    /// catches a drop guard landing after a reconcile), its `detail=`, and the
+    /// session's `meta attention=`. A10's notifier and A8's glance read
+    /// `attention=` off the presence row and nothing on the bus announces a
+    /// local `meta set attention`, so it is sampled here, on a round that is
+    /// already paying for a `status`.
     ///
-    /// The op is the body's `text=`, one of `claim`, `request`, `release` and
-    /// `grant <p>`. Anything else is recorded and dropped rather than guessed
-    /// at — A3 treated every `control` message from a human as a claim, which
-    /// worked only because `claim` was the only op it implemented.
-    fn on_control_message(&mut self, addr: &subject::InAddr, body: &Body, trust: &str) {
-        let Some(epoch) = &body.epoch else {
-            self.publish_ev_for(
-                Some(&addr.sid.clone()),
-                &format!("refused sid={} face=control reason=epoch", addr.sid),
-            );
-            return;
-        };
-        if self.epochs.get(&addr.sid) != Some(epoch) {
-            self.publish_ev_for(
-                Some(&addr.sid.clone()),
-                &format!("refused sid={} face=control reason=epoch", addr.sid),
-            );
-            return;
-        }
-        let mut words = body.text.split_whitespace();
-        let event = match (words.next(), words.next()) {
-            // A `claim` is the HUMAN row. The same word from an agent is a
-            // `request`, because §6.6 grants row 1 unconditionally and an agent
-            // that could spell its way into it would own every keyboard.
-            (Some("claim"), _) if trust == "human" => HandoffEvent::Claim {
-                by: addr.src.clone(),
-            },
-            (Some("claim" | "request"), _) => HandoffEvent::Request {
-                by: addr.src.clone(),
-            },
-            (Some("release"), _) => HandoffEvent::Release {
-                by: addr.src.clone(),
-            },
-            (Some("grant"), Some(to)) if subject::is_principal(to) => HandoffEvent::Grant {
-                by: addr.src.clone(),
-                to: to.to_string(),
-            },
-            _ => {
-                self.publish_ev_for(
-                    Some(&addr.sid.clone()),
-                    &format!("refused sid={} face=control reason=op", addr.sid),
-                );
-                return;
-            }
-        };
-        self.apply_handoff(&addr.sid, &event);
-    }
-
-    /// What this bridge believes about one session's keyboard, in the shape
-    /// [`decide_control`] reads.
-    fn handoff_state(&mut self, sid: &str) -> handoff::State {
-        let holder = self.holders.get(sid).cloned();
-        let holder_live = match &holder {
-            None => true,
-            Some(h) => self.holder_is_live(h),
-        };
-        handoff::State {
-            holder,
-            holder_live,
-            halted: self.halt_applied,
-        }
-    }
-
-    /// Whether a holder can still act — §6.6's `expired`, OBSERVED rather than
-    /// timed (see [`crate::handoff`]).
-    ///
-    /// A human or a service is live by definition: there is nothing local to
-    /// observe about `h-andrew`, and "live" is the CONSERVATIVE answer here
-    /// because it is what makes an agent's `request` wait rather than take the
-    /// wheel. A session is live while this node hosts it, or while some node's
-    /// roster row still says `state=live` — the same one `Last` read §6.1's
-    /// routing uses, so "who can act" and "where do I send" can never disagree.
-    fn holder_is_live(&mut self, holder: &str) -> bool {
-        if !holder.starts_with("s-") {
-            return true;
-        }
-        if self.epochs.contains_key(holder) {
-            return true;
-        }
-        // THE SAME SET §6.1's ROUTING USES, not a second reading of the same
-        // rows: [`Bridge::advertisers`] is the one place `state=live` is
-        // spelled, so the sentence above cannot come apart from the code.
-        !self.advertisers(holder).is_empty()
-    }
-
-    /// Run one §6.6 event through the table and DO what it says: move the local
-    /// holder, publish the last-value `control` row, mirror the lease, and tell
-    /// whoever lost the wheel.
-    fn apply_handoff(&mut self, sid: &str, event: &HandoffEvent) {
-        let state = self.handoff_state(sid);
-        match decide_control(&state, event) {
-            Decision::Nothing => {}
-            Decision::Refuse { reason } => {
-                self.publish_ev_for(
-                    Some(sid),
-                    &format!("refused sid={sid} face=control reason={reason}"),
-                );
-            }
-            Decision::Pending { by } => {
-                self.pending.insert(sid.to_string(), by.clone());
-                self.publish_control_row(sid, "request");
-                // The holder learns about it on its own lane, which is what
-                // makes "a pending row the holder's next wake shows" a thing the
-                // holder can actually see from another host.
-                if let Some(holder) = state.holder.clone() {
-                    self.notify_control(&holder, sid, &format!("request by={by}"));
-                }
-            }
-            Decision::Hold {
-                holder,
-                evidence,
-                lost,
-            } => {
-                self.holders.insert(sid.to_string(), holder.clone());
-                self.pending.remove(sid);
-                self.publish_control_row(sid, evidence);
-                // RE-BASELINE. The new holder is answerable for what the session
-                // does from HERE; whatever moved the classifier before the
-                // handoff is not its unaccounted change.
-                self.baseline_local(sid);
-                // A MIRRORED LOCAL LEASE IS NOT TAKEN BACK — and the rule for
-                // that lives in [`Bridge::acquire_lease`], not here. It was
-                // written as `(evidence != "lease")` on THIS line, and three
-                // other paths take the same lease without ever reading this
-                // one: [`Bridge::renew_leases`] every [`LEASE_RENEW`],
-                // [`Bridge::restore_control_rows`] on every attach, and
-                // [`Bridge::hand_lease_over`]'s `next`. One holder, one rule,
-                // one place — a guard that only one of four callers applies is
-                // not a guard.
-                self.hand_lease_over(sid, state.holder.as_deref(), Some(holder.as_str()));
-                if let Some(lost) = lost {
-                    self.notify_control(&lost, sid, "lost");
-                }
-            }
-            Decision::Free { evidence, lost } => {
-                self.holders.remove(sid);
-                self.pending.remove(sid);
-                self.publish_control_row(sid, evidence);
-                self.hand_lease_over(sid, state.holder.as_deref(), None);
-                if let Some(lost) = lost {
-                    self.notify_control(&lost, sid, "lost");
-                }
-            }
-        }
-    }
-
-    /// Publish the session's last-value `control` row: the wire twin of aterm's
-    /// `ControlToken`, and the row `on_term_record` compares a drive record's
-    /// `<src>` against at APPLY time.
-    fn publish_control_row(&mut self, sid: &str, evidence: &str) {
-        let subject = subject::session_face(&self.cfg.fleet, &self.node, sid, "control");
-        let holder = self
-            .holders
-            .get(sid)
-            .cloned()
-            .unwrap_or_else(|| "-".to_string());
-        let mut row = format!(
-            "v=1 t={} holder={holder} evidence={evidence}",
-            crate::now_ms()
-        );
-        if let Some(by) = self.pending.get(sid) {
-            row.push_str(&format!(" pending={by}"));
-        }
-        let _ = self.publish(&subject, row.as_bytes());
-    }
-
-    /// Read the `control` rows back off the bus (§6.6's row is last-value state,
-    /// not process state) and re-take the mirror lease for each one.
-    ///
-    /// ONLY THIS NODE'S OWN SUBTREE: `/f/<F>/pub/<node>/*/control` is written by
-    /// this node alone, so nothing another principal can publish reaches
-    /// `holders` — which is the map the one path to a PTY compares against.
-    fn restore_control_rows(&mut self) {
-        let filter = format!("/f/{}/pub/{}/*/control", self.cfg.fleet, self.node);
-        let page = {
-            let Some(conn) = self.conn.as_mut() else {
-                return;
-            };
-            // PAGED ON THE RESUME CURSOR (see [`last_all`]): `holders` is the map
-            // the one path to a PTY compares against, and a partial restore of it
-            // refuses the legitimate holder's every `term/in` with
-            // `reason=holder` while their claim still stands on the bus.
-            let started = Instant::now();
-            let answer = last_all(conn, &filter);
-            match self.observe(started, answer, Some("read")) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!("aterm-link: could not read the control rows back: {e}");
-                    return;
-                }
-            }
-        };
-        {
-            for (_, subject, raw) in &page {
-                // `["", "f", "<F>", "pub", "<node>", "<sid>", "control"]`
-                let segs: Vec<&str> = subject.split('/').collect();
-                let Some(sid) = segs.get(5).filter(|_| segs.len() == 7) else {
-                    continue;
-                };
-                let (body, _) = Body::decode(raw);
-                let holder = body.unknown.get("holder").cloned().unwrap_or_default();
-                if holder.is_empty() || holder == "-" {
-                    self.holders.remove(*sid);
-                    continue;
-                }
-                self.holders.insert((*sid).to_string(), holder.clone());
-                if let Some(p) = body.unknown.get("pending") {
-                    self.pending.insert((*sid).to_string(), p.clone());
-                }
-                // Re-take the mirror only for a session this instance actually
-                // hosts now: a row naming a sid from a previous launch has no
-                // lease to take, and asking for one would be an `ERR no such
-                // session` per row on every reconnect.
-                if self.epochs.contains_key(*sid) {
-                    self.acquire_lease(sid, &holder);
-                }
-            }
-        }
-    }
-
-    /// Take (or RENEW) aterm's own cooperative lease for a fabric holder, so
-    /// every local driver sees `driving=lease:fabric:<p>` in `who` and a
-    /// competing `turn` gets `ERR busy` (§6.6).
-    ///
-    /// `lease acquire` by the SAME holder is a renewal, so this one call is both
-    /// verbs. Nothing is done for the conservative pause: `human?` is not a
-    /// principal and there is nobody to hold a lease for — the pause's whole
-    /// content is that the bridge does not know who is driving.
-    ///
-    /// AND NOTHING IS DONE FOR A MIRRORED LOCAL LEASE, WHICH IS THE OTHER
-    /// HOLDER THAT IS NOT A LEASE TO TAKE. §6.6 row 5 records what a socket
-    /// driver ALREADY holds ([`is_mirrored`]); asking aterm for it under a
-    /// `fabric:` name is refused for as long as the driver keeps it — one
-    /// durable `ev lease-refused` per session per [`LEASE_RENEW`] on an
-    /// append-forever log — and, the moment the driver's own TTL lapses, it
-    /// SUCCEEDS: the bridge would then hold aterm's lease as
-    /// `fabric:owner-cli:<h>`, renew it every 10 s forever, answer the real
-    /// driver's reconnect `ERR lease held`, and report `driving=` a CLI driver
-    /// that holds nothing — which is the misattribution
-    /// `control.rs`'s `lease_forges_fabric_holder` refuses a caller, performed
-    /// by the bridge itself, with `lease release force` as the only escape.
-    /// [`Bridge::local_lease_holder`] filters `fabric:` holders out, so the
-    /// bridge could not even see that it was the holder.
-    ///
-    /// The rule is HERE rather than at the one call site that used to make it,
-    /// because `renew_leases`, `restore_control_rows` and `hand_lease_over`
-    /// reach this function too and none of them read that line.
-    fn acquire_lease(&mut self, sid: &str, holder: &str) {
-        if self.attachment == Attachment::Observer
-            || holder == handoff::PAUSED
-            || is_mirrored(holder)
-        {
-            return;
-        }
-        let line = format!("@{sid} lease acquire holder=fabric:{holder} ttl={LEASE_TTL_MS}");
-        match self.ctl_request(&line) {
-            Ok(reply) if reply.ok() => {}
-            // A LOCAL DRIVER MAY BE HOLDING IT. That is `ERR lease held` / `ERR
-            // busy`, and it is not a reason to fail the handoff: the bus row is
-            // the fabric's own answer to "who drives", and `send`/`key`/`feed`
-            // are advisory against a lease anyway (§6.6's honest bound). It is
-            // recorded so the disagreement is visible rather than assumed away.
-            Ok(reply) => {
-                let why = reason_token(reply.header());
-                self.publish_ev_for(
-                    Some(sid),
-                    &format!("lease-refused sid={sid} holder={holder} reason={why}"),
-                );
-            }
-            Err(e) => eprintln!("aterm-link: {line} failed: {e}"),
-        }
-    }
-
-    /// Move the mirror lease from one fabric holder to the next.
-    ///
-    /// THE RELEASE IS NAMED, NEVER FORCED. `lease acquire` refuses a DIFFERENT
-    /// live holder, so a handover that only acquired would be refused for the
-    /// remaining 30 s of the old holder's TTL and the local half of the design
-    /// would quietly say the wrong name. But `lease release force` steals ANY
-    /// cooperative hold, including a local driver's — so the release names the
-    /// mirror this bridge itself took (`fabric:<prev>`) and nothing else. If a
-    /// local driver holds the lease instead, the release does nothing, the
-    /// acquire is refused, and `ev lease-refused` records the disagreement
-    /// rather than resolving it by force: §6.6's honest bound is that the lease
-    /// is advisory, and a bridge that forced it would be making a claim the
-    /// design does not.
-    fn hand_lease_over(&mut self, sid: &str, prev: Option<&str>, next: Option<&str>) {
-        if self.attachment == Attachment::Observer {
-            return;
-        }
-        // AND NEVER RELEASED FOR A MIRROR THIS BRIDGE NEVER TOOK. A row-5
-        // holder's `fabric:owner-cli:<h>` lease does not exist ([`is_mirrored`]
-        // in [`Bridge::acquire_lease`]), so releasing it is a verb round trip
-        // that can only ever answer "not held" — and the same skip on both
-        // halves is what keeps the pair symmetrical.
-        if let Some(prev) = prev.filter(|p| *p != handoff::PAUSED && !is_mirrored(p)) {
-            let _ = self.ctl_request(&format!("@{sid} lease release holder=fabric:{prev}"));
-        }
-        if let Some(next) = next {
-            self.acquire_lease(sid, next);
-        }
-    }
-
-    /// RENEW every standing mirror lease. §6.6 says the lease is "renewed while
-    /// the row stands"; the TTL is 30 s, so a bridge that acquired once and
-    /// never renewed let the mirror lapse while the bus row still stood — the
-    /// local half of the design silently stopped being true.
-    ///
-    /// EVERY holder in the map, and the filtering is [`Bridge::acquire_lease`]'s
-    /// alone: a row-5 mirror and the conservative pause are not leases this
-    /// bridge took, so they are not leases it renews. This function used to be
-    /// the counter-example — it renewed a mirrored `owner-cli:` holder every
-    /// [`LEASE_RENEW`] under a rule written at ONE of the four call sites.
-    fn renew_leases(&mut self) {
-        let standing: Vec<(String, String)> = self
-            .holders
-            .iter()
-            .filter(|(sid, _)| self.epochs.contains_key(*sid))
-            .map(|(sid, holder)| (sid.clone(), holder.clone()))
-            .collect();
-        for (sid, holder) in standing {
-            self.acquire_lease(&sid, &holder);
-        }
-    }
-
-    /// Tell a principal something about a session's keyboard, on its own lane:
-    /// `lost` when it was displaced, `request by=<p>` when somebody is waiting.
-    fn notify_control(&mut self, principal: &str, sid: &str, text: &str) {
-        if principal == handoff::PAUSED || !subject::is_principal(principal) {
-            return;
-        }
-        // ROUTED, not assumed. A displaced holder can be a session on ANOTHER
-        // node, and addressing it by name on this node's own lane would put the
-        // notice where nobody reads it. `resolve_to` is the one place that
-        // answers "where does this address live", pin, roster and all — and a
-        // contested or unknown one is dropped rather than sent somewhere wrong.
-        let to = if principal.starts_with("s-") {
-            format!("@{principal}")
-        } else {
-            principal.to_string()
-        };
-        let Route::To(prefix) = self.resolve_to(&to, None) else {
-            return;
-        };
-        let subject = format!("{prefix}/control");
-        let mut body = Body::new(crate::now_ms());
-        body.from = Some(sid.to_string());
-        body.text = format!("control {text} sid={sid}");
-        let encoded = body.encode(None);
-        // THROUGH `publish_own`: a holder hosted on THIS node is addressed on
-        // this node's own lane, and an offset we published there but did not
-        // remember comes back as `forged-self` plus a `cap-compromised` alarm.
-        self.publish_own(&subject, &encoded);
-    }
-
-    /// THE LOCAL HALF OF §6.6 — one sample of what the instance says about
-    /// EVERY session this node hosts, on the roster tick.
-    ///
-    /// Two rows of the table are local observations rather than bus events, and
-    /// this function is where ROW 5 is read: it visits `self.locals` — every
-    /// hosted session, held or free — because row 5's arm is the one for a
-    /// session that has NO holder (a local socket driver's `lease acquire`,
-    /// mirrored as `holder=owner-cli:<h>`), and filtering to held sessions here
-    /// would delete it. It also re-reads `attention=` for every session, and
-    /// takes row 4's baseline for the ones that are held.
-    ///
-    /// ROW 4 ITSELF IS NOT ON THIS DEADLINE. The conservative pause moved to
-    /// [`Bridge::watch_held_control`] at [`LOCAL_OBSERVE`] (250 ms) over the
-    /// HELD sessions alone, because its evidence is an EDGE that a 2 s sampler
-    /// does not see late but does not see at all — see [`LOCAL_OBSERVE`]. What
-    /// this function still does for row 4 is belt and braces: the baseline has
-    /// to be current at the moment a holder appears, and
-    /// [`Bridge::apply_handoff`] re-baselines on `Decision::Hold` as well.
-    ///
-    /// The row-4 accounting below is documented here because this is where the
-    /// baseline is taken; the verdict is drawn in
-    /// [`Bridge::observe_local_control`], which both deadlines call.
-    ///
-    /// * an unaccounted `status revision=` advance — something moved the session
-    ///   that this bridge did not cause. The row is parked at `human?` until
-    ///   somebody claims it again. `docs/RFC-operator-2026-08-15.md:297-301` is
-    ///   explicit that screen state detects such a change and CANNOT attribute
-    ///   it (repaint, resize, another client, non-echoed typing), so the verdict
-    ///   is labelled inferred and the remedy is a re-claim, not an accusation.
-    /// * a local `lease acquire` by a socket driver, mirrored as
-    ///   `holder=owner-cli:<h>`.
-    ///
-    /// THE ACCOUNTING, and its honest bounds. Two things stop this from firing
-    /// on ordinary life, and neither makes it miss a change it can see:
-    ///
-    /// * the session must have been QUIET for [`SETTLE_QUIET`]. A classifier
-    ///   that is still moving is settling from something already accounted for
-    ///   — a fresh session goes `starting → idle` on its own within a second,
-    ///   and pausing a handover on that would make every handover useless.
-    /// * the bridge marks a session `driven` when it applies a `term/in`, and
-    ///   the sample that SEES the advance consumes the mark. A sample that sees
-    ///   nothing does not, because the output a keystroke causes lands after the
-    ///   verb returns; the mark expires after [`DRIVEN_KEEP`] instead, so it
-    ///   cannot silently account for a human's change an hour later.
-    ///
-    /// WHAT IT STILL GETS WRONG, in one direction only: a keystroke whose effect
-    /// on the classifier arrives more than [`DRIVEN_KEEP`] later reads as
-    /// unaccounted, and a session whose own program changes phase while a remote
-    /// principal holds the keyboard reads as unaccounted too. Both cost one
-    /// re-claim.
-    ///
-    /// And one in the OTHER direction, which is why [`Bridge::baseline_local`]
-    /// keeps the settling clock across a handoff: an advance the settling rule
-    /// suppresses is CONSUMED, never deferred, so a change that lands before the
-    /// session has been seen quiet is not merely late — it is gone. The
-    /// window is now only what it has to be (a session that really is still
-    /// moving), rather than every session for one round after every handoff. That is the direction the RFC chose — "pause the target,
-    /// re-read, require expectation re-confirmation" — because the alternative
-    /// is a keystroke applied to a screen somebody else already changed.
-    ///
-    /// AND WHERE THE PERIOD ITSELF IS THE BOUND: row 4 is checked for the HELD
-    /// sessions at [`LOCAL_OBSERVE`] rather than here, because an evidence
-    /// source that only exists while the change is happening is not merely
-    /// served late by a slow sampler — it is not served at all.
+    /// IT WAS THE LOCAL HALF OF §6.6. Two of that table's rows were local
+    /// observations rather than bus events — row 4, the conservative pause that
+    /// parked a session at `human?` when something moved it that the bridge had
+    /// not caused, and row 5, the mirror of a local socket driver's `lease
+    /// acquire` onto the bus as `holder=owner-cli:<h>` — and both existed only
+    /// to decide who a `term/in` would be accepted from. Round 21 cut the drive
+    /// face, and `watch_held_control`, `baseline_local`, `DRIVEN_KEEP`,
+    /// `SETTLE_QUIET` and the `driven`/`settled`/`unaccounted` accounting went
+    /// with it. What is left is a sampler, not a policy.
     fn sample_local_control(&mut self) {
         if self.attachment == Attachment::Observer {
             return;
         }
         let sids: Vec<String> = self.locals.values().cloned().collect();
         for sid in sids {
-            // OBSERVED FOR EVERY SESSION, not only held ones: the baseline has to
-            // be current at the moment a holder appears, or the first sample
-            // after a handoff reads the classifier's whole history as one
-            // unaccounted change. (It is BELT AND BRACES now rather than the only
-            // guard — [`Bridge::apply_handoff`] re-baselines on `Decision::Hold`
-            // — which is what lets [`Bridge::watch_held_control`] visit the held
-            // sessions alone at [`LOCAL_OBSERVE`].)
             self.observe_local_control(&sid);
             // THE ESCALATION IS A ROSTER OBSERVATION TOO — and so is the rest
             // of the row's meaning. A10's notifier and A8's glance read
@@ -3610,9 +2999,9 @@ impl Bridge {
             // retained face rewritten on a timer is an unbounded write for no
             // new information.
             //
-            // It stays on THIS deadline, not row 4's: every one of these is a
-            // LEVEL. It is still true when it is read late, so a slower
-            // sampler sees it late rather than not at all.
+            // The roster deadline is the right one for all of these: every
+            // one is a LEVEL. It is still true when it is read late, so a
+            // slower sampler sees it late rather than not at all.
             //
             // A SESSION STILL QUEUED FOR ADMISSION IS LEFT TO THE ADMISSION,
             // which runs right after this on the same round and publishes its
@@ -3634,54 +3023,22 @@ impl Bridge {
         }
     }
 
-    /// §6.6 ROW 4, FOR THE SESSIONS IT APPLIES TO, ON ITS OWN FAST DEADLINE.
+    /// ONE session's local observation, off one `status`: the `detail=` its
+    /// presence row carries, the `revision` the screen reader is gated on, and
+    /// the endpoint's own `hold=` reconciled against this bridge's view.
     ///
-    /// The conservative pause is the one local observation that can be missed
-    /// ENTIRELY rather than merely served late, because `status revision=` only
-    /// advances while the change that moved it is still happening. See
-    /// [`LOCAL_OBSERVE`] for the measurement and the phase-lock that made this a
-    /// reproducible blindness rather than a rare one.
+    /// A STATUS THAT CANNOT BE READ RECONCILES NOTHING — an unread state is not
+    /// a disagreement, and the sample is taken FIRST so a `None` returns before
+    /// any state moves: `seen` and `revision` are left exactly as the last real
+    /// observation left them ([`Bridge::status_sample`]).
     ///
-    /// Only HELD sessions: row 4's verdict is discarded unread for a free one
-    /// ([`Bridge::observe_local_control`]'s `None` arm is row 5), so visiting the
-    /// whole roster four times a second would be load with no answer attached.
-    fn watch_held_control(&mut self) {
-        if self.attachment == Attachment::Observer {
-            return;
-        }
-        let held: Vec<String> = self
-            .locals
-            .values()
-            .filter(|sid| self.holders.contains_key(*sid))
-            .cloned()
-            .collect();
-        for sid in held {
-            self.observe_local_control(&sid);
-        }
-    }
-
-    /// ONE session's §6.6 row 4 (held) or row 5 (free), off one `status`.
-    ///
-    /// ONE `status`, TWO answers. `revision=` is the conservative pause's input;
-    /// `hold=` is the endpoint's own opinion of whether it is held, which is the
-    /// only thing that can catch the drop guard landing after a reconcile
-    /// ([`Bridge::converge_hold`]). A status that cannot be read reconciles
-    /// nothing — an unread state is not a disagreement.
-    ///
-    /// AND AN UNREAD STATUS IS NOT A REVISION EITHER. That reasoning used to
-    /// stop at `converge_hold`: the failed read then fell through as
-    /// `revision = 0` — a value in the SAME RANGE as a real one — and installed
-    /// it as a baseline with `seen = true`. The next successful read was
-    /// therefore `revision > 0`, i.e. an ADVANCE, on a session nothing had
-    /// touched; one settled round later that is `UnaccountedChange`, which
-    /// parks the row at `human?`, tells the holder it lost the wheel and
-    /// refuses their every `term/in` `reason=holder`. One unreadable `status`
-    /// — a session mid-relaunch, a busy verb lane — was enough. So the sample
-    /// is taken FIRST and a `None` returns before any state moves: `seen`,
-    /// `revision`, `moved_at` and `driven_at` are all left exactly as the last
-    /// real observation left them.
+    /// Round 21 cut the rest. This used to be §6.6's rows 4 and 5 — the
+    /// conservative pause that parked a driven row at `human?`, and the mirror
+    /// of aterm's own local lease onto the bus — and both existed only to
+    /// decide who was allowed to send a `term/in`. With the drive face gone
+    /// there is no such decision to make, and `moved_at`, `driven_at`,
+    /// `DRIVEN_KEEP`, `SETTLE_QUIET` and the whole `match holder` went with it.
     fn observe_local_control(&mut self, sid: &str) {
-        let holder = self.holders.get(sid).cloned();
         let Some(sample) = self.status_sample(sid) else {
             return;
         };
@@ -3693,77 +3050,133 @@ impl Bridge {
             .fields
             .set_detail(Some(&sample.detail));
         self.converge_hold(sid, held);
-        let now = Instant::now();
         let entry = self.local.entry(sid.to_string()).or_default();
-        let advanced = entry.seen && revision > entry.revision;
-        // BOTH WINDOWS ARE SPANS OF TIME, so they mean the same thing however
-        // often this runs. See [`DRIVEN_KEEP`].
-        let settled = entry
-            .moved_at
-            .is_some_and(|at| now.saturating_duration_since(at) >= SETTLE_QUIET);
-        let driven = entry
-            .driven_at
-            .is_some_and(|at| now.saturating_duration_since(at) < DRIVEN_KEEP);
-        let unaccounted = advanced && settled && !driven;
         entry.seen = true;
         if revision > entry.revision {
             entry.revision = revision;
-            entry.moved_at = Some(now);
-            entry.driven_at = None;
-        } else if entry.moved_at.is_none() {
-            // A first sighting starts the settling clock, so the very first
-            // advance a session shows is never news. This is the `quiet = 0` the
-            // count-based rule opened with.
-            entry.moved_at = Some(now);
-        }
-        match holder {
-            // A MIRRORED ONE (row 5) IS NEITHER OF THE OTHER TWO CASES.
-            //
-            // It is not row 4: the whole content of the row is that a LOCAL
-            // driver is driving, so the `status revision=` it advances is the
-            // most accounted-for change there is. Reading it as unaccounted
-            // parked the row at `human?` on the driver's first keystroke — and
-            // `human?` is not a mirror, so row 5 could never fire again and the
-            // real driver never reappeared on the bus. (Nothing is weakened by
-            // skipping the pause here: no `<src>` can equal an `owner-cli:`
-            // holder, so [`Bridge::on_term_record`] already refuses every bus
-            // record for a mirrored session, exactly as it does for `human?`.)
-            //
-            // And it is not row 5's acquire either — it is row 5's WITHDRAWAL.
-            // The mirror is a last-value row that outlives the lease it mirrors:
-            // once `holders[sid]` was set, this arm was `Some(_)` forever, so a
-            // driver that exited or let its TTL lapse left a bus row naming it
-            // as the holder for the life of the node, an agent's `request`
-            // Pending against a holder that holds nothing, and — before
-            // [`Bridge::acquire_lease`] learned to skip it — a bridge-held
-            // `fabric:owner-cli:` lease renewed over the top of it every 10 s.
-            // The withdrawal goes through §6.6's own table as the holder's own
-            // `release`, so nothing here decides who may hold the row.
-            Some(holder) if is_mirrored(&holder) => {
-                let still = self
-                    .local_lease_holder(sid)
-                    .map(|h| format!("{MIRRORED_PREFIX}{h}"));
-                if still.as_deref() != Some(holder.as_str()) {
-                    self.apply_handoff(sid, &HandoffEvent::Release { by: holder });
-                }
-            }
-            // A HELD SESSION: watch for a change the bridge did not cause.
-            Some(_) => {
-                if unaccounted {
-                    self.apply_handoff(sid, &HandoffEvent::UnaccountedChange);
-                }
-            }
-            // A FREE ONE: mirror whoever holds aterm's own lease.
-            None => {
-                if let Some(local) = self.local_lease_holder(sid) {
-                    self.apply_handoff(sid, &HandoffEvent::LocalLease { holder: local });
-                }
-            }
         }
     }
 
-    /// THE PERIODIC BACKSTOP: the local §6.6 observations, the roster re-read,
-    /// the halt reassert for anything new, and the unfinished feed.
+    /// RETIRE THE PRESENCE OF A SESSION NOTHING HOSTS — the ghost row, and the
+    /// permanent WARNING it produces.
+    ///
+    /// ## The hole this fills
+    ///
+    /// Every ordinary exit publishes `state=exited`: the push lane's
+    /// `session-exited` line does it ([`Bridge::on_event`]), and
+    /// [`Bridge::refresh_sessions`] does it by LOOKING, for the line that never
+    /// arrives. Neither runs when the whole instance dies. The only `Will` this
+    /// crate registers is on the NODE face ([`Bridge::bring_presence_up`]), so
+    /// the node row flips to `state=gone` and every SESSION row under it stays
+    /// retained at `state=live` — forever, because presence is a last-value
+    /// face and nothing supersedes a row whose writer is dead.
+    ///
+    /// Measured on the owner's machine 2026-09-20: `aterm fabric status` had
+    /// been reporting, with no way to ever stop,
+    ///
+    /// ```text
+    /// ! the bus advertises @s-d5a5de326f33873b6167 live on n-1b631315bf5cae35 —
+    ///   this machine's node — but no aterm instance here hosts it: mail to it
+    ///   is undeliverable
+    /// ```
+    ///
+    /// and the warning is RIGHT — mail to that sid is undeliverable. What was
+    /// missing is anyone to fix it.
+    ///
+    /// ## Why it is safe to write someone else's row
+    ///
+    /// A session face names a node, and this bridge only ever publishes under
+    /// its own ([`Bridge::publish_session_presence`]), so the subject is one it
+    /// already owns. What it must not do is retire a row belonging to a LIVE
+    /// sibling — two bridges CAN share a state dir, and hence a node id, and
+    /// `fabric.rs` records a measured case of exactly that. Three conditions
+    /// together rule it out:
+    ///
+    /// * the sid is absent from this bridge's own roster, and
+    /// * it has been absent across [`GHOST_AFTER`] of THIS bridge's
+    ///   observations — not merely old on the bus, which a quietly busy
+    ///   session's row also is, and
+    /// * the row's `inc=` is at or below this bridge's own incarnation. A
+    ///   bridge that attached after this one took `max(local, bus) + 1` and so
+    ///   carries a STRICTLY HIGHER `inc`; leaving those alone means a newer
+    ///   sibling's live sessions are never touched, and the worst this sweep
+    ///   can do to a node it has been superseded on is nothing.
+    ///
+    /// A retirement is one record per ghost, once — the sid is dropped from
+    /// [`Bridge::ghosts`] after it is published, and the row it wrote is no
+    /// longer `state=live` so the next sweep does not see it. That is the same
+    /// bound presence keeps everywhere else: a last-value face on an
+    /// append-forever log may not be republished on a clock.
+    fn retire_ghost_presence(&mut self) {
+        let filter = format!("/f/{}/pub/{}/*/presence", self.cfg.fleet, self.node);
+        let rows = {
+            let Some(conn) = self.conn.as_mut() else {
+                return;
+            };
+            let started = Instant::now();
+            let answer = last_all(conn, &filter).map(|(rows, _)| rows);
+            match self.observe(started, answer, Some("read")) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("aterm-link: could not sweep the presence roster: {e}");
+                    return;
+                }
+            }
+        };
+        let hosted: BTreeSet<String> = self.locals.values().cloned().collect();
+        let now = Instant::now();
+        // [`Fault::SweepGhostsAtOnceWhileMarked`] collapses the WAIT and
+        // nothing else.
+        let patience = if self.fault == Fault::SweepGhostsAtOnceWhileMarked
+            && self.state.root().join("sweep-ghosts-now").exists()
+        {
+            Duration::ZERO
+        } else {
+            GHOST_AFTER
+        };
+        let mut unhosted: BTreeSet<String> = BTreeSet::new();
+        let mut retire: Vec<String> = Vec::new();
+        for (_, subject, raw) in &rows {
+            // `["", "f", "<F>", "pub", "<node>", "<sid>", "presence"]` — the
+            // node face is `<sid>` = `node` and is not a session.
+            let segs: Vec<&str> = subject.split('/').collect();
+            if segs.len() != 7 || segs[3] != "pub" || segs[6] != "presence" {
+                continue;
+            }
+            let sid = segs[5];
+            if sid == "node" || hosted.contains(sid) {
+                continue;
+            }
+            let (body, _) = Body::decode(raw);
+            if body.unknown.get("state").map(String::as_str) != Some("live") {
+                continue;
+            }
+            // ONLY WHAT THIS INCARNATION CAN PROVE UNHOSTED.
+            if !adoptable(
+                body.unknown.get("inc").and_then(|v| v.parse::<u64>().ok()),
+                self.inc,
+                self.witnessed_dead,
+            ) {
+                continue;
+            }
+            unhosted.insert(sid.to_string());
+            let since = *self.ghosts.entry(sid.to_string()).or_insert(now);
+            if now.saturating_duration_since(since) >= patience {
+                retire.push(sid.to_string());
+            }
+        }
+        // A SID THAT CAME BACK STOPS BEING A GHOST. The clock is "continuously
+        // unhosted", so anything not seen unhosted this round loses its date.
+        self.ghosts.retain(|sid, _| unhosted.contains(sid));
+        for sid in retire {
+            self.publish_session_presence(&sid, "exited");
+            self.publish_ev(&format!("presence-retired sid={sid} reason=unhosted"));
+            self.ghosts.remove(&sid);
+        }
+    }
+
+    /// THE PERIODIC BACKSTOP: the local observations, the roster re-read, the
+    /// halt reassert for anything new, and the outbox drain.
     ///
     /// Every part of it is a thing DISCOVERED BY LOOKING rather than by an
     /// arrival, which is why it cannot live on the idle arm (see
@@ -3774,9 +3187,9 @@ impl Bridge {
     /// lane coalesces — does not reach.
     ///
     /// The order matters and is the order the idle arm used to state: the local
-    /// sample first (it is where a stale `fabric-lost` hold is corrected), the
-    /// roster next, then the feed retry, so a retry is never spent on a hold this
-    /// round could have lifted.
+    /// sample first — it is where a stale `fabric-lost` hold is corrected — and
+    /// the roster next, so a session admitted this round is admitted against a
+    /// hold this round has already reconciled.
     fn roster_backstop(&mut self) {
         self.sample_local_control();
         let before: Vec<String> = self.locals.values().cloned().collect();
@@ -3790,10 +3203,6 @@ impl Bridge {
         if before != after {
             self.reassert_halt();
         }
-        // AND THE UNFINISHED FEED, if there is one — the retry cadence for a
-        // `term/in` whose outcome was never obtained. Bounded by
-        // [`FEED_BUDGET`]; it also has its own faster deadline in the loop.
-        self.resolve_pending_feed();
         // AND THE OUTBOX, WHICH THE RUN LOOP HAS BEEN CLAIMING THIS FUNCTION
         // DRAINED. It said so in as many words — the outbox "has its prompt
         // trigger on the push lane (`EVENT <sid> post`) and its own backstop in
@@ -3808,61 +3217,6 @@ impl Bridge {
         // stopped by the budget is resumed by the next call"). One call makes
         // all three true.
         self.drain_outbox();
-    }
-
-    /// Take a fresh `status revision=` baseline for one session, discarding any
-    /// pending `driven` mark with it.
-    ///
-    /// "OBSERVED QUIET AT LEAST ONCE" SURVIVES A HANDOFF, and dropping it was a
-    /// hole in §9.3's structural "human always wins".
-    ///
-    /// [`Bridge::sample_local_control`] will not call an advance unaccounted
-    /// until the session has been seen quiet once — the settling rule, and it is
-    /// the right rule: a session that is still moving is settling from something
-    /// already accounted for, and pausing a handover on that would make every
-    /// handover useless. But a suppressed advance is CONSUMED, not deferred: the
-    /// baseline moves to the new revision and that particular change is never
-    /// reconsidered. So restarting the settling clock here — on a session the
-    /// last sample had already seen QUIET, whose classifier has not moved since
-    /// — threw away the very observation the rule asks for, and made §6.6 row 4
-    /// depend on where the sampling phase happened to fall: a human who typed
-    /// once, in the round after taking or granting the keyboard, was never
-    /// noticed at all. (Twice and they were: the second advance meets a settled
-    /// session. A guarantee that needs the person to type twice is not the
-    /// guarantee §9.3 states.)
-    ///
-    /// So `moved_at` is KEPT when this baseline reads the same revision the last
-    /// sample did — nothing moved, so nothing is settling — and restarted only
-    /// when the classifier moved INTO the baseline, which is the settling case
-    /// the rule exists for. A session with no prior sample starts its clock
-    /// here, which is the un-settled state the count-based rule opened with.
-    fn baseline_local(&mut self, sid: &str) {
-        // AND AN UNREADABLE `status` TAKES NO BASELINE AT ALL. Folding the
-        // failed read into `revision = 0` installed `seen: true` over a real
-        // observation, so the next successful read was an advance from zero and
-        // the first settled round after it parked the session at `human?` —
-        // see [`Bridge::observe_local_control`], which had the same hole. The
-        // prior sample is the best answer available and is kept: its `revision`
-        // is a real reading, so a genuine advance past it is still seen, and a
-        // `driven_at` it carries is bounded by [`DRIVEN_KEEP`] anyway.
-        let Some(StatusSample { revision, .. }) = self.status_sample(sid) else {
-            return;
-        };
-        let prior = self.local.get(sid).copied().unwrap_or_default();
-        let moved_at = if prior.seen && revision == prior.revision {
-            prior.moved_at
-        } else {
-            Some(Instant::now())
-        };
-        self.local.insert(
-            sid.to_string(),
-            LocalSample {
-                seen: true,
-                revision,
-                moved_at,
-                driven_at: None,
-            },
-        );
     }
 
     /// The session's `status revision=`, `hold=` and `detail=`, or `None`
@@ -3925,8 +3279,7 @@ impl Bridge {
     /// never in `minimal` mode. A read that fails leaves the field as it was.
     ///
     /// The revision is the one [`Bridge::observe_local_control`] recorded this
-    /// round (or, for a held session, [`Bridge::watch_held_control`] 250 ms
-    /// ago): aterm's classifier bumps it on every phase or detail change it
+    /// round: aterm's classifier bumps it on every phase or detail change it
     /// publishes — output starting is `running` at once, output stopping is
     /// `quiet` after its 5 s `quiet_after` — so a Claude Code turn that ends
     /// moves it within 5 s, which is the edge that makes the next round
@@ -3954,631 +3307,6 @@ impl Bridge {
         if let Some(rows) = screen {
             slot.fields.read_screen(&rows);
             slot.text_rev = revision;
-        }
-    }
-
-    /// The holder of aterm's own cooperative lease, when it is a LOCAL driver
-    /// rather than this bridge's own `fabric:` mirror.
-    fn local_lease_holder(&mut self, sid: &str) -> Option<String> {
-        let reply = self.ctl_request(&format!("@{sid} lease status")).ok()?;
-        if !reply.ok() {
-            return None;
-        }
-        reply
-            .header()
-            .split_whitespace()
-            .find_map(|t| t.strip_prefix("holder="))
-            .filter(|h| !h.starts_with("fabric:"))
-            .map(str::to_string)
-    }
-
-    /// THE ONE PATH FROM THE BUS TO A PTY, and every condition on it, in one
-    /// place (§6.6):
-    ///
-    /// > applied iff `<src>` equals the `control` holder **at apply time** ∧
-    /// > `hold=0` ∧ the body's `epoch=` equals the live session's launch nonce ∧
-    /// > (`gen=` absent or equal to the live `content_seq:fp16`).
-    ///
-    /// A rejected attempt leaves no `In` and is recorded `ev refused
-    /// reason=holder|hold|epoch|gen`. `re=` is dense and guessable and `gen=` is
-    /// observable from presence, so a body that could TRIGGER keystrokes on their
-    /// strength would let any lane-writer drive a worker — which is why no other
-    /// record shape reaches this function at all. A `re=` on an applied record is
-    /// carried into the `ev` as CAUSALITY and is read by nothing else; it can no
-    /// more unlock this function than it could before.
-    ///
-    /// ## The window, and the journal around it (§6.5)
-    ///
-    /// The feed is bracketed: [`StateDir::set_feed_intent`] writes the offset,
-    /// the session and the key BEFORE the verb; the outcome is published as an
-    /// `ev` after it; the intent is cleared only then. A `SIGKILL` anywhere
-    /// inside that bracket leaves the intent on disk, and
-    /// [`Bridge::resolve_pending_feed`] asks the endpoint — with the SAME key —
-    /// which side of the window it fell on. That is the difference between this
-    /// rung and A3, whose drive face resumed at the head and therefore lost the
-    /// record without ever saying so.
-    fn on_term_record(&mut self, rec: &BrokerRecord) {
-        if self.attachment == Attachment::Observer {
-            return;
-        }
-        let (off, subject, raw) = rec;
-        let off = *off;
-        let Ok(addr) = subject::parse_term_in(&self.cfg.fleet, &self.node, subject) else {
-            return;
-        };
-        let (body, Some(bytes)) = Body::decode(raw) else {
-            self.publish_ev_for(
-                Some(&addr.sid.clone()),
-                &format!("refused sid={} face=term reason=malformed", addr.sid),
-            );
-            return;
-        };
-        // `epoch=` IS MANDATORY, and the check is presence-then-equality rather
-        // than `Option == Option`. `body.rs` documents it as "MANDATORY on
-        // `term/in` and `control`" and `on_control_message` enforces presence
-        // explicitly; the DRIVE face — the one path to a PTY — compared two
-        // `Option`s, so a record carrying NO `epoch=` at all passed whenever
-        // this bridge happened to have no entry for that sid. `holders` is
-        // restored from the bus and can outlive `epochs`, so that state is
-        // reachable: a record from the recorded holder with no epoch was
-        // journalled and fed with nothing epoch-fenced about it.
-        let mut reason = if self.halt_applied {
-            Some("hold")
-        } else if self.holders.get(&addr.sid).map(String::as_str) != Some(addr.src.as_str()) {
-            Some("holder")
-        } else if !matches!(
-            (body.epoch.as_deref(), self.epochs.get(&addr.sid)),
-            (Some(claimed), Some(live)) if claimed == live
-        ) {
-            Some("epoch")
-        } else {
-            None
-        };
-        // THE LIVE GENERATION, read ONCE. It is both the fourth condition's
-        // right-hand side and the `seq=` §10 wants on the `applied` row, so
-        // reading it twice would be two round trips describing two instants.
-        let live = self.live_gen(&addr.sid);
-        // THE FOURTH CONDITION, and the one A3 left out: `gen=` absent, or equal
-        // to the live generation. It is read HERE, at apply time, from the
-        // instance — never from the presence row this bridge published, which
-        // could be a round old. A `gen=` that no longer matches means the sender
-        // answered a screen that has since moved, which is exactly the approval
-        // prompt §6.6 names (`docs/OPERATOR-EMBEDDED.md:253-256`).
-        if reason.is_none() {
-            if let Some(claimed) = body.gen.clone() {
-                if live.as_deref() != Some(claimed.as_str()) {
-                    reason = Some("gen");
-                }
-            }
-        }
-        if let Some(reason) = reason {
-            self.publish_ev_for(
-                Some(&addr.sid.clone()),
-                &format!("refused sid={} face=term reason={reason}", addr.sid),
-            );
-            return;
-        }
-        // §10's `seq=<n>`: the session's `content_seq` BASELINE, read immediately
-        // before the write, so "the screen that followed is `term/out` after seq
-        // n" is a statement a reader can check. `feed-bin`'s own reply carries no
-        // `seq=` — only the line-dispatched input verbs are stamped
-        // (`control.rs` `stamp_input_seq`) and the framed path never reaches it —
-        // so the bridge reads the baseline rather than inventing one. `-` when
-        // the screen could not be read at all, which is honest: an unknown
-        // baseline is not a zero.
-        let baseline = live
-            .as_deref()
-            .and_then(|g| g.split(':').next())
-            .unwrap_or("-")
-            .to_string();
-        // JOURNAL BEFORE THE VERB. The key is minted from what is already on the
-        // record and in this process: the epoch just checked, this node's bound
-        // producer id, and the record's own bus offset + 1 (offsets are dense and
-        // monotone on a subscription, so they are already the monotone sequence
-        // A6's mark wants — and `+1` because sequence 0 is A6's "consumed
-        // nothing"). The same record therefore mints the same key on a replay,
-        // which is the whole mechanism.
-        // NO OFFSET LEAVES THE JOURNAL WITHOUT A VERDICT.
-        //
-        // The journal is ONE slot (`state.rs`: one file, `feeding`), and A6's
-        // retry path deliberately KEEPS an entry across records: a non-final
-        // verdict — `ERR busy` while a local `turn` holds the lease, `ERR
-        // halted`, `ERR rate`, or an aterm that did not answer — publishes no
-        // `ev` and leaves the entry armed to be asked again. A3 then wrote the
-        // next drive record's intent over it unconditionally, so a second
-        // keystroke arriving before the retry erased the first: never fed,
-        // never retried, and never reported — no `applied`, no `refused`, no
-        // `in-doubt`. That is exactly the silent loss `pty_idem.rs`'s header
-        // and `Verdict::is_final`'s doc both say this rung exists to end.
-        //
-        // So a pending entry is RESOLVED before a new one is minted, and if it
-        // still cannot be resolved this round it is published as `in-doubt …
-        // reason=superseded` and retired. Superseded is the honest word: the
-        // bridge does not know whether those bytes reached the PTY, and §6.5's
-        // rule for that state is "reported, never silently replayed".
-        if !self.settle_pending_feed_before(off) {
-            self.publish_ev_for(
-                Some(&addr.sid.clone()),
-                &format!("refused sid={} face=term reason=pending", addr.sid),
-            );
-            return;
-        }
-        let epoch = body.epoch.clone().unwrap_or_default();
-        let intent = crate::state::FeedIntent {
-            off,
-            sid: addr.sid.clone(),
-            key: format!("{epoch}:{}:{}", self.producer_id, off + 1),
-            tries: 1,
-            // THE BUDGET IS A DURATION AND IT STARTS HERE. See [`FEED_BUDGET`].
-            first_at: crate::now_ms(),
-            doubt: false,
-        };
-        if let Err(e) = self.state.set_feed_intent(&intent) {
-            // NOT FED. An unjournalled feed is exactly the in-doubt window this
-            // rung closes, so a state dir that cannot be written refuses the
-            // keystroke and says so, rather than typing it blind.
-            eprintln!("aterm-link: could not journal the feed intent: {e}");
-            self.publish_ev_for(
-                Some(&addr.sid.clone()),
-                &format!("refused sid={} face=term reason=no-journal", addr.sid),
-            );
-            return;
-        }
-        let reply = self.feed(&intent, &bytes);
-        // THE WINDOW, timed from inside it. The keystroke is on the PTY and this
-        // process has not yet said so anywhere: the intent is on disk, the `ev`
-        // is not published, and nothing but the journal knows what happened. A
-        // test that raced this from outside would be a flake; the process whose
-        // progress defines the window is the one that ends it.
-        if self.fault == Fault::KillInFeedWindow
-            && reply.as_deref().is_some_and(|r| r.starts_with("OK"))
-        {
-            self.fault.fire(Fault::KillInFeedWindow, &self.state);
-        }
-        self.record_feed_outcome(&intent, &feed_verdict(reply.as_deref()), &baseline, false);
-    }
-
-    /// Write one journalled `term/in`'s bytes to the PTY under its key.
-    ///
-    /// `None` is an I/O failure against aterm itself — the one outcome that says
-    /// nothing at all about the PTY, and therefore the one the journal exists
-    /// for.
-    fn feed(&mut self, intent: &crate::state::FeedIntent, bytes: &[u8]) -> Option<String> {
-        if self.fault == Fault::RefuseFirstFeed {
-            self.fault = Fault::None;
-            Fault::RefuseFirstFeed.fired(&self.state);
-            return Some("ERR busy turn=0".to_string());
-        }
-        if self.fault == Fault::RefuseFeedsWhileMarked
-            && self.state.root().join("refuse-feeds").exists()
-        {
-            return Some("ERR busy turn=0".to_string());
-        }
-        // `id=` is a TRAILING token on `feed-bin` (the frame announces its length
-        // first, `control.rs` `parse_feed_bin`), unlike the leading `id=` the
-        // line verbs take. One wrong position here is an `ERR usage` on every
-        // keystroke, so it is written once, in one place.
-        let line = format!("@{} feed-bin {} id={}", intent.sid, bytes.len(), intent.key);
-        match self.ctl_request_with_body(&line, bytes) {
-            Ok(reply) => Some(reply.header().to_string()),
-            Err(e) => {
-                eprintln!("aterm-link: feed-bin failed: {e}");
-                None
-            }
-        }
-    }
-
-    /// Turn one feed's reply into the record §10 asks for, then retire the
-    /// journal entry.
-    ///
-    /// Four outcomes, and every one of them is SAID:
-    ///
-    /// | reply | `ev` | meaning |
-    /// |---|---|---|
-    /// | `OK …` | `applied re=<off> seq=<n>` | it ran; this is §10's causal pointer |
-    /// | `OK dup=1` | `applied re=<off> dup=1` | a replay found it already landed |
-    /// | `ERR in-doubt seq=<n>` | `in-doubt re=<off> …` | it MAY have typed; an operator's problem, never a silent retry |
-    /// | `ERR busy idem=<n>`, or no reply at all | retried, then `in-doubt … reason=unresolved` | an attempt under this key is in the seam, or aterm never answered: it MAY have typed |
-    /// | anything else | `refused re=<off> reason=<first token>` | refused before a byte could move |
-    ///
-    /// The two middle rows and every other transient reply are RETRIED under the
-    /// same key first ([`FEED_BUDGET`]); what a spent budget publishes is the
-    /// sticky `doubt` bit's business, below, not the last reply's.
-    ///
-    /// The journal is cleared last, and only after the `ev` publish was
-    /// attempted. A crash between the publish and the clear costs one duplicate
-    /// `applied … dup=1` row on the next replay and nothing else; a crash the
-    /// other way round would cost the record that says what happened.
-    fn record_feed_outcome(
-        &mut self,
-        intent: &crate::state::FeedIntent,
-        verdict: &Verdict,
-        baseline: &str,
-        replayed: bool,
-    ) {
-        // AN UNANSWERED QUESTION IS NOT AN ANSWER. A transient refusal consumed
-        // no sequence, so the record is still pending: keep the journal and ask
-        // again on the next round, under the same key. Past the budget the
-        // silence itself is the news, and it is published.
-        //
-        // THE ENTRY THEREFORE OUTLIVES THIS CALL, and the journal has one slot.
-        // [`Bridge::settle_pending_feed_before`] is what stops the next drive
-        // record from erasing it without a verdict, and the loop's retry
-        // deadline is what stops a BUSY bridge — one that never reaches the
-        // idle arm — from never asking again.
-        if !verdict.is_final() {
-            // DOUBT IS STICKY, AND IT IS DURABLE. An attempt aterm never
-            // answered may have reached the PTY; a later `ERR busy turn=`
-            // refuses THAT attempt before the mark is claimed and says nothing
-            // about the earlier one, so the doubt cannot be argued away by what
-            // came after it. Written back with the journal entry it belongs to.
-            // (`ERR busy idem=` is not one of those later refusals — it is
-            // doubt in its own right, and [`feed_verdict`] says why.)
-            let doubt = intent.doubt || matches!(verdict, Verdict::InDoubt { .. });
-            let elapsed = crate::now_ms().saturating_sub(intent.first_at);
-            let spent = intent.first_at > 0 && elapsed >= FEED_BUDGET.as_millis() as u64;
-            if !spent && intent.tries < FEED_TRIES_MAX {
-                if doubt != intent.doubt {
-                    let marked = crate::state::FeedIntent {
-                        doubt,
-                        ..intent.clone()
-                    };
-                    if let Err(e) = self.state.set_feed_intent(&marked) {
-                        eprintln!("aterm-link: could not journal the feed's doubt: {e}");
-                    }
-                }
-                return;
-            }
-            // WHAT THE SILENCE ACTUALLY SAYS. `in-doubt` is §6.5's "it may have
-            // typed and nothing can tell", and publishing it for a record that
-            // was refused CLEANLY on every attempt — the key's sequence never
-            // consumed, which is the argument `Verdict::is_final` itself makes
-            // — asserts an unknown the bridge does not have. A budget spent
-            // entirely on pre-write refusals is a REFUSAL, named by the last
-            // reason the endpoint gave, and it is recoverable by whoever reads
-            // it; an in-doubt is terminal.
-            //
-            // WHICH TURNS ENTIRELY ON `doubt` BEING COMPLETE, and the one reply
-            // that hides inside a refusal is `ERR busy idem=`: it is answered by
-            // the mark, not before it, so it is read as doubt at the source
-            // ([`feed_verdict`]) rather than filtered out here — by the time a
-            // verdict reaches this branch `reason_token` has already reduced
-            // every `ERR busy` to the same word.
-            let exhausted = if doubt {
-                Verdict::InDoubt {
-                    seq: String::new(),
-                    why: Some("unresolved"),
-                }
-            } else {
-                Verdict::Refused {
-                    why: match verdict {
-                        Verdict::Refused { why } => why.clone(),
-                        _ => "unresolved".to_string(),
-                    },
-                }
-            };
-            eprintln!(
-                "aterm-link: giving up on {} after {} attempts over {elapsed} ms; escalating",
-                intent.render(),
-                intent.tries
-            );
-            if self.publish_ev_re(
-                Some(&intent.sid.clone()),
-                &exhausted.ev(&intent.sid, intent.off, baseline, replayed),
-                intent.off,
-            ) {
-                self.state.clear_feed_intent();
-            }
-            return;
-        }
-        // ACCOUNT FOR IT. The next `status revision=` advance this session shows
-        // is the bridge's own doing, so it must not read as the unaccounted
-        // change that parks the row (§6.6 row 4). A `dup=1` typed nothing, so it
-        // accounts for nothing.
-        if *verdict == (Verdict::Applied { dup: false }) {
-            self.local.entry(intent.sid.clone()).or_default().driven_at = Some(Instant::now());
-        }
-        // THE JOURNAL IS RETIRED ONLY ONCE ITS VERDICT IS ON THE BUS. A clear
-        // after a publish that failed (an unreachable broker) would retire the
-        // record with its fate on nobody's log — the silent loss again, one
-        // layer down. Keeping it costs at most one duplicate `applied … dup=1`
-        // on the next round, which is what A6's mark is for.
-        if self.publish_ev_re(
-            Some(&intent.sid.clone()),
-            &verdict.ev(&intent.sid, intent.off, baseline, replayed),
-            intent.off,
-        ) {
-            self.state.clear_feed_intent();
-        }
-    }
-
-    /// Clear the way for a NEW drive record at `next_off`: resolve whatever the
-    /// single-slot journal is still holding, and if it cannot be resolved, say
-    /// so on the bus before overwriting it.
-    ///
-    /// See the note at the call site. The `in-doubt` is not a formality: the
-    /// entry survives only when the last attempt's verdict was non-final, which
-    /// means the bridge genuinely does not know whether those bytes reached the
-    /// PTY, and an offset that vanished from the journal with no `ev` is
-    /// unrecoverable by anyone.
-    /// Answers whether the journal is now FREE. `false` means the pending entry
-    /// could not be resolved AND its supersession could not be recorded, so the
-    /// caller must refuse the new record rather than erase the old one — losing
-    /// a keystroke that was never fed is strictly better than losing one that
-    /// may already be on a PTY.
-    fn settle_pending_feed_before(&mut self, next_off: u64) -> bool {
-        let Some(pending) = self.state.feed_intent() else {
-            return true;
-        };
-        if pending.off == next_off {
-            // The same record, being re-armed by a replay: not a supersession.
-            return true;
-        }
-        self.resolve_pending_feed();
-        let Some(still) = self.state.feed_intent() else {
-            return true;
-        };
-        eprintln!(
-            "aterm-link: superseding an unresolved feed: {}",
-            still.render()
-        );
-        // THE SAME DISTINCTION THE BUDGET MAKES. A record every attempt refused
-        // before a byte could move is not in doubt just because a newer record
-        // has taken the slot: nothing typed, the key's sequence was never
-        // consumed, and `refused` is the recoverable verdict a reader can act
-        // on. `in-doubt` is kept for the entry that has genuinely been in
-        // doubt — an attempt aterm never answered — which is the state
-        // `FeedIntent::doubt` records and an old journal line assumes.
-        let superseded = if still.doubt {
-            Verdict::InDoubt {
-                seq: String::new(),
-                why: Some("superseded"),
-            }
-        } else {
-            Verdict::Refused {
-                why: "superseded".to_string(),
-            }
-        };
-        if !self.publish_ev_re(
-            Some(&still.sid.clone()),
-            &superseded.ev(&still.sid, still.off, "-", true),
-            still.off,
-        ) {
-            return false;
-        }
-        self.state.clear_feed_intent();
-        true
-    }
-
-    /// ASK THE ENDPOINT which side of the feed window a journalled record fell
-    /// on, and record the answer (§6.5).
-    ///
-    /// ## When it runs, and how often
-    ///
-    /// It is a no-op unless a `feeding` entry is present. An entry is present
-    /// for TWO reasons, and A3's doc named only the first: this process died
-    /// between the journal write and the outcome record, OR the last attempt's
-    /// verdict was not final ([`Verdict::is_final`]) and
-    /// [`Bridge::record_feed_outcome`] deliberately kept the entry to ask again.
-    ///
-    /// So it does NOT run once. It runs at every attach, on a deadline from the
-    /// main loop, and on the idle roster round, re-asking under the SAME key
-    /// until the journal retires — bounded by [`FEED_BUDGET`], a span of wall
-    /// clock measured from the first attempt and carried in the journal so a
-    /// restart cannot buy a fresh one, with [`FEED_TRIES_MAX`] as the backstop
-    /// for the restart loop in which no time passes; the attempt count is
-    /// written durably BEFORE each attempt. Nothing is published on the
-    /// intermediate rounds; the `ev` comes on a final verdict, on budget
-    /// exhaustion, or when a new drive record supersedes the entry
-    /// ([`Bridge::settle_pending_feed_before`]).
-    ///
-    /// **The property that makes repeating it safe is not that it happens once.**
-    /// It is A6's per-session, per-producer, monotone mark: the replay re-sends
-    /// the same key, so the endpoint answers `OK dup=1` (it landed — write
-    /// nothing), `ERR in-doubt` (it may have; refuse and escalate) or applies it
-    /// fresh (it did not land — the repair).
-    ///
-    /// **The replay re-sends the same key, and that is the whole safety
-    /// argument.** A6's mark is per-session, per-producer and monotone, so the
-    /// endpoint answers `OK dup=1` (it landed — write nothing), `ERR in-doubt`
-    /// (it may have; refuse and escalate) or applies it fresh (it did not land —
-    /// the repair). What the replay does NOT re-check is deliberate and bounded:
-    ///
-    /// * the EPOCH is re-checked, structurally — it is inside the key, and a key
-    ///   minted against a session that has since relaunched is `ERR epoch` at the
-    ///   endpoint before any byte moves;
-    /// * the HOLD is re-checked, structurally — the endpoint's gate refuses
-    ///   `feed-bin` under a hold before A6's mark is even claimed, so a halt that
-    ///   landed while this bridge was down stops the replay dead;
-    /// * the HOLDER is NOT re-consulted. The apply was authorized when it began;
-    ///   a claim that arrives afterwards does not retroactively un-authorize an
-    ///   operation already in flight, and treating it as though it did would turn
-    ///   every crash into a silent loss — the exact failure this rung exists to
-    ///   end;
-    /// * the `gen=` is NOT re-checked, because the keystroke's OWN effect is what
-    ///   moved the screen. A replay that re-checked it could never repair
-    ///   anything.
-    ///
-    /// Whatever it finally learns is published as an `ev` and the journal is
-    /// retired. What it must never do is retire an entry SILENTLY — a keystroke
-    /// that left the journal with no record of its fate is the silent loss §6.5
-    /// forbids, and every exit from this function publishes one.
-    fn resolve_pending_feed(&mut self) {
-        if self.attachment == Attachment::Observer {
-            return;
-        }
-        let Some(intent) = self.state.feed_intent() else {
-            return;
-        };
-        // THE BYTES COME BACK FROM THE LOG, not from the state dir. The record is
-        // still there — the bus is append-forever (§10) — so the journal never
-        // has to hold a stranger's payload at rest, and the replay is over the
-        // same bytes the broker has rather than a copy that could have drifted.
-        let filter = subject::term_filter(&self.cfg.fleet, &self.node);
-        let fetched = match self.conn.as_mut() {
-            Some(c) => {
-                let started = Instant::now();
-                let answer = c.fetch(intent.off, &filter, 1);
-                self.observe(started, answer, Some("read")).ok()
-            }
-            None => None,
-        };
-        let found = fetched
-            .and_then(|(rows, _)| rows.into_iter().next())
-            .filter(|(off, _, _)| *off == intent.off);
-        let Some((_, subject, raw)) = found else {
-            // The record cannot be re-read, so it cannot be resolved. Say so and
-            // retire the entry rather than carrying it forever: a journal that
-            // never empties is a bridge that replays on every attach.
-            self.record_feed_outcome(&intent, &Verdict::UNREADABLE, "-", true);
-            return;
-        };
-        // The subject is re-parsed rather than trusted from the journal: this is
-        // still the ONE path to a PTY, and it may not widen just because the
-        // record has been seen before.
-        let same_session = subject::parse_term_in(&self.cfg.fleet, &self.node, &subject)
-            .is_ok_and(|addr| addr.sid == intent.sid);
-        let (_, bytes) = Body::decode(&raw);
-        let (true, Some(bytes)) = (same_session, bytes) else {
-            self.record_feed_outcome(&intent, &Verdict::UNREADABLE, "-", true);
-            return;
-        };
-        eprintln!(
-            "aterm-link: resolving an unfinished feed: {}",
-            intent.render()
-        );
-        // THE ATTEMPT IS COUNTED BEFORE IT IS MADE, and durably, so a crash
-        // inside the retry is bounded by the same budget as a refusal is. A
-        // counter that only advanced on a completed attempt would let a bridge
-        // that dies at the same step relaunch into it forever.
-        let intent = crate::state::FeedIntent {
-            tries: intent.tries + 1,
-            // A JOURNAL LINE FROM BEFORE `first=` EXISTED starts its budget now
-            // rather than at the epoch, which would read as instantly spent.
-            first_at: if intent.first_at == 0 {
-                crate::now_ms()
-            } else {
-                intent.first_at
-            },
-            ..intent
-        };
-        if let Err(e) = self.state.set_feed_intent(&intent) {
-            eprintln!("aterm-link: could not journal the replay attempt: {e}");
-            return;
-        }
-        let reply = self.feed(&intent, &bytes);
-        let baseline = self
-            .live_gen(&intent.sid)
-            .and_then(|g| g.split(':').next().map(str::to_string))
-            .unwrap_or_else(|| "-".to_string());
-        self.record_feed_outcome(&intent, &feed_verdict(reply.as_deref()), &baseline, true);
-    }
-
-    // -----------------------------------------------------------------------
-    // the screen face (opt-in)
-    // -----------------------------------------------------------------------
-
-    /// Whether this session's screen is published (`--screen <sid>` or
-    /// `--screen all`).
-    fn screens(&self, sid: &str) -> bool {
-        self.cfg
-            .screen
-            .iter()
-            .any(|s| s == "all" || s == sid || s.trim_start_matches('@') == sid)
-    }
-
-    /// Publish a `screen` snapshot for every opted-in session whose generation
-    /// moved (§3.3, §10).
-    ///
-    /// This is the face a consistent-cut replay re-folds a screen from. It is a
-    /// LAST-VALUE face carrying a whole frame rather than a `term/out` stream of
-    /// deltas, which is what §3.3 specifies and what keeps the cost of the
-    /// feature one record per changed screen per period instead of one per byte
-    /// the shell wrote.
-    ///
-    /// Three bounds, all of them because this is the one fabric face that
-    /// carries screen CONTENT:
-    ///
-    /// * **opt-in** — `--screen` is empty by default (§14's open question 2);
-    /// * **rate** — at most one publish per changed session per
-    ///   [`SCREEN_PERIOD`], which is the "≤ 4/s" §3.3 states of each
-    ///   `…/<sid>/screen` subject. Taken from the clock rather than from how
-    ///   often the loop happens to run, so a busy bridge pays no more than an
-    ///   idle one — but the clock gates the SWEEP, so the bound is per SUBJECT
-    ///   and not per node: N changed screens are N records a period, which is
-    ///   the cost the paragraph above names;
-    /// * **change** — a generation that has not moved publishes nothing, so a
-    ///   quiet session costs one record and then nothing at all. On an
-    ///   append-forever log (§10) a periodic republish would be an unbounded
-    ///   write for no new information, which is the shape of defect five audit
-    ///   rounds keep finding.
-    ///
-    /// A frame over [`SCREEN_MAX`] is SKIPPED with an `ev`, never truncated: a
-    /// half-frame is a document that parses and lies.
-    ///
-    /// One echo, deliberately unremarked-upon anywhere else: this subject is
-    /// inside the bridge's own `term/<node>/>` subscription, so every snapshot
-    /// comes back through the mailbox. [`Bridge::on_term_record`] drops it at
-    /// `parse_term_in` — a `screen` subject is seven segments and the drive face
-    /// is eight, with a literal `in` at position six — so it costs one parse and
-    /// cannot loop. Narrowing the subscription to exclude it would need a second
-    /// filter and a second connection to carry it, which is a worse trade than a
-    /// parse four times a second.
-    fn publish_screens(&mut self) {
-        if self.attachment == Attachment::Observer || self.cfg.screen.is_empty() {
-            return;
-        }
-        if Instant::now() < self.screen_due {
-            return;
-        }
-        self.screen_due = Instant::now() + SCREEN_PERIOD;
-        let sids: Vec<String> = self
-            .locals
-            .values()
-            .filter(|sid| self.screens(sid))
-            .cloned()
-            .collect();
-        for sid in sids {
-            let Ok(reply) = self.ctl_request(&format!("@{sid} text --json")) else {
-                continue;
-            };
-            let Some(frame) = reply.rows().first().cloned() else {
-                continue;
-            };
-            let Some(gen) = gen_of_frame(&frame) else {
-                continue;
-            };
-            if self.screen_gen.get(&sid) == Some(&gen) {
-                continue;
-            }
-            if frame.len() > SCREEN_MAX {
-                self.publish_ev_for(
-                    Some(&sid.clone()),
-                    &format!(
-                        "screen-skipped sid={sid} reason=too-large bytes={}",
-                        frame.len()
-                    ),
-                );
-                // The generation is recorded anyway: a screen too large to
-                // publish is not a screen to re-ask about four times a second.
-                self.screen_gen.insert(sid, gen);
-                continue;
-            }
-            let epoch = self.epochs.get(&sid).cloned().unwrap_or_else(|| "-".into());
-            let subject = format!("/f/{}/term/{}/{sid}/screen", self.cfg.fleet, self.node);
-            let mut body = format!(
-                "v=1 t={} epoch={epoch} gen={gen} len={}\n",
-                crate::now_ms(),
-                frame.len()
-            )
-            .into_bytes();
-            body.extend_from_slice(frame.as_bytes());
-            match self.publish(&subject, &body) {
-                Ok(_) => {
-                    self.screen_gen.insert(sid, gen);
-                }
-                Err(e) => eprintln!("aterm-link: could not publish {sid}'s screen: {e}"),
-            }
         }
     }
 
@@ -5040,7 +3768,7 @@ impl Bridge {
             // misses a second node advertising the sid, so §6.1's `ERR ambiguous`
             // never fires and the post routes to whichever node the pin holds.
             let started = Instant::now();
-            let answer = last_all(conn, &filter);
+            let answer = last_all(conn, &filter).map(|(rows, _)| rows);
             let page = match self.observe(started, answer, Some("read")) {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -5176,7 +3904,6 @@ impl Bridge {
                 let sid = toks.next().unwrap_or(target).to_string();
                 self.publish_session_presence(&sid, "exited");
                 self.epochs.remove(&sid);
-                self.holders.remove(&sid);
                 let _ = self.refresh_sessions();
             }
             _ => {}
@@ -5237,7 +3964,7 @@ impl Bridge {
         // that follows costs the bus nothing (the `attaching` field has the
         // measurement). It is applied below, once presence is up — see
         // [`Bridge::read_fleet_halts`] for why the two halves sit where they do.
-        let Some(halts) = self.read_fleet_halts() else {
+        let Some((halts, fleet_from)) = self.read_fleet_halts() else {
             eprintln!("aterm-link: the standing fleet halt could not be read; not attaching");
             self.conn = None;
             return false;
@@ -5274,60 +4001,38 @@ impl Bridge {
             self.refill(&sid);
         }
         let fleet_filter = subject::fleet_filter(&self.cfg.fleet);
-        let term_filter = subject::term_filter(&self.cfg.fleet, &self.node);
         let group = subject::inbox_group(&self.cfg.fleet, &self.node);
         let inbox_filter = subject::inbox_filter(&self.cfg.fleet, &self.node);
-        // THE DRIVE FACE RESUMES AT ITS DURABLE CURSOR, and the fleet face from
-        // zero.
+        // THE FLEET FACE RESUMES FROM ITS OWN LAST RECORD, NOT FROM ZERO.
         //
-        // The asymmetry is still the point, and it has moved by one step. A halt
-        // is idempotent state — replaying every halt record on a reconnect
-        // reaches the same standing verdict. A keystroke is not idempotent BY
-        // ITSELF, which is why A3 resumed at the head; but A6 gave every `term/in`
-        // a key (`{epoch}:{producer}:{off+1}`) that the endpoint's monotone mark
-        // answers `dup` to without writing, and the producer id survives a bridge
-        // restart while the epoch does not survive an aterm one. So a replay can
-        // no longer retype anything, and the head-resume's own cost — a `term/in`
-        // published while the bridge was between incarnations, never seen, never
-        // fed, never refused, named by no `ev` — is a silent loss with nothing
-        // left to justify it. See `state.rs`'s `term_off`.
+        // It is a last-value face — `on_fleet_record` keeps only
+        // `fleet/h-*/halt`, and the standing verdict is the newest row per
+        // human — so the `Last` read whose answer `apply_fleet_halts` REBUILDS
+        // `self.halts` from is already the whole state. Subscribing from zero
+        // after it re-delivered every halt record ever published to re-derive
+        // the state that read had just derived, and `state.rs`'s `halt-acked`
+        // exists only to stop the node re-answering each one: "the fleet face
+        // resubscribes from offset 0 on every reconnect, so without this the
+        // node re-answers every halt in the fleet's history at every
+        // reconnect."
         //
-        // BOUNDED, AND WHAT IS SKIPPED IS SAID. A cursor further behind than
-        // [`TERM_RESUME_SPAN`] resumes at the floor instead and publishes the
-        // span it passed over, because a bridge that was down for a day must not
-        // walk the whole log — and must not pretend it walked it either.
-        // `max=0` is the broker's head query (R2).
-        let head = match self.conn.as_mut() {
-            Some(conn) => {
-                let started = Instant::now();
-                let answer = conn.fetch(0, &term_filter, 0);
-                match self.observe(started, answer, Some("read")) {
-                    Ok((_, (_, head))) => head,
-                    Err(_) => return false,
-                }
-            }
-            None => return false,
-        };
-        let floor = head.saturating_sub(TERM_RESUME_SPAN);
-        let term_from = match self.state.term_off() {
-            Some(cursor) => {
-                let resume = cursor.saturating_add(1);
-                if resume < floor {
-                    self.publish_ev(&format!("term-skipped from={resume} to={}", floor - 1));
-                    floor
-                } else {
-                    resume
-                }
-            }
-            // No cursor at all: a first launch, or a state dir that lost the
-            // file. The head is A3's behaviour and the conservative direction —
-            // it can only skip records, never re-offer one twice.
-            None => head,
-        };
-        for (filter, source, from) in [
-            (fleet_filter, Source::Fleet, 0),
-            (term_filter, Source::Term, term_from),
-        ] {
+        // AND THE REPLAY WAS NOT MERELY REDUNDANT. `on_fleet_record` APPLIES
+        // each halt as it arrives, so the walk re-applied every barrier the
+        // fleet ever carried: the first `state=on` in the log held every
+        // session on this instance until the walk reached its matching `off`,
+        // a hold nothing on the bus justified and one this attach had already
+        // computed the correct answer to moments earlier.
+        //
+        // The mark closes the window the old comment worried about instead of
+        // paying for it — `Request::Last`'s own doc says a subscribe from a
+        // page's `next` tails on gap-free from that page's snapshot, so a halt
+        // published between the read and this subscribe still arrives, exactly
+        // once.
+        // THE FLEET FACE, ON ITS OWN CONNECTION. This was a loop over two faces
+        // until round 21 took the drive face's; one subscription does not need
+        // one, and a loop over a single element reads as though a second is
+        // expected.
+        {
             let (client, closer) = match self.connect() {
                 Ok(c) => c,
                 Err(e) => {
@@ -5335,7 +4040,7 @@ impl Bridge {
                     return false;
                 }
             };
-            let Ok(sub) = client.subscribe(from, &filter) else {
+            let Ok(sub) = client.subscribe(fleet_from, &fleet_filter) else {
                 self.link_down("subscribe");
                 return false;
             };
@@ -5343,7 +4048,7 @@ impl Bridge {
             // `recv` with nothing to deliver is what a subscription does.
             let _ = closer.set_read_timeout(None);
             self.closers.push(closer);
-            spawn_reader(sub, source, self.mailbox.clone());
+            spawn_reader(sub, Source::Fleet, self.mailbox.clone());
         }
         let (client, closer) = match self.connect() {
             Ok(c) => c,
@@ -5359,19 +4064,18 @@ impl Bridge {
         let _ = closer.set_read_timeout(None);
         self.closers.push(closer);
         spawn_reader(sub, Source::Inbox, self.mailbox.clone());
-        // THE KEYBOARD SURVIVES THE BRIDGE. The `control` row is last-value bus
-        // state written only by this node, so it is read back rather than
-        // reinvented: a restart that forgot it would leave a human's claim
-        // standing on the bus while every `term/in` under it was refused
-        // `reason=holder`.
-        self.restore_control_rows();
-        // AND THE FEED THE LAST INCARNATION DIED INSIDE. It needs the publisher
-        // connection (to re-read the record and to publish the verdict) and the
-        // restored holders are irrelevant to it, so it runs last — and it runs
-        // before the loop takes another `term` record, because the term
-        // subscription's reader has only just been spawned and the mailbox is
-        // drained on this thread.
-        self.resolve_pending_feed();
+        // THE GHOST CANDIDATES ARE DISCOVERED HERE, ONCE PER ATTACH, so the
+        // loop's sweep arm can be gated on the set being non-empty and a fleet
+        // with no ghost pays nothing at all. This first call retires nothing —
+        // [`GHOST_AFTER`]'s patience is measured from this bridge's own first
+        // sight — it only seeds [`Bridge::ghosts`] and arms the deadline.
+        //
+        // ONCE PER ATTACH IS THE HONEST BOUND, and it is worth writing down:
+        // a ghost that appears WHILE this bridge is attached (another instance
+        // sharing this node id dying) is not noticed until the next attach. The
+        // alternative is the minute timer this gating exists to remove.
+        self.retire_ghost_presence();
+        self.ghost_due = Instant::now() + GHOST_SWEEP;
         true
     }
 
@@ -5423,43 +4127,37 @@ impl Bridge {
                     continue;
                 }
             }
-            // THE MIRROR LEASE IS RENEWED FROM THE LOOP, not from the idle
-            // branch: a busy bridge never idles, and a lease that lapsed under
-            // load is exactly the state §6.6 says must not exist while the row
-            // stands. It is a bounded local call on a deadline, so a quiet
-            // bridge pays it three times a minute per held session and a busy
-            // one pays it no more often.
-            if Instant::now() >= self.lease_due {
-                self.renew_leases();
-                self.lease_due = Instant::now() + LEASE_RENEW;
-            }
-            // AND THE LOCAL OBSERVATIONS, FOR THE SAME REASON — the reason this
-            // loop has now made four times. Two of §6.6's six rows and the whole
-            // `attention=` escalation are discovered by LOOKING, not by anything
-            // arriving, so a bridge that only looks when nothing is arriving does
-            // not implement them on a busy node. See [`ROSTER_REFRESH`]. It runs
-            // BEFORE the feed retry, because it is where a stale `fabric-lost`
-            // hold gets corrected and retrying into a hold this round could have
-            // lifted would burn the budget on a refusal of our own making.
+            // AND THE LOCAL OBSERVATIONS, FOR THE SAME REASON. The roster, the
+            // `attention=` escalation and the per-session `detail=`/`revision`
+            // sample are discovered by LOOKING, not by anything arriving, so a
+            // bridge that only looks when nothing is arriving does not do them
+            // on a busy node. See [`ROSTER_REFRESH`].
             if Instant::now() >= self.roster_due {
                 self.roster_backstop();
                 self.roster_due = Instant::now() + ROSTER_REFRESH;
             }
-            // AND ROW 4 ON ITS OWN, FASTER DEADLINE. The roster's period is fine
-            // for everything that is still true when it is read late; the
-            // conservative pause is not one of those things. See
-            // [`LOCAL_OBSERVE`].
-            if Instant::now() >= self.observe_due {
-                self.watch_held_control();
-                self.observe_due = Instant::now() + LOCAL_OBSERVE;
-            }
-            // AND THE UNFINISHED FEED, FROM THE LOOP. See [`FEED_RETRY`]: the
-            // idle arm alone is unreachable on a node that is receiving
-            // records, which is exactly the node whose keystrokes are being
-            // refused `ERR busy`.
-            if Instant::now() >= self.feed_retry_due {
-                self.resolve_pending_feed();
-                self.feed_retry_due = Instant::now() + FEED_RETRY;
+            // AND THE GHOSTS — ONLY WHILE THERE IS ONE, which is what keeps
+            // this from being a heartbeat.
+            //
+            // The sweep is a `Last` walk of a broker subtree, and `observe`
+            // turns any answered broker request into an ack, which
+            // `ack_wants_report` turns into a `link up` once it is a
+            // `LINK_REFRESH` since the last one. On a free-running minute timer
+            // that is one report per minute for the life of every bridge on the
+            // fleet, forever, for nothing — and three docs in this tree promise
+            // there is no such thing (`LINK_REFRESH` here, `status`'s catalog
+            // entry, and the manual's fabric page). The candidates are
+            // discovered once per attach, in the attach's own burst of reads,
+            // and this arm runs only until the set it seeded drains to empty.
+            //
+            // After the roster round, so a sid admitted this very tick is
+            // already in `locals` and is never counted unhosted for the round
+            // that admitted it.
+            let sweep_now = self.fault == Fault::SweepGhostsAtOnceWhileMarked
+                && self.state.root().join("sweep-ghosts-now").exists();
+            if sweep_now || (!self.ghosts.is_empty() && Instant::now() >= self.ghost_due) {
+                self.retire_ghost_presence();
+                self.ghost_due = Instant::now() + GHOST_SWEEP;
             }
             // AND THE DEADLINES (R8). The broker holds no timers; this clock is
             // the only one that can say an ask went unanswered.
@@ -5467,24 +4165,12 @@ impl Bridge {
                 self.expire_deadlines();
                 self.deadline_due = Instant::now() + DEADLINE_TICK;
             }
-            // FROM THE LOOP, not from the idle branch: a busy bridge never
-            // idles, and a screen face that only advanced while nothing was
-            // happening would be blank at exactly the moments a reader wants it.
-            // Its own clock bounds the rate.
-            self.publish_screens();
+            // EACH OF THE DUTIES ABOVE CARRIES ITS OWN DEADLINE, and none of
+            // them lives on the idle branch, because a busy bridge never idles
+            // and every one of them is discovered by LOOKING rather than by
+            // something arriving.
             match self.mailbox.take(IDLE_TICK) {
                 Some(Item::Fleet(r)) => self.on_fleet_record(&r),
-                Some(Item::Term(r)) => {
-                    let off = r.0;
-                    self.on_term_record(&r);
-                    // AFTER, NEVER BEFORE. A crash between the handling and this
-                    // write replays the record, which A6's key answers `dup` to;
-                    // a crash the other way round would lose it exactly the way
-                    // the head-resume did.
-                    if let Err(e) = self.state.set_term_off(off) {
-                        eprintln!("aterm-link: could not record the drive cursor: {e}");
-                    }
-                }
                 Some(Item::Event(line)) => self.on_event(&line),
                 Some(Item::Inbox(r)) => self.on_inbox_record(&r),
                 Some(Item::Closed(Source::Aterm)) => {
@@ -5597,14 +4283,23 @@ enum Delivery {
 /// `Err` is returned for a walk that could not be COMPLETED, page bound
 /// included, because a caller that cannot tell "no rows" from "I stopped
 /// looking" is the caller that lifts the halt.
-fn last_all(conn: &mut Conn, filter: &str) -> io::Result<Vec<BrokerRecord>> {
+///
+/// AND THE SPLICE POINT, which is the FIRST page's `next` and not the last's.
+/// `Request::Last`'s own doc states the rule: each page of a paged query is
+/// read at its OWN, later head, so a reader that tails from the last page's
+/// mark skips whatever superseded a value an earlier page reported. A caller
+/// that wants to go on watching the face it just snapshotted passes this to
+/// `subscribe`, and the two are gap-free and dup-free across the seam.
+fn last_all(conn: &mut Conn, filter: &str) -> io::Result<(Vec<BrokerRecord>, u64)> {
     let mut rows = Vec::new();
     let mut after = String::new();
+    let mut splice = None;
     for _ in 0..LAST_PAGES_MAX {
-        let (page, _, resume) = conn.last_page(filter, &after, 256)?;
+        let (page, (next, _), resume) = conn.last_page(filter, &after, 256)?;
+        splice.get_or_insert(next);
         rows.extend(page);
         if resume.is_empty() {
-            return Ok(rows);
+            return Ok((rows, splice.unwrap_or(next)));
         }
         after = resume;
     }
@@ -5824,209 +4519,6 @@ pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// What one `feed-bin` attempt's reply MEANS about the PTY (§6.5).
-///
-/// A pure function of the reply string, kept apart from the side effects so the
-/// four outcomes can be pinned by a test that needs no aterm, no broker and no
-/// PTY. Getting this wrong is not a cosmetic error: calling an in-doubt an
-/// `applied` is a silent loss, and calling it a `refused` invites the retry the
-/// design forbids.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Verdict {
-    /// It ran. `dup` means A6's mark recognized an already-consumed sequence and
-    /// wrote NOTHING — the answer a replay of a landed keystroke gets.
-    Applied { dup: bool },
-    /// It may have typed, and nothing here can tell. Reported and stopped:
-    /// §6.5's "in-doubt, reported, never replayed".
-    InDoubt {
-        /// The sequence the endpoint named, or `-`.
-        seq: String,
-        /// Why, when the doubt is the bridge's own rather than the endpoint's.
-        why: Option<&'static str>,
-    },
-    /// Refused before anything could reach the PTY.
-    Refused { why: String },
-}
-
-impl Verdict {
-    /// A journalled feed whose record cannot be read back off the bus, so its
-    /// outcome can never be resolved. Reported once and retired — an entry kept
-    /// for a record that will not come back would replay on every attach.
-    const UNREADABLE: Verdict = Verdict::InDoubt {
-        seq: String::new(),
-        why: Some("unreadable"),
-    };
-
-    /// Whether this verdict SETTLES the record — nothing further can be learned
-    /// by asking again.
-    ///
-    /// The three that do: it ran (`applied`, `dup=1` included), the endpoint
-    /// itself declared the outcome unknowable (`ERR in-doubt` — it has kept the
-    /// mark and will answer the same thing forever), and a refusal that can never
-    /// become an acceptance because the record no longer addresses anything real.
-    ///
-    /// Everything else is TRANSIENT: `ERR halted` (a hold something will lift),
-    /// `ERR busy turn=`/`lease=` (a lease something will drop), `ERR rate` (a
-    /// floor that recovers), `ERR busy idem=` (this key's own attempt is still
-    /// inside the seam) and an aterm that did not answer at all. Retiring the
-    /// journal on any of them would be the silent loss this rung exists to end,
-    /// and asking again is safe because the key makes it safe; asking again
-    /// FOREVER is not, which is what [`FEED_BUDGET`] bounds — in seconds, not in
-    /// scheduler rounds.
-    ///
-    /// THEY ARE NOT ALL THE SAME KIND OF UNANSWERED, and a spent budget has to
-    /// tell them apart. The three REFUSALS were decided before a byte could
-    /// move, so the key's sequence was not consumed and the question is simply
-    /// unasked. The other two are not refusals at all: a silence says nothing
-    /// about the PTY, and `ERR busy idem=` says an attempt under this very key
-    /// is running right now — so [`feed_verdict`] reads both as `InDoubt` and
-    /// `FeedIntent::doubt` keeps that sticky, which is what stops an exhausted
-    /// budget from publishing `refused` over a keystroke that landed.
-    fn is_final(&self) -> bool {
-        match self {
-            Verdict::Applied { .. } => true,
-            Verdict::InDoubt { why, .. } => matches!(*why, None | Some("unreadable")),
-            // A refusal the record can never outgrow. `epoch` means the session
-            // relaunched — a different incarnation, and §6.6 says a key minted
-            // against a dead one must never land on its successor. `usage` and
-            // `no` (`ERR no such session`) mean this bridge and this endpoint
-            // disagree about what was asked, which no retry repairs.
-            Verdict::Refused { why } => matches!(why.as_str(), "epoch" | "usage" | "no"),
-        }
-    }
-
-    /// The `ev` payload this verdict is published as.
-    ///
-    /// `applied` carries §10's two fields: the offset it applied (`re=`) and the
-    /// `content_seq` baseline the screen that followed is measured from
-    /// (`seq=`). `replay=1` marks a verdict that came from the journal rather
-    /// than from a live record, so a reader can tell a repair from a first pass.
-    fn ev(&self, sid: &str, off: u64, baseline: &str, replayed: bool) -> String {
-        let tail = if replayed { " replay=1" } else { "" };
-        match self {
-            Verdict::Applied { dup } => {
-                let dup = if *dup { " dup=1" } else { "" };
-                format!("applied sid={sid} face=term re={off} seq={baseline}{dup}{tail}")
-            }
-            Verdict::InDoubt { seq, why } => {
-                let seq = if seq.is_empty() { "-" } else { seq.as_str() };
-                let why = why.map(|w| format!(" reason={w}")).unwrap_or_default();
-                format!("in-doubt sid={sid} face=term re={off} seq={seq}{why}{tail}")
-            }
-            // `re=` LIKE THE OTHER TWO. A feed verdict names the offset it is
-            // about: the record's own body carries `re=` (see
-            // [`Bridge::publish_ev_re`]), but the payload is what an `ev` reader
-            // prints, and this was the one of the three verdicts a reader could
-            // not correlate to a keystroke. It matters more now that a budget
-            // spent entirely on clean pre-write refusals is published as
-            // `refused` rather than as an `in-doubt` that always carried it.
-            //
-            // The `refused` rows the DRIVE GATE publishes (`reason=holder|hold|
-            // epoch|gen`, before anything is journalled) are a different call
-            // path — [`Bridge::publish_ev_for`] — and are unchanged: there is no
-            // journal entry behind them to correlate.
-            Verdict::Refused { why } => {
-                format!("refused sid={sid} face=term re={off} reason={why}{tail}")
-            }
-        }
-    }
-}
-
-/// Read one `feed-bin` reply.
-///
-/// `None` is an I/O failure against aterm itself — the socket died, or the reply
-/// never came. That says NOTHING about the PTY, which is the in-doubt shape seen
-/// from the other side of the socket, so it is one.
-fn feed_verdict(reply: Option<&str>) -> Verdict {
-    let Some(reply) = reply else {
-        return Verdict::InDoubt {
-            seq: String::new(),
-            why: Some("no-reply"),
-        };
-    };
-    if reply.starts_with("OK") {
-        return Verdict::Applied {
-            dup: reply.split_whitespace().any(|t| t == "dup=1"),
-        };
-    }
-    if reply.starts_with("ERR in-doubt") {
-        return Verdict::InDoubt {
-            seq: reply
-                .split_whitespace()
-                .find_map(|t| t.strip_prefix("seq="))
-                .unwrap_or_default()
-                .to_string(),
-            why: None,
-        };
-    }
-    // `ERR busy idem=<seq>` IS NOT A PRE-WRITE REFUSAL, and it is the one
-    // `ERR busy` that is not. The other two are decided before the seam — the
-    // turn lease (`turn=`) and the mirrored drive lease (`lease=`) — but this
-    // one is `pty_idem`'s own answer for a key AT the mark with a RUNNING tip:
-    // an attempt under this very key is inside the seam right now and its bytes
-    // may already be on the PTY. The bridge cannot reach that state by itself
-    // (`ctl_request` is serial), it reaches it by DYING inside the feed window
-    // and replaying the journalled key into an endpoint still writing it —
-    // which is the case this whole rung exists for.
-    //
-    // Read as a clean refusal it would be worse than useless: `reason_token`
-    // keeps only the first word, so it would arrive as `Refused{"busy"}`,
-    // indistinguishable from the lease refusals, and a budget spent entirely on
-    // it would publish `refused` — a definite non-delivery — for a keystroke
-    // that landed. A human reading that re-types, the re-type mints a NEW key,
-    // and A6's mark cannot dedupe it: the silent duplicate `pty_idem` exists to
-    // remove. So it is DOUBT, and doubt is sticky in the journal.
-    //
-    // Nothing else changes: `InDoubt` with a `why` is non-final, so the retry
-    // loop is untouched. The `idem=` clears as soon as the attempt behind it
-    // settles, and the next replay reads `OK dup=1` and is `applied`.
-    //
-    // THE SEQUENCE IT NAMES IS NOT COMPARED against this attempt's own, though
-    // it could be: `pty_idem` also answers this while refusing a HIGHER key
-    // because an older one is still running, and that one is a clean refusal of
-    // the key asked about. Reading both as doubt can only over-report doubt,
-    // which §6.5 makes a reader's problem rather than a keystroke's, and it
-    // keeps this a pure function of the reply — the same conservative direction
-    // `FeedIntent::parse` takes for a `doubt=` token it cannot find.
-    if let Some(seq) = reply.strip_prefix("ERR busy ").and_then(|rest| {
-        rest.split_whitespace()
-            .find_map(|t| t.strip_prefix("idem="))
-    }) {
-        return Verdict::InDoubt {
-            seq: seq.to_string(),
-            why: Some("in-flight"),
-        };
-    }
-    // Every other refusal. Only the FIRST word of the reason travels: a `turn`
-    // reply is a whole screen and an `ev` never carries content (§11.2).
-    Verdict::Refused {
-        why: reason_token(reply),
-    }
-}
-
-/// The floor on the gap between `screen` snapshots — §3.3's "≤ 4/s", as a
-/// period rather than a rate so the bound holds however often the loop runs.
-const SCREEN_PERIOD: Duration = Duration::from_millis(250);
-
-/// The largest `text --json` frame published on the `screen` face. A frame over
-/// it is skipped with an `ev` rather than truncated: half a frame is a document
-/// that parses and lies.
-const SCREEN_MAX: usize = 256 * 1024;
-
-/// The BACKSTOP on how many times one `term/in` is ever fed. The budget itself
-/// is [`FEED_BUDGET`].
-///
-/// A retry under A6's key cannot duplicate, so the risk either bound guards is
-/// not a double keystroke — it is a bridge that asks forever and reports
-/// nothing. The wall clock answers that for every ordinary case; this answers
-/// the one case a wall clock cannot, and it is the reason the count survives at
-/// all: a bridge that dies INSIDE the feed and is relaunched into the same
-/// journal entry can burn attempts without time passing, and a clock that
-/// stepped backwards would leave `FEED_BUDGET` unreachable. At [`FEED_RETRY`]'s
-/// cadence a 45 s budget is about 180 attempts, so this is set well above it —
-/// it is a runaway stop, not a schedule.
-const FEED_TRIES_MAX: u32 = 512;
-
 /// The default a halt with no `reason=` is held under. It still names the
 /// origin, which is the one thing a bare `state=on` record does say.
 const HALT_REASON_DEFAULT: &str = "fleet-halt";
@@ -6066,32 +4558,38 @@ fn halt_reason_token(raw: Option<&str>) -> String {
     out
 }
 
-/// The `inc=` on a presence body, if it has one.
-fn inc_of(body: &[u8]) -> Option<u64> {
-    let (b, _) = Body::decode(body);
-    b.unknown.get("inc").and_then(|s| s.parse().ok())
-}
-
-/// The prefix §6.6 row 5 mirrors a LOCAL socket driver's cooperative lease
-/// under, and the one place this file spells it.
+/// WHETHER A RETAINED ROW AT `inc` IS THIS BRIDGE'S TO RETIRE.
 ///
-/// It is minted by `handoff::decide_control`'s row-5 arm
-/// (`format!("owner-cli:{holder}")`) and read back here by [`is_mirrored`]:
-/// `bridge::tests::the_mirror_prefix_is_the_one_decide_control_mints` fails if
-/// the two ever drift, because a holder this side stopped recognising would be
-/// a holder [`Bridge::acquire_lease`] starts taking a `fabric:` lease for.
-const MIRRORED_PREFIX: &str = "owner-cli:";
-
-/// Whether a `control` holder is §6.6 row 5's MIRROR of a lease a local socket
-/// driver already holds, rather than a fabric principal this bridge holds
-/// anything for.
+/// The predicate the ghost sweep turns on, split out so it can be tested
+/// without two bridges and a broker. Three answers, and the default is no:
 ///
-/// A mirror is an OBSERVATION the bridge published, never a hold it took. Every
-/// path that would act on a holder as though the bridge owned it — taking
-/// aterm's cooperative lease, releasing it, and §6.6 row 4's conservative pause
-/// — asks this question first.
-fn is_mirrored(holder: &str) -> bool {
-    holder.starts_with(MIRRORED_PREFIX)
+/// * `Some(inc) == self_inc` — this incarnation published the row itself and
+///   does not host the session, so it is a ghost of our own making.
+/// * `Some(inc) == witnessed_dead` — an incarnation whose WILL this bridge saw
+///   on the node face when it attached. A will fires only on disconnect, so
+///   that record is proof the process behind it is gone.
+/// * anything else, `None` included — refuse. A row with no `inc=` cannot be
+///   attributed at all, and a row from an incarnation whose death nobody
+///   witnessed may belong to a sibling that is alive right now.
+///
+/// ROUND 21 SHIPPED THIS AS `inc > self_inc => skip`, WHICH IS THE WRONG WAY
+/// ROUND. `self.inc` is `max(local, bus) + 1`, so a bridge attaching SECOND on
+/// a shared state dir always outranks the first: the older sibling's rows are
+/// ALL below it, and all of them were retired after five minutes, alive or not.
+/// The guard read as though it protected a sibling and in fact protected only a
+/// FUTURE one, which cannot exist while this process is the one sweeping.
+///
+/// AND THE OBVIOUS REPAIR IS ALSO WRONG. `inc <= witnessed_dead` looks like the
+/// generous reading of "and everything older" — but a surviving OLDER sibling
+/// does not rewrite the node face when a younger one's will fires, so a node
+/// face reading `state=gone inc=K` proves K dead and says nothing whatever
+/// about `K-1`. The equality is the whole of what is proven, so the equality is
+/// what is used.
+fn adoptable(inc: Option<u64>, self_inc: u64, witnessed_dead: Option<u64>) -> bool {
+    match inc {
+        Some(inc) => inc == self_inc || witnessed_dead == Some(inc),
+        None => false,
+    }
 }
 
 /// The principal whose REPLY a record published at `subject` is — the owner
@@ -6383,7 +4881,6 @@ where
             match sub.recv() {
                 Ok(Some(rec)) => match source {
                     Source::Fleet => mailbox.push_fleet(rec, generation),
-                    Source::Term => mailbox.push_term(rec, generation),
                     Source::Inbox => mailbox.push_inbox(rec, generation),
                     Source::Aterm => {}
                 },
@@ -6460,6 +4957,55 @@ mod tests {
         assert_eq!(trust_of("h-andrew", true), "relayed");
     }
 
+    /// **AN OLDER LIVE SIBLING'S ROWS ARE NEVER RETIRED — the two-bridges,
+    /// one-node case, at unit level.**
+    ///
+    /// Two bridges CAN share a state dir and therefore a node id; `fabric.rs`
+    /// records the measured 2026-09-14 case where one did. The pair is
+    /// pathological but it is reachable, and the sweep publishes `state=exited`
+    /// over somebody's presence row, so the guard is the difference between
+    /// retiring a ghost and taking a live agent off the fleet roster.
+    ///
+    /// ROUND 21'S GUARD GOT THIS BACKWARDS and the shape of the mistake is worth
+    /// keeping: it skipped `inc > self.inc`, which reads as "do not touch a
+    /// sibling" and in fact means "do not touch a FUTURE incarnation" — one that
+    /// cannot exist while this process is the one sweeping. Because `self.inc`
+    /// is `max(local, bus) + 1`, the bridge that attaches SECOND always
+    /// outranks the first, so every row the older LIVE sibling had published was
+    /// below the guard and was retired after five minutes.
+    ///
+    /// Driven through [`adoptable`] rather than through two real bridges: what
+    /// is being asserted is the predicate, and a second broker, a second aterm
+    /// and a shared state dir would make a slow test of a fast question.
+    #[test]
+    fn only_this_incarnation_and_a_witnessed_dead_one_are_adoptable() {
+        // B attached second on a shared state dir: A is inc 1 and ALIVE, B is
+        // inc 2, and B saw a LIVE node row at attach, so it witnessed no death.
+        let (a_live, b) = (1, 2);
+        assert!(
+            !adoptable(Some(a_live), b, None),
+            "an older sibling that is still running had its sessions retired"
+        );
+        // B's own rows for sessions it does not host are B's to retire.
+        assert!(adoptable(Some(b), b, None));
+        // A DEATH IT WITNESSED. B attaches, finds the node face carrying A's
+        // will (`state=gone inc=1`), and may retire exactly A's rows.
+        assert!(adoptable(Some(a_live), b, Some(a_live)));
+        // AND ONLY THAT ONE. A will proves the incarnation it names is gone and
+        // says nothing about any other, because a surviving older sibling does
+        // not rewrite the node face when a younger one's will fires.
+        assert!(
+            !adoptable(Some(1), 3, Some(2)),
+            "`inc <= witnessed` is the generous reading, and it is not proven"
+        );
+        // A FUTURE incarnation is still refused, which the old guard did get right.
+        assert!(!adoptable(Some(9), b, None));
+        assert!(!adoptable(Some(9), b, Some(a_live)));
+        // A row with no `inc=` cannot be attributed to anyone.
+        assert!(!adoptable(None, b, Some(a_live)));
+        assert!(!adoptable(None, b, None));
+    }
+
     /// **EVERY PER-SID MAP ON `Bridge` IS RECONCILED WITH THE LIVE ROSTER.**
     ///
     /// aterm ships no evidence manifest, so a bound that is not enforced
@@ -6471,9 +5017,14 @@ mod tests {
     /// resident footprint grew with every tab ever opened for the life of the
     /// instance.
     ///
-    /// This reads the struct rather than a list, so the SEVENTH map is covered
-    /// the day it is added — which is the shape of the mistake, not the
-    /// instance of it.
+    /// This reads the STRUCT rather than a list, so the next map is covered the
+    /// day it is added — which is the shape of the mistake, not the instance of
+    /// it. Round 21 proved both halves in one round: it ADDED `ghosts` and this
+    /// test caught it on the first run (it is the exception that proves the
+    /// rule, named in the loop with the reason its entries must outlive their
+    /// session), and it REMOVED three — `holders` and `pending` with the drive
+    /// face, `screen_gen` with the screen face — which is why the closing
+    /// assertion no longer counts them.
     #[test]
     fn every_per_sid_map_is_pruned_to_the_roster() {
         let src = include_str!("bridge.rs");
@@ -6484,19 +5035,30 @@ mod tests {
             .split_once("\n}\n")
             .expect("and it ends")
             .0;
-        let mut checked = 0;
+        let mut checked: Vec<&str> = Vec::new();
         for line in body.lines() {
             let line = line.trim();
             // `<name>: BTreeMap<String, …>` — a map keyed by a sid. The two
             // maps keyed by something else (`halts` is per HUMAN, `locals` is
-            // aterm's own local id) are named in the exception below.
+            // aterm's own local id) are named in the exception below, and so is
+            // the one map whose entries EXIST because their session is not in
+            // the roster.
             let Some((name, _)) = line.split_once(": BTreeMap<String, ") else {
                 continue;
             };
-            if matches!(name, "halts") {
+            // `ghosts` IS reconciled, and deliberately not against `live`: it
+            // dates sids the bridge has seen advertised on the bus with NO
+            // local session hosting them ([`Bridge::retire_ghost_presence`]),
+            // so a retain against the roster would empty it on every round and
+            // the five-minute patience it exists to measure could never
+            // elapse. Its own reconciliation is against the set still seen
+            // unhosted this sweep — `self.ghosts.retain(|sid, _|
+            // unhosted.contains(sid))` — which is the same bound this test is
+            // about, taken against the right set.
+            if matches!(name, "halts" | "ghosts") {
                 continue;
             }
-            checked += 1;
+            checked.push(name);
             assert!(
                 src.contains(&format!("self.{name}.retain(|sid, _| live.contains(sid))")),
                 "`{name}` is keyed by a sid and nothing reconciles it with the roster: \
@@ -6504,7 +5066,23 @@ mod tests {
                  departed session's entry must outlive the session"
             );
         }
-        assert!(checked >= 6, "the struct's per-sid maps were not found");
+        // THE SCAN ITSELF STILL WORKS — asserted by NAME, not by a count.
+        //
+        // This line used to be `checked >= 6`, then `>= 4` after round 21's
+        // drive-face cut took `holders` and `pending`, and it would have gone
+        // to `>= 3` an hour later when the `--screen` cut took `screen_gen`. A
+        // number that has to be edited by every cut is not a guard, it is a
+        // chore that eventually gets edited without being thought about. What
+        // the floor was ever FOR is catching a loop that silently stopped
+        // matching the struct — a field reformatted onto two lines, a type
+        // alias, a rename — and `epochs` answers that: it is the sid set this
+        // node hosts, the one map here that cannot go without the bridge losing
+        // its roster.
+        assert!(
+            checked.contains(&"epochs"),
+            "the field scan matched no `epochs` — this loop has stopped reading \
+             the struct and is checking nothing: {checked:?}"
+        );
         // AND THE QUEUE BESIDE THEM, which is a set rather than a map and would
         // have slipped through the loop above.
         assert!(src.contains("self.pending_admit.retain(|sid| live.contains(sid))"));
@@ -6554,16 +5132,13 @@ mod tests {
             "the idle arm and `cmd_outbox`'s drain budget both name this function as \
              the outbox's backstop; it must actually drain it"
         );
-        // And the local sweep's header must not describe the pre-`LOCAL_OBSERVE`
-        // shape: it visits EVERY session, and row 5's arm is the one for a
-        // session with no holder — the case the old text said cost nothing.
-        assert!(
-            !src.contains(concat!(
-                "both are read here, on the roster tick, ",
-                "for the sessions that HAVE a"
-            )),
-            "row 4 moved to `watch_held_control`, and row 5 needs the sessions with NO holder"
-        );
+        // THE ROW-4/ROW-5 PIN WENT WITH ROWS 4 AND 5. It asserted the local
+        // sweep's header did not describe a pre-`LOCAL_OBSERVE` shape, and named
+        // `watch_held_control` as where row 4 had moved to. Round 21 cut the
+        // drive face, and both rows and that function with it, so the negative
+        // pin now guards prose that cannot come back and names a function that
+        // does not exist — the same "green run over an empty set" this test
+        // removed for `SCREEN_PERIOD` a few lines above.
     }
 
     /// **`host=` HAS A WRITER ON THE PLATFORM THIS SHIPS ON.**
@@ -6597,49 +5172,6 @@ mod tests {
             !host.is_empty() && !host.contains(char::is_whitespace),
             "{host:?}"
         );
-    }
-
-    /// **THE MIRROR PREFIX THIS FILE READS IS THE ONE `decide_control` MINTS.**
-    ///
-    /// [`is_mirrored`] is the guard on three things that must never happen to a
-    /// §6.6 row-5 holder: taking aterm's cooperative lease for it, releasing
-    /// that lease, and row 4's conservative pause. All three read a PREFIX, and
-    /// the string is minted in `handoff.rs` — two files, one literal. If the
-    /// table's spelling ever moves, this side stops recognising a mirror and
-    /// [`Bridge::renew_leases`] goes straight back to asking aterm for a lease
-    /// a local driver already holds, every ten seconds, forever.
-    #[test]
-    fn the_mirror_prefix_is_the_one_decide_control_mints() {
-        let free = handoff::State {
-            holder: None,
-            holder_live: true,
-            halted: false,
-        };
-        let Decision::Hold {
-            holder, evidence, ..
-        } = decide_control(
-            &free,
-            &HandoffEvent::LocalLease {
-                holder: "drv-7".to_string(),
-            },
-        )
-        else {
-            panic!("row 5 mirrors a local lease as a Hold");
-        };
-        assert_eq!(evidence, "lease");
-        assert!(
-            is_mirrored(&holder),
-            "the mirror `{holder}` must be recognised by this file's own predicate"
-        );
-        // AND NOTHING ELSE IS A MIRROR. A fabric principal and the pause are
-        // the two holders that must keep their existing treatment.
-        assert!(!is_mirrored("h-andrew"));
-        assert!(!is_mirrored("s-abcdef0123456789"));
-        assert!(!is_mirrored(handoff::PAUSED));
-        // The claim row 4's skip rests on: no cap-forced `<src>` can ever equal
-        // a mirrored holder, so a mirrored session applies nothing off the bus
-        // — the same reason the pause is safe.
-        assert!(!subject::is_principal(&holder));
     }
 
     /// The `outbox` frame parses back, bodies with newlines included, and a
@@ -6790,161 +5322,6 @@ mod tests {
         assert_eq!(caps[0].tag, vec![0x0a, 0x0b]);
         assert_eq!(caps[1].grant, "rw,p=n-1:/f/F/in/>");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A minted node id is `n-` plus sixteen lowercase hex digits — a principal
-    /// by §3.2's grammar, so it can be a subject segment and a cap principal
-    /// without any further escaping.
-    /// THE FOUR ANSWERS OF §6.5, READ CORRECTLY. Every one of these mappings is
-    /// a safety decision: an in-doubt read as an `applied` is a keystroke
-    /// silently lost, an in-doubt read as a `refused` invites the retry the
-    /// design forbids, and a `dup=1` read as a fresh apply would tell the
-    /// conservative pause that this bridge caused a screen change it did not.
-    #[test]
-    fn a_feed_reply_is_read_as_exactly_one_of_the_four_answers() {
-        assert_eq!(
-            feed_verdict(Some("OK 7 bytes")),
-            Verdict::Applied { dup: false }
-        );
-        assert_eq!(
-            feed_verdict(Some("OK dup=1")),
-            Verdict::Applied { dup: true }
-        );
-        assert_eq!(
-            feed_verdict(Some("ERR in-doubt seq=41")),
-            Verdict::InDoubt {
-                seq: "41".to_string(),
-                why: None
-            }
-        );
-        // aterm did not answer: nothing is known about the PTY, so it is doubt.
-        assert_eq!(
-            feed_verdict(None),
-            Verdict::InDoubt {
-                seq: String::new(),
-                why: Some("no-reply")
-            }
-        );
-        // `ERR busy turn=` and `ERR epoch` are ordinary refusals — decided
-        // before the seam, so the endpoint never claimed the sequence. `ERR
-        // busy idem=` is NOT one of them, and this test used to say it was:
-        // see `a_busy_that_names_the_mark_is_doubt_and_not_a_refusal`.
-        assert_eq!(
-            feed_verdict(Some("ERR busy turn=3")),
-            Verdict::Refused {
-                why: "busy".to_string()
-            }
-        );
-        assert_eq!(
-            feed_verdict(Some("ERR epoch")),
-            Verdict::Refused {
-                why: "epoch".to_string()
-            }
-        );
-        // ONLY THE FIRST WORD travels. A `turn` reply can be a whole screen and
-        // an `ev` never carries content.
-        assert_eq!(
-            feed_verdict(Some("ERR halted reason=main%20broken origin=fleet")),
-            Verdict::Refused {
-                why: "halted".to_string()
-            }
-        );
-        // A body token spelled `dup=1` inside something else is not a dup: the
-        // reply is split on whitespace, not searched for a substring.
-        assert_eq!(
-            feed_verdict(Some("OK 4 bytes nodup=1")),
-            Verdict::Applied { dup: false }
-        );
-    }
-
-    /// The `ev` each verdict is published as — §10's `applied re=<M> seq=<n>`
-    /// included, with `re=` also carried as a BODY field by the publisher so a
-    /// reader rebuilds the edge structurally rather than by string-searching a
-    /// pct-encoded payload.
-    #[test]
-    fn a_verdict_renders_the_ev_row_section_ten_asks_for() {
-        let sid = "s-abc";
-        assert_eq!(
-            Verdict::Applied { dup: false }.ev(sid, 900, "42", false),
-            "applied sid=s-abc face=term re=900 seq=42"
-        );
-        assert_eq!(
-            Verdict::Applied { dup: true }.ev(sid, 900, "42", true),
-            "applied sid=s-abc face=term re=900 seq=42 dup=1 replay=1"
-        );
-        assert_eq!(
-            Verdict::InDoubt {
-                seq: "901".to_string(),
-                why: None
-            }
-            .ev(sid, 900, "-", true),
-            "in-doubt sid=s-abc face=term re=900 seq=901 replay=1"
-        );
-        assert_eq!(
-            Verdict::UNREADABLE.ev(sid, 900, "-", true),
-            "in-doubt sid=s-abc face=term re=900 seq=- reason=unreadable replay=1"
-        );
-        assert_eq!(
-            Verdict::Refused {
-                why: "holder".to_string()
-            }
-            .ev(sid, 900, "-", false),
-            // `re=` LIKE THE OTHER TWO: a feed verdict names the keystroke it
-            // is about, in the payload an `ev` reader prints.
-            "refused sid=s-abc face=term re=900 reason=holder"
-        );
-    }
-
-    /// **AN `ERR busy` THAT NAMES THE MARK IS DOUBT, NOT A REFUSAL — and it is
-    /// the only `ERR busy` that is.**
-    ///
-    /// `ERR busy turn=` and `ERR busy lease=` are decided before the seam, so a
-    /// budget spent entirely on them is published as `refused`: recoverable, and
-    /// true. `ERR busy idem=<seq>` is `pty_idem`'s answer for a key AT the mark
-    /// with a RUNNING tip — an attempt under this very key is inside the seam
-    /// and its bytes may already be on the PTY. `reason_token` keeps only the
-    /// first word, so read as a refusal it is INDISTINGUISHABLE from the other
-    /// two, and an exhausted budget would publish `refused` — a definite
-    /// non-delivery — for a keystroke that landed. The re-type that invites
-    /// mints a new key, which A6's mark cannot dedupe: the silent duplicate.
-    ///
-    /// So it is `InDoubt`, which is what sets `FeedIntent::doubt`, which is what
-    /// keeps the exhausted verdict `in-doubt … reason=unresolved`. The last
-    /// three assertions are that condition, read out of `record_feed_outcome`.
-    #[test]
-    fn a_busy_that_names_the_mark_is_doubt_and_not_a_refusal() {
-        let in_flight = feed_verdict(Some("ERR busy idem=41"));
-        assert_eq!(
-            in_flight,
-            Verdict::InDoubt {
-                seq: "41".to_string(),
-                why: Some("in-flight")
-            }
-        );
-        // Non-final, so the retry loop is exactly as it was: the `idem=` clears
-        // when the attempt behind it settles, and the next replay reads
-        // `OK dup=1`.
-        assert!(
-            !in_flight.is_final(),
-            "an attempt still inside the seam is asked about again"
-        );
-        // The other two `ERR busy` shapes are refusals, and keep their word.
-        for reply in ["ERR busy turn=7", "ERR busy lease=agent-a"] {
-            assert_eq!(
-                feed_verdict(Some(reply)),
-                Verdict::Refused {
-                    why: "busy".to_string()
-                },
-                "{reply}"
-            );
-        }
-        // THE CONDITION THE EXHAUSTED VERDICT TURNS ON, as `record_feed_outcome`
-        // computes it: a history of lease refusals publishes `refused`, and one
-        // `ERR busy idem=` anywhere in it does not.
-        let doubt = |v: &Verdict| matches!(v, Verdict::InDoubt { .. });
-        assert!(!doubt(&feed_verdict(Some("ERR busy turn=7"))));
-        assert!(doubt(&in_flight));
-        assert!(doubt(&feed_verdict(None)));
     }
 
     /// A LOST VERB LANE BECOMES THE LOOP'S EXIT, and a refused line does not.
@@ -7171,10 +5548,7 @@ mod tests {
         // itself: the assertion passed unchanged on a tree whose header still
         // cited the name that never existed, which is the exact defect it was
         // added to close.
-        let cited = concat!(
-            "no_inbox_record_ever_reaches_the_pty",
-            "_and_a_stale_epoch_is_refused"
-        );
+        let cited = concat!("no_bus_record_ever", "_reaches_a_pty");
         let header: String = src
             .lines()
             .take_while(|l| l.starts_with("//") || l.trim().is_empty())
@@ -7182,33 +5556,40 @@ mod tests {
             .join("\n");
         assert!(
             header.contains(cited),
-            "the module header must cite the test that guards the one path to a PTY"
+            "the module header must cite the test that holds the claim that NO bus \
+             record reaches a PTY"
         );
         assert!(
             include_str!("../tests/bridge_e2e.rs").contains(&format!("fn {cited}")),
             "the cited guard must exist under exactly that name"
         );
-        // Split so this test's own prose is not the counterexample.
-        assert!(
-            !src.contains(concat!("It runs ", "ONCE")),
-            "the replay runs at every attach, on the loop's retry deadline and \
-             on the idle roster round, bounded by FEED_BUDGET"
-        );
-        assert!(
-            src.contains("bounded by [`FEED_BUDGET`]"),
-            "the retry budget must be stated, as a DURATION, where the replay is documented"
-        );
-        // THE SCREEN FACE'S RATE BOUND IS PER SUBJECT. The bullet used to state
-        // §3.3's "≤ 4/s" as a per-node aggregate while the shared clock gates
-        // the SWEEP and every changed session publishes inside it — 4N/s under
-        // `--screen all`, on the one face that carries screen CONTENT and the
-        // one §14 names the largest retention risk. Split so this test's own
-        // prose is not the counterexample.
-        assert!(
-            !src.contains(concat!("per [`SCREEN_PERIOD`] across", " all")),
-            "the screen face's rate bullet must not restate a per-subject \
-             bound as a per-node aggregate"
-        );
+        // AND NOTHING FEEDS A PTY ANY MORE, which is a claim this test can check
+        // over the source rather than take on trust. Round 21 cut `feed`,
+        // `on_term_record` and `resolve_pending_feed`; the two assertions that
+        // used to pin the replay's retry budget went with them, because a bound
+        // on a thing that no longer exists is the "green run over an empty set"
+        // this test was written against. Split so this prose is not the
+        // counterexample.
+        for gone in [
+            concat!("fn ", "feed", "("),
+            concat!("fn ", "on_term_record"),
+            concat!("fn ", "resolve_pending_feed"),
+        ] {
+            assert!(
+                !src.contains(gone),
+                "`{gone}` is back: the module header claims no bus record reaches a \
+                 PTY by any path, and that claim is now the absence of these"
+            );
+        }
+        // THE SCREEN FACE'S RATE PIN WENT WITH THE SCREEN FACE. It asserted
+        // that the header did NOT restate §3.3's per-subject "≤ 4/s" as a
+        // per-node aggregate — a real defect while `--screen all` could publish
+        // 4N/s of screen CONTENT onto an append-forever log. Round 21 deleted
+        // `SCREEN_PERIOD`, `publish_screens` and the flag, so the assertion
+        // became a negative pin over prose that cannot come back: a green run
+        // over an empty set, which is the exact thing the paragraph twelve lines
+        // above says this test removed. It is removed here rather than left to
+        // read as coverage.
         // EVERY FILE THIS CRATE SHIPS, read from the directory rather than from a
         // list — a list would silently stop covering the next file added, which
         // is the same shape of gap as scanning one file for a crate-wide claim.
@@ -7400,6 +5781,9 @@ mod tests {
         );
     }
 
+    /// A minted node id is `n-` plus sixteen lowercase hex digits — a principal
+    /// by §3.2's grammar, so it can be a subject segment and a cap principal
+    /// without any further escaping.
     #[test]
     fn a_minted_node_id_is_a_principal() {
         let id = mint_node_id();

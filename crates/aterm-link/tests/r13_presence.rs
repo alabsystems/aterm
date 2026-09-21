@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use harness::{World, FLEET};
+use harness::{until, World, FLEET};
 
 /// The words that must never leave the screen.
 const SENTINEL: &str = "SECRET-TRANSCRIPT-TEXT";
@@ -43,6 +43,100 @@ fn presence(w: &World, sid: &str) -> Option<String> {
     rows.iter()
         .find(|(_, s, _)| *s == subject)
         .map(|(_, _, b)| String::from_utf8_lossy(b).into_owned())
+}
+
+/// **A PRESENCE ROW NOTHING HOSTS IS RETIRED, AND A LIVE ONE IS NOT.**
+///
+/// The ghost: a `state=live` session row under this machine's node that no
+/// instance here hosts. `aterm fabric status` has always been able to SEE one
+/// — it is the warning "the bus advertises @<sid> live on <node> … but no
+/// aterm instance here hosts it: mail to it is undeliverable", which was
+/// standing on the owner's own machine for s-d5a5de326f33873b6167 when this
+/// round began — and nothing could ever clear it. An ordinary exit publishes
+/// `state=exited` two ways over, but an instance that dies takes its bridge
+/// with it, and the only `Will` in the crate is on the NODE face, so every
+/// session row under it stays retained at `state=live` forever.
+///
+/// THE TWO ROWS THIS MUST TELL APART are both unhosted by THIS bridge. One
+/// carries an `inc=` at or below the bridge's own — an incarnation it
+/// succeeded, which is dead by construction. The other carries a higher one: a
+/// bridge that attached AFTER this one, on a node id they share, whose
+/// sessions are alive and none of this bridge's business. Retiring the second
+/// would take a live agent off the fleet, so the guard is not decoration.
+#[test]
+fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() {
+    let w = World::boot_with(
+        "r21ghost",
+        &[],
+        &[("ATERM_LINK_FAULT", "sweep-ghosts-at-once-while-marked")],
+    );
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+
+    // TWO ROWS THIS BRIDGE DID NOT WRITE AND DOES NOT HOST. `inc=1` is at or
+    // below any attached bridge's own; `inc=99999` is a successor's.
+    let ghost = "s-deadbeefdeadbeefdead";
+    let sibling = "s-cafecafecafecafecafe";
+    let mut god = w.god();
+    for (n, (sid, inc)) in [(ghost, 1u64), (sibling, 99_999)].iter().enumerate() {
+        let subject = format!("/f/{FLEET}/pub/{}/{sid}/presence", w.node);
+        god.publish(
+            7_100 + n as u64,
+            1,
+            &subject,
+            format!("v=1 t=1 inc={inc} epoch=- gen=- state=live hold=0 holder=- attention=-")
+                .as_bytes(),
+        )
+        .expect("publish the retained row");
+    }
+    for sid in [ghost, sibling] {
+        assert_eq!(
+            presence(&w, sid).as_deref().and_then(|b| kv(b, "state")),
+            Some("live"),
+            "the row starts live: {sid}"
+        );
+    }
+
+    // THE SWEEP, WITH ITS FIVE-MINUTE PATIENCE COLLAPSED AND NOTHING ELSE
+    // CHANGED.
+    let marker = w.state.join("sweep-ghosts-now");
+    std::fs::write(&marker, b"1\n").expect("arm the impatient sweep");
+    until("the unhosted row to be retired", || {
+        let body = presence(&w, ghost)?;
+        (kv(&body, "state") == Some("exited")).then_some(())
+    });
+
+    // AND THE TWO IT MUST NOT TOUCH. Give the sweep several more rounds first,
+    // so this is "it ran and left them alone", not "it had not got there yet".
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        presence(&w, sibling)
+            .as_deref()
+            .and_then(|b| kv(b, "state")),
+        Some("live"),
+        "a NEWER incarnation's session is not this bridge's to retire"
+    );
+    assert_eq!(
+        presence(&w, &a).as_deref().and_then(|b| kv(b, "state")),
+        Some("live"),
+        "a session this bridge actually hosts is never swept"
+    );
+    std::fs::remove_file(&marker).expect("disarm the impatient sweep");
+
+    // ONE RECORD PER GHOST, ONCE. Presence is a last-value face on an
+    // append-forever log; a sweep that republished on its clock would be one
+    // record per dead session per minute, forever.
+    let subject = format!("/f/{FLEET}/pub/{}/{ghost}/presence", w.node);
+    let retirements = {
+        let mut c = w.god();
+        let (rows, _) = c
+            .fetch(0, &subject, 256)
+            .expect("fetch the ghost's subject");
+        rows.iter()
+            .filter(|(_, _, b)| String::from_utf8_lossy(b).contains("state=exited"))
+            .count()
+    };
+    assert_eq!(retirements, 1, "exactly one retirement record");
 }
 
 /// Wait for the row to carry `key=value`, asserting on every read that no
@@ -187,7 +281,7 @@ fn a_sessions_presence_row_carries_role_detail_phase_context_and_title_and_never
     assert!(!body.contains(SENTINEL), "{body}");
 
     // THE WHOLE ROSTER, not just this row: no presence body on the bus
-    // carries a word of any screen. (The screen face is opt-in and off.)
+    // carries a word of any screen. (Round 21 cut the screen face; nothing publishes it.)
     let mut c = w.god();
     let filter = format!("/f/{FLEET}/pub/*/*/presence");
     let (rows, _) = c.last(&filter, "", 64).expect("the roster");

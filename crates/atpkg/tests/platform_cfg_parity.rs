@@ -1,77 +1,43 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! PLATFORM-CFG PARITY: a `crate::<module>::<item>` reference must still RESOLVE on every
+//! Platform-cfg parity: a `crate::<module>::<item>` reference must still resolve on every
 //! target `atpkg` is compiled for.
 //!
-//! THE CLASS THIS GUARDS. `#[cfg(unix)]` on a definition is invisible from a Unix box. The
-//! crate builds, the tests pass, `tippy` is quiet, and the only reader that ever disagrees is
-//! a compiler on the other side of the cfg — which, on a tree with no CI and a fleet that
-//! develops on macOS, is a compiler nobody runs until a release cut. Two live instances were
-//! found on 2026-09-16, both written and merged from macOS, both one missing attribute:
+//! `#[cfg(unix)]` on a definition is invisible from a Unix box — the crate builds, the tests
+//! pass, `tippy` is quiet, and the only reader that disagrees is a compiler this macOS fleet
+//! runs at a release cut. A helper gated `unix` with no `not(unix)` twin, called from an
+//! ungated caller, stops `atpkg` compiling for `x86_64-pc-windows-msvc`; a test that loses
+//! its `#[cfg(target_os = "macos")]` while calling a macOS-only helper costs the whole
+//! unit-test binary on Linux and Windows. Both shapes have been live here.
 //!
-//!   * `crate::seam::is_real_dir` was `#[cfg(unix)]` with no `not(unix)` twin while
-//!     [`atpkg::compat::ensure_root_with`] — which carries no cfg at all — called it, so
-//!     `atpkg` did NOT COMPILE for `x86_64-pc-windows-msvc`: `error[E0425]: cannot find
-//!     function `is_real_dir` in module `crate::seam``. Every other Unix-gated helper in
-//!     `seam.rs` has a `not(unix)` twin; that one did not. `atpkg` is one of the eighteen
-//!     first-party crates the `win` cell's floor row counts as covered
-//!     (tools/cross-cell-gate.tsv, `floor win 147`), so it was a regression against a
-//!     RECORDED floor that nothing on a Unix box could see.
-//!   * `doctor`'s `a_tracked_install_record_is_reported_as_the_cause` lost the
-//!     `#[cfg(target_os = "macos")]` its sibling `provenance_tagged_executables_and_shims_
-//!     warn_but_exit_zero` carries, while still calling
-//!     `crate::provenance::set_xattr_for_test` — which is `#[cfg(all(test, target_os =
-//!     "macos"))]`, because it calls the six-argument Darwin `setxattr`. So `cargo test -p
-//!     atpkg` did not BUILD on Linux or Windows, and what was lost is the whole unit-test
-//!     binary, not one test. THIS FILE FOUND THAT ONE: it was written for the first defect
-//!     and went red on the second before a human knew it was there.
+//! The law: for every reference spelled `crate::<module>::<name>` resolving to an item
+//! declared in that module's own file, at least one declaration of the name must survive
+//! wherever the reference site survives. A name whose declarations cover both sides of a
+//! predicate (`unix` + `not(unix)`, the twin shape `seam.rs` uses four times over) is exempt,
+//! as is one with any declaration carrying no platform cfg.
 //!
-//! WHY HERE AND NOT ONLY IN `gate cells`. `cargo xtask gate cells` is the repo's AUTHORITY on
-//! this question — it really cross-compiles the four cells and ratchets a per-triple package
-//! floor — and it stays the authority. But it is opt-in (not in `gate all`'s roster), it needs
-//! each triple's std installed, and it costs minutes. This file is the cheap standing guard
-//! that rides along with `cargo test -p atpkg` on whatever box the change is being written on:
-//! pure `std`, no subprocess, no network, no new dependency, reading only committed sources
-//! under `CARGO_MANIFEST_DIR`. It cannot replace a real cross-compile and does not claim to.
-//!
-//! THE LAW. For every reference spelled `crate::<module>::<name>` (or `crate::<name>` for the
-//! crate root) that resolves to an item DECLARED in that module's own file: at least one
-//! declaration of that name must survive wherever the reference site itself survives. A name
-//! whose declarations already cover both sides of a predicate (`unix` + `not(unix)` — the twin
-//! shape `seam.rs` uses four times over) is exempt by construction, and so is a name with any
-//! declaration carrying no platform cfg at all.
-//!
-//! SCOPE AND LIMITS, said out loud so a green run is not read as more than it is:
-//!
-//!   * Only `crate::`-qualified paths are judged. A bare in-scope call is not, because
-//!     deciding whether a bare name is an item or a local needs a real resolver, and a guard
-//!     that guesses fails on a day nobody was editing cfgs. Both defects above were spelled
-//!     `crate::`, and that is the crate's dominant spelling.
-//!   * Only `atpkg`. The class is repo-wide; this is the crate the two defects landed in.
-//!   * The cfg algebra is deliberately shallow: `all(…)` on the reference side is split into
-//!     conjuncts, `any(…)` on the declaration side into disjuncts, and a declaration is
-//!     usable when each of its conjuncts is met. Anything subtler than that is treated as
-//!     COVERED, never as a violation — this guard would rather miss than cry wolf, because a
-//!     false red teaches people to delete it.
-//!   * A construct whose extent the lexer cannot pin (a `cfg`'d match arm, say) over-gates
-//!     rather than under-gates, for the same reason.
-//!
-//! Those limits are why `the_scan_still_sees_the_crate` exists: a scanner that quietly stopped
-//! finding anything would otherwise pass forever.
+//! `cargo xtask gate cells` really cross-compiles and stays the authority; this rides along
+//! with `cargo test -p atpkg`, reading only committed sources under `CARGO_MANIFEST_DIR`.
+//! Only `crate::`-qualified paths are judged (a bare name needs a real resolver), only
+//! `atpkg`, and the cfg algebra is shallow: anything subtler than `all`/`any` split into
+//! conjuncts and disjuncts is treated as covered rather than as a violation, because a false
+//! red teaches people to delete the guard. Hence `the_scan_still_sees_the_crate`: a scanner
+//! that quietly stopped finding anything would otherwise pass for ever.
+//! violation, because a false red teaches people to delete the guard; a construct whose
+//! extent the lexer cannot pin over-gates rather than under-gates, for the same reason. Those
+//! limits are why `the_scan_still_sees_the_crate` exists: a scanner that quietly stopped
+//! finding anything would otherwise pass for ever.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-// ---------------------------------------------------------------------------
-// THE LAW
-// ---------------------------------------------------------------------------
+// The law
 
-/// `cfg` keys that name a TARGET rather than a build choice. A predicate mentioning none of
+/// `cfg` keys that name a target rather than a build choice. A predicate mentioning none of
 /// these (`test`, `feature = "x"`, `debug_assertions`) is still tracked — it is part of what
-/// a reference site survives — but it never by itself makes a declaration this file's
-/// business.
+/// a reference site survives — but never by itself makes a declaration this file's business.
 const PLATFORM_KEYS: &[&str] = &[
     "unix",
     "windows",
@@ -210,9 +176,7 @@ fn mentions_platform(pred: &str) -> bool {
     PLATFORM_KEYS.iter().any(|key| contains_word(pred, key))
 }
 
-// ---------------------------------------------------------------------------
-// THE SCAN
-// ---------------------------------------------------------------------------
+// The scan
 
 /// One item declaration and the `cfg` predicates standing over it, outermost first.
 struct Decl {
@@ -260,9 +224,9 @@ impl Scan {
                 continue;
             }
             if let Some(pred) = cfg_predicate(trimmed) {
-                // Read the predicate off the line AS WRITTEN where that parses: the blanked
-                // copy has lost `"macos"` out of `target_os = "macos"`, and a diagnostic that
-                // says `target_os=` names nothing a reader can go and look at.
+                // Read the predicate off the line as written where that parses: the blanked
+                // copy has lost `"macos"` out of `target_os = "macos"`, which a diagnostic
+                // needs to name a site a reader can go and look at.
                 pending.push(cfg_predicate(written.trim()).unwrap_or(pred));
                 active.push(flatten(&stack));
                 continue;
@@ -284,7 +248,7 @@ impl Scan {
                     gates: flatten(&stack),
                 });
             }
-            // Recorded BEFORE the line's own braces are consumed, so the first line of a
+            // Recorded before the line's own braces are consumed, so the first line of a
             // gated statement counts as standing inside its own gate.
             active.push(flatten(&stack));
             for (at, ch) in line.char_indices() {
@@ -353,7 +317,7 @@ fn cfg_predicate(trimmed: &str) -> Option<String> {
 
 /// The name an item declaration binds, at any indentation: the first item keyword followed by
 /// an identifier. A spurious hit (an associated `type` in an `impl`, a nested `fn`) can only
-/// ADD a declaration, and an extra declaration only ever makes the law more permissive.
+/// add a declaration, and an extra declaration only ever makes the law more permissive.
 fn item_name(code: &str) -> Option<String> {
     const KEYWORDS: &[&str] = &[
         "fn", "struct", "enum", "trait", "type", "const", "static", "union", "mod",
@@ -425,14 +389,11 @@ fn starts_word(chars: &[char], at: usize, word: &str) -> bool {
         && chars.len() - at >= word.chars().count()
 }
 
-// ---------------------------------------------------------------------------
-// THE LEXER
-// ---------------------------------------------------------------------------
+// The lexer
 
-/// What the scanner is in the middle of at a line boundary. Carried ACROSS lines on purpose:
-/// this crate writes multi-line string literals (the untracked-lane notes in `compat.rs` are
-/// four lines of one `\`-continued string), and a line-at-a-time lexer would read their prose
-/// as code and miscount every brace after them.
+/// What the scanner is in the middle of at a line boundary. Carried across lines on purpose:
+/// this crate writes multi-line `\`-continued string literals, and a line-at-a-time lexer
+/// would read their prose as code and miscount every brace after them.
 #[derive(Clone, Copy)]
 enum Lex {
     Code,
@@ -573,9 +534,7 @@ fn char_literal_end(chars: &[char], at: usize) -> usize {
     at + 1
 }
 
-// ---------------------------------------------------------------------------
-// CFG ALGEBRA (shallow on purpose — see the header)
-// ---------------------------------------------------------------------------
+// cfg algebra (shallow on purpose — see the header)
 
 fn split_top(list: &str) -> Vec<String> {
     let mut parts = Vec::new();
@@ -638,9 +597,7 @@ fn render(preds: &[String]) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// THE TREE
-// ---------------------------------------------------------------------------
+// The tree
 
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -691,11 +648,9 @@ fn report(found: &[Violation]) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
-// THE TESTS
-// ---------------------------------------------------------------------------
+// The tests
 
-/// THE LAW over the real crate.
+/// The law over the real crate.
 #[test]
 fn every_crate_qualified_reference_resolves_on_every_target() {
     let tree = read_tree(&src_root());
@@ -713,7 +668,7 @@ fn every_crate_qualified_reference_resolves_on_every_target() {
     );
 }
 
-/// NON-VACUITY, half one: the two defects this file was born from, replayed as literals. A
+/// Non-vacuity, half one: the two defects this file was born from, replayed as literals. A
 /// guard nobody has watched go red is a guard nobody should believe.
 #[test]
 fn the_law_goes_red_on_the_two_defects_it_was_born_from() {
@@ -786,7 +741,7 @@ mod tests {
     assert!(found.is_empty(), "{}", report(&found));
 }
 
-/// NON-VACUITY, half two: every shape that must stay GREEN. A guard that cannot tell a twin
+/// Non-vacuity, half two: every shape that must stay green. A guard that cannot tell a twin
 /// from a defect is worse than none — it gets deleted the first week.
 #[test]
 fn the_shapes_that_are_not_defects_stay_green() {
@@ -872,12 +827,10 @@ pub fn e(
     assert!(found.is_empty(), "{}", report(&found));
 }
 
-/// NON-VACUITY, half three: the scan must still SEE the crate. Every limit in this file's
+/// Non-vacuity, half three: the scan must still see the crate. Every limit in this file's
 /// header narrows what it judges, and the failure mode of a narrowed guard is a lexer that
-/// quietly matches nothing and passes forever. These floors are far below the tree's measured
-/// numbers (2026-09-16: 61 files, 630 platform-gated declarations, 2,408 resolved
-/// `crate::`-qualified references, 28 of them reaching a platform-gated declaration) and are
-/// here to catch a scanner that stopped working, not to pin a shape.
+/// quietly matches nothing and passes for ever. These floors sit far below the tree's real
+/// numbers — they are here to catch a scanner that stopped working, not to pin a shape.
 #[test]
 fn the_scan_still_sees_the_crate() {
     let tree = read_tree(&src_root());

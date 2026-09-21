@@ -293,8 +293,10 @@ pub fn node_grants(node: &str) -> Vec<String> {
         // is the point: a node that could write `term/<n>/*/in/<src>` could
         // forge a driver into its own sessions (§8.2)
         format!("ro:/f/{FLEET}/term/{node}/>"),
-        // the SCREEN face for the sessions it hosts — write only, and only used
-        // when a node was started with `--screen`
+        // the SCREEN face for the sessions it hosts — write only. Round 21 cut
+        // its publisher; the grant stays because `join::node_ring_of` requires
+        // EXACTLY these eight and narrowing the ring would refuse every cap
+        // already minted on the fleet
         format!("rw,p={node}:/f/{FLEET}/term/{node}/*/screen"),
     ]
 }
@@ -380,31 +382,6 @@ impl Human {
         let lane = format!("/f/{FLEET}/in/{node}/{sid}/{}/control", self.name);
         let body = format!("v=1 t=1 epoch={epoch} text={}", op.replace(' ', "%20"));
         self.publish(&lane, body.as_bytes())
-    }
-
-    /// A keystroke on a session's drive face, bound to the epoch and the
-    /// generation the human read — and carrying `re=` as CAUSALITY, the offset
-    /// of the ask this keystroke is the answer to.
-    ///
-    /// `re=` is carried, never consulted: §6.6 is explicit that a body which
-    /// could trigger keystrokes on the strength of a `re=` would let any
-    /// lane-writer drive a worker, so the bridge's four conditions are the
-    /// holder, the hold, the epoch and the generation, and nothing else.
-    pub fn drive(
-        &mut self,
-        node: &str,
-        sid: &str,
-        epoch: &str,
-        gen: &str,
-        re: Option<u64>,
-        bytes: &[u8],
-    ) -> u64 {
-        let lane = format!("/f/{FLEET}/term/{node}/{sid}/in/{}", self.name);
-        let re = re.map(|r| format!(" re={r}")).unwrap_or_default();
-        let mut body =
-            format!("v=1 t=1 epoch={epoch} gen={gen}{re} len={}\n", bytes.len()).into_bytes();
-        body.extend_from_slice(bytes);
-        self.publish(&lane, &body)
     }
 
     /// Everything on this human's own read lane, oldest first, as
@@ -825,10 +802,12 @@ pub fn built_binary(name: &str, krate: &str, env_var: &str) -> PathBuf {
 /// ## AND IT IS EVERY FOUND BINARY, NOT JUST aterm-gui
 ///
 /// `aterm-gui` was the one this was written for, so it was written as
-/// `refuse_a_stale_binary` and wired into [`gui_binary`] alone. This crate FINDS a second
-/// binary the same way and for the same reason — `glance_and_tui.rs`'s `ctl_binary`,
-/// whose own doc invokes the same doctrine ("a rung that passed because its subject was
-/// not built would be worth nothing") and then did not check the stale half. When that
+/// `refuse_a_stale_binary` and wired into [`gui_binary`] alone. This crate USED TO FIND a
+/// second binary the same way and for the same reason — `glance_and_tui.rs`'s
+/// `ctl_binary`, whose own doc invoked the same doctrine ("a rung that passed because its
+/// subject was not built would be worth nothing") and then did not check the stale half.
+/// Round 21 deleted that file with the TUI it drove; the doctrine and the one guard
+/// stay. When that
 /// was noticed, `target/debug/aterm-ctl` was FOUR AND A HALF HOURS behind
 /// `crates/aterm-types/src/control_verbs.rs` — the very file the round was auditing —
 /// and the glance/tui e2e was driving it green. One guard, taking the crate name and
@@ -2124,22 +2103,24 @@ fn the_stale_guard_sees_every_crate_the_binary_was_built_from() {
 /// here and `ctl_binary` in `glance_and_tui.rs`; the staleness guard was wired into the
 /// first only, and `aterm-ctl` was four and a half hours behind `control_verbs.rs` when
 /// that was found — the file the round was auditing, with the suite green over it. Since
-/// 2026-09-12 there is ONE finder, [`built_binary`], and both callers delegate to it
-/// (the second copy had also kept the `<root>/target`-only search that failed every
-/// suite under `CARGO_TARGET_DIR`).
+/// 2026-09-12 there is ONE finder, [`built_binary`], and since round 21 took
+/// `glance_and_tui.rs` there is one caller left (the second copy had also kept the
+/// `<root>/target`-only search that failed every suite under `CARGO_TARGET_DIR`).
 ///
-/// The check is STRUCTURAL: every `for profile in ["debug", "release"]` search in these
-/// two files must call [`refuse_a_stale_binary`] on what it found; `harness/mod.rs` must
-/// still contain a search; and `glance_and_tui.rs` must either own an age-checked search
-/// or delegate its `aterm-ctl` lookup to [`built_binary`]. It covers the two files it
-/// reads and no others, which is stated here rather than implied: a third finder in a
-/// third file is not seen by this test, and adding one means adding it to the list below.
+/// The check is STRUCTURAL: every `for profile in ["debug", "release"]` search in the
+/// listed files must call [`refuse_a_stale_binary`] on what it found, and
+/// `harness/mod.rs` must still contain a search. It covers the files it reads and no
+/// others, which is stated here rather than implied: a finder in a file not listed
+/// below is not seen by this test, and adding one means adding it to the list.
+///
+/// ROUND 21 TOOK THE SECOND FILE, NOT THE SECOND CHECK. `glance_and_tui.rs` was the
+/// other entry, and it delegated its `aterm-ctl` lookup to [`built_binary`] rather
+/// than owning a search. The TUI it drove is gone and the file with it, so the entry is
+/// re-pointed by removal — which this test's own doc asks for in preference to deleting
+/// the test, and the remaining entry is the finder that actually matters.
 #[test]
 fn every_binary_this_crate_finds_is_age_checked() {
-    for (name, src) in [
-        ("harness/mod.rs", include_str!("mod.rs")),
-        ("glance_and_tui.rs", include_str!("../glance_and_tui.rs")),
-    ] {
+    for (name, src) in [("harness/mod.rs", include_str!("mod.rs"))] {
         let mut searches = 0;
         for (i, _) in src.match_indices(r#"for profile in ["debug", "release"]"#) {
             searches += 1;
@@ -2152,11 +2133,8 @@ fn every_binary_this_crate_finds_is_age_checked() {
                  {window}"
             );
         }
-        let delegates = name == "glance_and_tui.rs"
-            && src.contains("harness::built_binary(")
-            && src.contains("\"ATERM_CTL_BIN\"");
         assert!(
-            searches > 0 || delegates,
+            searches > 0,
             "{name}: the search this test guards has moved or been renamed, so this test \
              now guards nothing — re-point it rather than deleting it"
         );

@@ -6,16 +6,16 @@
 //! `Bridge::run`'s idle arm is entered only when `mailbox.take(IDLE_TICK)`
 //! answers `None`, i.e. only after a full 250 ms with every queue empty, and the
 //! tick counter that gated the roster round advanced only there. Round 1
-//! identified that hazard and moved `renew_leases`, `resolve_pending_feed` and
-//! `publish_screens` out onto their own deadlines for exactly this reason — and
-//! left `sample_local_control` behind, which is the ONLY producer of §6.6 row 4
-//! (the conservative pause), the only producer of row 5 (the local lease
-//! mirror), and the only place `attention=` is re-sampled and republished.
+//! identified that hazard and moved the other periodic duties out onto their own
+//! deadlines for exactly this reason — and left `sample_local_control` behind,
+//! which is the only place `attention=` is re-sampled and republished. (It was
+//! also the only producer of §6.6's rows 4 and 5, the conservative pause and the
+//! local-lease mirror; round 21 cut both with the drive face they decided for,
+//! and `renew_leases` and `resolve_pending_feed` went with them.)
 //!
 //! So a node receiving one record per <250 ms — a peer posting, a redelivery
-//! backlog after an outage — silently stopped implementing two of §6.6's six
-//! rows and the whole escalation path A10's `notify --on attention` and A8's
-//! `glance` read, for as long as it stayed busy.
+//! backlog after an outage — silently stopped implementing the escalation path
+//! `notify --on attention` reads, for as long as it stayed busy.
 //!
 //! The load here is LOAD, not synchronisation: a publisher thread keeps the
 //! bridge's inbox queue non-empty, and every assertion is still an `until` over
@@ -34,8 +34,8 @@ use harness::{until, World, FLEET};
 /// `attention=` is set with a purely LOCAL verb (`meta set attention …`) and
 /// nothing on the bus or the push lane announces it: the bridge discovers it by
 /// looking, on its periodic round. Under sustained inbound traffic that round
-/// never came, so the escalation reached `notify --on attention` and `glance.json`
-/// never — the one path a session has to say "I need a human".
+/// never came, so the escalation never reached `notify --on attention` or the
+/// roster `ls` prints — the one path a session has to say "I need a human".
 #[test]
 fn a_busy_bridge_still_publishes_an_escalation_nothing_announces() {
     let w = World::boot("r2busy", &[]);

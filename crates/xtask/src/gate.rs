@@ -10334,6 +10334,108 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
         }
     }
 
+    /// THE LIBC ORACLE'S CELL TABLE AND THIS CONST ARE ONE CLAIM (2026-09-20).
+    /// `libc-oracle/run.sh` decides one cell per box — the cell the box is
+    /// native to, the rule [`FLEET_HOST_TRIPLES`] applies to the forge cells —
+    /// and it carries its cell table twice: as `cell_table` in the shell driver
+    /// and as `CELLS` in `libc-oracle/gen/symgate.py`, which the negative
+    /// controls import. Three files naming the fleet's machines, none able to
+    /// see the others: this test reads all three, so a host added to any one
+    /// of them is red here until the other two agree.
+    #[test]
+    fn the_libc_oracle_cell_table_agrees_with_the_fleet() {
+        let root = crate::workspace_root();
+        let sh = std::fs::read_to_string(root.join("libc-oracle/run.sh"))
+            .expect("libc-oracle/run.sh is readable");
+        let py = std::fs::read_to_string(root.join("libc-oracle/gen/symgate.py"))
+            .expect("libc-oracle/gen/symgate.py is readable");
+        type Row = (String, String, Option<String>);
+        // run.sh: `cell_table='…'`, one `triple cell host` row per line, `none`
+        // for a cell no box hosts.
+        let sh_block = sh
+            .split_once("cell_table='")
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .map(|(block, _)| block)
+            .expect("run.sh carries cell_table='…'");
+        let sh_rows: Vec<Row> = sh_block
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                assert_eq!(
+                    f.len(),
+                    3,
+                    "a run.sh cell_table row is `triple cell host`: {l:?}"
+                );
+                let host = (f[2] != "none").then(|| f[2].to_string());
+                (f[0].to_string(), f[1].to_string(), host)
+            })
+            .collect();
+        // symgate.py: `CELLS = [ ('triple', 'cell' | None, 'host' | None), … ]`,
+        // where a None cell is the zero-surface row run.sh spells `zero`.
+        let py_block = py
+            .split_once("CELLS = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(block, _)| block)
+            .expect("symgate.py carries CELLS = […]");
+        let field = |s: &str| -> Option<String> {
+            let s = s.trim();
+            (s != "None").then(|| s.trim_matches('\'').to_string())
+        };
+        let py_rows: Vec<Row> = py_block
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('('))
+            .map(|l| {
+                let inner = l
+                    .trim_start_matches('(')
+                    .trim_end_matches(',')
+                    .trim_end_matches(')');
+                let f: Vec<&str> = inner.split(',').collect();
+                assert_eq!(
+                    f.len(),
+                    3,
+                    "a symgate.py CELLS row is (triple, cell, host): {l:?}"
+                );
+                (
+                    field(f[0]).expect("a triple"),
+                    field(f[1]).unwrap_or_else(|| "zero".to_string()),
+                    field(f[2]),
+                )
+            })
+            .collect();
+        assert!(sh_rows.len() >= 6, "the cell table lost rows: {sh_rows:?}");
+        assert_eq!(
+            sh_rows, py_rows,
+            "run.sh's cell_table and symgate.py's CELLS must be the same rows in the same order"
+        );
+        for (triple, _, host) in &sh_rows {
+            match host {
+                Some(h) => {
+                    assert_eq!(
+                        h, triple,
+                        "a cell is decided where it is native, so `{triple}`'s host can only be itself"
+                    );
+                    assert!(
+                        super::FLEET_HOST_TRIPLES.contains(&triple.as_str()),
+                        "the oracle says a fleet box hosts `{triple}`; FLEET_HOST_TRIPLES does not list it"
+                    );
+                }
+                None => assert!(
+                    !super::FLEET_HOST_TRIPLES.contains(&triple.as_str()),
+                    "FLEET_HOST_TRIPLES lists `{triple}`, so the oracle's table must name it as \
+                     that cell's host, not `none`"
+                ),
+            }
+        }
+        for triple in super::FLEET_HOST_TRIPLES {
+            assert!(
+                sh_rows.iter().any(|(t, _, h)| t == triple && h.is_some()),
+                "FLEET_HOST_TRIPLES names `{triple}`, which the libc oracle's cell table does not host"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // G-CELLS, THE TEST-TARGET PASS
     // -----------------------------------------------------------------------

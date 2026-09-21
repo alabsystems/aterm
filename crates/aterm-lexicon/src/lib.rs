@@ -428,14 +428,23 @@ struct LexiconHit {
 }
 
 // ---- TOML shapes ----
+//
+// `deny_unknown_fields` on all four, the kitty-command loader's law verbatim
+// (see `tricks.rs`): a typo'd key (`form = [...]` for `forms`, `stem` for
+// `stems`) must be a parse error the test suite — and the user's own stderr —
+// trips over, not a list that silently never loads. A rejected OVERRIDE is
+// already handled loudly by the host, which logs the error and falls back to
+// the builtin; a silently dropped entry was not handled at all.
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLexicon {
     #[serde(default)]
     entry: Vec<RawEntry>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawEntry {
     class: String,
     #[serde(default)]
@@ -474,12 +483,14 @@ fn default_mode() -> String {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawExceptions {
     #[serde(default)]
     exception: Vec<RawException>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawException {
     word: String,
     #[serde(default)]
@@ -494,16 +505,42 @@ struct RawException {
 struct Langs {
     all: bool,
     set: FxHashSet<String>,
+    /// The codes as the CALLER listed them, in order, so an unknown one is
+    /// reported deterministically and spelled back the way it was written.
+    listed: Vec<String>,
 }
 
 impl Langs {
     fn new(langs: &[&str]) -> Self {
         let all = langs.contains(&"all");
-        let set = langs.iter().map(|l| (*l).to_string()).collect();
-        Langs { all, set }
+        let listed: Vec<String> = langs.iter().map(|l| (*l).to_string()).collect();
+        let set = listed.iter().cloned().collect();
+        Langs { all, set, listed }
     }
     fn enabled(&self, lang: &str) -> bool {
         self.all || self.set.contains(lang)
+    }
+    /// Record every configured code the loaded data names NOWHERE. A gate can
+    /// only un-gate a language the file actually holds, so `languages =
+    /// ["DA"]`, `["da-DK"]`, `["dk"]` or `["ALL"]` un-gates nothing at all —
+    /// and until this was recorded, the person who set it watched the
+    /// vocabulary they asked for simply not arrive, with the terminal saying
+    /// nothing. `"all"` is the reserved un-gate-everything spelling and is
+    /// never a language.
+    fn note_unknown(&self, known: &FxHashSet<String>, conflicts: &mut Vec<String>) {
+        for lang in &self.listed {
+            if lang == "all" || known.contains(lang) {
+                continue;
+            }
+            // Composed without `format!` (see `DebugText`).
+            let mut msg = String::from("configured language ");
+            msg.push_str(&DebugText(lang.as_str()).to_string());
+            msg.push_str(
+                " names nothing in this vocabulary: it un-gated nothing (the codes \
+                 are the bare lowercase ones the data uses)",
+            );
+            conflicts.push(msg);
+        }
     }
 }
 
@@ -586,8 +623,17 @@ impl Lexicon {
         // Running count of surface forms materialized so far, shared across every
         // entry, to bound the total against MAX_TOTAL_SURFACES (see its docs).
         let mut total: usize = 0;
+        // Every language the DATA names — gating, and whether the entry is
+        // otherwise well formed, aside. This is the set a configured code is
+        // judged against (`Langs::note_unknown`); built here rather than read
+        // off `lang_table`, which stops growing at the `LangSet` ceiling and
+        // would start calling real languages unknown.
+        let mut data_langs: FxHashSet<String> = FxHashSet::default();
 
         for e in raw.entry {
+            if !data_langs.contains(e.lang.as_str()) {
+                data_langs.insert(e.lang.clone());
+            }
             let class = match e.class.as_str() {
                 "profanity" => Class::Profanity,
                 "feline" => Class::Feline,
@@ -648,6 +694,18 @@ impl Lexicon {
             // surfaces would push the total past MAX_TOTAL_SURFACES is skipped (and
             // recorded as a conflict) rather than materialized.
             let mut surfaces: Vec<String> = Vec::new();
+            // `mode` has exactly two spellings. Any other value falls through
+            // to the explicit-`forms` path below and DISCARDS every stem — an
+            // entry that compiles to nothing, and used to say nothing about
+            // it. Composed without `format!` (see `DebugText`).
+            if e.mode != "suffix" && e.mode != "forms" {
+                let mut msg = String::from("unknown mode ");
+                msg.push_str(&DebugText(e.mode.as_str()).to_string());
+                msg.push_str(" (lang ");
+                msg.push_str(&e.lang);
+                msg.push_str("): expected \"suffix\" or \"forms\"; `stems` and `suffixes` ignored");
+                conflicts.push(msg);
+            }
             if e.mode == "suffix" {
                 // `prod` is exactly the surface count the loop below would push
                 // (stems × suffixes, or stems alone when there are no suffixes);
@@ -703,6 +761,20 @@ impl Lexicon {
                 total = total.saturating_add(forms);
             }
 
+            // AN ENTRY THAT COMPILES TO NOTHING. Individually unmatchable
+            // surfaces are a deliberate data choice — 34 of them sit in the
+            // shipped file as documentation of a word whose head noun is
+            // listed separately ("anak kucing" beside "kucing"), and each is
+            // skipped in silence below on purpose. An entry where EVERY
+            // surface goes that way is a different thing: it contributes no
+            // key at all, so its class is unreachable in that language and
+            // nothing ever said so. Measured when this landed: exactly one of
+            // 550 entries (id canine, whose only surface was the two-word
+            // "anak anjing"), which is why the law is worth stating and cheap
+            // to keep.
+            let offered = surfaces.len();
+            let mut inserted = 0usize;
+
             for s in surfaces {
                 let s = s.trim();
                 if s.is_empty() {
@@ -730,6 +802,7 @@ impl Lexicon {
                         msg.push_str(") requires cjk_single_char = true to scan");
                         conflicts.push(msg);
                     }
+                    inserted = inserted.saturating_add(1);
                     insert_class(
                         &mut cjk_forms,
                         key,
@@ -786,6 +859,7 @@ impl Lexicon {
                     // remains the data's way to opt the skeleton in — the
                     // same-class merge in [`insert_class`] ANDs the bit.
                     let marks_required = key.is_ascii() && fold::has_foldable_marks(s);
+                    inserted = inserted.saturating_add(1);
                     insert_class(
                         &mut spaced,
                         key,
@@ -800,7 +874,21 @@ impl Lexicon {
                     );
                 }
             }
+
+            if offered > 0 && inserted == 0 {
+                // Composed without `format!` (see `DebugText`).
+                let mut msg = String::from("entry (class ");
+                msg.push_str(&e.class);
+                msg.push_str(", lang ");
+                msg.push_str(&e.lang);
+                msg.push_str(") compiled to NO scannable surface: all ");
+                msg.push_str(&offered.to_string());
+                msg.push_str(" are multi-word, mixed-script or empty");
+                conflicts.push(msg);
+            }
         }
+
+        langs.note_unknown(&data_langs, &mut conflicts);
 
         for x in raw_exc.exception {
             let key = x.word.trim().to_string();
@@ -935,7 +1023,10 @@ impl Lexicon {
                 && opts
                     .ignore
                     .is_none_or(|ignore| !ignore.contains(surface.as_str()))
-                && !(class == Class::Feline && !opts.allow_bare_cat && surface.chars().count() <= 3)
+                && !(class == Class::Feline
+                    && !opts.allow_bare_cat
+                    && surface.chars().count() <= 3
+                    && !hit.marks_required)
                 && !(class == Class::Emphasis
                     && surface.chars().count() <= 3
                     && !self.user_surfaces.contains(surface.as_str()))
@@ -1112,7 +1203,22 @@ impl Lexicon {
                     // form is identical and lets the verifier discharge it.
                     k = k.saturating_add(1);
                 }
-                self.scan_cjk_run(chars, i, k, opts, window, bounds, out);
+                // THE CODE / PATH / URL GUARD, on the NO-SPACE arm too. A
+                // maximal no-space run is this arm's whole token: it is
+                // delimited by a script change exactly as a spaced token is
+                // delimited by a non-token character, so the boundary test
+                // `try_spaced_token` applies to a token's endpoints applies
+                // here to the run's. Without it the crate's headline promise
+                // ("suppresses tokens that sit in a code / path / URL
+                // context") held for Latin and failed for every script that
+                // does not put spaces between words: `cat.txt` and `/api/cat`
+                // were suppressed while `子猫.txt`, `/api/고양이/list`,
+                // `--แมว` and `子猫=1` all decorated. One law, spelled on one
+                // path, with the whole divergence falling on the non-Latin
+                // scripts (defect class D).
+                if !(left_suppresses(chars, i) || right_suppresses(chars, k)) {
+                    self.scan_cjk_run(chars, i, k, opts, window, bounds, out);
+                }
                 i = k;
             } else if fold::is_token_char(c) {
                 let j = token_end(chars, i);
@@ -1163,8 +1269,25 @@ impl Lexicon {
         {
             return;
         }
-        // Bare-`cat` policy: short feline tokens are opt-in.
-        if hit.class == Class::Feline && !opts.allow_bare_cat && folded.chars().count() <= 3 {
+        // Bare-`cat` policy: short feline tokens are opt-in — but only the
+        // ones bare ASCII can actually SPELL, which is the whole of what the
+        // knob names ("`cat` is also the ubiquitous shell command"). A
+        // MARKS-REQUIRED key matches only a token that itself carries
+        // folded-away marks (vi `mèo` folds to `meo`; a typed bare `meo`
+        // never matches it), so it was never in that blast radius. Before
+        // this, switching the shell-command decoration off also switched
+        // Vietnamese feline off ENTIRELY — `mèo` is the only single-token cat
+        // word vi has, its other five surfaces being multi-word and dropped
+        // at build. Deliberately NOT widened to every non-ASCII fold: the
+        // data's own notes record `قط`, `بس`, `بلا`, `кот` as homographs of
+        // very common words, and none carries `ambiguous = true`, so the
+        // <= 3 guard is incidentally load-bearing for them. Splitting those
+        // is a DATA change, not a scanner change.
+        if hit.class == Class::Feline
+            && !opts.allow_bare_cat
+            && folded.chars().count() <= 3
+            && !hit.marks_required
+        {
             return;
         }
         // Emphasis policy: hype words must be >= 4 folded chars — EXCEPT
@@ -1430,7 +1553,18 @@ fn insert_class(
 ) {
     match map.get_mut(&key) {
         Some(prev) if class_rank(new.class) > class_rank(prev.class) => {
+            // MARKS-REQUIRED IS A PROPERTY OF THE KEY, NOT OF THE CLASS. Its
+            // own doc reads "EVERY claiming surface lost diacritics in
+            // folding AND folded to a bare-ASCII key, so plain ASCII text
+            // spells something ELSE" — and a claimant that listed the BARE
+            // spelling disproves that premise whatever class it sits in. So
+            // its testimony outlives the precedence replacement, exactly as
+            // it merges on the same-class arm below. hu `cicák` (feline,
+            // marked) and id `cicak` (the house gecko, bare) fold to ONE key;
+            // without this, adding a language SILENCED a word that worked.
+            let marks_required = prev.marks_required && new.marks_required;
             *prev = new;
+            prev.marks_required = marks_required;
         }
         Some(prev) if prev.class == new.class => {
             prev.langs = prev.langs.union(new.langs);
@@ -1455,7 +1589,13 @@ fn insert_class(
                 _ => {}
             }
         }
-        Some(_) => {}
+        Some(prev) => {
+            // The losing class is dropped whole, its languages with it — but
+            // the key-level fact above outlives it in this direction too, or
+            // the merge would depend on which claimant the file happened to
+            // list first. Nothing else of the loser survives.
+            prev.marks_required &= new.marks_required;
+        }
         None => {
             map.insert(key, new);
         }

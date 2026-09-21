@@ -4,34 +4,18 @@
 //! The rustup VIEW's debris sweep against the one writer the store-wide lock cannot speak
 //! for: a lane helper that outlived the process which submitted it.
 //!
-//! `seam::sweep_view_debris` justified its unguarded `remove_dir_all` with the lock alone
-//! — "a view is laid under the store-wide writer lock, so debris here is owned by a
-//! process that no longer exists". That argument was disproved for this exact machinery
-//! eight seconds before the sweep landed: the view lane hands its work to a LAUNCHD job
-//! (`stage_helper::Job::prepare(&scratch, "view-helper")`), so the helper is launchd's
-//! child, not the submitter's, and a killed submitter releases the lock while its helper
-//! keeps writing. `store::sweep_stage_scratch` and `gc`'s pass were taught to stop those
-//! orphans first (`tests/orphan_lane_sweep.rs`); the view sweep was written without it.
+//! The view lane hands its work to a launchd job (`stage_helper::Job::prepare(&scratch,
+//! "view-helper")`), so the helper is launchd's child, not the submitter's, and a killed
+//! submitter releases the lock while its helper keeps writing — `seam::sweep_view_debris`
+//! cannot justify its unguarded `remove_dir_all` with the lock alone and has to stop the
+//! orphan first, as `store::sweep_stage_scratch` and `gc`'s pass do. The refresh driven over
+//! the orphan is the one that lays nothing, so the sweep is the only thing under test.
+//! Measured two ways, neither fakeable: launchd must no longer list the label, and the debris
+//! must stay gone. A bystander of our shape under a live pid must survive the same pass —
+//! stopping it would widen the sweep.
 //!
-//! The orphan is reproduced exactly — a real launchd job carrying OUR label shape, under
-//! a pid that does not exist, re-creating view debris in a loop — and a real refresh is
-//! driven over it. The refresh is the one that lays NOTHING (the view already matches),
-//! so the sweep is the only thing under test: nothing else in that path would stop the
-//! job. Measured two ways, neither fakeable: launchd must no longer list the label, and
-//! the debris must STAY gone.
-//!
-//! AND WHAT IT MUST NOT STOP: a bystander of our own shape under a LIVE pid — another
-//! pass in flight, or a pid since reused — sits in the same `launchctl list` and must
-//! survive. Stopping it would be widening a sweep, which is the one thing these sweeps
-//! may never do.
-//!
-//! ITS OWN TEST BINARY, for `orphan_lane_sweep.rs`'s reason: the fixture is a launchd job
-//! with a dead owner pid, and stopping exactly such jobs is what every sweep in this
-//! crate does — run beside a thousand parallel unit tests, one of them would stop the
-//! fixture before the sweep under test ever saw it. Cargo runs test binaries one at a
-//! time.
-//!
-//! macOS only: there is no launchd, and so no lane job to outlive anyone, anywhere else.
+//! Its own test binary, for `orphan_lane_sweep.rs`'s reason: the fixture is a launchd job
+//! with a dead owner pid, and every sweep here stops exactly those. macOS only.
 
 #![cfg(target_os = "macos")]
 
@@ -68,9 +52,8 @@ fn fake_store(prefix: &Path, build: u64) -> PathBuf {
     dir
 }
 
-/// A pid nothing runs under, measured rather than guessed (macOS pids stay below 99999)
-/// and taken WITHOUT spawning: a fork here would hand the child a copy of every fd this
-/// binary holds open.
+/// A pid nothing runs under (macOS pids stay below 99999), found without spawning: a
+/// fork here would hand the child a copy of every fd this binary holds open.
 fn a_dead_pid() -> u32 {
     (90_000..99_999u32)
         .rev()
@@ -103,10 +86,9 @@ fn a_launchd_helper_outliving_a_killed_view_pass_is_stopped_before_its_debris_is
         .unwrap_or_else(|e| panic!("the view must lay on this macOS: {e}"));
     let view = view_dir(&layout, "trust");
 
-    // THE ORPHAN: the debris of a view pass that is gone, with a launchd job still
-    // writing into it. The label carries the view lane's own shape — `view-helper` is one
-    // of `JOB_STEMS` — under a pid that does not exist, which is exactly what a killed
-    // pass leaves registered.
+    // The orphan: the debris of a view pass that is gone, with a launchd job still writing
+    // into it. The label carries the view lane's own shape (`view-helper` is one of
+    // `JOB_STEMS`) under a pid that does not exist — what a killed pass leaves registered.
     let dead = a_dead_pid();
     let me = std::process::id();
     let debris = view.join(format!(".bin.old-{dead}"));
@@ -124,7 +106,7 @@ fn a_launchd_helper_outliving_a_killed_view_pass_is_stopped_before_its_debris_is
         String::from_utf8_lossy(&submit.stderr)
     );
 
-    // THE BYSTANDER: our shape under a LIVE pid. Not orphaned, so not ours to stop.
+    // The bystander: our shape under a live pid. Not orphaned, so not ours to stop.
     let live = format!("systems.alab.atpkg.view-helper-{me}-9-{me:x}");
     let bystander_registered = Command::new("/bin/launchctl")
         .args(["submit", "-l", &live, "--", "/bin/sh", "-c"])
@@ -140,7 +122,7 @@ fn a_launchd_helper_outliving_a_killed_view_pass_is_stopped_before_its_debris_is
     }
     let was_writing = debris.join("bin").join("trustc").exists();
 
-    // THE SUCCESSOR: a refresh whose view already matches, so `sweep_view_debris` is the
+    // The successor: a refresh whose view already matches, so `sweep_view_debris` is the
     // whole of what it does.
     let refreshed = refresh_view_in_process(&layout, "trust");
 

@@ -11,7 +11,7 @@
 //! ```
 //!
 //! Until this verb is green the fabric has no outbound path at all: `ls` and
-//! `glance.json` are both PULLS, so an `attention` raised on a headless box at
+//! `aterm fabric` are both PULLS, so an `attention` raised on a headless box at
 //! 3 a.m. reaches nobody until somebody looks (§13). This runs a command the
 //! operator chose — ntfy, mail, a webhook — once per matching record.
 //!
@@ -212,7 +212,7 @@ impl Sel {
     /// never gets and a slot they cannot get back.
     ///
     /// This crate's other two readers of the same rows already refuse it —
-    /// `main.rs`'s `column()` truncates, `glance::Row::parse` REJECTS — so the
+    /// `cli.rs`'s `column()` truncates, `glance::Row::parse` REJECTS — so the
     /// wall here is theirs, not a third one: the presence arm calls
     /// [`crate::glance::Row::parse`] outright, and the other two arms call the
     /// same [`crate::subject::is_principal`] that `parse_in` and `Row::parse`
@@ -228,7 +228,7 @@ impl Sel {
         match self {
             Sel::Attention => {
                 // ONE READER OF A PRESENCE ROW, NOT THREE. `glance::Row::parse`
-                // is the wall `ls` and `glance.json` already stand behind: seven
+                // is the wall `ls` and `aterm fabric` already stand behind: seven
                 // segments, this fleet, `pub`/`presence`, a node that is a
                 // principal and an owner that is `node` or an `s-` principal.
                 // A second copy of that rule here is a second chance to disagree
@@ -1169,7 +1169,7 @@ mod tests {
     /// never happened, ten times a minute, while the operator's real escalations
     /// answer `dropped reason=rate`.
     ///
-    /// `main.rs`'s `column()` truncates these segments and `glance::Row::parse`
+    /// `cli.rs`'s `column()` truncates these segments and `glance::Row::parse`
     /// rejects them; this is the reader whose output reaches a human's phone.
     #[test]
     fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value() {
@@ -1295,9 +1295,10 @@ mod tests {
 
     /// **THE STATE-DIR RULE IS DUPLICATED FROM `cli.rs`, SO IT IS PINNED TO
     /// IT.** `cli.rs` carried this rule as a binary main until 2026-09-10, so it
-    /// exists four times — there, in `hook.rs`, in `notify.rs` and in `tui.rs` —
-    /// and it belongs in `state.rs` where all four could call one copy. Until it
-    /// moves, every copy is pinned to the original: change `main.rs`'s rule and
+    /// exists three times — there, in `hook.rs` and in `notify.rs` (`tui.rs` held a
+    /// fourth until round 21 deleted the module) —
+    /// and it belongs in `state.rs` where all three could call one copy. Until it
+    /// moves, every copy is pinned to the original: change `cli.rs`'s rule and
     /// this fails, rather than leaving `notify` reading its state under a
     /// directory `serve` no longer writes.
     #[test]
@@ -1305,7 +1306,7 @@ mod tests {
         assert_eq!(
             state_dir_rule(include_str!("notify.rs")),
             state_dir_rule(include_str!("cli.rs")),
-            "notify.rs's copy of the state-dir rule has drifted from main.rs's; \
+            "notify.rs's copy of the state-dir rule has drifted from cli.rs's; \
              `aterm-link notify` would read its state under a directory \
              `aterm-link serve` no longer uses"
         );

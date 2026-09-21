@@ -315,10 +315,10 @@ impl App {
     /// Re-state HOW the staged `build` applies on the live update bar, if the
     /// bar is still up for it, and repaint only when the words changed.
     ///
-    /// EVERY site that changes the posture calls this — arming the lane, the
-    /// typing hold, and each of the stand-down paths that latch manual-only
-    /// (the refused physical attempt, the policy fallback, the reaped abort,
-    /// the returned-apply reconcile). Until 2026-08-30 only the first two did:
+    /// EVERY site that changes the posture calls this — arming the lane and
+    /// each of the physical stand-down paths that latch manual-only (the
+    /// refused physical attempt, the policy fallback, the reaped abort, the
+    /// returned-apply reconcile). Until 2026-08-30 only the first two did:
     /// an admission refusal is synchronous and lands inside the `Staged` bar's
     /// hold, so the bar kept promising "applies in place within ~2 min" while
     /// the Version-menu row already said the attempt did not start — two
@@ -1566,7 +1566,6 @@ mod tests {
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
-            apply_by: std::time::Instant::now() + std::time::Duration::from_secs(600),
         });
     }
 
@@ -2031,9 +2030,10 @@ mod tests {
         let detail = bar_detail(&app);
         assert!(
             detail.contains("applies by itself at the next quiet moment")
+                && detail.contains("within 15 min regardless")
                 && detail.contains("your shells keep running")
                 && !detail.to_lowercase().contains("restart")
-                && !detail.contains("min"),
+                && !detail.contains("~2 min"),
             "{detail}"
         );
         app.auto_apply_manual_only = Some(latch(None));
@@ -2437,7 +2437,6 @@ mod tests {
                 dmg_sha256: digest,
                 retry_at: later,
                 attempts: 0,
-                apply_by: later,
             });
             assert_eq!(app.automatic_apply_retry_scheduled(build), exact);
             assert!(!app.automatic_apply_retry_scheduled(build + 1));
@@ -2526,7 +2525,6 @@ mod tests {
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
-            apply_by: std::time::Instant::now() + std::time::Duration::from_secs(600),
         });
         app.status_bars = crate::status_bars::StatusBars::default();
         app.surface_update_apply_outcome("automatic", failed(), false);
@@ -2539,7 +2537,6 @@ mod tests {
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
-            apply_by: std::time::Instant::now() + std::time::Duration::from_secs(600),
         });
         app.status_bars = crate::status_bars::StatusBars::default();
         app.surface_update_apply_outcome("automatic", failed(), false);

@@ -49,6 +49,14 @@
 //!   pointed at a socket nothing served reported `connected` all the same) —
 //!   but it is the BRIDGE's last observation, as old as `link_age_ms=` says,
 //!   and this probe is the report's own, made now.
+//!   `stale` is the third case and the one the other two cannot see (round 21):
+//!   the endpoint gave the bridge a post and has had nothing back since — no
+//!   ack, no landing, no `link` record. A dead helper closes its fds
+//!   (`disconnected`) and a dead BROKER is reported within the bridge's own 5 s
+//!   ack deadline (`stalled`); a WEDGED helper does neither, and before round 21
+//!   its instance read `connected` for as long as it hung. It is not read off
+//!   the ack's age alone: a quiet link's age grows without bound by design, so
+//!   the clock runs only while an answer is owed.
 //!   The pid is the process serving `link broker <socket>` in the process table,
 //!   and on macOS the launchd job whose pid that is. THE HEAD QUERY IS PART OF
 //!   THE CHECK ([`BrokerView::read_ok`]): a broker that acknowledges the `Hello`
@@ -105,7 +113,7 @@
 //! body it shows only the `t=` and the length. The report writes no file.
 //!
 //! Every string that came off the bus or out of another process — a subject
-//! segment, a title, a principal — goes through [`crate::tui::safe`] before it
+//! segment, a title, a principal — goes through [`crate::render::safe`] before it
 //! reaches the terminal, so nothing a sender chose can move the cursor, reorder
 //! a line or forge a column.
 //!
@@ -127,8 +135,8 @@ use astream_broker::Client;
 use crate::body::Body;
 use crate::bridge::{read_cap_file, Config};
 use crate::ctl::Ctl;
+use crate::render::{safe, trust_of, SCREEN};
 use crate::transport::{self, Conn, Transport};
-use crate::tui::{safe, trust_of, SCREEN};
 
 /// Usage, printed for `help` (exit 0) and after a usage error (exit 2).
 pub const USAGE: &str = "\
@@ -658,34 +666,56 @@ pub fn receipts_in_toml(text: &str) -> Result<Option<bool>, String> {
 
 /// `[fabric] receipts` from the aterm.toml [`config_path`] resolves, for a
 /// `serve` whose command line said neither `--receipts` nor `--no-receipts`.
-/// OFF when the file has no such key, or no file exists; ALSO off — said on
+///
+/// ON when the file has no such key, or no file exists; ALSO on — said on
 /// stderr, not fatal — when the file cannot be read or the value is wrong, for
 /// the reason [`presence_from_config`] gives: a bridge that refused to start
 /// over a config typo would hold every session of its instance.
+///
+/// THE DEFAULT IS ONE THING NOW, AND IT IS THIS ONE (round 21). It used to be
+/// off here while `aterm fabric on` wrote `receipts = true` into the file, so
+/// whether a node acked depended on which door its operator came through: a
+/// `fabric on` node acked, and a hand-written `[fabric] command`, a bridge
+/// started by hand, or a different `XDG_CONFIG_HOME` did not. The owner's own
+/// machine was the second kind — its `[fabric]` table was written by
+/// `tools/fabric-enable.sh` and carries no `receipts` key — so `aterm fabric
+/// status` there read `receipts off`.
+///
+/// OFF WAS THE WRONG ONE TO SETTLE ON because it breaks `ask`: with no ack,
+/// `post --wait-ack` has nothing that can ever release it and every `ask`
+/// burns its whole deadline before answering. The catalog says as much in as
+/// many words — "a recipient whose bridge runs without receipts never acks, so
+/// bound it". The cost of the other direction is one ack record and one `ev`,
+/// about 200 bytes, per ask or task a recipient actually DECIDES — not per
+/// message, and nothing at all on a fleet that sends only notes.
+///
+/// `--no-receipts`, and `[fabric] receipts = false`, still turn it off; an
+/// operator's explicit `false` is never overwritten by a later `aterm fabric
+/// on`.
 #[must_use]
 pub fn receipts_from_config() -> bool {
     let Some(path) = config_path() else {
-        return false;
+        return true;
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
         Err(e) => {
             eprintln!(
-                "aterm-link: {} could not be read ({e}); receipts default to off",
+                "aterm-link: {} could not be read ({e}); receipts default to on",
                 path.display()
             );
-            return false;
+            return true;
         }
     };
     match receipts_in_toml(&text) {
-        Ok(on) => on.unwrap_or(false),
+        Ok(on) => on.unwrap_or(true),
         Err(e) => {
             eprintln!(
-                "aterm-link: {}: {e}; receipts default to off",
+                "aterm-link: {}: {e}; receipts default to on",
                 path.display()
             );
-            false
+            true
         }
     }
 }
@@ -1116,7 +1146,7 @@ pub struct Traffic {
     /// The body's text length in bytes.
     pub len: usize,
     /// The RECEIVER's label, computed from the address alone
-    /// ([`crate::tui::trust_of`]).
+    /// ([`crate::render::trust_of`]).
     pub trust: &'static str,
     /// The text itself — only `tail --bodies` ever prints it.
     pub text: String,
@@ -1533,6 +1563,15 @@ pub fn fabric_cell(i: &InstanceView) -> String {
     let state = safe(i.fabric.as_deref().unwrap_or("-"), 32);
     match (i.fabric.as_deref(), &i.reason, i.rtt_ms, i.link_age_ms) {
         (Some("stalled"), Some(reason), _, _) => format!("{state} ({})", safe(reason, 32)),
+        // `stale` CARRIES THE AGE FOR THE SAME REASON `connected` DOES — it is
+        // the same number, and it is the whole evidence for the word. The
+        // endpoint only says `stale` while a post it handed over is still
+        // unanswered, so unlike a large age on `connected` this one is not a
+        // quiet link.
+        (Some("stale"), _, _, Some(age_ms)) => {
+            format!("{state} (owed, last ack {} ago)", age(age_ms))
+        }
+        (Some("stale"), _, _, None) => format!("{state} (owed, never acked)"),
         (Some("connected"), _, Some(rtt), Some(age_ms)) => {
             format!("{state} (rtt {rtt} ms, acked {} ago)", age(age_ms))
         }
@@ -2009,6 +2048,15 @@ fn fleet_halts(conn: &mut Conn, fleet: &str) -> Vec<(String, String)> {
 }
 
 /// Join the bus roster with the local instances, by sid.
+/// How long a retired session row is still shown as `gone` before it becomes
+/// one of the `exited` count.
+///
+/// Presence is retained per SUBJECT and a session's subject is minted once, so
+/// without a bound this table would list every session ever run on this
+/// machine. An hour is long enough for the operator who just watched an
+/// instance die to see what became of its sessions.
+const GONE_SHOW_MS: u64 = 60 * 60 * 1000;
+
 fn join_sessions(report: &mut Report, roster: Option<&crate::glance::Glance>) {
     let mut bus: BTreeMap<String, Vec<&crate::glance::Row>> = BTreeMap::new();
     if let Some(g) = roster {
@@ -2054,13 +2102,55 @@ fn join_sessions(report: &mut Report, roster: Option<&crate::glance::Glance>) {
             });
         }
     }
+    // WHOSE NODES THESE ARE. A retired row under THIS machine's node is the
+    // answer to a warning this report used to repeat forever, so it is shown;
+    // one under a remote node is somebody else's history and stays a number.
+    let local_nodes: BTreeSet<String> = report
+        .instances
+        .iter()
+        .filter_map(|i| i.node.clone())
+        .chain(report.node.clone())
+        .collect();
+    let now = crate::now_ms();
     for (sid, rows) in &bus {
         if seen.contains(sid) {
             continue;
         }
         for row in rows {
             if row.field("state") != "live" {
-                report.exited += 1;
+                // A GHOST THAT WAS RETIRED IS SHOWN AS `gone`, ONCE IT IS
+                // OVER AND WHILE IT IS STILL NEWS.
+                //
+                // The bridge's own token on a session face is `exited`
+                // (`bridge.rs`'s `publish_session_presence`); `gone` is what
+                // this table prints, because it is the word the fleet already
+                // uses for "this is over" on the node face and the reader's
+                // question is reachability, not vocabulary. Bounded by the
+                // row's own `t=`: presence is retained per subject forever, so
+                // one row per session ever run on this machine would be the
+                // whole history, not a report.
+                let recent = row
+                    .field("t")
+                    .parse::<u64>()
+                    .ok()
+                    .is_some_and(|t| now.saturating_sub(t) <= GONE_SHOW_MS);
+                if !(recent && local_nodes.contains(&row.node)) {
+                    report.exited += 1;
+                    continue;
+                }
+                report.sessions.push(SessionRow {
+                    sid: sid.clone(),
+                    pid: None,
+                    node: row.node.clone(),
+                    bus: "gone".to_string(),
+                    local: None,
+                    bus_hold: Some(row.field("hold").to_string()),
+                    bus_role: bus_field(row, "role"),
+                    bus_title: bus_field(row, "title"),
+                    detail: bus_field(row, "detail"),
+                    phase: bus_field(row, "phase"),
+                    context: bus_field(row, "context"),
+                });
                 continue;
             }
             report.sessions.push(SessionRow {
@@ -2223,6 +2313,21 @@ fn warnings(
                 inst.link_age_ms
                     .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
             )),
+            // OWED AND SILENT. The endpoint handed this bridge a post and has
+            // had nothing back since — not an ack, not a landing, not a link
+            // report. A bridge whose BROKER died says `link down reason=no-ack`
+            // within its own 5 s deadline and reads `stalled`; one that closed
+            // its fds reads `disconnected`. This is the third case and the one
+            // neither of those can see: the helper process itself is wedged,
+            // holding both lanes open and answering nothing.
+            (Some("stale"), _) => w.push(format!(
+                "instance {pid}'s bridge has not answered for the work it was given \
+                 (fabric=stale, last ack {}): its posts queue and `post --wait` from its \
+                 sessions fails fast rather than waiting — the bridge process is attached \
+                 but not moving mail, so kill the bridge pid and let the instance relaunch it",
+                inst.link_age_ms
+                    .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
+            )),
             (Some("connected"), _) if !r.broker.reachable && same_broker => w.push(format!(
                 "instance {pid} says fabric=connected (its bridge's last ack was {}), but the \
                  broker at {broker} does not answer this report's own probe: either the broker \
@@ -2379,7 +2484,19 @@ fn warnings(
         .chain(r.node.as_deref())
         .collect();
     if answered {
-        for s in r.sessions.iter().filter(|s| s.pid.is_none()) {
+        // ON THE `bus` COLUMN, NOT ON `pid` ALONE. A row with no local host used
+        // to mean exactly one thing — the bus advertises it LIVE and nobody
+        // serves it — because a row whose `state=` was anything else was counted
+        // into `exited` and never listed. Round 21 started LISTING a retired one
+        // as `gone` (see [`join_sessions`]), so `pid.is_none()` now also matches
+        // every session that ended normally in the last hour, and this warning
+        // fired for all of them: the sentence says "advertises @<sid> live",
+        // which for a `gone` row is simply false.
+        for s in r
+            .sessions
+            .iter()
+            .filter(|s| s.pid.is_none() && s.bus == "live")
+        {
             if local_nodes.contains(s.node.as_str()) {
                 w.push(format!(
                     "the bus advertises @{} live on {} — this machine's node — but no \
@@ -2684,10 +2801,13 @@ pub fn render_text(r: &Report) -> String {
     kvs.push((
         "receipts",
         if r.receipts {
-            "on (inbox seen handled|refused|deferred on an ask/task acks the sender)".to_string()
+            "on (the default; inbox seen handled|refused|deferred on an ask/task acks the \
+             sender — `[fabric] receipts = false` or `--no-receipts` turns it off)"
+                .to_string()
         } else {
-            "off (no ack reaches a sender; `[fabric] receipts = true` or `--receipts` turns \
-             it on)"
+            "off — TURNED OFF HERE (no ack reaches a sender, so their `post --wait-ack` and \
+             `ask` wait out the whole deadline; remove `[fabric] receipts = false` or \
+             `--no-receipts` to restore the default)"
                 .to_string()
         },
     ));
@@ -3296,8 +3416,9 @@ fn status_main(json: bool) -> ExitCode {
 /// One `tail` line. The widths are fixed, because a live tail cannot know the
 /// widest row to come; the principals are last so a long one only pushes
 /// what follows it. With `--bodies` the text comes LAST, after the trust label
-/// — the ordering `tui` keeps for the same reason: what a record IS must reach
-/// the reader before what it says.
+/// — what a record IS must reach the reader before what it says. (`tui.rs`
+/// ordered its transcript the same way and for the same reason, until round 21
+/// deleted the module; `aterm-gui`'s presence band still does.)
 #[must_use]
 pub fn tail_line(t: &Traffic, now_ms: u64, offset: i64, bodies: bool) -> String {
     let c = traffic_cells(t, now_ms, offset);
@@ -3307,7 +3428,7 @@ pub fn tail_line(t: &Traffic, now_ms: u64, offset: i64, bodies: bool) -> String 
     );
     if bodies && !t.text.is_empty() {
         line.push_str("  text=");
-        line.push_str(&safe(&t.text, crate::tui::TEXT_CAP));
+        line.push_str(&safe(&t.text, crate::render::TEXT_CAP));
     }
     line.trim_end().to_string()
 }
@@ -4626,10 +4747,17 @@ mod tests {
 
         // A LIVE presence row for this machine's node that no instance hosts.
         let mut r = healthy();
-        let rows = [
+        // `s-gone` CARRIES A FRESH `t=` ON PURPOSE. The listing is bounded by
+        // [`GONE_SHOW_MS`], so a row stamped `t=1` is an hour past it, is
+        // counted into `exited` and never reaches the warning filter at all —
+        // which would make the assertion below pass whether that filter checks
+        // the bus state or not. A retired row is only interesting to this test
+        // while it is still shown.
+        let fresh_gone = format!("v=1 t={} state=exited hold=0", crate::now_ms());
+        let rows: [(&str, &[u8]); 5] = [
             (
                 "/f/lab/pub/n-a/node/presence",
-                &b"v=1 t=1 state=live fabric=connected"[..],
+                b"v=1 t=1 state=live fabric=connected",
             ),
             (
                 "/f/lab/pub/n-a/s-one/presence",
@@ -4639,10 +4767,7 @@ mod tests {
                 "/f/lab/pub/n-a/s-ghost/presence",
                 b"v=1 t=1 state=live hold=0",
             ),
-            (
-                "/f/lab/pub/n-a/s-gone/presence",
-                b"v=1 t=1 state=exited hold=0",
-            ),
+            ("/f/lab/pub/n-a/s-gone/presence", fresh_gone.as_bytes()),
             (
                 "/f/lab/pub/n-far/s-far/presence",
                 b"v=1 t=1 state=live hold=0",
@@ -4671,15 +4796,26 @@ mod tests {
                 ("s-one", Some(100), "live"),
                 ("s-far", None, "live"),
                 ("s-ghost", None, "live"),
+                ("s-gone", None, "gone"),
             ],
-            "local rows first, joined by sid; exited remote rows are counted, not listed"
+            "local rows first, then the bus-only ones by sid; a recently retired \
+             local row is LISTED as `gone` rather than counted"
         );
-        assert_eq!(r.exited, 1);
+        assert_eq!(r.exited, 0, "nothing here is old enough to be a bare count");
         let w = warned(&r);
         assert!(
             w.iter()
                 .any(|l| l.contains("the bus advertises @s-ghost live on n-a")),
             "{w:#?}"
+        );
+        // AND THE RETIRED ROW EARNS NO WARNING, which is the whole of the fix.
+        // Listing a `gone` row gave it `pid: None`, and the warning selected on
+        // that alone — so every session that ended normally in the last hour was
+        // reported as "advertised live and undeliverable", which is false twice
+        // over: nothing advertises it, and its `state=` says `exited`.
+        assert!(
+            !w.iter().any(|l| l.contains("@s-gone")),
+            "a retired row is not advertised live and must not be warned about: {w:#?}"
         );
         assert!(
             !w.iter().any(|l| l.contains("@s-far")),

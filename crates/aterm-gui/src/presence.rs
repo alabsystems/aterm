@@ -469,8 +469,9 @@ pub(crate) struct HoldFact {
     pub(crate) fleet: bool,
 }
 
-/// The newest inbox row, trust FIRST (`aterm-link`'s `tui.rs` rule: the
-/// receiver's verdict is the first thing a reader sees).
+/// The newest inbox row, trust FIRST (`aterm-link`'s rule, in its `render`
+/// module since round 21: the receiver's verdict is the first thing a reader
+/// sees).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MailLast {
     pub(crate) kind: String,

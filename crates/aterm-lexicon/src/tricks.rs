@@ -68,7 +68,7 @@ const BUILTIN_TRICKS: &str = include_str!("../data/tricks.toml");
 /// One thing the cursor pet can be told to do. The variant order is the
 /// listing order ([`Trick::ALL`]) and the `data/tricks.toml` row order.
 ///
-/// Every consumer matches this EXHAUSTIVELY (no wildcard arm): a seventeenth
+/// Every consumer matches this EXHAUSTIVELY (no wildcard arm): an eighteenth
 /// trick must break the build at each place that has to learn it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Trick {
@@ -92,6 +92,8 @@ pub enum Trick {
     Groom,
     /// Make a noise.
     Speak,
+    /// Sing: a run of notes, not one.
+    Sing,
     /// Look at the person.
     Look,
     /// Give a paw / bat at something.
@@ -108,7 +110,7 @@ pub enum Trick {
 
 impl Trick {
     /// Every trick, in declaration order.
-    pub const ALL: [Trick; 16] = [
+    pub const ALL: [Trick; 17] = [
         Trick::Sit,
         Trick::Down,
         Trick::Sleep,
@@ -119,6 +121,7 @@ impl Trick {
         Trick::Purr,
         Trick::Groom,
         Trick::Speak,
+        Trick::Sing,
         Trick::Look,
         Trick::Paw,
         Trick::Hide,
@@ -142,6 +145,7 @@ impl Trick {
             Trick::Purr => "purr",
             Trick::Groom => "groom",
             Trick::Speak => "speak",
+            Trick::Sing => "sing",
             Trick::Look => "look",
             Trick::Paw => "paw",
             Trick::Hide => "hide",
@@ -152,7 +156,7 @@ impl Trick {
     }
 
     /// The inverse of [`code`](Self::code). It walks [`ALL`](Self::ALL)
-    /// instead of restating the sixteen strings, so `code` stays the ONE
+    /// instead of restating the seventeen strings, so `code` stays the ONE
     /// spelling table and the two can never disagree. Exact match only: the
     /// ids are data keys, not typed words, so nothing is folded.
     #[must_use]
@@ -177,6 +181,7 @@ impl Trick {
             Trick::Purr => "purrs with a little heart",
             Trick::Groom => "stops for a wash",
             Trick::Speak => "perks up and meows a note",
+            Trick::Sing => "sits up and sings a whole run of notes",
             Trick::Look => "perks up and looks at you",
             Trick::Paw => "bats a paw at the air",
             Trick::Hide => "ducks behind the nearest text",

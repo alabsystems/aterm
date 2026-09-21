@@ -1145,6 +1145,7 @@ pub fn model_registry() -> Vec<Model> {
         native_update_channel_scan_model(),
         native_update_admission_model(),
         native_update_auto_intent_model(),
+        native_update_apply_ladder_model(),
         native_update_hidden_output_quiet_model(),
         native_update_attempt_identity_model(),
         native_update_menu_activation_model(),

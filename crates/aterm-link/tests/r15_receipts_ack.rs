@@ -215,13 +215,73 @@ fn post_wait_ack_returns_the_recipients_verdict() {
     );
 }
 
-/// **A BRIDGE WITHOUT `--receipts` SENDS NO ACK.** The same `inbox seen
-/// handled` on an ask that acks under `--receipts` publishes nothing when the
-/// flag is off — the decision is still recorded locally, the sender simply
+/// **A BRIDGE NOBODY CONFIGURED ACKS ANYWAY — THE DEFAULT IS ON (round 21).**
+///
+/// The point of the round-21 change, pinned: `World::boot` passes no receipt
+/// flag, and the harness gives the bridge a scratch `XDG_CONFIG_HOME` whose
+/// seeded aterm.toml has no `[fabric]` table at all — so this is exactly the
+/// node that used to read `receipts off`, and the owner's own machine was one
+/// of them (its `[fabric]` block was written by `tools/fabric-enable.sh`,
+/// which writes no `receipts` key).
+///
+/// WHY IT MATTERS MORE THAN THE BYTES IT COSTS: with no ack there is nothing
+/// that can ever release a `post --wait-ack`, so `ask` waited out its whole
+/// deadline on such a node and then reported a timeout for a question that had
+/// in fact been answered. The catalog said so all along — "a recipient whose
+/// bridge runs without receipts never acks, so bound it".
+#[test]
+fn a_bridge_with_no_receipt_flag_and_no_config_key_acks_by_default() {
+    let w = World::boot("r21defaultreceipts", &[]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let ack_lane = format!("/f/{FLEET}/in/{}/{a}/{}/ack", w.node, w.node);
+
+    let asked = w.verb(&format!("@{a} post to=@{b} kind=ask --wait=30000 anyone?"));
+    assert!(
+        asked.ok(),
+        "ask: {} — log:\n{}",
+        asked.header(),
+        w.log_tail()
+    );
+    let off = off_of(asked.header());
+
+    let id = until("the ask to reach B", || id_at_off(&w, &b, off));
+    assert!(w.verb(&format!("@{b} inbox seen {id} handled")).ok());
+
+    // THE ACK REACHES THE SENDER'S OWN RING, with no flag and no config key
+    // anywhere. Waited for on the RING and not on the lane: the record lands on
+    // the bus a moment before the bridge delivers it, and a wait on the lane
+    // alone races that gap.
+    let row = until("the receipt to reach the sender", || {
+        replies_to(&w, &a, off)
+            .into_iter()
+            .find(|r| harness_kv(r, "kind") == Some("ack"))
+    });
+    assert_eq!(
+        harness_kv(&row, "verdict"),
+        Some("handled"),
+        "the recipient's word reaches the sender: {row}"
+    );
+    assert_eq!(
+        lane_len(&w, &ack_lane),
+        1,
+        "exactly one ack for one decision, by default — log:\n{}",
+        w.log_tail()
+    );
+}
+
+/// **A BRIDGE TOLD `--no-receipts` SENDS NO ACK.** The same `inbox seen
+/// handled` on an ask that acks by default publishes nothing once the flag
+/// turns it off — the decision is still recorded locally, the sender simply
 /// never hears it.
+///
+/// THE FLAG IS NOW WHAT MAKES THIS TEST TRUE (round 21). It used to boot with
+/// no flags at all and rely on the code default being off while `aterm fabric
+/// on` wrote `receipts = true` — the split this round closed. Booting bare now
+/// gets the default, which is on, and the off path needs saying out loud.
 #[test]
 fn receipts_off_sends_no_ack() {
-    let w = World::boot("r15noreceipts", &[]);
+    let w = World::boot_flags("r15noreceipts", &["--no-receipts"]);
     w.wait_ready();
     let (a, b) = w.two_sessions();
     let ack_lane = format!("/f/{FLEET}/in/{}/{a}/{}/ack", w.node, w.node);

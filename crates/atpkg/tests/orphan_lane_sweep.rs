@@ -1,41 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The store's stage-scratch sweep against the ONE writer the store-wide lock cannot
-//! speak for: a staging helper that outlived the process which submitted it.
+//! The store's stage-scratch sweep against the one writer the store-wide lock cannot speak
+//! for: a staging helper that outlived the process which submitted it.
 //!
-//! The untracked staging lane hands extraction to a LAUNCHD job
-//! (`atpkg::stage_helper`), so the helper is launchd's child, not the installer's. A
-//! `kill -9` of the installer therefore releases the store lock while its helper keeps
-//! extracting into `store/<program>/<build>.incoming-<the dead installer's pid>`. The
-//! next install took that lock, swept the scratch as debris — deleting it out from under
-//! the live helper — and stopped the helper only later, when its own lane submitted a
-//! job. In between, a writer this installer could not see was laying files inside the
-//! store, and the scratch it had just reclaimed came straight back as debris nothing
-//! reclaims (scratch is invisible to `list_installed`, so only a re-stage of that same
-//! build number would ever meet it again).
+//! The untracked staging lane hands extraction to a launchd job (`atpkg::stage_helper`), so
+//! the helper is launchd's child, not the installer's: `kill -9` of the installer releases
+//! the store lock while the helper keeps extracting into `<build>.incoming-<dead pid>`. The
+//! sweep must stop that helper before deleting its scratch, or it deletes out from under a
+//! live writer and the scratch comes back as debris nothing reclaims. Measured the one way
+//! that cannot be faked: the scratch must stay deleted. Three bystanders — our label shape
+//! under a live pid, a dead-pid tail under another vendor's prefix, our prefix with a stem
+//! that is no lane of ours — must survive the same `launchctl remove` pass.
 //!
-//! The orphan is reproduced exactly — a real launchd job carrying OUR label shape under
-//! a pid that does not exist, writing into that scratch in a loop — and a real install
-//! is driven over it through the public `verify_and_stage`, whose first act is the
-//! sweep. Whether the sweep stopped the helper first is measured the one way that cannot
-//! be faked: the scratch must STAY deleted.
-//!
-//! AND WHAT IT MUST NOT STOP. The sweep issues `launchctl remove`, so the selection rule
-//! is as load-bearing as the stopping: three BYSTANDER jobs are registered beside the
-//! orphan and must all survive the same pass — one of OUR shape under a LIVE pid (an
-//! install in flight, or a pid since reused), one carrying a dead-pid tail under another
-//! vendor's prefix, and one under our own prefix with a stem that is not a lane of ours.
-//! A sweep that took any of those would be stopping a stranger's job.
-//!
-//! ITS OWN TEST BINARY, on purpose. The fixture is a launchd job with a dead owner pid,
-//! and stopping exactly such jobs is what every sweep in this crate now does — so run
-//! inside the unit suite, a thousand parallel tests would stop the fixture before the
-//! sweep under test ever saw it (measured: the precondition failed, and the fixture's
-//! own process churn took an unrelated timing test down with it). Cargo runs test
-//! binaries one at a time, so here the fixture is only ever met by the sweep under test,
-//! and for the same reason all of it is ONE test function rather than four.
-//!
+//! Its own test binary: the fixture is a launchd job with a dead owner pid, and every sweep
+//! here stops exactly those, so a parallel unit suite would stop it first. Hence also one
+//! test function rather than four. macOS only — there is no launchd elsewhere.
 //! macOS only: there is no launchd, and so no lane job to outlive anyone, anywhere else.
 
 #![cfg(target_os = "macos")]
@@ -75,10 +55,9 @@ fn sha256_hex(path: &Path) -> String {
         .to_string()
 }
 
-/// A `raw-binary` row whose `sha256` HONESTLY describes `archive`: the smallest payload
-/// that reaches the swap, so what is under test is the sweep and not an extractor.
-/// `tree_root` is empty (the pre-`tree_root` manifest shape), which skips the apply-time
-/// re-verify without weakening anything this test asserts.
+/// A `raw-binary` row whose `sha256` honestly describes `archive`: the smallest payload
+/// that reaches the swap, so the sweep is what is under test and not an extractor. An
+/// empty `tree_root` skips the apply-time re-verify, which nothing here asserts.
 fn artifact(archive: &Path) -> Artifact {
     Artifact {
         target: "aarch64-apple-darwin".into(),
@@ -108,9 +87,8 @@ fn artifact(archive: &Path) -> Artifact {
     }
 }
 
-/// A pid nothing runs under, measured rather than guessed (macOS pids stay below 99999)
-/// and taken WITHOUT spawning: a fork here would hand the child a copy of every fd this
-/// binary holds open.
+/// A pid nothing runs under (macOS pids stay below 99999), found without spawning: a
+/// fork here would hand the child a copy of every fd this binary holds open.
 fn a_dead_pid() -> u32 {
     (90_000..99_999u32)
         .rev()
@@ -130,7 +108,7 @@ fn listed(label: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Register `label` on a job that idles until it is stopped: a BYSTANDER, there to be
+/// Register `label` on a job that idles until it is stopped: a bystander, there to be
 /// found by the sweep's `launchctl list` and left alone.
 fn submit_idle(label: &str) -> bool {
     Command::new("/bin/launchctl")
@@ -149,10 +127,9 @@ fn a_launchd_helper_outliving_a_killed_stager_is_stopped_before_its_scratch_is_s
     let build = dir.join("store").join("ay").join("18");
     std::fs::create_dir_all(build.parent().unwrap()).unwrap();
 
-    // THE ORPHAN: the scratch of a stager that is gone, with a launchd job still writing
-    // into it. The label carries the lane's own shape — `<stem>-<pid>-<seq>-<nonce>`
-    // under `systems.alab.atpkg.` — because that shape, with a dead owner, is exactly
-    // what a killed stager leaves registered.
+    // The orphan: the scratch of a stager that is gone, with a launchd job still writing
+    // into it. The label carries the lane's own shape (`<stem>-<pid>-<seq>-<nonce>` under
+    // `systems.alab.atpkg.`), which with a dead owner is what a killed stager leaves.
     let dead = a_dead_pid();
     let me = std::process::id();
     let scratch = build.with_file_name(format!("18.incoming-{dead}"));
@@ -170,9 +147,8 @@ fn a_launchd_helper_outliving_a_killed_stager_is_stopped_before_its_scratch_is_s
         String::from_utf8_lossy(&submit.stderr)
     );
 
-    // THE BYSTANDERS, each excluded by a DIFFERENT clause of the selection rule: a live
-    // owner pid, a prefix that is not ours, and a stem that is not a lane of ours. All
-    // three sit in the very `launchctl list` the sweep reads.
+    // The bystanders, each excluded by a different clause of the selection rule: a live
+    // owner pid, a prefix that is not ours, a stem that is no lane of ours.
     let live = format!("systems.alab.atpkg.stage-helper-{me}-9-{me:x}");
     let foreign_prefix = format!("com.example.atpkg-audit.stage-helper-{dead}-0-{me:x}");
     let foreign_stem = format!("systems.alab.atpkg.mytool-{dead}-0-{me:x}");
@@ -186,7 +162,7 @@ fn a_launchd_helper_outliving_a_killed_stager_is_stopped_before_its_scratch_is_s
     }
     let was_writing = scratch.join("bin.part").exists();
 
-    // THE SUCCESSOR: a real install of build 18, whose first act is the scratch sweep.
+    // The successor: a real install of build 18, whose first act is the scratch sweep.
     let staged = verify_and_stage(&art, &archive, &build);
 
     let job_left_running = listed(&label);

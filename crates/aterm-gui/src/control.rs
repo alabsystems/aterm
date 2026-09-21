@@ -1387,6 +1387,9 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let apply_policy_reason = apply_snapshot
         .as_ref()
         .and_then(|live| live.apply_policy_reason(&st));
+    let apply_phase = apply_snapshot
+        .as_ref()
+        .and_then(|live| live.apply_phase(&st));
     // Self-healing ledger fields: failing=<consecutive>:<kind> (0 when healthy) and
     // the lifetime rescue-path count — so a driver can see a broken pipeline (or a
     // limping primary path) from one line, without parsing health.toml.
@@ -1455,6 +1458,13 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         st.is_failing_persistently(),
         st.outcome
     );
+    // WHERE the automatic lane is on its ladder, so a driver reading this line
+    // can tell "waiting for a quiet moment, two minutes in" from "landing at the
+    // next poll" without the log. Present only while the automatic lane owns
+    // the apply; the token's absence on every other posture is deliberate.
+    if let Some(phase) = apply_phase {
+        out = format!("{} apply_phase={phase}\n", out.trim_end_matches('\n'));
+    }
     if let Some(reason) = apply_policy_reason {
         out = format!(
             "{} apply_policy_reason={}\n",
@@ -4062,11 +4072,14 @@ fn post_scope_denied(scope: Scope) -> bool {
 /// WHAT THAT BOUGHT AN INJECTED AGENT, all three of which are §6.6/§9.3
 /// properties: `who` and `lease status` showed `driving=lease:fabric:h-andrew`,
 /// attributing the agent's own drive to a human, to every local driver and to a
-/// person at the glass; `Bridge::local_lease_holder` filters holders starting
-/// with `fabric:`, so the bridge never wrote the §6.6 row-5 `holder=owner-cli:<h>`
-/// event and the drive stayed invisible on the bus control ledger; and a genuine
-/// human claim arriving afterwards was refused as a different live holder's
-/// lease, so the real mirror never took.
+/// person at the glass; the bridge's §6.6 row-5 mirror filtered holders starting
+/// with `fabric:`, so it never wrote the `holder=owner-cli:<h>` event and the
+/// drive stayed invisible on the bus control ledger; and a genuine human claim
+/// arriving afterwards was refused as a different live holder's lease, so the
+/// real mirror never took. (The bus half of that is history: `aterm-link` round
+/// 21 cut the drive face, the mirror and the control ledger with it. The LOCAL
+/// property below — who `lease` lets you claim to be — is unchanged, and is
+/// what this rule is for.)
 ///
 /// ACQUIRE ONLY, which is the clause §11.2 states. The RESIDUAL is `lease release
 /// … force`: it steals any cooperative hold, `fabric:` ones included, from any
@@ -22746,7 +22759,10 @@ mod tests {
     /// mirror when the human finally claimed the keyboard.
     #[test]
     fn only_the_bridge_may_claim_the_fabric_lease_namespace() {
-        // The bridge's own mirror, verbatim from `Bridge::acquire_lease`.
+        // The bridge's own mirror, verbatim from the `acquire` that
+        // `aterm-link`'s row-5 lease mirror used to send. Round 21 cut that
+        // mirror; this string is kept as the exact shape the rule must keep
+        // refusing from any other scope, which is what the test is about.
         assert!(!lease_forges_fabric_holder(
             Scope::Bridge,
             "acquire holder=fabric:h-andrew ttl=30000"

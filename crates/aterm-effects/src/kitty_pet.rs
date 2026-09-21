@@ -563,6 +563,31 @@ const PURR_MOTE_LIFE: f32 = 1.9;
 /// before and after.
 const PURR_MOTE_STEPS: f32 = 16.0;
 
+/// THE SONG (the typed `sing` verb): how many ♪ it deals, the opening beat
+/// included. A `speak` is ONE note; a song is a run of them, and that
+/// difference is the whole of what the two verbs look like on glass.
+const SONG_NOTES: u8 = 4;
+/// The gap between the song's notes. It is SHORTER THAN [`PERK_HOLD`] on
+/// purpose and by assertion: every ♪ re-takes the perk it is sung from
+/// ([`PetBrain::mail_beat`]), so a gap that outlasted the hold would let the
+/// pose lapse between notes — and the song's own "work took the pose" rule
+/// would then end it after the first, leaving a `sing` that is a `speak`
+/// with extra state and a test that still passes on `mote(Note)`. Measured
+/// the hard way: at 0.42 s it dealt exactly one note.
+const SONG_BEAT: f32 = 0.26;
+const _: () = assert!(
+    SONG_BEAT < PERK_HOLD,
+    "a song whose gap outlasts the perk it rides deals exactly one note"
+);
+const _: () = assert!(
+    SONG_BEAT * (SONG_NOTES as f32) < PURR_MOTE_LIFE,
+    "a song's notes must overlap, or it is a queue of meows and not a song"
+);
+const _: () = assert!(
+    (SONG_NOTES as usize) <= PET_MOTES_MAX,
+    "a song must fit the mote pool, or its last ♪ is silently dropped"
+);
+
 // ── the settled gaze and the loaf ───────────────────────────────────────────
 //
 // Review #6: a settled pet should acknowledge YOU. The settle-turn reads the
@@ -2974,6 +2999,14 @@ pub struct PetBrain {
     /// Seconds remaining in the petting hold — the purr-flavored beat a
     /// consumed pet buys regardless of the contentment ledger.
     pet_hold_t: f32,
+    /// THE SONG's two: how many ♪ the commanded `sing` still owes
+    /// ([`SONG_NOTES`] at the verb, one spent per beat) and the seconds to
+    /// the next one. A COUNTER, not a clock, so the run is finite by
+    /// construction rather than by arithmetic — it can only ever deal the
+    /// notes it was handed. Named in [`PetBrain::needs_frames`], and dropped
+    /// the tick work takes the perk the song rides.
+    song_left: u8,
+    song_next: f32,
     /// Genuine pointer travel across a resting body earns the same bounded
     /// affection as a click. This sensor never requests a wake or a frame.
     stroke: StrokeDetector,
@@ -3465,6 +3498,8 @@ impl Default for PetBrain {
             pending_pet: 0,
             pet_at: None,
             pet_hold_t: 0.0,
+            song_left: 0,
+            song_next: 0.0,
             stroke: StrokeDetector::default(),
             watch_heat: 0.0,
             watch_t: 0.0,
@@ -5069,6 +5104,9 @@ impl PetBrain {
             self.pending_pet = 0;
             self.pet_at = None;
             self.pet_hold_t = 0.0;
+            // …and a song sung to nobody, with it: the ♪ a hidden cat deals
+            // land on no glass, and an owed one would pin `needs_frames`.
+            self.song_left = 0;
             // …and the typed kitty command, whole: a word typed at a cat
             // nobody can see is a request to nobody (and a typed word never
             // summons), and a commanded seat is a pose about a body that is
@@ -5434,13 +5472,15 @@ impl PetBrain {
                     self.praise(p.trick);
                 }
             }
-            // …and THE ORPHANED HOLDS the commands made reachable: a roll or
-            // a hide that was live when reduced motion (or a load shed)
-            // engaged has no arm left to spend it — this one pins the pose
-            // to Sit or Sleep — and both hold `needs_frames` open.
+            // …and THE ORPHANED HOLDS the commands made reachable: a roll,
+            // a hide or a SONG that was live when reduced motion (or a load
+            // shed) engaged has no arm left to spend it — this one pins the
+            // pose to Sit or Sleep — and every one of them holds
+            // `needs_frames` open.
             self.wriggle_t = 0.0;
             self.hide_to = None;
             self.hiding = false;
+            self.song_left = 0;
             // Wave 2 is theater and theater only: no perk at a stream under
             // reduced motion, no pointer play, and no heat left behind to
             // fire either later.
@@ -5535,6 +5575,12 @@ impl PetBrain {
         // drops the first tick the one-shot it marks is over.
         if self.action != PetAction::Perk {
             self.drop_trick_go();
+            // …and THE SONG with it. `sing` rides the perk each of its beats
+            // re-takes, so a pose the WORK took is a song that is over —
+            // the same law as the verb above it, for the same reason: a cat
+            // walking home mid-song would be singing with nothing on glass
+            // saying it was ever asked to.
+            self.song_left = 0;
         }
         if !self.trick_settle_posed() {
             self.clear_trick_settle();
@@ -5543,6 +5589,18 @@ impl PetBrain {
             self.trick_act = false;
         }
         self.pet_hold_t = (self.pet_hold_t - dt).max(0.0);
+        // THE SONG's beats, dealt HERE rather than from a pose arm because
+        // every pose arm RETURNS for the whole of its hold — and the perk
+        // each ♪ re-takes IS such a hold, so a song dealt inside the ladder
+        // would deal exactly one note and call it four.
+        if self.song_left > 0 {
+            self.song_next = (self.song_next - dt).max(0.0);
+            if self.song_next <= 0.0 {
+                self.song_left -= 1;
+                self.song_next = SONG_BEAT;
+                self.mail_beat(width);
+            }
+        }
         // The wave-1 latch TTLs, on the injected clock (never dt, which is
         // motion-clamped): a bell that outlived its window mid-flight
         // expires unconsumed; a pet expires two seconds after the LAST click.
@@ -9626,6 +9684,7 @@ impl PetBrain {
             && self.action != PetAction::Perk
             && self.wriggle_t <= 0.0
             && self.pet_hold_t <= 0.0
+            && self.song_left == 0
             && !self.groom_owed
             && self.hide_to.is_none()
             && self.resume.is_none()
@@ -9649,6 +9708,7 @@ impl PetBrain {
             | Trick::Roll
             | Trick::Groom
             | Trick::Speak
+            | Trick::Sing
             | Trick::Look
             | Trick::Paw
             | Trick::Hide
@@ -9806,6 +9866,18 @@ impl PetBrain {
             Trick::Speak => {
                 self.facing_left = away;
                 self.mail_beat(width);
+            }
+            Trick::Sing => {
+                // THE SONG: `speak`'s beat, and then [`SONG_NOTES`] − 1 more
+                // of them on the song counter — which is the whole
+                // difference between the two verbs on glass, and the reason
+                // `sing` is a trick of its own rather than another word for
+                // `speak`. The run rides the perk each beat re-takes, so
+                // work ending the pose ends the song with it.
+                self.facing_left = away;
+                self.mail_beat(width);
+                self.song_left = SONG_NOTES - 1;
+                self.song_next = SONG_BEAT;
             }
             Trick::Look => {
                 // The opening beat IS the verb: the perk is simply held a
@@ -11564,6 +11636,9 @@ impl PetBrain {
             || self.stumble_t > 0.0
             || self.braking
             || self.wriggle_t > 0.0
+            // …and a SONG must tick to finish dealing its notes: bounded by
+            // construction at [`SONG_NOTES`], one spent per beat.
+            || self.song_left > 0
             || self.hide_to.is_some()
             || self.hiding
             // The stream watch must tick to lapse (bounded by
@@ -28715,6 +28790,24 @@ mod tests {
             let early = |action: PetAction, frames: &[PetFrame]| {
                 frames[..120].iter().any(|f| f.action == action)
             };
+            // THE HOLD, NOT THE FLASH — the longest RUN the observable
+            // survives, in seconds. Three verbs ARE a pose held for a beat
+            // and nothing else (the wash, the purr, the bat), so `any()` on
+            // their pose was satisfied by ONE 16 ms frame: a frame that
+            // disagrees with both its neighbours is not a performance, it is
+            // the flash. MEASURED on the shipped tree — delete the hold from
+            // `perform_trick` (`groom_owed`, `pet_hold_t`, `play_hold`) and
+            // the wash falls from 76 frames to 1, the purr from 69 to 1, the
+            // bat from 38 to 1, while all 2285 tests of this crate stay
+            // green. The hold IS the verb.
+            let held_for = |pred: &dyn Fn(&PetFrame) -> bool| {
+                let (mut best, mut run) = (0usize, 0usize);
+                for f in after {
+                    run = if pred(f) { run + 1 } else { 0 };
+                    best = best.max(run);
+                }
+                best as f32 * 0.016
+            };
             let seen = match trick {
                 Trick::Sit => saw(PetGlyphId::PetSitLookup),
                 Trick::Down => early(PetAction::Loaf, &frames) && !early(PetAction::Loaf, &plain),
@@ -28725,9 +28818,28 @@ mod tests {
                 Trick::Jump => did(PetAction::Leap) && after.iter().any(|f| f.lift > 0.3),
                 Trick::Play => saw(PetGlyphId::PetPlaybow) && saw(PetGlyphId::PetBat),
                 Trick::Roll => saw(PetGlyphId::PetRoll0) && saw(PetGlyphId::PetRoll1),
-                Trick::Purr => did(PetAction::Purr) && mote(PetMoteKind::Heart),
-                Trick::Groom => saw(PetGlyphId::PetGroom),
+                Trick::Purr => {
+                    mote(PetMoteKind::Heart)
+                        && held_for(&|f| f.action == PetAction::Purr) >= PET_HOLD - 0.05
+                }
+                // …and the RUN is what tells the commanded wash from the
+                // ladder's own: a `down` cat grooms off the loaf rung inside
+                // this very window, for about half of [`GROOM_HOLD`].
+                Trick::Groom => held_for(&|f| f.pose == PetGlyphId::PetGroom) >= GROOM_HOLD - 0.05,
                 Trick::Speak => mote(PetMoteKind::Note),
+                // THE SONG is a RUN, and that is the whole of what separates
+                // it from `speak`'s single note on glass: at some instant
+                // more than one ♪ is in the air at once. A one-note `sing`
+                // (a dropped counter, a beat that never fired twice) fails
+                // here while `mote(Note)` alone would still pass.
+                Trick::Sing => after.iter().any(|f| {
+                    f.motes
+                        .iter()
+                        .flatten()
+                        .filter(|m| m.kind == PetMoteKind::Note)
+                        .count()
+                        >= 2
+                }),
                 Trick::Look => {
                     let held = after
                         .iter()
@@ -28735,7 +28847,10 @@ mod tests {
                         .count();
                     held as f32 * 0.016 >= 2.0 * PERK_HOLD - 0.05
                 }
-                Trick::Paw => saw(PetGlyphId::PetBat) && mote(PetMoteKind::Dust),
+                Trick::Paw => {
+                    mote(PetMoteKind::Dust)
+                        && held_for(&|f| f.pose == PetGlyphId::PetBat) >= BAT_HOLD - 0.05
+                }
                 Trick::Hide => after
                     .iter()
                     .any(|f| f.action == PetAction::Crouch && f.under_ink),

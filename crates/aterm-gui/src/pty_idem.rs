@@ -4,13 +4,17 @@
 //! **A6 — the idempotency key at the PTY seam** (design §6.5's last open row,
 //! spelled out in §11.2's "The idempotency key at the PTY seam").
 //!
-//! §6.5's table has one hop still marked DESIGNED: `bus → PTY (term/in)`.
-//! `feed-bin` is not idempotent, so a bridge that crashes between "wrote the
-//! bytes" and "recorded that it wrote them" has two bad options. Replay, and the
-//! keystroke is typed twice. Do not replay, and the keystroke is lost — which is
-//! what the bridge does today, silently, by subscribing the drive face from the
-//! HEAD on every attach. **A silent duplicate and a silent loss are both
-//! failures**; the design asks for neither.
+//! §6.5's table had one hop marked DESIGNED: `bus → PTY (term/in)`. `feed-bin`
+//! is not idempotent, so a bridge that crashed between "wrote the bytes" and
+//! "recorded that it wrote them" had two bad options — replay, and the keystroke
+//! is typed twice; do not replay, and it is lost. **A silent duplicate and a
+//! silent loss are both failures**, and the design asked for neither.
+//!
+//! THAT HOP NO LONGER EXISTS. `aterm-link` round 21 cut the `term/in` drive
+//! face: no bus record reaches a PTY by any path, and the bridge subscribes no
+//! such subscription to resume from anywhere. What is below is unaffected —
+//! `feed-bin`'s `id=` is the LOCAL seam, used by `aterm-ctl feed-bin` and
+//! `send --stdin`, and it is `Realm::Bridge` that lost its writer.
 //!
 //! This module is the missing half. A driver stamps an input verb with
 //! `id=<epoch>:<producer>:<seq>`; the endpoint keeps a per-session, per-producer

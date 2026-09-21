@@ -922,11 +922,12 @@ pub fn differential_args() -> Vec<String> {
 
 /// The nested workspace's checked-in driver is the oracle contract. Keeping
 /// this as one argv value (with no cargo fallback or reimplementation here)
-/// means changes to its target-cell matrix automatically reach the required
-/// merge gate. The target dir is absolute because `run.sh` deliberately runs
-/// cross-cell Cargo commands from `/`; inheriting a relative caller value would
-/// turn that into `/target`, while inheriting an arbitrary absolute one would
-/// collapse this scheduler lane onto somebody else's Cargo lock.
+/// means changes to its cell table automatically reach the required merge
+/// gate. The target dir is absolute because `run.sh`'s children do not share a
+/// cwd — the native cell runs from the oracle workspace and the negative
+/// controls from a copy of it under `$TMPDIR` — so a relative caller value
+/// would resolve differently for each, while inheriting an arbitrary absolute
+/// one would collapse this scheduler lane onto somebody else's Cargo lock.
 ///
 /// # Errors
 /// Returns the current-directory error from making a relative repository root
@@ -942,7 +943,10 @@ pub fn libc_oracle_cmd(ctx: &Ctx) -> std::io::Result<Cmd> {
 }
 
 /// `libc-oracle/run.sh` exit contract: 0 proves conformance, 1 is a finding,
-/// and 3 means a preflight/environment inability decided nothing. A missing
+/// and 3 means a preflight/environment inability decided nothing — the
+/// driver's own preflight, or `gen/symgate.py` answering 3 because the
+/// reference libc could not be documented under Trust, which run.sh
+/// propagates rather than folding into a finding about the shim. A missing
 /// status likewise decided nothing; every other status violates the driver's
 /// declared contract and remains a gate finding.
 #[must_use]
@@ -1834,11 +1838,19 @@ fn feature_gates(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
-// 4.5a) FIRST-PARTY LIBC ABI ORACLE. The const/layout/type assertions compile
-//    for every target cell, the emitted-symbol gate closes link-name aliases,
-//    and `cargo test` executes the pointer-valued and C-macro checks for the
-//    host's native cell. Therefore a native Linux run is the required Linux
-//    runtime route; cross-compiling that cell alone is deliberately not enough.
+// 4.5a) FIRST-PARTY LIBC ABI ORACLE, for THIS HOST'S native cell. `targo test`
+//    compiles the cell's const/layout/type assertions and executes its
+//    pointer-valued and C-macro checks, and the emitted-source gate closes
+//    link-name aliases — all under the Trust sysroot, the only compiler the
+//    driver names. The other cells are decided where THEY are native (the
+//    `FLEET_HOST_TRIPLES` rule in xtask's gate.rs): a merge-gate run on the
+//    Intel Mac decides x86_64-apple-darwin, one on m17-tower decides
+//    x86_64-unknown-linux-gnu, and a cell no box hosts is decided by no gate,
+//    which the driver's `### CELLS` report says row by row. Until 2026-09-20
+//    the driver also type-checked five cross cells on stock toolchains through
+//    rustup; the owner's direction ("avoid extra dependencies and especially
+//    we are avoiding rustc because we have trust!") removed that path, so a
+//    box with no rustup — the atpkg store shape — can pass this stage.
 //
 //    Missing/non-executable driver and exit 3 are COULD-NOT-RUN, never a skip;
 //    exit 1 is a conformance finding. There is no stock-workspace fallback:
@@ -1862,7 +1874,7 @@ fn libc_oracle(ctx: &Ctx, r: &mut Report) {
         ));
         return;
     }
-    let label = "libc-oracle/run.sh (cross-cell ABI + native runtime)";
+    let label = "libc-oracle/run.sh (this host's native ABI cell; the other cells are decided where they are native)";
     if ctx.selftest {
         r.skip(format!("{label} (selftest: not executed)"));
         return;
@@ -2791,7 +2803,7 @@ mod tests {
         let target = &cmd.envs[0].1;
         assert!(
             PathBuf::from(target).is_absolute(),
-            "run.sh executes cross commands from /, so this cannot be relative: {target:?}"
+            "run.sh's children run from different cwds, so this cannot be relative: {target:?}"
         );
         assert!(
             PathBuf::from(target).ends_with("relative-repo/libc-oracle/target"),

@@ -11,9 +11,10 @@
 #![cfg(test)]
 
 use aterm_spec::derive::{
-    Model, native_update_admission_model, native_update_attempt_identity_model,
-    native_update_auto_intent_model, native_update_disk_transaction_model,
-    native_update_hidden_output_quiet_model, native_updater_model,
+    Model, native_update_admission_model, native_update_apply_ladder_model,
+    native_update_attempt_identity_model, native_update_auto_intent_model,
+    native_update_disk_transaction_model, native_update_hidden_output_quiet_model,
+    native_updater_model,
 };
 use aterm_spec::interp::{State, admits};
 
@@ -21,8 +22,8 @@ use crate::native_update_admission::{
     AdmissionBlock, AdmissionDecision, AdmissionFacts, ApplyLane, classify,
 };
 use crate::native_update_auto_intent::{
-    ArmDecision, ArmFacts, AttemptDisposition, AttemptResult, PollDecision, PollFacts, WaitReason,
-    arm, finish, poll,
+    ApplyPhase, ArmDecision, ArmFacts, AttemptDisposition, AttemptResult, PollDecision, PollFacts,
+    WaitReason, arm, finish, poll,
 };
 use crate::native_updater_service::{
     ApplyDecision, ApplyMode, ApplyPreflightStart, CheckCompletion, CheckStart, ClosePreflight,
@@ -662,7 +663,7 @@ fn real_auto_intent_survives_manual_check_collision_and_unsuccessful_attempts() 
             work_active: service.snapshot().active.is_some(),
             applying: false,
             activity_quiet: true,
-            activity_grace_expired: false,
+            phase: ApplyPhase::PreferIdle,
             staged_ready: false,
             staged_build: None,
             staged_exact_target: false,
@@ -702,14 +703,15 @@ fn real_auto_intent_survives_manual_check_collision_and_unsuccessful_attempts() 
             work_active: service.snapshot().active.is_some(),
             applying: false,
             activity_quiet: true,
-            activity_grace_expired: false,
+            phase: ApplyPhase::PreferIdle,
             staged_ready: true,
             staged_build,
             staged_exact_target: true,
         }),
         PollDecision::Attempt {
             build: 11,
-            quiet: true
+            quiet: true,
+            phase: ApplyPhase::PreferIdle,
         }
     );
     let quiet = model.successors("QuietElapsed", &modeled)[0].clone();
@@ -761,9 +763,9 @@ fn real_auto_intent_survives_manual_check_collision_and_unsuccessful_attempts() 
 /// simultaneously idle, so the old "activity always defers" rule meant a
 /// verified staged build waited for a moment that never arrived — and the user
 /// ended up clicking Install by hand, which is the exact outcome automatic apply
-/// exists to remove. Deferral is now bounded: inside the window activity still
-/// wins, past it the lossless lane lands anyway and reports `quiet: false` so the
-/// host takes the lane that activity cannot revoke.
+/// exists to remove. Deferral is bounded by the ladder: in its first phase
+/// activity still wins, in every later phase the same still-busy facts attempt,
+/// and the phase rides along so the park gate reads the ladder.
 #[test]
 fn real_auto_intent_bounds_activity_deferral_instead_of_waiting_forever() {
     let model = native_update_auto_intent_model();
@@ -783,7 +785,7 @@ fn real_auto_intent_bounds_activity_deferral_instead_of_waiting_forever() {
         work_active: false,
         applying: false,
         activity_quiet: false,
-        activity_grace_expired: false,
+        phase: ApplyPhase::PreferIdle,
         staged_ready: true,
         staged_build: Some(11),
         staged_exact_target: true,
@@ -797,17 +799,21 @@ fn real_auto_intent_bounds_activity_deferral_instead_of_waiting_forever() {
     assert_exact_model_action(&model, "GraceWindowCloses", &modeled, &closed);
     assert_eq!(closed["grace_expired"], 1);
 
-    // Past it, the same still-busy facts attempt.
-    assert_eq!(
-        poll(PollFacts {
-            activity_grace_expired: true,
-            ..busy
-        }),
-        PollDecision::Attempt {
-            build: 11,
-            quiet: false
-        }
-    );
+    // Past it, the same still-busy facts attempt — in every later phase.
+    for phase in [
+        ApplyPhase::PreferOutputGap,
+        ApplyPhase::KeysOnly,
+        ApplyPhase::Land,
+    ] {
+        assert_eq!(
+            poll(PollFacts { phase, ..busy }),
+            PollDecision::Attempt {
+                build: 11,
+                quiet: false,
+                phase,
+            }
+        );
+    }
     let attempted = model.successors("Attempt", &closed)[0].clone();
     assert_exact_model_action(&model, "Attempt", &closed, &attempted);
     assert_eq!(
@@ -838,13 +844,16 @@ fn real_auto_intent_bounds_activity_deferral_instead_of_waiting_forever() {
 /// `Attempt` is the LAUNCH and is gated by the poll policy (the test above);
 /// `ParkReaders` is the freeze and is gated by `prelaunch_park_admitted`. Bind
 /// the shipping predicate to the model's guard over every combination of the
-/// facts the model can express, so a rule that drifts out of one of them fails
-/// here rather than on a user's terminal.
+/// facts the model can express — the model's `quiet` is the ladder's first
+/// phase asking for a quiet moment, its `grace_expired` is every later phase —
+/// so a rule that drifts out of one of them fails here rather than on a user's
+/// terminal.
 #[test]
 fn real_park_gate_admits_exactly_the_model_s_reader_park() {
     use crate::app_update_handoff::{
         ParkGate, ParkGateFacts, prelaunch_hold_cap, prelaunch_park_admitted,
     };
+    use crate::native_update_auto_intent::ActivityFacts;
     let model = native_update_auto_intent_model();
     // Walk to the Attempting phase (launched, nothing parked) the way the
     // reducer does: a stage lands while idle, the quiet epoch elapses, attempt.
@@ -859,7 +868,15 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
 
     // The model's two facts, over both automatic modes and both ways of being
     // admissible. `held_for` is zero throughout: the cap is the OTHER gate and
-    // has its own enumeration in `app_update_handoff::park_gate_tests`.
+    // has its own enumeration in `app_update_handoff::park_gate_tests`. A calm
+    // machine otherwise, so the ladder's finer preferences (keys, output) do
+    // not enter: those are enumerated in the same module.
+    let calm = |quiet: bool| ActivityFacts {
+        quiet,
+        hands_off_keys: true,
+        output_quiet: true,
+        focused: true,
+    };
     for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
         for quiet in [false, true] {
             for grace_expired in [false, true] {
@@ -872,38 +889,28 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
                     quiet || grace_expired,
                     "the model's guard is quiet-or-past-grace"
                 );
-                // The shipping predicate, given the same two facts and a machine
-                // that is otherwise calm. `AutomaticPastGrace` past its grace
-                // needs no quiet epoch; `Automatic` does.
+                // The shipping predicate, given the same two facts: the
+                // model's `grace_expired` is any phase after the first.
+                let phase = if grace_expired {
+                    ApplyPhase::PreferOutputGap
+                } else {
+                    ApplyPhase::PreferIdle
+                };
                 let real = prelaunch_park_admitted(
                     ParkGateFacts {
                         mode,
-                        quiet,
-                        hands_off_keys: true,
-                        output_quiet: true,
-                        focused: true,
+                        phase,
+                        activity: calm(quiet),
                         masters_quiet: true,
                         held_for: std::time::Duration::ZERO,
                     },
                     prelaunch_hold_cap(mode),
                 ) == ParkGate::Park;
-                let admissible = match mode {
-                    ApplyMode::Automatic => quiet,
-                    // The past-grace lane reaches the park only once its grace
-                    // has closed (its entry gate), and there it parks on a calm
-                    // machine whether or not the quiet epoch has elapsed.
-                    _ => true,
-                };
-                assert_eq!(real, admissible, "{mode:?} quiet={quiet}");
-                // And where the model refuses, the real gate must refuse too for
-                // the lane the model is describing.
-                if mode == ApplyMode::Automatic {
-                    assert_eq!(
-                        real,
-                        model_parks && quiet,
-                        "the quiet automatic lane and the model agree exactly"
-                    );
-                }
+                assert_eq!(
+                    real, model_parks,
+                    "{mode:?} quiet={quiet} grace_expired={grace_expired}: the shipping gate \
+                     and the model agree exactly"
+                );
             }
         }
     }
@@ -927,10 +934,8 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
             prelaunch_park_admitted(
                 ParkGateFacts {
                     mode,
-                    quiet: false,
-                    hands_off_keys: true,
-                    output_quiet: false,
-                    focused: true,
+                    phase: ApplyPhase::PreferIdle,
+                    activity: calm(false),
                     masters_quiet: true,
                     held_for: std::time::Duration::ZERO,
                 },
@@ -939,6 +944,75 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
             ParkGate::Wait(_)
         ));
     }
+}
+
+/// THE LADDER, bound to its model (docs/DESIGN-auto-apply-ladder-2026-09-21.md).
+///
+/// The shipping `apply_phase` tiles the wall clock into the model's four
+/// phases, and the shipping `automatic_park_refusal` — the ONE predicate the
+/// entry gate and the park gate both read — must admit exactly the states in
+/// which the model's `Park` is enabled, over every phase and every combination
+/// of the four terminal facts. The mutant's stand-down is the 2026-09-20
+/// incident, caught here as a wedge: the busy terminal that never updates.
+#[test]
+fn real_apply_ladder_admits_exactly_the_model_s_park() {
+    use crate::native_update_auto_intent::{
+        ActivityFacts, LANDS_WITHIN, PREFER_IDLE_WINDOW, PREFER_OUTPUT_GAP_WINDOW, apply_phase,
+        automatic_park_refusal,
+    };
+    let model = native_update_apply_ladder_model();
+
+    // The wall clock tiles into the model's phases, in order, ending at the bound.
+    let phases = [
+        (ApplyPhase::PreferIdle, 0, std::time::Duration::ZERO),
+        (ApplyPhase::PreferOutputGap, 1, PREFER_IDLE_WINDOW),
+        (
+            ApplyPhase::KeysOnly,
+            2,
+            PREFER_IDLE_WINDOW + PREFER_OUTPUT_GAP_WINDOW,
+        ),
+        (ApplyPhase::Land, 3, LANDS_WITHIN),
+    ];
+    for (phase, modeled, since_armed) in phases {
+        assert_eq!(apply_phase(since_armed), phase);
+        assert_eq!(
+            apply_phase(since_armed + std::time::Duration::from_secs(1)),
+            phase
+        );
+        for bits in 0..16u32 {
+            let facts = ActivityFacts {
+                quiet: bits & 1 != 0,
+                hands_off_keys: bits & 2 != 0,
+                output_quiet: bits & 4 != 0,
+                focused: bits & 8 != 0,
+            };
+            let mut state = model.init_state();
+            state.insert("phase", modeled);
+            state.insert("quiet", i64::from(facts.quiet));
+            state.insert("keys", i64::from(facts.hands_off_keys));
+            state.insert("output", i64::from(facts.output_quiet));
+            state.insert("focused", i64::from(facts.focused));
+            let model_parks = !model.successors("Park", &state).is_empty();
+            let real_parks = automatic_park_refusal(phase, facts).is_none();
+            assert_eq!(
+                real_parks, model_parks,
+                "{phase:?} {facts:?}: the shipping predicate and the model's guard agree"
+            );
+            if model_parks {
+                let parked = model.successors("Park", &state)[0].clone();
+                assert!(model.check_invariant("ParkedOnlyWhenTheLadderAdmits", &parked));
+            }
+        }
+    }
+
+    // The healthy ladder always lands; the mutant wedges a busy terminal.
+    let landed = |state: &State| state["landed"] == 1;
+    assert!(aterm_spec::interp::find_deadlock(&model, landed).is_none());
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let wedge = aterm_spec::interp::find_deadlock(&buggy, landed)
+        .expect("the incident: stood down, never landing");
+    assert_eq!(wedge["manual_only"], 1);
+    assert!(!buggy.check_invariant("ActivityNeverLatchesManualOnly", &wedge));
 }
 
 /// The hold cap and the re-park, bound to the model steps that describe them:
@@ -1070,14 +1144,15 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
             work_active: false,
             applying: false,
             activity_quiet: crate::automatic_output_activity_quiet(quiet_now_ns, latest_output_ns,),
-            activity_grace_expired: false,
+            phase: ApplyPhase::PreferIdle,
             staged_ready: true,
             staged_build: Some(11),
             staged_exact_target: true,
         }),
         PollDecision::Attempt {
             build: 11,
-            quiet: true
+            quiet: true,
+            phase: ApplyPhase::PreferIdle,
         }
     );
     let attempted = model.successors("Attempt", &state)[0].clone();

@@ -106,25 +106,19 @@ pub fn under_protected_root(home: &Path, path: &Path) -> bool {
         .any(|(lib, domain)| first == *lib && second == *domain)
 }
 
-/// Whether `path` lies at or under a FILE PROVIDER domain specifically — iCloud
+/// Whether `path` lies at or under a file-provider domain specifically — iCloud
 /// Drive (`Library/Mobile Documents`) or a third-party sync provider
 /// (`Library/CloudStorage`).
 ///
-/// Narrower than [`under_protected_root`] on purpose. The `$HOME` folders and
-/// `/Volumes` are classes a held Full Disk Access grant reaches, so refusing
-/// them would block ordinary work the owner has already consented to once. The
-/// file-provider domains are the one class the design records as **not**
-/// reliably covered by that grant (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md`
-/// §3.4, and `NEVER_COVERED` in the `privacy` verb): an access there can raise
-/// `"aterm" wants to access files managed by "iCloud Drive"` no matter what the
-/// owner has granted.
+/// Narrower than [`under_protected_root`] on purpose: the `$HOME` folders and
+/// `/Volumes` are reached by a held Full Disk Access grant, so refusing them
+/// would block work the owner has already consented to. The file-provider
+/// domains are the one class that grant does not reliably cover (`NEVER_COVERED`
+/// in the `privacy` verb), so an access there can raise a consent dialog in
+/// aterm's name whatever the owner has granted — and a dialog a program inside a
+/// session can raise is a consent surface an agent controls.
 ///
-/// That matters wherever a path can arrive from INSIDE a session, because a
-/// consent dialog a program can raise in aterm's name is a consent surface an
-/// agent controls — the same rule that fences the warm-up and `tccutil reset`
-/// to the Security panel.
-///
-/// Purely lexical, per component, like its sibling. Shares [`LIBRARY_DOMAINS`],
+/// Purely lexical, per component. Shares [`LIBRARY_DOMAINS`] with its sibling,
 /// so the two predicates cannot drift.
 #[must_use]
 pub fn under_file_provider_domain(home: &Path, path: &Path) -> bool {
@@ -147,10 +141,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The FILE PROVIDER predicate is strictly narrower than its sibling: it
-    /// answers `true` for the two sync domains and `false` for every other
-    /// protected root, because those are reached by a held Full Disk Access
-    /// grant and these are not.
+    /// The file-provider predicate is strictly narrower than its sibling: true for
+    /// the two sync domains, false for every other protected root.
     #[test]
     fn only_the_file_provider_domains_are_named_by_the_narrow_predicate() {
         let home = PathBuf::from("/Users//someone");
@@ -170,8 +162,8 @@ mod tests {
                 "{p} is also protected at large"
             );
         }
-        // Protected, but NOT file-provider: a held grant reaches these, so the
-        // narrow predicate must not claim them or it would refuse ordinary work.
+        // Protected, but not file-provider: a held grant reaches these, so the narrow
+        // predicate must not claim them or it would refuse ordinary work.
         let protected_elsewhere = [
             "/Users//someone/Documents/notes.md",
             "/Users//someone/Desktop/notes.md",

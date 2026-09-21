@@ -95,27 +95,12 @@ fn parent_exe_name() -> Option<String> {
 /// only where that link cannot be read, `/proc/<pid>/comm`. Elsewhere, and on any
 /// refusal, `None`.
 ///
-/// LINUX READS THE EXE LINK, NOT `comm` (2026-09-17). `comm` was the first source here
-/// and it is not this function's answer: it is a 15-byte kernel LABEL, not a name.
-/// Measured on x86_64 Linux — this crate's own test binary, `atpkg-5f7cdb9e74b7019f`,
-/// reads back from `comm` as `atpkg-5f7cdb9e7`, so the reader could not name ANY
-/// executable whose basename runs to 16 bytes; and a `python3` child that called
-/// `prctl(PR_SET_NAME, "bash")` reads back from `comm` as `bash` while its exe link
-/// still says `python3.14`, which is exactly the masquerade [`SHELLS`] is documented to
-/// refuse. The exe link is the file itself and no process can rewrite it.
-///
-/// Two consequences of the link, both measured the same day. It is resolved through
-/// every symlink, so a multi-call binary invoked by an applet name answers with the real
-/// file (`/bin/sh` → `dash` on a Debian-family host — hookless either way, so
-/// [`crate::cli::shell_remedy_for`] prints the same `PATH` line for both). And a file
-/// replaced under a running process keeps its link with " (deleted)" appended
-/// (`/…/sleep (deleted)` after an `rm`) — the routine state of every shell alive across
-/// a package upgrade — so that kernel annotation comes off the basename.
-///
-/// `comm` stays as the fallback because it is the only readable source when the link is
-/// not: `readlink /proc/1/exe` is `EACCES` for a non-root reader (measured), while
-/// `comm` is world-readable, and a name is better than nothing for a parent of another
-/// uid — which `known_shell` still has to admit before anything is claimed of it.
+/// Linux prefers the exe link because `comm` is a 15-byte kernel label a process can
+/// rewrite: `prctl(PR_SET_NAME, "bash")` on a non-shell is exactly the masquerade
+/// [`SHELLS`] refuses. The link is annotated " (deleted)" once the file is replaced under
+/// a running process — the routine state of a shell across a package upgrade — so that
+/// suffix comes off the basename. `comm` remains the fallback only because it is
+/// world-readable where the link is not (`/proc/1/exe` is `EACCES` for a non-root reader).
 #[must_use]
 pub(crate) fn process_exe_name(pid: u32) -> Option<String> {
     #[cfg(target_os = "macos")]
@@ -136,9 +121,6 @@ pub(crate) fn process_exe_name(pid: u32) -> Option<String> {
 /// The basename of the file `/proc/<pid>/exe` points at, with procfs's " (deleted)"
 /// annotation removed. `None` when the link cannot be read (no such pid, or a process
 /// this one may not `ptrace`-read).
-///
-/// A file genuinely named `x (deleted)` and a deleted `x` read as the same ten trailing
-/// bytes here; procfs itself makes them so, and only one of the two ever runs a shell.
 #[cfg(target_os = "linux")]
 fn linux_exe_link_name(pid: u32) -> Option<String> {
     let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
@@ -254,17 +236,11 @@ mod tests {
         assert_eq!(invoking_shell_from(None, None), None);
     }
 
-    /// WAIT FOR THE EXEC, then measure. `Command::spawn` does NOT promise the child has
-    /// exec'd: Rust takes the `posix_spawn` path on macOS wherever it can, and that path
-    /// cannot report an exec failure back through a CLOEXEC pipe, so it returns as soon as
-    /// the kernel has the process. Both cases below then either ask for a name the child
-    /// does not carry yet, or — worse, in the outliving case — delete the file before the
-    /// exec reads it, so the child dies ENOENT and there is nothing left to name. Measured
-    /// 2026-09-17: `a_program_outliving_its_own_file_is_still_named` failed once in two
-    /// runs on a loaded 4-core Intel Mac, and inside the merge gate's own test stage.
-    ///
-    /// So poll until the pid answers the name it is supposed to carry, bounded, and say
-    /// what a timeout means: not the law under test, but a child that never got there.
+    /// Poll until `pid` answers `want`, bounded. `Command::spawn` does not promise the
+    /// child has exec'd — macOS takes the `posix_spawn` path, which returns as soon as the
+    /// kernel has the process — so measuring straight after a spawn races the exec, and the
+    /// outliving case below would delete the file before exec ever read it. A timeout here
+    /// means the child never got there, not that the law under test failed.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn await_exec(pid: u32, want: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -284,10 +260,9 @@ mod tests {
     /// The pid reader names THIS test binary and a spawned `sleep` by executable, and
     /// answers `None` for a pid nobody has.
     ///
-    /// Our own name is the fixture that catches Linux's `comm`: cargo suffixes a test
-    /// binary with `-<16 hex>`, which puts it past the 15-byte `TASK_COMM_LEN` cap that
-    /// truncated `atpkg-5f7cdb9e74b7019f` to `atpkg-5f7cdb9e7`. The length is asserted so
-    /// a shorter binary name could never quietly retire the case.
+    /// Our own name is the fixture that catches Linux's `comm`: cargo's `-<16 hex>` suffix
+    /// puts a test binary past the 15-byte `TASK_COMM_LEN` cap. The length is asserted so a
+    /// shorter binary name cannot quietly retire the case.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_pid_reader_names_a_process_by_its_executable() {
@@ -319,15 +294,9 @@ mod tests {
     /// `/…/sleep (deleted)`. macOS keeps answering the exec path it recorded, so both
     /// platforms are asserted the same way.
     ///
-    /// THE FIXTURE IS THIS TEST BINARY, not a copy of a system one. A copy of `/bin/sleep`
-    /// is what this case used until 2026-09-17, and on macOS 13.7.8 that is not a program
-    /// this host will reliably run: `/bin/sleep` carries Apple's identifier
-    /// (`com.apple.sleep`) and a LAUNCH CONSTRAINT, so a copy of it elsewhere is refused by
-    /// AMFI — measured, `kernel (AppleMobileFileIntegrity) AMFI: Launch Constraint Violation
-    /// (enforcing)` with the copy never reaching exec — and when it did run, deleting it
-    /// left nothing to name, so the case failed 2 runs in 3 on this Mac and inside the merge
-    /// gate. A copy of the test binary carries no such constraint: it is the locally built,
-    /// ad-hoc-signed file this process is already running.
+    /// The fixture must be a copy of this test binary, not of a system one: macOS refuses
+    /// to exec a copy of `/bin/sleep` (an AMFI launch constraint on `com.apple.sleep`), and
+    /// a child that never reaches exec leaves nothing to name.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_program_outliving_its_own_file_is_still_named() {
@@ -336,8 +305,8 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("atpkg-exe-name-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // The copy keeps a basename of OUR choosing, which is also what is asserted: the
-        // reader must answer the file's name, not the name of the binary it was copied from.
+        // A basename of our own choosing, which is what is asserted: the reader must answer
+        // the file's name, not the name of the binary it was copied from.
         let exe = dir.join("outliver");
         std::fs::copy(std::env::current_exe().unwrap(), &exe).expect("copy this test binary");
         let mut perms = std::fs::metadata(&exe).unwrap().permissions();
@@ -379,20 +348,10 @@ mod tests {
 
     /// The copy's whole job: exist, under its own name, until the parent kills it.
     ///
-    /// NO WALL CLOCK. This parked for a flat 60 s until 2026-09-19, which quietly made
-    /// the case above depend on the parent reaching its NEXT LINE inside that minute —
-    /// the only wall-clock quantity left in it, and one nothing had measured. (The
-    /// naming itself is not the risk: measured under this suite's own parallelism the
-    /// copy is named in 20-42 us and the whole case costs 8.7-19.5 ms, against
-    /// `await_exec`'s 30 s hang guard.) A parent descheduled past the minute came back
-    /// to a probe that had exited on its own, found nothing to name, and read as the
-    /// LAW failing — a program outliving its file — when what had expired was the
-    /// fixture.
-    ///
-    /// The park is an EVENT now: the probe lives until it is killed (the normal path,
-    /// and immediate) or until its parent goes away. That second condition is also
-    /// what keeps a stray out of the process table when a parent dies without killing
-    /// it, which is strictly more than the timer ever promised.
+    /// No wall clock: the park ends on an event — killed (the normal path) or the parent
+    /// going away. A fixed timeout would let a descheduled parent come back to a probe that
+    /// had already exited, so an expired fixture would read as the law failing. Watching
+    /// the parent also keeps a stray out of the process table if the parent dies first.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn probe_parks_until_killed() {

@@ -968,20 +968,13 @@ pub fn pending_passthrough(
 }
 
 /// `atpkg __landing <program> [<prefix>] -- [args…]` — the hidden verb an agent program's
-/// `agents/` twin execs while `<prefix>/landing/<program>` stands ([`crate::landing`]):
-/// wait for the newer build to land, saying so on STDERR, then `exec` the CURRENT
-/// `bin/<program>` shim — re-resolved after the wait, so the new build is what runs —
-/// with the arguments verbatim (on Windows, where nothing can `exec`, the `.cmd` shim runs
-/// as a child with inherited stdio and its real exit code is this process's; 2026-09-17).
-/// Every ending of the wait runs the tool: a landed build, the expired bound
-/// ([`crate::landing::WAIT_SECS`], a constant), a failed pass, a stale marker, a prefix that is
-/// not landing at all, or Ctrl-C — SIGINT on Unix, a console control handler on Windows
-/// ([`landing_wait_in_process`]): either stops the wait; neither kills the command.
-/// ONE EXCEPTION, on Windows only: arming that handler is best-effort
-/// ([`crate::platform::add_ctrl_handler`] answers `false` when
-/// `SetConsoleCtrlHandler` fails), and when it could not be armed the console's default
-/// behaviour ends this process on Ctrl-C, so that one ending does NOT run the tool. The
-/// handler is unverified on a Windows host (2026-09-17), the failure path with it.
+/// `agents/` twin execs while `<prefix>/landing/<program>` stands ([`crate::landing`]): wait
+/// for the newer build, then `exec` the current `bin/<program>` shim, re-resolved after the
+/// wait so the new build is what runs. On Windows the `.cmd` shim runs as a child instead.
+///
+/// Every ending of the wait runs the tool — landed, timed out, failed, stale marker, not
+/// landing, or Ctrl-C. The one exception is Windows with an unarmed console control handler
+/// ([`crate::platform::add_ctrl_handler`]), where Ctrl-C ends this process instead.
 fn cmd_landing(rest: &[String]) -> ExitCode {
     // The operands, parsed by the pure half ([`crate::landing::HandOver::parse`]): the
     // program; the PREFIX operand the twin's prelude passes (absolute, laid from the
@@ -3729,19 +3722,11 @@ fn cmd_list(args: &[String]) -> ExitCode {
     run_list(layout(), human)
 }
 
-/// What `atpkg repair`'s shell-integration step prints: the hooks headline, then one line
-/// per rc file the pass EDITED, failed to edit, or will never edit. An rc that already
-/// carried the block gets no line, because nothing happened to it.
-///
-/// The per-rc lines exist because repair has more than one audience. The manual, doctor and
-/// the agent primer send users AND agents to `aterm pkg repair` for a stale rustup link or
-/// a missing reroute stub, and repair is also the one pass that re-lays an rc block the
-/// user deleted ([`crate::hooks::refresh_rewiring_rc`]). It used to print "shell
-/// integration rewritten (~/.aterm/shell.d + rc wiring)" whether it had re-laid an
-/// opted-out block, failed to write the rc (a `~/.zshrc` linked into a read-only store),
-/// skipped it at the consent fence, written no hook at all, or found no rc to wire. So a
-/// re-laid opt-out is named here with the way back out, and "rc wiring" is never claimed
-/// for four files at once.
+/// What `atpkg repair`'s shell-integration step prints: the hooks headline, then one line per
+/// rc file the pass edited, failed to edit, or will never edit; an rc that already carried the
+/// block gets none. Repair is the one pass that re-lays a block the user deleted
+/// ([`crate::hooks::refresh_rewiring_rc`]), so a re-laid opt-out is named with the way back
+/// out rather than folded into a wholesale "rc wiring" claim.
 fn repair_hook_lines(pass: &crate::hooks::HookPass) -> Vec<String> {
     use crate::hooks::{HookPass, RcOutcome};
     let mut lines = match pass {
@@ -3872,11 +3857,9 @@ fn repair_store(layout: &crate::store::Layout) -> ExitCode {
             "repair: {r} was revoked (yanked/below floor) — left disabled; run `aterm pkg update`"
         );
     }
-    // THE EXEC ROOTS, at `Deep`, over the shims just re-laid: every file of every root
-    // proven a clone of its store file (a few thousand `lstat`s on bundle 8595, and the
-    // stock names' bytes), a root that is rebuilt when it is not — including one laid as
-    // hard links before clones — and every trust shim, aliases included, rendered through
-    // it. Repair is
+    // The exec roots, at `Deep`, over the shims just re-laid: every file of every root proven
+    // a clone of its store file, a root rebuilt when it is not, and every trust shim rendered
+    // through it. Repair is
     // the fix doctor names for a PATH tippy that cannot run, so a root it could not lay is
     // something left undone: exit 1, like a shim that could not be re-laid.
     let exec_roots_ok = reconcile_exec_roots(layout, crate::seam::Depth::Deep);
@@ -4336,9 +4319,8 @@ fn uninstall_and_retire(layout: &crate::store::Layout, program: &str) -> std::io
     // date so a later `system:` row never reports a retirement this act superseded.
     layout.clear_retired(program);
     // The rustup seam goes WITH the toolchain it presents (audit 2026-09-14): the view
-    // is a clone of the live trust build, so `uninstall trust` used to leave
-    // `~/.rustup/toolchains/trust` running a ghost of the deleted compiler from a tree
-    // nothing owned. `uninstall --all` always detached; the single
+    // is a clone of the live trust build, so `uninstall trust` would otherwise leave
+    // `~/.rustup/toolchains/trust` running a ghost of the deleted compiler. The single
     // program now does too — before the build trees go, as the whole-set path orders it.
     if program == "trust" {
         detach_rustup_seams(layout);
@@ -5664,9 +5646,9 @@ fn default_set_adopts(
 }
 
 /// Forget adoption. Called by `uninstall`: removing a managed program is an explicit act,
-/// and set-completion must never undo it on the next unattended pass. The record of WHO
-/// adopted goes with it ([`clear_seed_adoption`]), so that no record outlives the marker
-/// it describes and vouches for whatever adopts the machine next.
+/// and set-completion must never undo it on the next unattended pass. The record of who
+/// adopted goes with it ([`clear_seed_adoption`]), so no record outlives the marker it
+/// describes.
 fn clear_adoption(layout: &crate::store::Layout) {
     let path = layout.adopted();
     if path.is_file() {
@@ -5675,24 +5657,21 @@ fn clear_adoption(layout: &crate::store::Layout) {
     clear_seed_adoption(layout);
 }
 
-/// Whether THE SEED PASS adopted this machine ([`crate::store::Layout::adopted_by_seed`]):
-/// `cmd_seed` created the [`adopted`] marker itself, so installing aterm is the consent
-/// behind the set, and `[packages].seed_install = false`, which `cmd_seed` reads BEFORE it
-/// adopts, is the switch that would have stopped it. Both files must exist. A record
-/// without the marker vouches for nothing, and a marker without the record (the explicit
-/// verb adopted, or the marker predates the record) claims no more than the uninstall
+/// Whether the seed pass adopted this machine ([`crate::store::Layout::adopted_by_seed`]):
+/// `cmd_seed` created the [`adopted`] marker itself, so installing aterm is the consent behind
+/// the set, and `[packages].seed_install = false`, read before it adopts, is the switch that
+/// would have stopped it. Both files must exist: a record without the marker vouches for
+/// nothing, and a marker without the record claims no more than the uninstall
 /// ([`set_completion_consent`]).
 fn adopted_by_seed(layout: &crate::store::Layout) -> bool {
     adopted(layout) && layout.adopted_by_seed().is_file()
 }
 
-/// `cmd_seed`'s adoption: [`record_adoption`] plus the record of who adopted, written ONLY
-/// when this call creates the marker. The seed pass runs on every launch, and on an
-/// adopted machine it is a no-op. If it stamped a marker it found, a machine the explicit
-/// verb adopted (the Settings button after `uninstall --all`) would become the first
-/// launch's on its very next launch, and its update passes would again say "installing
-/// aterm is the consent", which is false there. Best-effort like the marker: a missing
-/// record claims less, never more.
+/// `cmd_seed`'s adoption: [`record_adoption`] plus the record of who adopted, written only
+/// when this call creates the marker. The seed pass runs on every launch, so if it stamped a
+/// marker it found, a machine the explicit verb adopted would become the first launch's on its
+/// very next launch and its update passes would again say "installing aterm is the consent".
+/// Best-effort like the marker: a missing record claims less, never more.
 fn record_seed_adoption(layout: &crate::store::Layout) {
     if adopted(layout) {
         return;
@@ -5724,7 +5703,7 @@ fn record_seed_adoption(layout: &crate::store::Layout) {
 }
 
 /// Forget that the seed pass adopted. This is the explicit toolset verb's call: running it
-/// IS the consent, and it never reads `seed_install`. From then on neither "installing
+/// is the consent, and it never reads `seed_install`. From then on neither "installing
 /// aterm is the consent" nor that key holds for the passes that keep the set complete.
 fn clear_seed_adoption(layout: &crate::store::Layout) {
     let path = layout.adopted_by_seed();
@@ -6290,13 +6269,10 @@ pub(crate) fn alias_fix(
 /// stand. Best-effort per program: an unwritable `bin/` is the install lane's problem to
 /// report, not this pass's to fail on.
 fn reconcile_aliases(layout: &crate::store::Layout, index: &crate::manifest::Index) {
-    // ONE listing of `bin/` for the whole pass, shared by the program list and every
-    // program's tool list. It is EXACT for both, not merely close: this loop lays `alab-`
-    // ALIASES and prunes, and neither touches any program's PRIMARY shims — which is all
-    // `active_tools_in` reports (it filters `is_alias()`) — so no iteration can invalidate
-    // what a later one reads here. The deleting half is not on the snapshot:
-    // `activate::reconcile_aliases` calls `prune_stale_shims`, which lists the directory
-    // ITSELF, after this pass's own writes, at the moment it decides. See `ops::BinScan`.
+    // One listing of `bin/` for the whole pass, and exact for it: this loop lays `alab-`
+    // aliases and prunes, neither of which touches the primary shims `active_tools_in`
+    // reports. The deleting half is not on the snapshot — `prune_stale_shims` lists the
+    // directory itself, after this pass's writes, at the moment it decides.
     let scan = crate::ops::BinScan::capture(layout);
     for (program, build) in crate::ops::active_builds_in(&scan) {
         if crate::linkmode::is_linked(layout, &program) {
@@ -6750,15 +6726,14 @@ fn record_universal_control_outcome(
 /// measure them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SpotlightCensus {
-    /// Cargo target dirs whose NAME leaves them open to Spotlight.
+    /// Cargo target dirs whose name leaves them open to Spotlight.
     exposed: usize,
     /// Already hidden by name.
     hidden: usize,
-    /// Of the exposed, how many a pass WOULD migrate — a dry-run apply, which refuses
-    /// the free-standing dir (its pointer is an env var), the live build and the
-    /// occupied destination exactly as the real pass does, so this count can reach
-    /// zero where `exposed` never could (the doctor records that trap).
-    /// `apply_one(.., true, true)` is pure: `Planned` is returned before any rename.
+    /// Of the exposed, how many a pass would migrate — a dry-run apply, which refuses the
+    /// free-standing dir, the live build and the occupied destination exactly as the real pass
+    /// does, so this count can reach zero where `exposed` never could (the doctor records that
+    /// trap). `apply_one(.., true, true)` is pure: `Planned` is returned before any rename.
     would_migrate: usize,
     /// `false` when the walk hit its budget: every surface then says "at least".
     complete: bool,
@@ -6789,20 +6764,14 @@ fn spotlight_census(home: &std::path::Path) -> SpotlightCensus {
     }
 }
 
-/// The Spotlight half of the pass's own `machine-state:` record, AFTER its apply.
-///
-/// THE PASS REPORTS FROM THE WALK IT PAID FOR (2026-09-16). Until now the record was
-/// printed by bare `atpkg machine` alone, so the window CONFIRMED every change a pass
-/// made by spawning a second child that walked `$HOME` again under the doctor's budget
-/// and dry-ran an apply over every exposed dir it found — once per `machine-settings:`
-/// marker, and once more after every Settings verb that runs a pass (2026-09-15 audit).
-/// A pass that migrated nothing and failed nothing knows the posture already: its scan
-/// IS the machine's state, and every exposed dir it left was a refusal a dry run
-/// refuses identically ([`crate::noindex::apply_one`]), so nothing is left to migrate.
-/// Only a pass that MOVED something, or failed to, walks again — that is the one case
-/// where the pre-apply scan no longer describes the disk — and a pass whose Spotlight
-/// half is switched off walks once only when its Universal Control half changed
-/// something (a record without counts would say less than the read it replaces).
+/// The Spotlight half of the pass's own `machine-state:` record, after its apply: the pass
+/// reports from the walk it already paid for. A pass that migrated nothing and failed nothing
+/// knows the posture already — every exposed dir it left was a refusal a dry run refuses
+/// identically ([`crate::noindex::apply_one`]) — so a pass that moved something, or failed
+/// to, walks again, that being the one case where the pre-apply scan no longer fits the
+/// disk. The other walk is a pass whose Spotlight half is OFF and whose Universal Control
+/// half changed something: it has no scan to report from, and a record without counts
+/// would say less than the read it replaces.
 fn spotlight_after_apply(
     home: &std::path::Path,
     scan: &crate::noindex::Scan,
@@ -6823,12 +6792,10 @@ fn spotlight_after_apply(
     }
 }
 
-/// Print the pass's own `machine-state:` record from `census`, the machine re-read
-/// for the Universal Control half (the two keys, one `defaults read` each; the
-/// apply's outcome is not trusted over the keys themselves). The same line, from the same builder, that bare
-/// `atpkg machine` prints — [`MACHINE_STATE_MARKER`] — so the window's one parser
-/// serves both, and the record follows the `machine-settings:` change line it
-/// confirms.
+/// Print the pass's own `machine-state:` record from `census`, the machine re-read for the
+/// Universal Control half (the keys themselves, not the apply's outcome). The same line, from
+/// the same builder, that bare `atpkg machine` prints — [`MACHINE_STATE_MARKER`] — so the
+/// window's one parser serves both.
 fn print_machine_state_after_apply(
     cfg: &crate::config::MachineConfig,
     policy: crate::config::UniversalControlPolicy,
@@ -6956,8 +6923,8 @@ fn apply_machine_settings() -> Vec<String> {
         }
         census = Some(spotlight_after_apply(home, &scan, &outcomes));
     }
-    // ONCE: `universal_control()` warns on stderr about a spelling it does not know,
-    // and the record below asks for the policy too.
+    // Once: `universal_control()` warns on stderr about a spelling it does not know, and the
+    // record below asks for the policy too.
     let policy = cfg.universal_control();
     let outcome = crate::machine::apply_universal_control(policy, &crate::machine::SystemDefaults);
     if let Some(line) = record_universal_control_outcome(outcome, &mut entries) {
@@ -6966,13 +6933,10 @@ fn apply_machine_settings() -> Vec<String> {
     if !entries.is_empty() {
         println!("atpkg: {}", machine_settings_line(&entries));
     }
-    // THE RECORD FOLLOWS THE CHANGE (2026-09-16): what the machine looks like now,
-    // from this pass's own measurement, so a window that just read the change line
-    // has the state a moment later on the same stream instead of spawning a read to
-    // walk `$HOME` again. Printed whenever the Spotlight half walked (its scan is in
-    // hand), and — with that half switched off — only when something changed, the one
-    // case the window would otherwise read for; the walk that costs is the one the
-    // read would have made anyway. Off macOS there is no machine to record.
+    // The record follows the change, from this pass's own measurement, so a window that just
+    // read the change line has the state a moment later instead of spawning a walk of `$HOME`.
+    // Printed whenever the Spotlight half walked, and — with that half off — only when
+    // something changed. Off macOS there is no machine to record.
     if crate::noindex::SUPPORTED
         && let Some(home) = home.as_deref()
     {
@@ -8871,10 +8835,9 @@ fn cmd_update_all_code() -> u8 {
         // contract exists to prevent, on the lane that is MORE surprising because
         // nothing local prompted it.
         let before_net = crate::active_builds(&layout);
-        // The consent the line states is the one that holds on THIS machine:
-        // installing aterm, with `seed_install = false` as the switch that
-        // would have stopped it, only where the seed pass itself adopted the
-        // set and neither key overrides that ([`set_completion_consent`]).
+        // The consent the line states is the one that holds on this machine: installing
+        // aterm, with `seed_install = false` as the switch that would have stopped it, only
+        // where the seed pass itself adopted the set ([`set_completion_consent`]).
         let net = install_default_set(
             &layout,
             &*fetcher,
@@ -9164,44 +9127,28 @@ impl ProvisionLane {
     }
 }
 
-/// WHO consented to a default-set pass — named by the caller beside its
-/// [`ProvisionLane`], because the wire lane's announcement states the consent
-/// and the switches that stop the pass, and those are not the same for every
-/// caller. [`NET_OFF_SWITCH`] is true of every pass (the decline `uninstall
-/// --all` records outranks adoption and `auto_install` alike in
-/// [`should_complete_set`]); the two clauses [`Consent::announced`] adds around
-/// it are true only of a pass completing a set the seed pass adopted.
+/// Who consented to a default-set pass — named by the caller beside its [`ProvisionLane`],
+/// because the wire lane's announcement states the consent and the switches that stop the
+/// pass, and those differ per caller. [`NET_OFF_SWITCH`] is true of every pass; the two clauses
+/// [`Consent::announced`] adds around it only of a pass completing a set the seed pass adopted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Consent {
-    /// Nobody asked: the pass runs because installing aterm adopted the
-    /// toolset — `cmd_seed` at the first launch, and `cmd_update_all`'s
-    /// unattended set-completion arm on a machine the seed pass itself adopted
-    /// ([`set_completion_consent`], told so by [`adopted_by_seed`]). Installing
-    /// aterm IS the consent here, and `[packages].seed_install = false`, which
-    /// `cmd_seed` reads BEFORE it records adoption, is the switch that would
-    /// have kept the pass from ever running — so this line names both.
+    /// Nobody asked: the pass runs because installing aterm adopted the toolset. The line
+    /// names both that consent and `[packages].seed_install = false`, read before adoption is
+    /// recorded, which is the switch that would have stopped it.
     InstallingAterm,
-    /// No consent claimed beyond the one every pass carries: the line names the
-    /// uninstall alone. This is the explicit verb's own pass — `aterm pkg
-    /// install --default-set` (what the Settings "Install ALab toolset" button
-    /// runs, on any platform — a CLI-only Linux box has no first launch at
-    /// all), whose running IS the consent, which clears the decline, the
-    /// removals and the seed pass's adoption record, and never reads
-    /// `seed_install`. It is also every `update` pass the seed pass's adoption
-    /// does not stand behind ([`set_completion_consent`]): the explicit verb
-    /// adopted the machine, or its marker predates the record of who adopted,
-    /// or `auto_install = true` completes the set whatever `seed_install` says,
-    /// or that key is already false. "Installing aterm is the consent" and the
-    /// `seed_install` switch are false of such a pass, or not known to be true,
-    /// so its line names neither.
+    /// No consent claimed beyond the one every pass carries: the line names the uninstall
+    /// alone. The explicit verb's own pass (running it is the consent, and it never reads
+    /// `seed_install`), and every `update` pass the seed pass's adoption does not stand behind —
+    /// or no longer speaks for, once `auto_install = true` or a `seed_install = false` set
+    /// after adoption overrides it ([`set_completion_consent`]).
     Explicit,
 }
 
 impl Consent {
-    /// The clauses the wire lane's announcement wraps around [`NET_OFF_SWITCH`]:
-    /// the consent ahead of it and the switch that would have prevented the pass
-    /// after it — each only where it is true. Parenthesis-free, as that phrase
-    /// is, for the toolchain bar's sake (see [`NET_OFF_SWITCH`]).
+    /// The clauses the wire lane's announcement wraps around [`NET_OFF_SWITCH`]: the consent
+    /// ahead of it and the switch that would have prevented the pass after it, each only where
+    /// it is true. Parenthesis-free, as that phrase is, for the toolchain bar's sake.
     fn announced(self) -> (&'static str, &'static str) {
         match self {
             Consent::InstallingAterm => (
@@ -9214,20 +9161,11 @@ impl Consent {
     }
 }
 
-/// The consent `cmd_update_all`'s set-completion pass states — pure, as
-/// [`should_complete_set`] is, so the choice is pinned by a test. "Installing
-/// aterm is the consent", with `seed_install = false` before the first launch as
-/// the switch, holds only where the SEED PASS adopted the machine
-/// (`adopted_by_seed`, from [`adopted_by_seed`]: `cmd_seed` created the adoption
-/// marker and recorded so) and neither key overrides that. `auto_install = true`
-/// completes the set whatever `seed_install` says, and a key set false after
-/// adoption can no longer stop the loop. The explicit verb clears the record, and
-/// a marker it writes never gets one: with the default keys, `uninstall --all`
-/// and then Settings "Install ALab toolset" (or `install --default-set` on a
-/// CLI-only box) adopts a machine whose later passes must not claim the first
-/// launch. Every such pass, and every pass on a marker that predates the record,
-/// whose adopter is unknown, gets [`Consent::Explicit`]. The decline is then the
-/// one switch its line names.
+/// The consent `cmd_update_all`'s set-completion pass states — pure, so the choice is pinned
+/// by a test. "Installing aterm is the consent" holds only where the seed pass adopted the
+/// machine ([`adopted_by_seed`]) and neither key overrides that: `auto_install = true`
+/// completes the set whatever `seed_install` says, and a key set false after adoption can no
+/// longer stop the loop. Every other pass gets [`Consent::Explicit`], naming the decline alone.
 fn set_completion_consent(
     auto_install: bool,
     seed_install: bool,
@@ -9240,27 +9178,13 @@ fn set_completion_consent(
     }
 }
 
-/// The off switch EVERY wire-lane announcement names, whoever consented
-/// ([`Consent`]) — kept free of parentheses on purpose, as the clauses around it
-/// are: the GUI's toolchain bar reads the sizes out of the line's TRAILING `(…)`
-/// (crates/aterm-gui `toolchain_announced`), so the size parenthetical has to
-/// stay the last one on the line. The switches themselves reach only the log:
-/// the bar keeps that parenthetical and nothing else.
+/// The off switch every wire-lane announcement names, whoever consented ([`Consent`]). Kept
+/// free of parentheses, as the clauses around it are: the GUI's toolchain bar reads the sizes
+/// out of the line's trailing `(…)`, which must stay the last one on the line.
 ///
-/// The switch is real on the lean app — every current release, on every CPU
-/// (tools/install.sh "container election"; `aterm help pkg`), so this lane is
-/// how the WHOLE set arrives on every current-release Mac; measured 2026-09-06
-/// on an Intel one: `uninstall --all` removes the set and writes the durable
-/// decline `should_complete_set` honours on every tick. The timing is stated
-/// because it is real on every lane: `uninstall`, `update` and `install` are all
-/// store mutators (`verb_mutates_store`), the dispatch edge holds the store-wide
-/// writer lock for the whole pass (`mutator_store_lock`), and a second process
-/// is refused with "another atpkg process holds the store lock … retry when it
-/// exits" — so the verb this line names cannot run until the pass it announces
-/// has ended, and a bare "opt out with" would send the reader into that refusal
-/// mid-download. `install.sh --no-toolchain` is NOT named: it persists nothing
-/// (docs/DESIGN-cli-toolchain-seed-2026-08-31.md, "Review corrections" 1), so
-/// the reader who relied on it is exactly who this line is for.
+/// The timing is stated because `uninstall` is a store mutator like the pass itself and the
+/// dispatch edge holds the writer lock throughout (`mutator_store_lock`), so a bare "opt out
+/// with" would send the reader into "another atpkg process holds the store lock" mid-download.
 const NET_OFF_SWITCH: &str = "opt out once this pass ends with `aterm pkg uninstall --all`, which \
                               removes the set and records the decline";
 
@@ -9269,21 +9193,11 @@ const NET_OFF_SWITCH: &str = "opt out once this pass ends with `aterm pkg uninst
 /// the sealed-payload lane returns `None` for EVERY set, and only a non-empty
 /// network pass speaks (the ordinary every-6-hours no-op tick stays silent).
 ///
-/// Names the SIGNED sizes — what comes over the wire and what stays on disk
-/// ([`seed_install_bytes`], the same `[cost]` row the install is verified
-/// against, in ONE trailing parenthetical [`size_parenthetical`] renders through
-/// [`crate::cost::human_bytes`] exactly as the seed lane's line does) — and the
-/// off switch ([`NET_OFF_SWITCH`]), with the consent ahead of it and the
+/// Names the signed sizes — what comes over the wire and what stays on disk
+/// ([`seed_install_bytes`], rendered by [`size_parenthetical`] exactly as the seed lane's line
+/// does) — and the off switch ([`NET_OFF_SWITCH`]), with the consent ahead of it and the
 /// `seed_install` switch after it only where `consent` makes them true
-/// ([`Consent::announced`]: a pass completing a set the seed pass adopted, not
-/// the explicit verb's).
-/// Until 2026-09-06 it carried none of it: the lean app — every current
-/// release, on every CPU — has no seal, so the whole set comes through THIS
-/// lane, and the first launch's only disclosure was "installing 10 program(s)
-/// over the network: ay, …" (aterm.log on an Intel Mac, where it was measured
-/// — not where it is true), while `aterm help pkg` promised that size is "the
-/// one thing disclosed up front". An unknown figure prints no figure — the
-/// [`seed_install_bytes`] contract.
+/// ([`Consent::announced`]).
 fn net_announcement(
     lane: ProvisionLane,
     consent: Consent,
@@ -9773,17 +9687,10 @@ fn install_default_set_inner(
         );
     }
     will_install.sort();
-    // The signed sizes, derived ONLY when the wire lane is about to speak: the
-    // sealed lane already quoted its own in `cmd_seed`, and the silent no-op
-    // tick has no line to print them on. No extra fetch for a manifest the
-    // triple probe above already pulled through the same `verified_pkg` — the
-    // network fetcher memoises manifests per `(repo, program, build)` (`net.rs`
-    // `pkg_manifest`). A member the probe DEFERRED (its fetch failed, so
-    // `group_missing_triple` proved nothing and left it in `will_install`) is
-    // retried once here — the memo keeps successes only, so that is one more
-    // direct-URL attempt plus its enumeration fallback, a metered api.github.com
-    // call — and the first miss ends the sums (no figure at all), so at most one
-    // such retry precedes the announcement.
+    // The signed sizes, derived only when the wire lane is about to speak. No extra fetch for
+    // a manifest the triple probe above already pulled — the network fetcher memoises per
+    // `(repo, program, build)` — and a member whose probe fetch failed is retried once here,
+    // the first miss ending the sums.
     let sizes = if lane == ProvisionLane::Network && !will_install.is_empty() {
         seed_install_bytes(fetcher, index, cfg, &will_install)
     } else {
@@ -10149,13 +10056,11 @@ fn bootstrap_group(
             0
         }
         Ok((crate::TxnOutcome::Unpublished { member, triple, .. }, _)) => {
-            // The transaction's own missing-triple hold, which fires only for a tuple with
-            // a member already installed. Two prescans ran first — set-completion's over
-            // the whole tuple, the one above over `missing` — and a failed fetch proves
-            // nothing to either (nor is it memoized), so this is reached when a manifest a
-            // prescan could not fetch was fetched by the transaction's own walk and has no
-            // artifact for this triple. The tuple cannot fully exist here: the same clean
-            // skip, in the same words.
+            // The transaction's own missing-triple hold, which fires only for a tuple with a
+            // member already installed. A failed fetch proves nothing to either prescan, so
+            // this is reached when a manifest a prescan could not fetch was fetched by the
+            // walk and has no artifact for this triple: the same clean skip, in the same
+            // words.
             println!(
                 "atpkg: {member}: no artifact for {triple} — coherence group '{g}' skipped \
                  whole (§6 clean skip)"
@@ -10417,17 +10322,15 @@ fn cmd_install_default_set_code() -> u8 {
     clear_decline(&layout);
     let all_removed: Vec<String> = removed_programs(&layout).into_iter().collect();
     clear_removed(&layout, &all_removed);
-    // The seed pass's claim on the set goes too. From here on the owner's own
-    // act stands behind it, and this verb never reads `seed_install`, so no
-    // later update pass may say "installing aterm is the consent" or name that
-    // key ([`clear_seed_adoption`]; the marker this verb writes below gets no
-    // record either).
+    // The seed pass's claim on the set goes too. From here on the owner's own act stands
+    // behind it, and this verb never reads `seed_install`, so no later update pass may say
+    // "installing aterm is the consent" or name that key ([`clear_seed_adoption`]).
     clear_seed_adoption(&layout);
     let fetcher = resolve_fetcher(&layout);
     let before = crate::active_builds(&layout);
-    // Running this verb IS the consent, and it never reads `seed_install`: its
-    // announcement names neither the first launch's consent nor that key, only
-    // the decline that stops every pass ([`Consent::Explicit`]).
+    // Running this verb is the consent, and it never reads `seed_install`: its announcement
+    // names neither the first launch's consent nor that key, only the decline that stops
+    // every pass ([`Consent::Explicit`]).
     let failures_outcome = install_default_set(
         &layout,
         &*fetcher,
@@ -10661,9 +10564,8 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // only the adoption it recorded (see [`refuse_seed_for_disk`]), never one an
     // earlier launch or an explicit `install --default-set` made.
     let adopted_by_this_run = !adopted(&layout);
-    // WHO adopted rides beside the marker, and only when THIS call creates it
-    // ([`record_seed_adoption`]): an update pass says "installing aterm is the
-    // consent" only on a machine the seed pass adopted.
+    // Who adopted rides beside the marker, and only when this call creates it: an update
+    // pass says "installing aterm is the consent" only on a machine the seed pass adopted.
     record_seed_adoption(&layout);
     // PENDING STUBS AT ADOPTION (R6): the instant this machine wants the toolset,
     // every default-set name resolves on PATH — BEFORE any question of whether a
@@ -11030,7 +10932,7 @@ fn refuse_seed_for_disk(
     true
 }
 
-/// The SIGNED sizes of a set — [`seed_install_bytes`]' answer, and the input of
+/// The signed sizes of a set — [`seed_install_bytes`]' answer, and the input of
 /// [`size_parenthetical`]. The two figures are independent: a registry row that
 /// declares only `disk_installed` still discloses that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11051,19 +10953,12 @@ impl SignedSizes {
     };
 }
 
-/// The SIGNED sizes of `members` for this triple, summed from the pinned manifests'
-/// `[cost]` row ([`crate::manifest::Cost`]): `download_bytes`, what the wire lane
-/// will move, and `disk_installed`, what stays when it is done — for BOTH
-/// announcing lanes: the sealed seed (`cmd_seed`, which quotes the on-disk figure
-/// only — its payload moves no network bytes) and the wire ([`net_announcement`],
-/// via `install_default_set`, both).
+/// The signed sizes of `members` for this triple, summed from the pinned manifests' `[cost]`
+/// row ([`crate::manifest::Cost`]): `download_bytes` for the wire lane, `disk_installed` for
+/// what stays. The sealed seed quotes the on-disk figure only, the wire lane both.
 ///
-/// The authoritative numbers, not a multiplier: the one disclosure a user gets before
-/// committing multiple GB of disk should come from the same signed bytes everything
-/// else in this lane is verified against. A figure is `None` when any member's
-/// manifest is unavailable (the first miss ends both sums) or its entry for that
-/// figure is zero — a partial sum would understate the commitment, and no number at
-/// all is more honest than a confidently wrong one.
+/// A figure is `None` when any member's manifest is unavailable (the first miss ends both
+/// sums) or its entry is zero: a partial sum would understate the commitment.
 fn seed_install_bytes(
     fetcher: &dyn crate::flow::Fetcher,
     index: &crate::TrustedIndex,
@@ -11071,9 +10966,9 @@ fn seed_install_bytes(
     members: &[String],
 ) -> SignedSizes {
     let triple = current_triple();
-    // [`crate::TrustedIndex::channel_for`], not a `channels` scan: the channel a HOST
-    // sees is the per-target view, so the figures announced are the ones this triple's
-    // pins will actually fetch.
+    // [`crate::TrustedIndex::channel_for`], not a `channels` scan: the channel a host sees
+    // is the per-target view, so the figures announced are the ones this triple's pins will
+    // actually fetch.
     let Some(ch) = index.channel_for(cfg.channel(), triple) else {
         return SignedSizes::UNKNOWN;
     };
@@ -11100,17 +10995,14 @@ fn sum_nonzero(total: Option<u64>, n: u64) -> Option<u64> {
     total.filter(|_| n > 0).map(|t| t.saturating_add(n))
 }
 
-/// The trailing size parenthetical both announcing lanes end with — ONE renderer
-/// ([`crate::cost::human_bytes`]: binary units, one decimal) so the figures a user
-/// is told cannot drift across surfaces (see [`seed_announcement`]). The GUI's
-/// toolchain bar shows exactly this text, read out of the line's LAST `(…)` and
-/// clipped at 40 characters (crates/aterm-gui `toolchain_announced` →
-/// [`crate::progress::sanitize_for_tty`], which appends '…' past the cap), so every
-/// arm is built to fit: two GiB-tier figures up to `999.9 GiB` render in 39. (The
-/// one arithmetic overflow — both figures in the `1000.0–1024.0 MiB` band — is 41
-/// and clips "on disk" to "on dis…" with both numbers intact; a set whose
-/// download packs several-fold never lands there.) An unknown figure is not
-/// printed; neither known prints nothing — no number beats a wrong one.
+/// The trailing size parenthetical both announcing lanes end with — one renderer
+/// ([`crate::cost::human_bytes`]) so the figures a user is told cannot drift across surfaces.
+/// The GUI's toolchain bar reads it out of the line's last `(…)` and clips at 40 characters,
+/// so the arms are built to fit: two 9-character figures (up to `999.9 GiB`) render in 39.
+/// The one overflow is the two-figure arm with BOTH in the `1000.0–1023.9 MiB` band, which
+/// renders 41 and clips "on disk" to "on dis…" with both numbers intact — a set whose
+/// download packs several-fold never lands there. An unknown figure prints nothing: no
+/// number beats a wrong one.
 fn size_parenthetical(sizes: SignedSizes) -> String {
     use crate::cost::human_bytes;
     match (sizes.download, sizes.disk) {
@@ -11143,9 +11035,8 @@ fn size_parenthetical(sizes: SignedSizes) -> String {
 ///   remaining out-of-crate quote and must carry the same GiB figure.
 ///
 /// `None` size prints no size at all: no number is more honest than a
-/// confidently wrong one (the [`seed_install_bytes`] contract). On-disk only —
-/// the sealed payload moves no network bytes, so unlike the wire lane's line
-/// there is no download figure to disclose.
+/// confidently wrong one (the [`seed_install_bytes`] contract). On-disk only: the sealed
+/// payload moves no network bytes, so there is no download figure to disclose.
 fn seed_announcement(count: usize, signed_bytes: Option<u64>) -> String {
     format!(
         "atpkg: {SEED_STARTING_MARKER}installing {count} ALab program(s) from the bundled \
@@ -12197,16 +12088,10 @@ fn report_channel_apply(
                 build,
                 triple,
             } => {
-                // THE MISSING-TRIPLE HOLD'S ROWS — the update-lane twin of the bootstrap's
-                // clean skip: the group's new pin cannot fully exist on this host, so the
-                // tuple stays whole on its current builds, and nothing was resolved,
-                // downloaded, staged or flipped. A correct state on a host the publisher
-                // does not (yet) build this pin for, never a failure: one line, one row per
-                // INSTALLED member naming the unpublished build and the build that stays
-                // (the attestation kept, like every arm whose bytes did not move), and the
-                // next pass retries. A member that is not installed has no build to stay
-                // on and gets no row here — the set-completion lane records its canonical
-                // `unavailable on <target>` row. The UpToDate arm lifts these rows.
+                // The missing-triple hold's rows — the update-lane twin of the bootstrap's
+                // clean skip: the new pin cannot fully exist on this host, so the tuple stays
+                // whole on its current builds and nothing moved. A correct state, never a
+                // failure; one row per installed member, and the UpToDate arm lifts them.
                 println!(
                     "atpkg: {label} NOT updated — {member}'s pinned build {build} is not \
                      published for {triple}; staying on the current builds"
@@ -12636,9 +12521,9 @@ fn cmd_link(rest: &[String]) -> ExitCode {
             for r in &out.refused {
                 eprintln!("atpkg:   refused sensitive bin name {r} (deny-list)");
             }
-            // THE SEAM FOLLOWS THE LINK (2026-09-16): rustup's `trust` presents the
-            // checkout from this moment, not from the next six-hourly pass — until then
-            // `targo` on PATH and `cargo +trust` were two compilers under one name.
+            // The seam follows the link from this moment, not from the next six-hourly
+            // pass: otherwise `targo` on PATH and `cargo +trust` are two compilers under
+            // one name.
             if program == crate::seam::SEAM_PROGRAM {
                 reassert_rustup_seam(&layout);
             }
@@ -12694,9 +12579,8 @@ fn cmd_unlink(program: Option<&String>) -> ExitCode {
                      run `aterm pkg install {program}` to put it back on PATH"
                 ),
             }
-            // …and rustup's `trust` returns to the installed build with the shims
-            // (2026-09-16): the view is rebuilt from the store, or — with no build to
-            // restore — detached with the checkout it presented, never left dangling.
+            // …and rustup's `trust` returns to the installed build with the shims: rebuilt
+            // from the store, or — with no build to restore — detached, never left dangling.
             if program == crate::seam::SEAM_PROGRAM {
                 if std::fs::symlink_metadata(crate::seam::store_current(&layout)).is_ok() {
                     reassert_rustup_seam(&layout);
@@ -12874,9 +12758,8 @@ mod tests {
     /// shadowing calls `super::install_default_set_with_path` and says which
     /// `PATH` it means.
     ///
-    /// The consent is the first launch's: it shapes only the wire lane's
-    /// announcement, whose words `net_announcement`'s own tests pin — no pass
-    /// test through this shim reads them.
+    /// The consent is the first launch's: it shapes only the wire lane's announcement, whose
+    /// words `net_announcement`'s own tests pin.
     fn install_default_set(
         layout: &crate::store::Layout,
         fetcher: &dyn crate::flow::Fetcher,
@@ -13904,14 +13787,11 @@ mod tests {
     }
 
     /// `atpkg repair` names each rc it edited. It used to print one "shell integration
-    /// rewritten (~/.aterm/shell.d + rc wiring)" line whether it had re-laid a block the
-    /// user deleted, failed to write the rc, or found no rc at all. doctor, the manual and
-    /// the agent primer send people to repair for a stale rustup link or a missing reroute
-    /// stub, so re-laying their opt-out went unannounced. Pinned over REAL passes on a
-    /// synthetic home: an opted-out `~/.zshrc` is kept by an unattended pass, re-laid by
-    /// repair and NAMED with the way back out; an rc already wired gets no line; an rc
-    /// linked into a read-only directory (as a non-root user), no rc at all, and a refused
-    /// `~/.aterm` each say what happened. No line claims "rc wiring" wholesale.
+    /// rewritten" line whether it had re-laid a block the user deleted, failed to write the
+    /// rc, or found no rc at all — so re-laying a user's opt-out went unannounced. Pinned over
+    /// real passes on a synthetic home: a re-laid opt-out is named with the way back out, an
+    /// rc already wired gets no line, and every refusal says what happened. No line claims
+    /// "rc wiring" wholesale.
     #[test]
     fn repair_names_the_rc_it_relaid_over_an_opt_out() {
         use crate::hooks::{HookPass, RcOutcome, RcWiring};
@@ -14061,23 +13941,12 @@ mod tests {
         }
     }
 
-    /// THE PASS LISTS `bin/` ONCE — NOT ONCE PER INSTALLED PROGRAM.
-    ///
-    /// [`reconcile_aliases`] used to open `bin/` once in `ops::active_builds` to find the
-    /// active programs, then twice more per program: once in `ops::active_tools` and once
-    /// more in `activate::prune_stale_shims`, each listing resolving EVERY entry in the
-    /// directory — so a twelve-program machine re-read every shim two dozen times per
-    /// six-hourly tick, and again on the launch path. The reading half now shares ONE
-    /// [`crate::ops::BinScan`] taken at the top of the pass.
-    ///
-    /// The residual one-per-program listing is `prune_stale_shims`, and it is DELIBERATE:
-    /// that predicate DELETES files on the user's `PATH`, so it keeps reading the directory
-    /// itself, at the moment it decides, after this pass's own writes. This test pins the
-    /// shape of the cost — `1 + N`, not `1 + 2N` — so that a future edit that moves the
-    /// prune onto a stale snapshot, or puts the shared scan back inside the loop, fails here
-    /// and has to say why. (The closing `reconcile_agents` adds none: `sweep_agents_dir`
-    /// lists `agents/` first and returns before its own `active_builds` when that directory
-    /// does not exist, which is this fixture — no agent program is installed.)
+    /// The pass lists `bin/` once, not once per installed program: the reading half shares one
+    /// [`crate::ops::BinScan`] taken at the top of [`reconcile_aliases`]. The one residual
+    /// per-program listing is `prune_stale_shims`, deliberately — it deletes files on the
+    /// user's `PATH`, so it reads the directory itself at the moment it decides. Pinning the
+    /// cost at `1 + N`, not `1 + 2N`, catches an edit that prunes from a stale snapshot or puts
+    /// the shared scan back inside the loop.
     #[test]
     fn the_alias_pass_lists_bin_once_and_per_program_only_where_it_deletes() {
         let layout = temp_layout("alias-pass-scans");
@@ -14097,9 +13966,9 @@ mod tests {
         let rows: Vec<(&str, bool, Option<&str>)> =
             programs.iter().map(|p| (*p, false, None)).collect();
         let index = index_of(&rows);
-        // Measure the STEADY STATE: the first pass lays whatever aliases are missing, the
+        // Measure the steady state: the first pass lays whatever aliases are missing, the
         // second is the six-hourly tick that finds everything already right and writes
-        // nothing. That second pass is the one whose reads this change is about.
+        // nothing. That second pass is the one whose reads are being counted.
         reconcile_aliases(&layout, &index);
         crate::ops::reset_bin_scans();
         reconcile_aliases(&layout, &index);
@@ -14114,13 +13983,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE SHADOW PASS LISTS `bin/` ONCE, whatever is installed.
-    ///
-    /// [`reconcile_shadowed`] walked the alias pass's first two listings — `active_builds`
-    /// once to find the programs, then `active_tools` for each — and unlike that pass it
-    /// only reads, prints and records: nothing in it writes to `bin/` or deletes from it,
-    /// so its whole cost is the one photograph and there is no per-program remainder to
-    /// allow for.
+    /// The shadow pass lists `bin/` once, whatever is installed. [`reconcile_shadowed`] only
+    /// reads, prints and records — nothing in it writes to or deletes from `bin/` — so its
+    /// whole cost is the one photograph, with no per-program remainder to allow for.
     #[test]
     fn the_shadow_pass_lists_bin_once_for_the_whole_machine() {
         let layout = temp_layout("shadow-pass-scans");
@@ -17457,12 +17322,10 @@ mod tests {
         }
     }
 
-    /// THE PASS'S OWN RECORD (2026-09-16). `apply_machine_settings` prints the
-    /// `machine-state:` record AFTER its `machine-settings:` change line, from the same
-    /// builder bare `atpkg machine` uses, so a window that reads the change has the
-    /// state a line later and spawns no second walk of `$HOME` to confirm it. Pinned on
-    /// the body's order of prints, since the window's card depends on that order (it
-    /// opens its expectation on the change line and answers it with the record).
+    /// `apply_machine_settings` prints the `machine-state:` record after its
+    /// `machine-settings:` change line, from the same builder bare `atpkg machine` uses, so a
+    /// window that reads the change has the state a line later and spawns no second walk of
+    /// `$HOME`. Pinned on the body's order of prints, which the window's card depends on.
     #[test]
     fn the_apply_prints_its_state_record_after_its_change_line() {
         let src = include_str!("cli.rs");
@@ -17490,8 +17353,8 @@ mod tests {
             src[printer..printer_end].contains("crate::machine::machine_state_line("),
             "…and its own builder"
         );
-        // ONCE: `universal_control()` warns on stderr about a spelling it does not
-        // know; the record must reuse the apply's answer, not ask again.
+        // Once: `universal_control()` warns on stderr about a spelling it does not know, so
+        // the record must reuse the apply's answer rather than ask again.
         assert_eq!(
             body.matches("cfg.universal_control()").count(),
             1,
@@ -17503,10 +17366,10 @@ mod tests {
         );
     }
 
-    /// A pass that moved nothing and failed nothing reports from the walk it made: its
-    /// scan's counts, and nothing left to migrate — every exposed dir it left was a
-    /// refusal a dry run refuses identically. A pass that MOVED something walks again,
-    /// because the pre-apply scan no longer describes the disk.
+    /// A pass that moved nothing and failed nothing reports from the walk it made: its scan's
+    /// counts, and nothing left to migrate — every exposed dir it left was a refusal a dry run
+    /// refuses identically. A pass that moved something walks again, because the pre-apply
+    /// scan no longer describes the disk.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_census_after_an_apply_is_the_scan_unless_something_moved() {
@@ -17547,7 +17410,7 @@ mod tests {
             (1, 0, 0, true)
         );
         // Something moved: the disk changed under the scan, so the census walks again
-        // and reports what is there NOW.
+        // and reports what is there now.
         let hidden = repo.join("target.noindex");
         std::fs::rename(&target, &hidden).unwrap();
         let moved = vec![Applied::Migrated {
@@ -17627,14 +17490,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_same_directory_under_another_spelling_is_the_real_home() {
-        // PID-SCOPED, like every other temp fixture in this crate. These two paths
-        // were fixed strings until 2026-09-19, so any second run of this suite on the
-        // same machine — the normal condition on a tree several sessions share, and
-        // the reason this case failed only "under the full suite" — raced this one on
-        // one directory and one symlink name: the loser found the link already there
-        // and panicked in `symlink(...).unwrap()`, or had its directory removed from
-        // under the assertions. Nothing about the law under test is shared, so
-        // nothing about its fixture needs to be.
+        // PID-scoped, like every other temp fixture in this crate: with fixed path strings a
+        // second run of this suite on the same machine raced this one on one directory and one
+        // symlink name, and the loser panicked in `symlink(...).unwrap()`.
         let t =
             std::env::temp_dir().join(format!("atpkg-same-directory-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
@@ -18227,8 +18085,8 @@ mod tests {
         let flag = seed_body
             .find("let adopted_by_this_run = !adopted(&layout);")
             .expect("cmd_seed captures whether this run adopts");
-        // The seed lane's adoption is [`record_seed_adoption`] — `record_adoption`
-        // plus the record of WHO adopted — so the name searched for is that one.
+        // The seed lane's adoption is [`record_seed_adoption`] — `record_adoption` plus the
+        // record of who adopted — so the name searched for is that one.
         let adopt = seed_body
             .find("record_seed_adoption(&layout);")
             .expect("cmd_seed adopts");
@@ -18498,9 +18356,8 @@ mod tests {
         };
         for consent in [Consent::InstallingAterm, Consent::Explicit] {
             assert!(net_announcement(ProvisionLane::Network, consent, &[], known).is_none());
-            // …and the sealed-payload lane NEVER claims the wire, whatever the
-            // set, the sizes or the consent: its announcement is `cmd_seed`'s own
-            // `seed-starting:` line.
+            // …and the sealed-payload lane never claims the wire, whatever the set, the
+            // sizes or the consent: its announcement is `cmd_seed`'s `seed-starting:` line.
             for sizes in [SignedSizes::UNKNOWN, known] {
                 assert!(
                     net_announcement(ProvisionLane::SealedPayload, consent, &two, sizes).is_none()
@@ -18840,25 +18697,14 @@ mod tests {
         );
     }
 
-    /// THE WIRE LANE SAYS WHAT IT IS ABOUT TO DO, AND HOW TO STOP IT. The lean app
-    /// — every current release, on every CPU — has no seal, so the WHOLE set
-    /// arrives through this lane on every current-release Mac — and until
-    /// 2026-09-06 its one line read "installing 10 program(s) over the network:
-    /// ay, clean, …" (aterm.log on an Intel Mac, where it was measured): no size,
-    /// no way out, while `aterm help pkg` called size "the one thing disclosed up
-    /// front". The way out it names is timed honestly: `uninstall --all` is a
-    /// store mutator like `update`, and the dispatch edge holds the store lock for
-    /// the whole pass, so that verb can only run once the pass ends — the line
-    /// must say so, or it sends the reader into "another atpkg process holds the
-    /// store lock" mid-download.
+    /// The wire lane says what it is about to do, and how to stop it: the lean app has no
+    /// seal, so the whole set arrives here on every current-release Mac. The way out is timed
+    /// honestly — `uninstall --all` cannot run until the pass releases the store lock, so the
+    /// line says "once this pass ends" rather than sending the reader into that refusal.
     #[test]
     fn the_network_lane_names_the_size_and_the_off_switches() {
-        // The set a first launch names today, derived from the compiled lists the
-        // client installs from — the ALab roster plus the agent programs, which
-        // 88c0e224e made default-set members installed unasked — sorted as
-        // `install_default_set_inner` sorts `will_install`. The 2026-09-06 line
-        // named ten; this one names twelve, and the log-cap check below runs
-        // against the longer line.
+        // The set a first launch names, from the compiled lists the client installs from,
+        // sorted as `install_default_set_inner` sorts `will_install`.
         let mut set: Vec<String> = crate::stub::DEFAULT_SET_STUB_NAMES
             .iter()
             .map(|(n, _)| (*n).to_string())
@@ -18866,11 +18712,8 @@ mod tests {
             .collect();
         set.sort();
         set.dedup();
-        // 3_650_000_000 B = 3.399… GiB and 1_100_000_000 B = 1.024… GiB, so the
-        // ONE renderer's rounding is exercised on both figures — the finding named
-        // the undisclosed cost as "~0.9 GB over the network, 3.4 GB on disk"
-        // (docs/GOLDEN-INSTALL-PATH.md: "~1.1 GB down"), and the same signed
-        // `[cost]` row carries both.
+        // 3_650_000_000 B = 3.399… GiB and 1_100_000_000 B = 1.024… GiB, so the one
+        // renderer's rounding is exercised on both figures of the same `[cost]` row.
         let both = SignedSizes {
             download: Some(1_100_000_000),
             disk: Some(3_650_000_000),
@@ -18901,10 +18744,8 @@ mod tests {
         assert!(line.contains("`aterm pkg uninstall --all`"), "{line}");
         assert!(line.contains("`[packages].seed_install = false`"), "{line}");
         assert!(line.contains("before the first launch"), "{line}");
-        // …the uninstall verb is timed honestly — it is refused while the pass
-        // holds the store lock (`verb_mutates_store` covers `update` and
-        // `uninstall` alike; `mutator_store_lock` at the dispatch edge), so the
-        // line says "once this pass ends" BEFORE naming it and says what it does…
+        // …the uninstall verb is timed honestly — refused while the pass holds the store
+        // lock — so the line says "once this pass ends" before naming it…
         let ends = line.find("once this pass ends").expect("the timing");
         let verb = line.find("`aterm pkg uninstall --all`").expect("the verb");
         assert!(
@@ -18919,10 +18760,8 @@ mod tests {
         // …the whole line owns exactly two '(' — "program(s)" and the size — so a
         // parenthesis can arrive from neither the switch phrase nor the format…
         assert_eq!(line.matches('(').count(), 2, "{line}");
-        // …and the sizes are the line's TRAILING parenthetical, which is where the
-        // toolchain bar reads them (crates/aterm-gui `toolchain_announced` takes
-        // the text after the LAST '(' when it closes with ')'), so the off-switch
-        // phrase must never bring a parenthesis of its own.
+        // …and the sizes are the line's trailing parenthetical, which is where the toolchain
+        // bar reads them, so the off-switch phrase must bring no parenthesis of its own…
         let (_, tail) = line.rsplit_once('(').expect("a parenthetical");
         assert_eq!(tail, "~1.0 GiB download, ~3.4 GiB on disk)", "{line}");
         let (consent_clause, seed_clause) = Consent::InstallingAterm.announced();
@@ -18932,28 +18771,18 @@ mod tests {
                 "the bar would read the wrong parenthetical: {phrase}"
             );
         }
-        // …shown WHOLE: the bar passes the text inside the parentheses through
-        // `sanitize_for_tty(s, 40)`, which appends '…' past 40 characters — and
-        // the figures this line exists to disclose may not be what gets clipped.
+        // …shown whole: the bar clips the text inside the parentheses at 40 characters, and
+        // the figures this line exists to disclose may not be what gets clipped…
         let inside = tail.strip_suffix(')').expect("closed");
         assert!(
             inside.chars().count() <= 40,
             "{inside:?} would be clipped on the toolchain bar"
         );
         assert_eq!(crate::progress::sanitize_for_tty(inside, 40), inside);
-        // …and the whole line fits the LOG. The GUI logs it as `atpkg install
-        // pass starting: {detail}` — one `Wake::PkgSeedStarted` serves the seed
-        // lane AND this one, so its line names the EVENT rather than a lane
-        // (crates/aterm-gui; `detail` is the text after "atpkg: net-starting: ",
-        // trimmed) — and its file sink caps one
-        // record BODY at aterm_log::MAX_RECORD_BYTES = 512, eliding the tail with
-        // '…' (`aterm_log::sanitize_record`). The sizes are the LAST thing on the
-        // line — they cannot move ahead of the switches, because the bar reads
-        // the LAST '(' (above) — so they are the first casualty of any growth
-        // (about a dozen more member names; opted-in extras join `will_install`
-        // too), and the one figure this line exists to disclose would be what
-        // vanished. atpkg does not depend on aterm-log, so the cap is pinned
-        // here by hand: change both or neither.
+        // …and the whole line fits the log, whose sink elides a record body past
+        // aterm_log::MAX_RECORD_BYTES = 512. The sizes are last on the line, so they are the
+        // first casualty of any growth. atpkg does not depend on aterm-log, so the cap is
+        // pinned here by hand: change both or neither.
         const MAX_RECORD_BYTES: usize = 512; // = aterm_log::MAX_RECORD_BYTES
         let detail = line
             .strip_prefix(&format!("atpkg: {NET_STARTING_MARKER}"))
@@ -18964,13 +18793,9 @@ mod tests {
             "the log sink would elide the sizes: {logged} bytes as logged, cap \
              {MAX_RECORD_BYTES}: {line}"
         );
-        // THE EXPLICIT VERB IS ITS OWN CONSENT. `aterm pkg install --default-set`
-        // — what the Settings "Install ALab toolset" button runs, on any
-        // platform — clears the decline and the removals and never reads
-        // `seed_install`, so "installing aterm is the consent" and the
-        // `seed_install` switch are both false on its pass. Its line is the same
-        // line with exactly those two clauses gone: the sizes, the timed
-        // uninstall switch (true on every lane) and the two '(' all stay.
+        // The explicit verb is its own consent: it never reads `seed_install`, so its line is
+        // the same line with exactly those two clauses gone — the sizes, the timed uninstall
+        // switch and the two '(' all stay.
         let explicit = net_announcement(ProvisionLane::Network, Consent::Explicit, &set, both)
             .expect("a non-empty network pass announces before acting");
         assert!(
@@ -18992,12 +18817,9 @@ mod tests {
             "{explicit}"
         );
         assert_eq!(explicit.matches('(').count(), 2, "{explicit}");
-        // One figure known prints that figure alone: a registry row without
-        // `download_bytes` keeps the seed lane's on-disk phrase; one without
-        // `disk_installed` names just the download — in its own tier
-        // (970_000_000 B is under 1 GiB, so the renderer says "925.1 MiB"; the
-        // two figures need not share a unit, and neither is ever rounded up
-        // into the next one to match the other).
+        // One figure known prints that figure alone, in its own tier: 970_000_000 B is under
+        // 1 GiB, so the renderer says "925.1 MiB". The two figures need not share a unit, and
+        // neither is rounded up to match the other.
         let disk_only = net_announcement(
             ProvisionLane::Network,
             Consent::InstallingAterm,
@@ -19045,18 +18867,10 @@ mod tests {
         assert!(!tail.ends_with(')'), "{bare}");
     }
 
-    /// WHO ADOPTED DECIDES WHAT THE LINE MAY CLAIM. "Installing aterm is the
-    /// consent", with `seed_install = false` before the first launch as the
-    /// switch, is true only of the update pass on a machine the SEED PASS
-    /// adopted (`adopted_by_seed`), with neither key overriding it:
-    /// `auto_install = true` completes the set whatever `seed_install` says
-    /// (`should_complete_set`), and a key set false after adoption can no longer
-    /// stop the loop. A machine the explicit verb adopted carries no record,
-    /// because that verb is its own consent and never reads the key. With the
-    /// default keys that is `uninstall --all` followed by Settings "Install ALab
-    /// toolset", or `install --default-set` on a CLI-only box. The callers' half
-    /// is source-shaped in the house style, because the verbs read the GLOBAL
-    /// layout and config; the record's own life cycle is
+    /// Who adopted decides what the line may claim: "installing aterm is the consent", with
+    /// `seed_install = false` as the switch, is true only of an update pass on a machine the
+    /// seed pass adopted, with neither key overriding it. A machine the explicit verb adopted
+    /// carries no record. The record's own life cycle is
     /// `who_adopted_is_recorded_only_when_the_seed_pass_creates_adoption`.
     #[test]
     fn only_a_pass_the_first_launch_adopted_says_installing_aterm_is_the_consent() {
@@ -19084,11 +18898,9 @@ mod tests {
             );
         }
 
-        // Up to the verb's OWN closing brace, not the next top-level `fn`: the
-        // items between `cmd_update_all` and the next function include
-        // `Consent` itself, whose arms would satisfy any search. Each verb is a
-        // thin `answer_announcement` wrapper over a `_code` worker that holds
-        // its body, so the scans read the worker.
+        // Up to the verb's own closing brace, not the next top-level `fn`: the items between
+        // `cmd_update_all` and the next function include `Consent` itself, whose arms would
+        // satisfy any search. Each verb wraps a `_code` worker, so the scans read the worker.
         fn body_of(src: &'static str, signature: &str) -> &'static str {
             let start = src.find(signature).expect("the verb");
             let end = src[start..]
@@ -19133,14 +18945,10 @@ mod tests {
         );
     }
 
-    /// WHO ADOPTED, ACROSS THE VERBS THAT CHANGE IT: the record behind
-    /// `set_completion_consent`'s third input. The seed pass writes it only when
-    /// it CREATES adoption, because it runs on every launch, and stamping a marker
-    /// it found would hand a machine the explicit verb adopted back to the first
-    /// launch's consent on its very next launch. The explicit verb clears it,
-    /// uninstall clears it with the marker, a record without the marker vouches
-    /// for nothing, and a marker with no record (the explicit verb's, or one
-    /// written before the record existed) claims no more than the uninstall.
+    /// Who adopted, across the verbs that change it: the record behind
+    /// `set_completion_consent`'s third input. The seed pass writes it only when it creates
+    /// adoption, since stamping a marker it found would hand a machine the explicit verb
+    /// adopted back to the first launch's consent. Neither file alone vouches for anything.
     #[test]
     fn who_adopted_is_recorded_only_when_the_seed_pass_creates_adoption() {
         let layout = temp_layout("who-adopted");
@@ -20739,10 +20547,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An INSTALLED `rustc`-locked tuple's registry: the channel moves `ta`@3 + `tb`@5 to
-    /// `ta`@4 + `tb`@6, with tb's new build published only for `tb_triple` — a foreign
-    /// triple is how the registry looks from a host the publisher does not build that pin
-    /// for — and `yanked` as the channel's deny-list.
+    /// An installed `rustc`-locked tuple's registry: the channel moves `ta`@3 + `tb`@5 to
+    /// `ta`@4 + `tb`@6, with tb's new build published only for `tb_triple` (how it looks from a
+    /// host the publisher does not build that pin for), and `yanked` as the deny-list.
     fn write_installed_group_registry(dir: &Path, tb_triple: &str, yanked: &[&str]) {
         write_group_index(dir, "ta = 4, tb = 6", yanked);
         write_pkg(dir, "ta", 4);
@@ -20790,16 +20597,10 @@ mod tests {
         }
     }
 
-    /// THE SIX-HOURLY FAILURE (measured on an Intel Mac, every logged pass 2026-09-11/12): an
-    /// INSTALLED coherence tuple whose channel moved it to a pin that publishes NO artifact
-    /// for this host's triple aborted in the stage phase on every pass — `rustc update
-    /// ABORTED at trust during stage`, one failure per tick, forever, while the tuple kept
-    /// running its previous builds. The bootstrap's own doctrine
-    /// ([`crate::flow::group_missing_triple`]) says a tuple that cannot fully exist on this
-    /// host is a correct state, not a failure — and the update lane now agrees: the group
-    /// is HELD, no failure is counted, every installed member's row says which build is
-    /// unpublished and which one stays, the live links do not move, and not a byte is
-    /// resolved, downloaded or staged. The pass after the build publishes moves the tuple.
+    /// A tuple that cannot fully exist on this host is a correct state, not a failure
+    /// ([`crate::flow::group_missing_triple`]): the group is held, no failure is counted, each
+    /// installed member's row says which build is unpublished and which one stays, the live
+    /// links do not move, and nothing is staged. The pass after the build publishes moves it.
     #[test]
     fn an_installed_group_whose_new_pin_is_unpublished_here_is_held_not_failed() {
         let dir = scratch("update-held-triple");
@@ -20907,15 +20708,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// …BUT A HOLD NEVER KEEPS A REVOKED BUILD RUNNING. When a member's CURRENT build is
-    /// yanked (or below the floor), `decide` asked for the upgrade to force the member OFF
-    /// it; quietly holding the tuple would leave the revoked build live on exactly the
-    /// host that has no replacement. The pass does what the disk-shortfall abort does: it
-    /// disables the revoked build's commands and aborts LOUDLY — one failure, and the
-    /// ordinary `aborted: stage` row doctor counts, recorded on the program it disabled.
-    /// And it STAYS loud: the next pass no longer sees the disabled program as installed
-    /// and holds the tuple quietly for the member that is, but the disabled program's row
-    /// is still a doctor fault.
+    /// …but a hold never keeps a revoked build running: quietly holding the tuple would leave
+    /// a yanked build live on exactly the host that has no replacement. The pass disables that
+    /// build's commands and aborts loudly instead, and stays loud — later passes hold the tuple
+    /// quietly for the member still installed, while the disabled row is still a doctor fault.
     #[test]
     fn an_unpublished_pin_never_quietly_holds_a_revoked_current_build() {
         let dir = scratch("update-held-revoked");
@@ -20941,7 +20737,7 @@ mod tests {
             outcome_of(&report, "ta")
         );
         // The line this pass printed for ta names the build this triple lacks: tb's new
-        // pin. ta's own replacement, ta@4, IS published here.
+        // pin. ta's own replacement, ta@4, is published here.
         let triple = current_triple();
         assert_eq!(
             crate::flow::recalled_unpublished_notice("ta", "tb", 6, triple),
@@ -20997,10 +20793,9 @@ mod tests {
             "…and doctor counts it against the disabled program: {problems:?}"
         );
 
-        // THE NEXT PASS. The tombstone took ta out of `active_builds`, so this pass sees
-        // only tb installed: decide() asks for ta fresh, every installed current build is
-        // valid, and tb's unpublished pin holds the tuple quietly. ta must not go quiet
-        // with it: still disabled, and still a doctor fault on its own row.
+        // The next pass: the tombstone took ta out of `active_builds`, so only tb is seen
+        // installed and tb's unpublished pin holds the tuple quietly. ta must not go quiet
+        // with it — still disabled, and still a doctor fault on its own row.
         let (report, failures) = update_pass(&layout, &fetcher);
         assert_eq!(failures, 0, "{:?}", report.groups);
         assert_eq!(
@@ -21064,9 +20859,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The hold is ONLY for a pin this host cannot run: the same installed tuple whose new
-    /// pin IS published for this triple upgrades exactly as it always did — staged whole,
-    /// flipped whole, managed rows naming the new index, the new signed roots recorded.
+    /// The hold is only for a pin this host cannot run: the same installed tuple whose new pin
+    /// is published for this triple upgrades as it always did — staged whole, flipped whole,
+    /// managed rows naming the new index, the new signed roots recorded.
     #[test]
     fn an_installed_group_whose_new_pin_is_published_here_upgrades_as_before() {
         let dir = scratch("update-group-served");
@@ -21104,12 +20899,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The hold reads only the members the pass would MOVE. `ta` is up to date on build 3,
-    /// whose signed manifest has no row for this triple; `tb`'s current build 5 is
-    /// yanked, so `decide` force-upgrades it to 6, which IS published here. Nothing of
-    /// ta's is staged, so ta's manifest proves nothing about this pass: tb moves to 6
-    /// exactly as it did before the hold existed — no hold, no abort, no failure, and
-    /// ta's commands keep working.
+    /// The hold reads only the members the pass would move. `ta` is up to date on build 3,
+    /// whose signed manifest has no row for this triple; `tb`'s current build 5 is yanked, so
+    /// `decide` force-upgrades it to 6, which is published here. Nothing of ta's is staged, so
+    /// tb moves to 6 as before: no hold, no abort, no failure, and ta's commands keep working.
     #[test]
     fn an_up_to_date_member_never_holds_or_aborts_a_siblings_upgrade() {
         let dir = scratch("update-uptodate-unserved");
@@ -21144,11 +20937,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The hold needs PROOF bound to the pin. A genuinely signed manifest served where
-    /// tb@6's belongs, but naming another build (tb@7) or another program (ta@6), with no
-    /// row for this triple, says nothing about tb@6: the pass takes the old loud path —
-    /// the stage refuses the mismatch, one failure, the ordinary `aborted: stage` row —
-    /// never the quiet hold.
+    /// The hold needs proof bound to the pin. A genuinely signed manifest served where tb@6's
+    /// belongs, but naming another build or another program, says nothing about tb@6: the pass
+    /// takes the loud path — the stage refuses the mismatch, one failure, the ordinary
+    /// `aborted: stage` row — never the quiet hold.
     #[test]
     fn a_manifest_that_does_not_bind_to_the_pin_never_proves_it_unpublished() {
         for (label, prog, build) in [("build", "tb", 7u64), ("program", "ta", 6u64)] {
@@ -21621,10 +21413,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A [`crate::DirFetcher`] whose FIRST request for `program`'s manifest fails, as a
-    /// dropped connection does; every later request is served. Nothing remembers a failed
-    /// fetch, so a prescan that met the failure proved nothing and a later walk, asking
-    /// again, gets the manifest.
+    /// A [`crate::DirFetcher`] whose first request for `program`'s manifest fails, as a dropped
+    /// connection does; every later request is served. Nothing remembers a failed fetch, so a
+    /// prescan that met the failure proved nothing and a later walk, asking again, succeeds.
     struct FirstManifestFetchFails {
         inner: crate::DirFetcher,
         program: &'static str,
@@ -21653,14 +21444,11 @@ mod tests {
         }
     }
 
-    // THE BOOTSTRAP ARM OF THE MISSING-TRIPLE HOLD. A partly installed tuple: ta@3 is
-    // live, tb is missing, and the channel pins ta = 4 (published only for a foreign
-    // triple) and tb = 6 (published here). Set-completion's prescan probes the whole
-    // tuple, but its request for ta@4's manifest fails, and a failed fetch proves
-    // nothing; the group arm's own prescan probes only the missing tb, which is served.
-    // The transaction's walk then fetches ta@4 and finds no artifact for this triple. A
-    // tuple that cannot fully exist here is a clean skip, never a failure: nothing
-    // staged, nothing resolved, ta still running build 3, tb not installed.
+    // The bootstrap arm of the missing-triple hold. A partly installed tuple: ta@3 is live,
+    // tb is missing, the channel pins ta = 4 (published only for a foreign triple) and tb = 6.
+    // The prescan's request for ta@4's manifest fails and proves nothing, so the walk fetches
+    // it and finds no artifact for this triple. A tuple that cannot fully exist here is a clean
+    // skip, never a failure: nothing staged, nothing resolved.
     #[test]
     fn default_set_bootstrap_skips_a_partial_tuple_whose_installed_pin_is_unpublished() {
         let dir = scratch("group-partial-unpublished");

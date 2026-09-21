@@ -13,9 +13,12 @@
 //!                  --cap-file <path>… [--attention]
 //! ```
 //!
-//! The rest (`wake`, `pin`, `lash`) belong to later
-//! rungs and are refused by name rather than silently accepted: a subcommand
-//! that parses and does nothing is worse than one that says it does not exist.
+//! An unknown word is refused BY NAME rather than answered with the usage text:
+//! a typo that prints help reads as a request for help rather than as the
+//! mistake it was. Three names — `wake`, `pin` and `lash` — used to have an arm
+//! of their own saying they were "a later rung"; round 21 removed it, and they
+//! are now unknown subcommands like any other. Both answers are exit 2; what
+//! changed is that this file no longer promises a rung nobody is building.
 //!
 //! ## `ls` PRINTS §7'S COLUMNS, AND SAYS WHICH OF THEM HAVE NO WRITER
 //!
@@ -93,8 +96,6 @@ aterm-link — the aterm fabric bridge
   aterm-link hook  install claude [--merge] [--dry-run] [--rewake] [--report-to @sid] | run <event> [--check]   (`hook` for its own usage)
   aterm-link notify --on <attention|ask:<p>|halt>,... --exec <cmd>  (`notify` for its own usage)
   aterm-link mirror <root> --sock <path>            (the file plane; `mirror` for its own usage)
-  aterm-link glance --fleet <F> --broker <ep> --cap-file <path>...   (writes <state>/fabric/glance.json)
-  aterm-link tui    --fleet <F> --broker <ep> --cap-file <path>... [--from <offset>]
   aterm-link broker <socket> [log] [--secret-file <path>]
                     the local bus itself (`broker` for its usage)
   aterm-link broker --tcp <host:port> --key-file <k> --secret-file <s> <log>
@@ -109,7 +110,7 @@ aterm-link — the aterm fabric bridge
                     bring a SECOND HOST into the fleet over the sealed wire
                     (`aterm fabric` is the same code; `fabric help` for its usage)
 
-`ls`, `glance`, `tui` and `mirror` default their flags from the rendezvous file
+`ls` and `mirror` default their flags from the rendezvous file
 `aterm fabric on` (or `join`) writes beside the instance control sockets (fabric.toml):
 --fleet, --broker, --cap-file and --state for the first three — and --tcp --key-file
 with a defaulted --broker on a host that joined over the sealed wire — --sock for
@@ -122,7 +123,6 @@ mirror. A flag given on the command line wins.
   --cap-file <path>      a minted capability (`<grant> <tag-hex>` lines); repeatable
   --state <dir>          the state dir (node id, incarnation, sequence, watermarks)
   --accept-from <p>,...  principals whose task/control arrive undemoted
-  --screen <sid|all>,... publish these sessions' screens on the bus (OFF by default)
   --sock <path>          hand-started OBSERVER mode against a control socket
   --token-file <path>    the instance token, for --sock
   --presence <mode>      `serve` only: what a session's presence row carries.
@@ -144,9 +144,15 @@ mirror. A flag given on the command line wins.
                          `post --wait-ack` returns, their `await inbox re=<off>`
                          latches and their `inbox` row reads `ack … verdict=`.
                          A note earns none; a session that only --peeks acks
-                         nothing. `--no-receipts` turns it off. Without either
-                         flag, `[fabric] receipts` in aterm.toml (`aterm fabric
-                         on` writes `receipts = true`), else off.
+                         nothing. ON BY DEFAULT, and that default is the same
+                         one whichever way the bridge was set up (round 21; it
+                         used to be off here and on for a node `aterm fabric on`
+                         had configured). `--no-receipts` turns it off for one
+                         run, `[fabric] receipts = false` in aterm.toml for
+                         good; with neither, that key decides and its absence
+                         means on. Off costs the SENDER: nothing can release a
+                         `post --wait-ack`, so every `ask` waits out its whole
+                         deadline.
   --attention            `ls` only: keep only rows carrying an `attention=` (§9.3)
 
 `ls` prints §7's row — <node> <host> <sid> state= inc= role= detail= driving=
@@ -154,7 +160,10 @@ holder= hold= fabric= attention= — then gen=, observer=, epoch=, phase=,
 context= and title=. `role=`, `detail=`, `phase=`, `context=` and `title=` are
 written by a round-13 bridge in `meta` mode (a `minimal` or older bridge leaves
 them `-`); every column is printed pct-encoded, so `context=12%` reads
-`context=12%25`; `driving=` has no writer in this fabric yet and always reads `-`;
+`context=12%25`; `driving=` has no writer in this fabric yet and always reads
+`-`, and since round 21 cut the drive face `holder=` has none either on a row
+this node wrote — it is still PRINTED because the roster is a pass-through and
+an older node on the wire still publishes one;
 `host=` and `fabric=` are on the NODE row only, so a session row reads `-` for
 both and the node's own row above it carries them.
 
@@ -168,7 +177,6 @@ astream also builds an ephemeral-X25519 (`handshake`) and a mutual signed-DH
 third-party crypto dependency to a crate whose dependency set the design pins,
 and `aterm link broker` serves no `identity` listener to reach.
 
-Later rungs own `wake`, `pin` and `lash`.
 
 ",
     build_line!()
@@ -197,15 +205,9 @@ pub fn dispatch(args: &[String]) -> ExitCode {
         Some("notify") => crate::notify::main(&args[1..]),
         Some("hook") => crate::hook::main(&args[1..]),
         Some("mirror") => crate::mirror::main(&crate::enable::with_default_sock(&args[1..])),
-        Some("glance") => crate::glance::main(&crate::enable::with_rendezvous_defaults(&args[1..])),
-        Some("tui") => crate::tui::main(&crate::enable::with_rendezvous_defaults(&args[1..])),
         Some("broker") => broker(&args[1..]),
         Some("mint") => mint(&args[1..]),
         Some("fabric") => crate::fabric::main(&args[1..]),
-        Some(other @ ("wake" | "pin" | "lash")) => {
-            eprintln!("aterm-link: `{other}` is a later rung and is not implemented yet");
-            ExitCode::from(2)
-        }
         // Asked for: stdout, exit 0 — the same contract `aterm --help` and the
         // `broker -h` / `mint -h` children keep. Before this the front door
         // answered its own `--help` with exit 2 on stderr, disagreeing with
@@ -241,7 +243,8 @@ fn run(args: &[String], serve: bool) -> ExitCode {
     if serve {
         // `--attention` IS AN `ls` FILTER, and `serve` refuses it BY NAME rather
         // than ignoring it: a flag that parsed and did nothing is the failure
-        // this crate refuses everywhere else (`--handshake`, `wake`).
+        // this crate refuses everywhere else (`--handshake`, and every unknown
+        // subcommand).
         if parsed.attention {
             eprintln!("aterm-link: --attention is an `ls` filter (§9.3); `serve` has no roster");
             eprint!("{USAGE}");
@@ -445,11 +448,14 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         cap_files: Vec::new(),
         state_dir: String::new(),
         accept_from: Vec::new(),
-        screen: Vec::new(),
         sock: None,
         token: None,
         presence: crate::presence::Mode::Meta,
-        receipts: false,
+        // ON, matching `receipts_from_config`'s absent-key answer and what
+        // `aterm fabric on` writes — one default, whichever door you came
+        // through (round 21). This value only ever survives for a caller that
+        // builds a `Cfg` without going through the config fallback below.
+        receipts: true,
     };
     let mut token_file: Option<String> = None;
     let mut tcp = false;
@@ -484,7 +490,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
                 cfg.accept_from
                     .extend(value()?.split(',').map(str::to_string));
             }
-            "--screen" => cfg.screen.extend(value()?.split(',').map(str::to_string)),
             "--attention" => attention = true,
             "--presence" => {
                 let v = value()?;
@@ -551,16 +556,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     for p in &cfg.accept_from {
         if !crate::subject::is_principal(p) {
             return Err(format!("--accept-from {p} is not a principal"));
-        }
-    }
-    // `--screen` NAMES SESSIONS, and `all` is spelled out rather than implied by
-    // a bare flag: this face carries screen CONTENT onto an append-forever log
-    // (§10) that has no encrypt-at-rest yet (T12), so "every screen on this node"
-    // is a sentence an operator should have to write.
-    for s in &cfg.screen {
-        let bare = s.trim_start_matches('@');
-        if s != "all" && !(crate::subject::is_principal(bare) && bare.starts_with("s-")) {
-            return Err(format!("--screen {s} is not `all` or an @s-<sid>"));
         }
     }
     Ok(Parsed {
@@ -1219,42 +1214,5 @@ mod tests {
             crate::pct::decode(printed).ends_with('…'),
             "the cut landed inside a %XX escape: {printed}"
         );
-    }
-
-    /// `--screen` NAMES SESSIONS, and `all` is spelled out.
-    ///
-    /// This is the one fabric face that puts screen CONTENT on an
-    /// append-forever log with no encrypt-at-rest (§10, T12, §14's open question
-    /// 2), so the flag is empty by default and a typo is a usage error rather
-    /// than a session quietly not being published — or, worse, a bare `--screen`
-    /// meaning "all of them".
-    #[test]
-    fn the_screen_flag_names_sessions_and_all_is_spelled_out() {
-        let base = "--fleet f1 --broker /tmp/b.sock --state /tmp/s";
-        assert!(parse(&argv(base)).expect("ok").cfg.screen.is_empty());
-        assert_eq!(
-            parse(&argv(&format!("{base} --screen all")))
-                .expect("ok")
-                .cfg
-                .screen,
-            vec!["all".to_string()]
-        );
-        // A comma list, and an `@`-prefixed sid, both the way `--accept-from`
-        // and `post to=` already spell theirs.
-        assert_eq!(
-            parse(&argv(&format!("{base} --screen @s-aaa,s-bbb")))
-                .expect("ok")
-                .cfg
-                .screen,
-            vec!["@s-aaa".to_string(), "s-bbb".to_string()]
-        );
-        for bad in [
-            "--screen",          // a flag with no value
-            "--screen n-node",   // a node is not a session
-            "--screen h-andrew", // nor is a human
-            "--screen every",    // "all" or nothing
-        ] {
-            assert!(parse(&argv(&format!("{base} {bad}"))).is_err(), "{bad}");
-        }
     }
 }

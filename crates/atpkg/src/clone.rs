@@ -1,67 +1,35 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! COPY-ON-WRITE CLONES of a build's files — the construction behind the rustup view
+//! Copy-on-write clones of a build's files — the construction behind the rustup view
 //! ([`crate::seam`]) and the per-build exec roots ([`crate::compat`]).
 //!
-//! # Why not hard links (the owner, 2026-09-16)
+//! # Why not hard links
 //!
-//! *"Trust and rustc are different … hard linking? that sounds stupid … doing that with
-//! hardlinks sounds like bugs and indeed: bugs."* Both views used to be HARD-LINK MIRRORS:
-//! every file of a view was one of the STORE's own inodes under a second name. That made
-//! the store's inodes part of every view's lifecycle, and each consequence was a measured
-//! defect:
-//!
-//! * a link or an unlink is a write to the store inode's link count and ctime, and tippy
-//!   pins its own executable's and its siblings' — so laying, rebuilding or retiring any
-//!   view aborted every tippy running from the store (measured 2026-09-15);
-//! * a link made by a provenance-tracked process is a provenance write on the store file
-//!   itself, so the view had to be laid through an untracked launchd lane or it tagged
-//!   the toolchain;
-//! * identity had to be proven by `(dev, ino)` — in Rust, and in every routed shim with a
-//!   `-ef` test — and a view could never outlive, or differ from, the store it shared.
-//!
-//! A CLONE has none of that. On APFS, `std::fs::copy` is `fclonefileat(2)`: a new inode
-//! whose data blocks are shared copy-on-write with the source, with the source's mode,
-//! length and modification time, costing only metadata (bundle 8595, 4,114 files and
-//! 2.6 GB, cloned for about 2 MB, measured 2026-09-16). Nothing about the store changes:
-//! not a link count, not a ctime, not an extended attribute. The clone runs exactly as the
-//! hard link did — the Trust frontends choose their behaviour by the name they are invoked
-//! under and find their siblings and sysroot by their own path, and a clone is a real file
-//! at a real path (8595's tippy lints from a cloned view, and `trustc --print sysroot`
-//! answers the view).
+//! A hard-link mirror makes the store's own inodes part of every view's lifecycle: a link
+//! or unlink writes the store inode's link count and ctime, which aborts every tippy
+//! running from the store (tippy pins its own executable's and its siblings'); a link from
+//! a provenance-tracked process tags the store file; and identity has to be proven by
+//! `(dev, ino)`. A clone has none of that — on APFS `std::fs::copy` is `fclonefileat(2)`, a
+//! new inode sharing the source's blocks copy-on-write with its mode, length and mtime,
+//! costing only metadata and touching nothing about the store.
 //!
 //! # Rules
 //!
-//! * A clone never silently becomes a copy of a toolchain. `std::fs::copy` falls back to a
-//!   byte copy across volumes, so [`clone_file`] refuses first when the destination
-//!   directory is not on the source's device.
-//! * On LINUX the same call is `copy_file_range(2)`: a reflink on a copy-on-write
-//!   filesystem (btrfs, XFS), a real copy otherwise. No Linux bundle ever needs an exec
-//!   root ([`crate::compat::needs_root`] — its copies are byte-identical), so what that
-//!   costs is the rustup view alone.
+//! * A clone never silently becomes a copy of a toolchain: `std::fs::copy` falls back to a
+//!   byte copy across volumes, so [`clone_file`] refuses when the destination directory is
+//!   not on the source's device.
+//! * On Linux the same call is `copy_file_range(2)` — a reflink on btrfs or XFS, a real
+//!   copy otherwise. No Linux bundle needs an exec root ([`crate::compat::needs_root`]), so
+//!   that cost falls on the rustup view alone.
 //! * [`is_clone_of`] is the identity: a regular file, not a symlink, with the source's
-//!   length, permission bits and modification time — and NOT the source's inode. The last
-//!   clause is what retires the hard-link views: one laid before this module reads as a
-//!   mismatch and is rebuilt once, as clones, and the store's link counts come back.
-//!
-//! # OFF UNIX THIS MODULE REFUSES, AND SAYS SO (2026-09-18)
-//!
-//! Both rules above rest on `st_dev`/`st_ino`, and neither number is reachable from
-//! stable Rust off Unix: `std::os::windows::fs::MetadataExt::file_index` and its
-//! `volume_serial_number` sibling are unstable (`windows_by_handle`), and this crate's
-//! dependency graph is argued edge by edge and carries no `windows-sys` to call
-//! `GetFileInformationByHandle` with. The third leg is worse: on Windows `std::fs::copy`
-//! is `CopyFileExW`, a byte copy on one volume and across two alike, so a "clone" laid
-//! there is a COPY OF A TOOLCHAIN — the one thing Rule 1 exists to forbid.
-//!
-//! Until 2026-09-18 the two `not(unix)` arms answered `true` and `Ok(())`: the hard-link
-//! rejection collapsed into [`attributes_match`], so a hard link into the store read as a
-//! clone (the defect dd3808bc9 had just fixed on the Unix side), and the cross-volume
-//! refusal could not fire. Both now FAIL CLOSED and name what is not checked — a guard
-//! that cannot fail is worse than no guard, because it reads as coverage. The decisions
-//! themselves live in [`distinct_files`] and [`one_volume`], which take the platform's
-//! answer as an argument and so are asserted on EVERY target, Unix or not.
+//!   length, permission bits and modification time — and not the source's inode. That last
+//!   clause retires the hard-link views, which read as a mismatch and are rebuilt once as
+//!   clones.
+//! * Off Unix both `not(unix)` arms fail closed: `st_dev`/`st_ino` are unreachable from
+//!   stable Rust and Windows' `std::fs::copy` byte-copies within one volume too, so nothing
+//!   laid there would be a clone. [`distinct_files`] and [`one_volume`] take the platform's
+//!   answer as an argument, so both decisions are asserted on every target.
 
 use std::io;
 use std::path::Path;
@@ -77,8 +45,8 @@ type VolumeId = u64;
 /// # Errors
 /// `src` is not a regular file, `dst` exists, `dst`'s directory is on another device than
 /// `src` (a clone cannot cross a volume, and a toolchain is never byte-copied in its
-/// place), or the copy itself fails. OFF UNIX it always refuses, with
-/// [`io::ErrorKind::Unsupported`] and the reason — see [`same_device`] and the module doc.
+/// place), or the copy itself fails. Off Unix it always refuses with
+/// [`io::ErrorKind::Unsupported`] — see [`same_device`] and the module doc.
 pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(src)?;
     if !meta.is_file() {
@@ -128,23 +96,10 @@ fn same_device(src: &Path, dst: &Path) -> io::Result<()> {
     one_volume(src, parent, Some(s.dev()), Some(p.dev()))
 }
 
-/// OFF UNIX THE VOLUME IS NOT CHECKED — AND THERE IS NOTHING TO CHECK IT FOR.
-///
-/// The invariant this guard carries on Unix is "`std::fs::copy` falls back to a byte copy
-/// across volumes, so never let it". Off Unix that fallback is not the exception, it is
-/// the whole implementation: Windows' `std::fs::copy` is `CopyFileExW`, which byte-copies
-/// on one volume and across two alike, and there is no `st_dev` on stable Rust to compare
-/// anyway (see the module doc). So a "clone" laid here is a copy of a toolchain no matter
-/// what the two paths are, and the answer is a NAMED REFUSAL rather than the `Ok(())`
-/// this arm returned until 2026-09-18 — which let `refresh_view_in_process`, the one
-/// caller that carries no `cfg` of its own, byte-copy the whole store into the view on
-/// every pass (off Unix `first_mismatch` always reports a mismatch, so every pass rebuilt)
-/// while the module doc promised that could not happen.
-///
-/// The rest of the seam already treats laying a view as a Unix operation
-/// ([`crate::seam::lay_view`], `lay_view_dirs` and `route_for_shim` are all `cfg(unix)`),
-/// so this refusal names a lane that was never implemented instead of removing one that
-/// worked.
+/// Off Unix the volume is not checked — and there is nothing to check it for: Windows'
+/// `std::fs::copy` byte-copies on one volume and across two alike, and stable Rust exposes
+/// no `st_dev` to compare, so a "clone" laid here would be a copy of a toolchain whatever
+/// the paths are. A named refusal, not an `Ok(())` that would read as coverage.
 #[cfg(not(unix))]
 fn same_device(src: &Path, dst: &Path) -> io::Result<()> {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
@@ -152,12 +107,9 @@ fn same_device(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 /// The verdict `same_device` returns once the platform has said which volume each side is
-/// on: `Ok(())` ONLY when both are known and equal.
-///
-/// `None` is a refusal, not a pass. A guard whose unknown case answers "fine" is exactly
-/// the shape this module carried off Unix, and it reads as coverage while checking
-/// nothing. Taking the two answers as arguments is what lets the `not(unix)` verdict be
-/// asserted from a Unix box — see `the_volume_verdict_refuses_what_it_cannot_prove`.
+/// on: `Ok(())` only when both are known and equal — `None` is a refusal, not a pass.
+/// Taking the two answers as arguments is what lets the `not(unix)` verdict be asserted
+/// from a Unix box — see `the_volume_verdict_refuses_what_it_cannot_prove`.
 fn one_volume(
     src: &Path,
     parent: &Path,
@@ -191,18 +143,13 @@ fn one_volume(
 
 /// Whether `at` is a clone of the regular file `src`: by `lstat`, a regular file (never a
 /// symlink) with `src`'s length, permission bits and modification time — and a different
-/// inode, so a hard link to `src` is NOT a clone of it (see the module doc).
+/// inode, so a hard link to `src` is not a clone of it (see the module doc).
 ///
-/// Attributes, not bytes: this runs over every file of a view on every update pass. It
-/// cannot tell a clone of `src` from another file that happens to share all three — and
-/// bundle 8595 ships exactly such a file, a separately signed `bin/rustc` with `trustc`'s
-/// length, mode and time and 2,428 different bytes. Where that matters, the three stock
-/// names, the deep check reads the bytes too ([`same_bytes`]).
-///
-/// OFF UNIX IT ANSWERS `false` FOR EVERY PAIR, because [`file_identity`] cannot tell a
-/// hard link from a clone there and this predicate would rather say "not proven" than
-/// "clone" (the seam's own `not(unix)` arms already report every view as mismatched, so
-/// the re-lay this provokes is the behaviour that side was already written for).
+/// Attributes, not bytes, because this runs over every file of a view on every update pass.
+/// It cannot tell a clone from another file sharing all three — bundle 8595 ships one, a
+/// separately signed `bin/rustc` with `trustc`'s length, mode and time — so for the three
+/// stock names the deep check reads the bytes too ([`same_bytes`]). Off Unix it answers
+/// `false` for every pair: [`file_identity`] cannot tell a hard link from a clone there.
 #[must_use]
 pub(crate) fn is_clone_of(src: &Path, at: &Path) -> bool {
     let (Ok(s), Ok(a)) = (
@@ -261,9 +208,8 @@ pub(crate) fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
     }
 }
 
-/// The OS's own identity for a file: what tells a HARD LINK (the store's inode under a
-/// second name) from a clone (a new inode carrying the same attributes). `(dev, ino)` on
-/// Unix.
+/// The OS's own identity for a file: what tells a hard link (the store's inode under a
+/// second name) from a clone (a new inode with the same attributes). `(dev, ino)` on Unix.
 type FileId = (u64, u64);
 
 #[cfg(unix)]
@@ -272,40 +218,29 @@ fn file_identity(m: &std::fs::Metadata) -> Option<FileId> {
     Some((m.dev(), m.ino()))
 }
 
-/// OFF UNIX ATPKG CANNOT READ A FILE'S IDENTITY, and says `None` rather than guessing.
-///
-/// Windows HAS one — `(dwVolumeSerialNumber, nFileIndexHigh:nFileIndexLow)` from
-/// `GetFileInformationByHandle` — but no stable std API reaches it
-/// (`std::os::windows::fs::MetadataExt::file_index` is unstable, behind
-/// `windows_by_handle`) and this crate carries no `windows-sys` edge to call it directly.
-/// NTFS has hard links and `std::fs::hard_link` makes them, so the question is live here;
-/// only the answer is missing. `None` is what [`distinct_files`] turns into "not a clone".
+/// Off Unix atpkg cannot read a file's identity, and says `None` rather than guessing.
+/// Windows has one (`GetFileInformationByHandle`), but no stable std API reaches it and
+/// this crate carries no `windows-sys` edge. NTFS has hard links, so the question is live
+/// here; only the answer is missing. [`distinct_files`] turns `None` into "not a clone".
 #[cfg(not(unix))]
 fn file_identity(_m: &std::fs::Metadata) -> Option<FileId> {
     None
 }
 
-/// Whether `a` and `b` are PROVABLY different files.
+/// Whether `a` and `b` are provably different files.
 ///
-/// An unreadable identity is not a difference. Where [`file_identity`] cannot answer this
+/// An unreadable identity is not a difference: where [`file_identity`] cannot answer, this
 /// answers `false`, so [`is_clone_of`] says "not a clone" and its callers re-lay rather
-/// than trust a file they cannot tell from a hard link into the store. Until 2026-09-18
-/// the `not(unix)` arm answered `true` unconditionally, which collapsed [`is_clone_of`]
-/// into [`attributes_match`] off Unix and made a hard link read as a clone — the defect
-/// dd3808bc9 fixed on the Unix side the same week.
+/// than trust a file they cannot tell from a hard link into the store.
 fn distinct_files(a: Option<FileId>, b: Option<FileId>) -> bool {
     matches!((a, b), (Some(x), Some(y)) if x != y)
 }
 
-/// THE TWO PLATFORM DECISIONS, ASSERTED ON EVERY TARGET.
-///
-/// The module's `unix` arms are covered by the filesystem tests below, which need
-/// `hard_link` and a mode bit and so cannot run everywhere. The `not(unix)` arms used to
-/// be covered by NOTHING — the only test module in this file was `cfg(all(test, unix))`,
-/// so neither stub had a single assertion anywhere, on any box. These do not touch the
-/// filesystem: they feed [`distinct_files`] and [`one_volume`] the answer each platform
-/// gives (`Some(..)` on Unix, `None` off it) and pin the verdict, so a Unix box asserts
-/// the Windows decision and a Windows box asserts the Unix one.
+/// The two platform decisions, asserted on every target. The filesystem tests below need
+/// `hard_link` and a mode bit, so they cannot run everywhere and left the `not(unix)` arms
+/// with no assertion at all. These touch no filesystem: they feed [`distinct_files`] and
+/// [`one_volume`] the answer each platform gives (`Some(..)` on Unix, `None` off it) and
+/// pin the verdict, so a Unix box asserts the Windows decision and a Windows box the Unix.
 #[cfg(test)]
 mod decisions {
     use super::*;
@@ -342,8 +277,7 @@ mod decisions {
         assert_eq!(crossed.kind(), io::ErrorKind::CrossesDevices);
         assert!(crossed.to_string().contains("different volumes"));
 
-        // Off Unix both answers are `None`. THIS is the arm that returned `Ok(())` until
-        // 2026-09-18 and so could never refuse anything.
+        // Off Unix both answers are `None` — the arm that must refuse rather than pass.
         let unknown = one_volume(src, parent, None, None).unwrap_err();
         assert_eq!(
             unknown.kind(),
@@ -361,9 +295,8 @@ mod decisions {
     }
 
     /// Off Unix the two platform answers really are the ones the tests above pin, and
-    /// `clone_file` really does refuse. Compiled (and run) only where that is the case;
-    /// type-checked for `x86_64-pc-windows-msvc` with
-    /// `rustc --test --target x86_64-pc-windows-msvc` over this file.
+    /// `clone_file` really does refuse. Compiled only where that is the case; type-checked
+    /// with `rustc --test --target x86_64-pc-windows-msvc` over this file.
     #[cfg(not(unix))]
     #[test]
     fn off_unix_the_platform_answers_are_unknown_and_a_clone_is_refused() {

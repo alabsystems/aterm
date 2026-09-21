@@ -18,8 +18,11 @@
 //!   `hold`, and the `await inbox` predicate. They are plain functions over a
 //!   `SessionCtx` (and, for the two bridge verbs, the registry), so every one of
 //!   them is directly testable without an event loop.
-//! * `LINK` — the INSTANCE's view of its bridge: connected, disconnected, or
-//!   never launched, plus the set of sessions that bridge has ever touched.
+//! * `LINK` — the INSTANCE's view of its bridge: connected, stale, stalled,
+//!   disconnected, or never launched, plus the set of sessions that bridge has
+//!   ever touched. Four of the five are STORED on a report; `stale` alone is
+//!   derived at read time, because the thing it names — a bridge that owes an
+//!   answer and has gone silent — arrives as no event at all ([`STALE_AFTER`]).
 //!
 //! ## Why `deliver` is not an Owner verb, and which half of `hold` is
 //!
@@ -840,6 +843,41 @@ const FABRIC_DISCONNECTED: u8 = 2;
 /// `connected` for as long as it lived). See [`link_report`].
 const FABRIC_STALLED: u8 = 3;
 
+/// The bridge's own `LINK_REFRESH` (`aterm-link/src/bridge.rs`), mirrored here
+/// because `aterm-gui` does not depend on `aterm-link`: after an ack, the
+/// longest a bridge lets its last `link up` go unrefreshed WHILE IT IS ACKING.
+/// A bridge that is getting answers therefore re-reports within this, and one
+/// that is not says nothing at all.
+const LINK_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a bridge may OWE an answer before `fabric=` reads `stale` — the
+/// contract's three refreshes.
+///
+/// IT IS MEASURED FROM THE WORK, NOT FROM THE LAST ACK, and that is the whole
+/// design. `fabric_link_age_ms=` on a quiet link grows without bound by
+/// construction ([`LinkReport`]: "a quiet link sends nothing, and `acked_at`
+/// simply ages"), so a rule reading "the last ack is older than this" is FALSE
+/// on every healthy idle fleet. Measured on the owner's live instance
+/// 2026-09-20, twice, twenty seconds apart, against a broker that answered a
+/// head query in 20 ms:
+///
+/// ```text
+/// fabric=connected fabric_rtt_ms=14 fabric_link_age_ms=277532
+/// fabric=connected fabric_rtt_ms=14 fabric_link_age_ms=297547
+/// ```
+///
+/// 297 s of "staleness" on a link with nothing whatever wrong with it — and
+/// `aterm ctl status`'s own shipped prose already says so
+/// (`aterm-types/src/control_verbs.rs`: "a large age on `connected` means a
+/// quiet link, not a dead one, and only the next exchange can tell"). Reading
+/// that as `stale` would refuse the wait on every `ask` and `task` on the
+/// fleet at once — the exact regression [`link_evidence`] was added to undo.
+///
+/// So the clock starts when the endpoint HANDS THE BRIDGE WORK
+/// ([`note_work_owed`]) and stops on any evidence the bridge is moving it
+/// ([`clear_work_owed`]). Silence is not read as death; an unanswered ASK is.
+const STALE_AFTER: std::time::Duration = LINK_REFRESH.saturating_mul(3);
+
 /// The reason token the link carries between a bridge's attach and its first
 /// report: no dial has been answered yet, one way or the other.
 const LINK_STARTING: &str = "starting";
@@ -883,6 +921,16 @@ struct LinkReport {
     /// endpoint takes a delivery or a landing as the evidence it is — see
     /// [`link_evidence`].
     reported: bool,
+    /// When the endpoint last handed this bridge work it has shown no sign of
+    /// having moved — the instant a post was queued into the outbox with no
+    /// ack, landing or link report since. `None` when the bridge owes nothing,
+    /// which is the state of every quiet fleet.
+    ///
+    /// THIS IS THE ONE FIELD `stale` IS DERIVED FROM, and it is deliberately
+    /// not `acked_at`: see [`STALE_AFTER`]. It is an `Option<Instant>` rather
+    /// than a count so that a second post while one is already owed does not
+    /// restart the clock — the bridge has been silent since the FIRST one.
+    owed_since: Option<std::time::Instant>,
 }
 
 /// The instance's view of its bridge. Process-global because the bridge is
@@ -958,6 +1006,7 @@ static LINK: FabricLink = FabricLink {
         acked_at: None,
         stalled_at: None,
         reported: false,
+        owed_since: None,
     }),
 };
 
@@ -1083,9 +1132,122 @@ fn bridge_reachable() -> bool {
     LINK.supervised.load(Ordering::Relaxed) || LINK.state.load(Ordering::Relaxed) != FABRIC_ABSENT
 }
 
+/// Whether the bridge has owed an answer for longer than [`STALE_AFTER`].
+///
+/// Read at call time from [`LinkReport::owed_since`], exactly as the ack's age
+/// is ([`fabric_link_facts`]) — there is no timer and no sweep, because the
+/// fact IS a duration and a stored flag would only be a copy of one that could
+/// go out of date. Lock order: this takes `LINK.link`, and every writer of it
+/// releases it before touching a session (see [`wake_parked`]), so the one
+/// order that exists is `ctx.fabric` → `LINK.link`.
+fn link_is_stale() -> bool {
+    let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    link.owed_since.is_some_and(|t| t.elapsed() >= STALE_AFTER)
+}
+
+/// How long until an owed answer goes [`STALE_AFTER`]-stale, or `None` when the
+/// bridge owes nothing. `Some(0)` means it already is.
+///
+/// A parked `post --wait` uses this to BOUND ITS SLEEP: the condvar is only
+/// signalled by an event, and a wedged bridge produces none, so without a cap
+/// the waiter would sleep out its whole `--wait` (up to `WAIT_MAX_MS` = 600 s)
+/// for a verdict that became true six seconds in. This is the same argument
+/// [`wake_parked`] makes for the `down` transition, for the case where there
+/// is no transition to hang a wake on.
+fn stale_in() -> Option<std::time::Duration> {
+    let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    link.owed_since
+        .map(|t| STALE_AFTER.saturating_sub(t.elapsed()))
+}
+
+/// Note that the endpoint has handed the bridge work. The clock starts on the
+/// FIRST unanswered one and is not restarted by later ones.
+fn note_work_owed() {
+    // ONLY A CONNECTED BRIDGE CAN OWE ANYTHING. `stale` is a refinement of
+    // `connected` and is read from nowhere else, so arming the clock while the
+    // state is `absent`, `disconnected` or `stalled` records a debt no reader
+    // can see and no event is guaranteed to clear — those three already say
+    // "your post is queued and not moving", which is the whole message.
+    //
+    // It is also the gate every other writer of this struct has and this one
+    // was missing: `bridge_attached`, `link_report` and `link_evidence` all
+    // refuse a write that does not belong to the live bridge generation, so a
+    // caller with no bridge cannot move the link's state. Without the same rule
+    // here, ANY `post` moved it — including one from a test with no bridge at
+    // all, which made `owed_since` the one field of `LinkReport` that leaked
+    // across the section lock `with_link` exists to provide.
+    if LINK.state.load(Ordering::Relaxed) != FABRIC_CONNECTED {
+        return;
+    }
+    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    if link.owed_since.is_none() {
+        link.owed_since = Some(std::time::Instant::now());
+    }
+}
+
+/// Whether ANY session on this instance is still waiting on the bridge for a
+/// post: queued, not landed (`off` unset), and not retired as dead.
+///
+/// Derived from the registry rather than counted, because a count drifts. A post
+/// can leave a ring without passing `outbox sent` — the session closes, or the
+/// ring trims — and a counter that missed one of those would leave the instance
+/// permanently in debt and permanently `stale`. Reading the rows cannot drift.
+///
+/// LOCK ORDER. The ctxs are cloned out from under the registry guard first and
+/// the fabric locks are taken after it is dropped, which is the discipline
+/// [`wake_parked`] states: the fabric lock is a leaf. Every caller of this must
+/// therefore already have released any fabric lock of its own, and must not hold
+/// `LINK.link` — the one order in this file is `ctx.fabric` → `LINK.link`.
+fn posts_outstanding(store: &Store) -> bool {
+    let ctxs: Vec<_> = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        g.live_handles().map(|h| h.ctx.clone()).collect()
+    };
+    ctxs.iter().any(|ctx| {
+        let inbox = ctx.fabric.lock();
+        inbox.posts.iter().any(|p| p.off.is_none() && !p.dead)
+    })
+}
+
+/// Reconcile the owed clock with what is ACTUALLY outstanding, after any event
+/// that proves the bridge is moving: an ack, a landing, a retirement.
+///
+/// THE CLOCK BELONGS TO THE OLDEST OUTSTANDING POST, NOT TO THE LAST EVENT, and
+/// getting that wrong was a real hole. The first version cleared unconditionally
+/// on any evidence, so: queue post 1 and post 2, the bridge lands 1 and wedges,
+/// and the debt is cleared by 1's landing while 2 is owed forever. The instance
+/// reads `connected`, and a `post --wait` already parked on 2 sleeps its whole
+/// wait — exactly the freeze `stale` exists to cut short, reintroduced by the
+/// fix for it.
+///
+/// So evidence CLEARS the debt only when nothing is outstanding, and otherwise
+/// RE-STAMPS it: the bridge is alive, so the remaining work gets a fresh
+/// [`STALE_AFTER`] rather than either a stale verdict it has not earned or an
+/// exemption it has not earned either.
+fn settle_work_owed(store: &Store) {
+    let outstanding = posts_outstanding(store);
+    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    link.owed_since = outstanding.then(std::time::Instant::now);
+}
+
+/// Age the owed clock by `by`, so a test reaches [`STALE_AFTER`] without
+/// sleeping for it. The alternative is a six-second unit test, and a test that
+/// slow is one that gets marked `#[ignore]` and stops holding anything.
+#[cfg(test)]
+fn backdate_work_owed(by: std::time::Duration) {
+    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    link.owed_since = link.owed_since.map(|t| t.checked_sub(by).unwrap_or(t));
+}
+
 /// The `status` reply's `fabric=` token.
+///
+/// `stale` is DERIVED and the other four are stored, because `stale` is the
+/// only one that becomes true with no event to store it on: a wedged helper
+/// holds both its fds open and says nothing, so there is no report to write it
+/// down at. See [`STALE_AFTER`].
 pub(crate) fn fabric_state() -> &'static str {
     match LINK.state.load(Ordering::Relaxed) {
+        FABRIC_CONNECTED if link_is_stale() => "stale",
         FABRIC_CONNECTED => "connected",
         FABRIC_DISCONNECTED => "disconnected",
         FABRIC_STALLED => "stalled",
@@ -1185,6 +1347,14 @@ pub(crate) fn bridge_attached(generation: BridgeGeneration) {
         // not a link that fell over ([`fabric_stalled_ms`]).
         link.stalled_at = None;
         link.reported = false;
+        // A NEW incarnation inherits no debt: whatever the last one was asked
+        // for and never moved, this one has not been asked yet — it drains the
+        // same outbox on its first round. The clock comes back on the first
+        // thing that proves it is moving, which re-stamps rather than clears
+        // while posts remain ([`settle_work_owed`]); this function has no
+        // `&Store` to reconcile against and does not need one, because an
+        // attach is `stalled` and `stale` is only read from `connected`.
+        link.owed_since = None;
     }
     LINK.state.store(FABRIC_STALLED, Ordering::Relaxed);
 }
@@ -1262,6 +1432,11 @@ pub(crate) fn link_report(
     reason: &str,
     rtt_ms: Option<u64>,
 ) -> bool {
+    // BEFORE ANY LINK LOCK: reading what is outstanding takes the sessions'
+    // fabric locks, and the one lock order in this file is `ctx.fabric` →
+    // `LINK.link`. Only an `up` report settles the debt, so only an `up` pays
+    // for the read.
+    let outstanding = up && posts_outstanding(store);
     let (went_down, went_up) = {
         let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
         if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
@@ -1280,6 +1455,13 @@ pub(crate) fn link_report(
             link.rtt_ms = rtt_ms;
             link.acked_at = Some(std::time::Instant::now());
             link.stalled_at = None;
+            // AN ACK IS EVIDENCE THE BRIDGE IS MOVING, NOT THAT OUR WORK IS
+            // DONE. It clears the debt only if nothing is outstanding, and
+            // otherwise re-stamps it — see [`settle_work_owed`], and note that
+            // `outstanding` was computed BEFORE this lock was taken, because
+            // reading it needs the fabric locks and the one order here is
+            // `ctx.fabric` → `LINK.link`.
+            link.owed_since = outstanding.then(std::time::Instant::now);
         } else {
             link.reason = reason.to_string();
             if rtt_ms.is_some() {
@@ -2030,6 +2212,7 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
             link.rtt_ms = None;
             link.acked_at = None;
             link.stalled_at = None;
+            link.owed_since = None;
         }
         LINK.touched
             .lock()
@@ -2237,7 +2420,13 @@ pub(crate) fn cmd_deliver(store: &Store, rest: &str) -> String {
     note_bridge_touched(store, sid);
     link_evidence(lane_generation());
     if rest_toks.iter().any(|t| t.starts_with("landed=")) {
-        return deliver_landed(&ctx, &rest_toks);
+        let landed = deliver_landed(&ctx, &rest_toks);
+        // THE OTHER RETIREMENT PATH. `deliver landed=` retires a post exactly as
+        // `outbox sent` does, so the owed clock is reconciled here for the same
+        // reason and in the same order — after the retirement, so the post that
+        // just landed is off the list before the list is read.
+        settle_work_owed(store);
+        return landed;
     }
     if rest_toks.iter().any(|t| t.starts_with("fetched=")) {
         return deliver_fetched(&ctx, &rest_toks);
@@ -2840,7 +3029,20 @@ pub(crate) fn cmd_outbox_sent(store: &Store, rest: &str) -> String {
     };
     note_bridge_touched(store, sid);
     link_evidence(lane_generation());
-    match retire_post(&ctx, post_id, off, reason, dup) {
+    let retired = retire_post(&ctx, post_id, off, reason, dup);
+    // A RETIREMENT SETTLES THE DEBT WHATEVER THE BRIDGE'S VINTAGE IS, and it
+    // settles it against WHAT IS LEFT. `link_evidence` above is the legacy arm —
+    // it returns at once for any bridge that reports its own link — but `outbox
+    // sent` is the endpoint watching the exact work it handed over come back
+    // finished, which is stronger evidence than an ack on some other lane.
+    //
+    // AFTER `retire_post`, NEVER BEFORE, and that ordering is the fix: this post
+    // has to be off the outstanding list before the list is read, or the
+    // reconcile re-stamps a debt for work that has just been settled. It also
+    // has to be after because `retire_post` holds the session's fabric lock and
+    // [`posts_outstanding`] takes every session's in turn.
+    settle_work_owed(store);
+    match retired {
         Ok(()) => "OK\n".to_string(),
         Err(e) => e,
     }
@@ -3686,6 +3888,12 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
         .unwrap_or_else(|p| p.into_inner())
         .record("post", payload);
     drop(inbox);
+    // THE BRIDGE NOW OWES AN ANSWER. This record is what becomes the push
+    // lane's `EVENT <sid> post <id>`, so from here the endpoint has asked and
+    // the bridge has not yet moved it. A bridge that is working answers in
+    // milliseconds and [`clear_work_owed`] runs; one that is wedged says
+    // nothing, and [`STALE_AFTER`] later `fabric=` reads `stale`.
+    note_work_owed();
     ctx.fabric.changed.notify_all();
     crate::presence::post_fabric_changed(&ctx.self_id);
 
@@ -3776,10 +3984,20 @@ fn wait_landing(
         if now >= deadline {
             return Err(format!("ERR timeout id={id}\n"));
         }
+        // PARK NO LONGER THAN THE STALE HORIZON. Nothing signals this condvar
+        // when a bridge simply stops answering — that is what makes `stale`
+        // worth having — so the sleep is cut to the moment the futility check
+        // above would start returning true, and the next turn of the loop
+        // answers `ERR fabric stale id=<n> queued=1` instead of sitting out
+        // the remaining minutes.
+        let mut park = deadline - now;
+        if let Some(until_stale) = stale_in().filter(|d| !d.is_zero()) {
+            park = park.min(until_stale);
+        }
         let (next, _) = ctx
             .fabric
             .changed
-            .wait_timeout(guard, deadline - now)
+            .wait_timeout(guard, park)
             .unwrap_or_else(|p| p.into_inner());
         guard = next;
     }
@@ -3817,10 +4035,21 @@ fn wait_receipt(ctx: &SessionCtx, id: u64, off: u64, dup: &str, bound_ms: u64) -
         if now >= deadline {
             return format!("ERR timeout id={id} off={off}\n");
         }
+        // PARK NO LONGER THAN THE STALE HORIZON, for the reason
+        // [`wait_landing`] gives: nothing signals this condvar when a bridge
+        // simply stops answering, so the sleep is cut to the moment the
+        // futility check above starts returning true. THIS WAIT IS THE LONGER
+        // OF THE TWO — its bound is the sender's `dl=` plus a grace, up to
+        // `WAIT_MAX_MS` — so sitting it out is the more expensive mistake, and
+        // round 21 shipped the cap on the landing wait alone.
+        let mut park = deadline - now;
+        if let Some(until_stale) = stale_in().filter(|d| !d.is_zero()) {
+            park = park.min(until_stale);
+        }
         let (next, _) = ctx
             .fabric
             .changed
-            .wait_timeout(guard, deadline - now)
+            .wait_timeout(guard, park)
             .unwrap_or_else(|p| p.into_inner());
         guard = next;
     }
@@ -3873,6 +4102,12 @@ fn wait_receipt(ctx: &SessionCtx, id: u64, off: u64, dup: &str, bound_ms: u64) -
 /// sessions at once (measured 2026-09-14).
 fn wait_is_futile() -> bool {
     match LINK.state.load(Ordering::Relaxed) {
+        // `stale` IS ALWAYS `queued=1`, for the same reason `stalled` is: the
+        // post is in the outbox and the bridge drains it the moment it moves
+        // again. The difference from `stalled` is only in what to go and fix
+        // — a bridge that SAID its link is down against one that has said
+        // nothing at all while owing an answer ([`STALE_AFTER`]).
+        FABRIC_CONNECTED if link_is_stale() => true,
         FABRIC_CONNECTED => false,
         FABRIC_STALLED => {
             let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
@@ -4939,6 +5174,233 @@ mod inbox_hold {
                 "OK\n"
             );
             assert_eq!(fabric_link_facts().0, "unknown");
+        });
+    }
+
+    /// A WEDGED HELPER IS `stale`, AND `stale` IS NOT THE ACK'S AGE.
+    ///
+    /// The third failure of a bridge, and the one neither `stalled` nor
+    /// `disconnected` can see: the helper process holds both inherited fds open
+    /// — so no `BridgeLostGuard` fires — and publishes nothing — so it never
+    /// reaches its own 5 s ack deadline and never reports `link down`. Before
+    /// round 21 its instance read `connected` for as long as it hung, and a
+    /// `post --wait` from its sessions sat out the whole `--wait` (up to
+    /// `WAIT_MAX_MS` = 600 s) for a landing nothing was going to report.
+    ///
+    /// AND THE HALF THAT IS EASY TO GET WRONG: a quiet link is NOT stale. The
+    /// ack's age grows without bound on a healthy idle fleet by construction
+    /// ([`LinkReport`]), and the owner's live instance was measured at
+    /// `fabric_link_age_ms=297547` — 297 s — against a broker answering a head
+    /// query in 20 ms (2026-09-20). Reading THAT as `stale` would refuse the
+    /// wait on every `ask` and `task` on the fleet at once, which is the
+    /// regression [`link_evidence`] exists to undo. So the clock runs from the
+    /// work, not from the ack: [`STALE_AFTER`].
+    #[test]
+    fn a_bridge_that_owes_an_answer_reads_stale_and_a_quiet_one_does_not() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(cmd_link(&store, "up rtt=3", Some(generation)), "OK\n");
+            assert_eq!(fabric_state(), "connected");
+
+            // A QUIET LINK IS NOT STALE, however old its ack gets. Nothing has
+            // been asked of this bridge, so there is nothing it owes.
+            //
+            // THE PRECONDITION IS ESTABLISHED, NOT ASSUMED, and that is about
+            // the harness rather than the rule. `LINK` is process-global while
+            // each test owns its own `Store`, and `cmd_post` arms the debt for
+            // whatever instance is connected — so a test running OUTSIDE this
+            // section, posting while this section has the link up, can arm it.
+            // `settle_work_owed` reconciles against THIS store, which has no
+            // posts, so the debt is genuinely clear; and because
+            // `backdate_work_owed` only ages a stamp that already exists, an arm
+            // that lands after this line is a FRESH one and still reads
+            // `connected`. Without it this assertion was flaky, which is a
+            // harness fact and not a defect in the rule it states.
+            settle_work_owed(&store);
+            backdate_work_owed(STALE_AFTER * 100);
+            assert_eq!(
+                fabric_state(),
+                "connected",
+                "an idle bridge owes nothing: no work, no debt, no `stale`"
+            );
+            assert!(!wait_is_futile(), "a quiet link must still take a wait");
+
+            // NOW HAND IT WORK. The debt is armed but fresh, so the state does
+            // not move and a wait is still worth taking.
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note one", None), "OK 1\n");
+            assert_eq!(
+                fabric_state(),
+                "connected",
+                "a fresh debt is not a stale one"
+            );
+            assert!(!wait_is_futile());
+
+            // AND LET IT GO UNANSWERED. No report, no landing, no ack — only
+            // time passing with the post still owed.
+            backdate_work_owed(STALE_AFTER);
+            assert_eq!(fabric_state(), "stale");
+            assert!(wait_is_futile());
+            let started = std::time::Instant::now();
+            assert_eq!(
+                cmd_post(&ctx, "to=h-andrew kind=ask --wait=30000 anyone?", None),
+                "ERR fabric stale id=2 queued=1\n",
+                "queued=1: the post IS in the outbox and the bridge drains it \
+                 the moment it moves again — `stale` is `wait, do not re-post`"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "a stale wait is refused at once, not after its timeout: {:?}",
+                started.elapsed()
+            );
+
+            // THE DEBT IS SETTLED BY EVIDENCE, NOT BY TIME. One `link up` and
+            // the instance is connected again with both posts still queued.
+            assert_eq!(cmd_link(&store, "up rtt=4", Some(generation)), "OK\n");
+            assert_eq!(fabric_state(), "connected");
+            assert!(!wait_is_futile());
+
+            // A LANDING SETTLES IT TOO, for a bridge whose vintage sends no
+            // `link` record of its own: `outbox sent` is the endpoint watching
+            // the exact work it handed over come back finished.
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note two", None), "OK 3\n");
+            backdate_work_owed(STALE_AFTER);
+            assert_eq!(fabric_state(), "stale");
+            assert_eq!(cmd_outbox_sent(&store, &format!("{_sid} 3 off=7")), "OK\n");
+            assert_eq!(fabric_state(), "connected", "a landing is an answer");
+
+            // AND A FRESH BRIDGE INHERITS NO DEBT.
+            assert_eq!(
+                cmd_post(&ctx, "to=h-andrew kind=note three", None),
+                "OK 4\n"
+            );
+            backdate_work_owed(STALE_AFTER);
+            assert_eq!(fabric_state(), "stale");
+            let next = next_bridge_generation();
+            bridge_attached(next);
+            assert_eq!(
+                fabric_state(),
+                "stalled",
+                "an attach is `stalled`, not `stale`"
+            );
+            assert_eq!(cmd_link(&store, "up rtt=1", Some(next)), "OK\n");
+            assert_eq!(
+                fabric_state(),
+                "connected",
+                "the new incarnation has not been asked for anything yet"
+            );
+        });
+    }
+
+    /// **THE DEBT BELONGS TO THE OLDEST OUTSTANDING POST, NOT TO THE LAST EVENT.**
+    ///
+    /// Round 21's first cut of `stale` cleared the owed clock on ANY evidence the
+    /// bridge was moving. That reintroduced the freeze it exists to cut short, one
+    /// post further along: queue two, let the bridge land the first and then wedge,
+    /// and the landing clears a debt the SECOND post is still owed. The instance
+    /// reads `connected` for ever, and a `post --wait` already parked on the second
+    /// sleeps its whole wait — up to `WAIT_MAX_MS`, 600 s — for a landing nothing
+    /// is going to report.
+    ///
+    /// Evidence now RECONCILES against what is actually outstanding
+    /// ([`settle_work_owed`]): it clears only when the outbox is empty of
+    /// un-landed posts, and otherwise re-stamps, so the remaining work gets a
+    /// fresh [`STALE_AFTER`] rather than an exemption.
+    #[test]
+    fn a_landing_re_arms_the_debt_while_another_post_is_still_outstanding() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(cmd_link(&store, "up rtt=3", Some(generation)), "OK\n");
+            assert_eq!(fabric_state(), "connected");
+
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note one", None), "OK 1\n");
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note two", None), "OK 2\n");
+
+            // THE FIRST LANDS. The second is still queued, so the debt must not
+            // be cleared — only re-stamped onto what is left.
+            assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 1 off=7")), "OK\n");
+            assert_eq!(
+                fabric_state(),
+                "connected",
+                "a fresh re-stamp is not a stale one"
+            );
+            backdate_work_owed(STALE_AFTER);
+            assert_eq!(
+                fabric_state(),
+                "stale",
+                "post 2 is owed and the bridge has said nothing since"
+            );
+            assert!(wait_is_futile());
+
+            // AND THE SECOND LANDING CLEARS IT, because nothing is left.
+            assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 2 off=8")), "OK\n");
+            assert_eq!(fabric_state(), "connected");
+            backdate_work_owed(STALE_AFTER * 100);
+            assert_eq!(
+                fabric_state(),
+                "connected",
+                "an empty outbox owes nothing, however long ago the last ack was"
+            );
+
+            // A DEAD VERDICT SETTLES ITS POST TOO: `off=-` is a retirement, so a
+            // post the bridge gave up on is not owed for ever.
+            assert_eq!(
+                cmd_post(&ctx, "to=h-andrew kind=note three", None),
+                "OK 3\n"
+            );
+            backdate_work_owed(STALE_AFTER);
+            assert_eq!(fabric_state(), "stale");
+            assert_eq!(
+                cmd_outbox_sent(&store, &format!("{sid} 3 off=- reason=undeliverable")),
+                "OK\n"
+            );
+            assert_eq!(fabric_state(), "connected");
+        });
+    }
+
+    /// **`post --wait-ack`'s SECOND WAIT IS CUT TO THE STALE HORIZON TOO.**
+    ///
+    /// [`wait_landing`] caps its park so a waiter is not left asleep when the
+    /// bridge stops answering; round 21 shipped that cap on the landing wait
+    /// alone and claimed both. The receipt wait is the LONGER of the two — its
+    /// bound is the sender's `dl=` plus a grace, up to `WAIT_MAX_MS` — so sitting
+    /// it out is the more expensive half of the bug.
+    #[test]
+    fn the_receipt_wait_wakes_at_the_stale_horizon_rather_than_at_its_bound() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(cmd_link(&store, "up rtt=3", Some(generation)), "OK\n");
+
+            // One post lands — it is the one whose receipt is being waited on —
+            // and a second is queued behind it, so the bridge is in debt. Both
+            // are `note`s: `ask` defaults to `--wait`, and a post that parks
+            // inside the arrange step would be measuring the landing wait's cap
+            // rather than the receipt wait's.
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note one", None), "OK 1\n");
+            assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note two", None), "OK 2\n");
+            assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 1 off=7")), "OK\n");
+            backdate_work_owed(STALE_AFTER - std::time::Duration::from_millis(300));
+
+            let started = std::time::Instant::now();
+            assert_eq!(
+                wait_receipt(&ctx, 1, 7, "", 30_000),
+                "ERR fabric stale id=1 off=7\n",
+                "the post LANDED, so the reply names its offset and not `queued=1`"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the receipt wait sat out its bound instead of waking at the \
+                 stale horizon: {:?}",
+                started.elapsed()
+            );
         });
     }
 

@@ -17,8 +17,6 @@
 //! | `acked` | the highest offset this bridge has a `PublishAck` for on its OWN lanes | the self-lane check gets more conservative, never less |
 //! | `pins` | the TOFU `sid → node` map, newest [`PINS_KEEP`] | a re-pin on next sight, which is the TOFU rule anyway |
 //! | `halt-acked` | the highest fleet-halt offset this node has answered | the node re-acks a barrier it already answered: one extra retained row, never a new subject |
-//! | `feeding` | the ONE `term/in` whose feed is in flight, and its idempotency key | losing it IS the silent loss §6.5 names — a keystroke that may or may not have been typed and nothing that can tell |
-//! | `term-off` | the drive-face offset already handled | the face resumes at the head, which is A3's silent loss for the records in between and never worse |
 //! | `sent/<sid>.<id>` | the producer sequence reserved for one queued post, and whether a `key=` table entry chose it | a fresh sequence is a second copy — this one IS load-bearing, and it is written BEFORE the publish |
 //! | `keys/<sid>` | `post key=` → the producer sequence it reserved, newest [`KEYS_KEEP`] per session | a re-post under a lost key is a second record; the bound is stated and the newest keys are the ones a retry names |
 //! | `acks/<sid>.<rid>` | the producer sequence reserved for one OWED receipt (R8), written BEFORE the publish, removed at retirement | a fresh sequence is a second `ack` on the sender's lane after a crash between the publish and the retirement |
@@ -27,113 +25,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-
-/// One `term/in` record the bridge is part-way through feeding to a PTY.
-///
-/// The three fields are the whole of what a replay needs: WHICH record (the bus
-/// offset — the record itself stays on the log, so the bytes are never copied
-/// into the state dir), WHICH session, and under WHICH key. The key carries the
-/// epoch, so a key minted for a session that has since relaunched is refused by
-/// the endpoint (`ERR epoch`) rather than typed into its successor — the fence
-/// is structural, not a check the replay has to remember to make.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeedIntent {
-    /// The bus offset of the `term/in` record being applied.
-    pub off: u64,
-    /// The session it is being applied to.
-    pub sid: String,
-    /// The `<epoch>:<producer>:<seq>` key it was stamped with.
-    pub key: String,
-    /// How many times the feed has been ATTEMPTED, journalled before each one.
-    ///
-    /// A BACKSTOP ON THE RETRY LOOP, NOT THE BUDGET. A retry under the same key
-    /// cannot duplicate — that is the whole of A6's mark — so retrying an
-    /// attempt whose outcome was never obtained is safe; retrying it FOREVER is
-    /// not. What bounds the ordinary case is `first_at` and the bridge's
-    /// `FEED_BUDGET`, because a COUNT of retries means whatever period the
-    /// scheduler happens to run them at and that period has already moved once.
-    /// This one bounds the case a wall clock cannot: a bridge that dies inside
-    /// the feed and relaunches into it, where no time need pass at all.
-    pub tries: u32,
-    /// When the FIRST attempt on this record was journalled, in `now_ms()`.
-    ///
-    /// The budget is a DURATION and this is where it starts. It survives the
-    /// restarts the retry is meant to survive, so a crash loop cannot buy
-    /// itself a fresh budget. `0` is "a journal line written before this field
-    /// existed": the next attempt stamps it with the clock rather than reading
-    /// an epoch-zero start as an instantly exhausted budget.
-    pub first_at: u64,
-    /// Whether any attempt on this record ever ended in genuine DOUBT — an
-    /// aterm that did not answer, where the bytes may have reached the PTY.
-    ///
-    /// It decides which verdict exhausting the budget publishes, and it is
-    /// STICKY because doubt is: a later `ERR busy` says the endpoint refused
-    /// that attempt before claiming the mark, and says nothing whatever about
-    /// an earlier attempt whose reply never came. Missing from an old journal
-    /// line it reads as `true`, which is the conservative direction.
-    pub doubt: bool,
-}
-
-impl FeedIntent {
-    /// The one line this intent is stored as.
-    #[must_use]
-    pub fn render(&self) -> String {
-        format!(
-            "off={} sid={} key={} tries={} first={} doubt={}",
-            self.off,
-            self.sid,
-            self.key,
-            self.tries,
-            self.first_at,
-            u8::from(self.doubt)
-        )
-    }
-
-    /// Parse one back. TOTAL: a truncated, reordered or hand-edited line reads as
-    /// `None` — "nothing was in flight" — rather than as a panic or a partly
-    /// filled intent. `None` is the safe direction: it loses a replay the bridge
-    /// might have made, where a half-parsed one could feed the wrong session.
-    #[must_use]
-    pub fn parse(line: &str) -> Option<Self> {
-        let (mut off, mut sid, mut key) = (None, None, None);
-        // A line written before `tries=` existed reads as one attempt already
-        // made, which is the conservative direction: it can only shorten the
-        // budget, never extend it.
-        let mut tries = 1;
-        // A line written before `first=` existed starts its budget at the next
-        // attempt rather than at the epoch, and one written before `doubt=`
-        // existed is assumed doubtful — the direction that publishes `in-doubt`
-        // over `refused`, which is the one an operator must not be talked out
-        // of by a missing field.
-        let mut first_at = 0;
-        let mut doubt = true;
-        for tok in line.split_whitespace() {
-            match tok.split_once('=') {
-                Some(("off", v)) => off = v.parse().ok(),
-                Some(("sid", v)) => sid = Some(v.to_string()),
-                Some(("key", v)) => key = Some(v.to_string()),
-                Some(("tries", v)) => tries = v.parse().unwrap_or(1),
-                Some(("first", v)) => first_at = v.parse().unwrap_or(0),
-                Some(("doubt", v)) => doubt = v != "0",
-                _ => {}
-            }
-        }
-        // A key is `<epoch>:<producer>:<seq>` and a sid is a principal; neither
-        // may be empty, or the "replay" would be a differently-shaped request.
-        let (off, sid, key) = (off?, sid?, key?);
-        if sid.is_empty() || key.split(':').count() != 3 {
-            return None;
-        }
-        Some(Self {
-            off,
-            sid,
-            key,
-            tries,
-            first_at,
-            doubt,
-        })
-    }
-}
 
 /// One outstanding deadline: an `ask` or `task` this node published with
 /// `dl=`, and has not yet seen an `answer`, `report` or `ack` for.
@@ -473,50 +364,6 @@ impl StateDir {
         self.write("halt-acked", &off.to_string())
     }
 
-    /// The highest DRIVE-FACE offset this bridge has finished handling.
-    ///
-    /// ## Why the head-resume was a silent loss, and why a replay is now safe
-    ///
-    /// A3 subscribed `/f/<F>/term/<node>/>` from the log's HEAD on every attach,
-    /// and argued it: "`feed-bin` is not idempotent (§6.5), so replaying the
-    /// drive face from zero would retype every command the session was ever
-    /// driven with". That was true for A3 and is false as of A6. The key
-    /// `on_term_record` mints is `{epoch}:{producer}:{off+1}` — the producer id
-    /// is derived from the node id the state dir mints ONCE and keeps forever, so
-    /// it is identical across bridge restarts, and the endpoint's mark is a
-    /// monotone per-`(Realm::Bridge, producer)` high-water that answers `dup`
-    /// and writes NOTHING below its water. After an aterm restart the epoch
-    /// differs and the record is refused before a claim is made. A replay from a
-    /// lower offset can no longer retype anything.
-    ///
-    /// Meanwhile the loss the head-resume caused was unmitigated and completely
-    /// silent: a `term/in` published while the bridge was between incarnations —
-    /// a broker hiccup, the supervisor's relaunch window, a back-off of up to 30 s
-    /// after a crash loop — was never seen, never fed, never refused, and named
-    /// by no `ev` at all. The doc on this very file called that out as A3's
-    /// defect while the code still did it.
-    ///
-    /// So the face resumes from HERE, and the cursor is written after each record
-    /// is handled. Losing the file costs a resume at the head — exactly A3's
-    /// behaviour, never worse.
-    #[must_use]
-    pub fn term_off(&self) -> Option<u64> {
-        self.read("term-off").and_then(|s| s.parse().ok())
-    }
-
-    /// Record the drive-face offset this bridge has finished handling. MONOTONE,
-    /// for the same reason every other watermark here is.
-    ///
-    /// # Errors
-    ///
-    /// Any I/O failure.
-    pub fn set_term_off(&self, off: u64) -> io::Result<()> {
-        if self.term_off().is_some_and(|have| have >= off) {
-            return Ok(());
-        }
-        self.write("term-off", &off.to_string())
-    }
-
     /// The TOFU `sid → node` pins (§6.1): the first node seen advertising a sid
     /// owns it, and a second node claiming it is a CONFLICT, never a route.
     #[must_use]
@@ -756,61 +603,9 @@ impl StateDir {
         self.write("deadlines", &lines.join("\n"))
     }
 
-    /// The `term/in` this bridge is FEEDING right now, if it is feeding one.
-    ///
-    /// ## Why this file exists (§6.5's last DESIGNED row, the bridge half)
-    ///
-    /// `feed-bin` reaches a PTY. A bridge that dies between "wrote the bytes"
-    /// and "recorded that it wrote them" has two bad options, and A3 took the
-    /// second: replay, and the keystroke is typed twice; do not replay, and it
-    /// is lost. A3 subscribes the drive face from the HEAD on every attach, so
-    /// the record is never seen again — a silent loss, which is the failure the
-    /// design says is not acceptable either.
-    ///
-    /// A6 built the endpoint half: `feed-bin … id=<epoch>:<producer>:<seq>` keeps
-    /// a per-session, per-producer high-water mark and answers an already-consumed
-    /// sequence `OK dup=1` **without writing**, or `ERR in-doubt seq=<n>` when the
-    /// outcome of that exact attempt is genuinely unknown. That turns a replay
-    /// from a gamble into a QUESTION — but only for a bridge that can still ask
-    /// it, which means one that wrote down what it was about to do BEFORE it did
-    /// it, and under which key.
-    ///
-    /// This is that record. ONE ENTRY, because at most one feed is ever
-    /// UNRESOLVED: written before the verb, and cleared once the outcome is on
-    /// the bus as an `ev`.
-    ///
-    /// "Unresolved" and not "in flight", because the entry deliberately outlives
-    /// the verb. `Bridge::record_feed_outcome` keeps it whenever the verdict is
-    /// not final — `ERR busy`, `ERR halted`, `ERR rate`, or an aterm that did
-    /// not answer — so the same record can be asked again under the same key.
-    /// The single slot is therefore a rule the bridge has to KEEP rather than a
-    /// fact it gets for free: `Bridge::settle_pending_feed_before` resolves or
-    /// publishes-and-retires a pending entry before a new drive record may take
-    /// the slot, so no offset ever leaves this file without a verdict on the
-    /// bus. A3 overwrote it, which lost the keystroke silently.
-    #[must_use]
-    pub fn feed_intent(&self) -> Option<FeedIntent> {
-        FeedIntent::parse(&self.read("feeding")?)
-    }
-
-    /// Write down the feed about to be attempted, DURABLY, before the verb.
-    ///
-    /// # Errors
-    ///
-    /// Any I/O failure — and the caller must NOT feed if this fails, because an
-    /// unjournalled feed is exactly the in-doubt window this file closes.
-    pub fn set_feed_intent(&self, intent: &FeedIntent) -> io::Result<()> {
-        self.write("feeding", &intent.render())
-    }
-
-    /// Forget a resolved feed. Called only after its outcome has been RECORDED,
-    /// so the file outlives every moment in which it could still be needed.
-    pub fn clear_feed_intent(&self) {
-        let _ = std::fs::remove_file(self.path("feeding"));
-    }
-
     /// The directory itself, for a caller writing something this type does not
-    /// model (the wake socket, `glance.json`).
+    /// model — the `pid` file `Bridge::new` writes, and the fault markers
+    /// `Bridge::run` looks for under it.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -1110,70 +905,6 @@ mod tests {
         let kept = st.asked();
         assert_eq!(kept.len(), ASKED_KEEP);
         assert_eq!(kept[0].off, 2, "the two oldest are gone");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// THE FEED INTENT IS ONE ENTRY, IT SURVIVES A REOPEN, AND A DAMAGED LINE
-    /// READS AS NOTHING. Losing it loses a replay; MIS-reading it would feed a
-    /// session the bridge was never asked to feed, so every partial parse
-    /// answers `None`.
-    #[test]
-    fn a_feed_intent_round_trips_and_a_damaged_one_reads_as_nothing() {
-        let dir = scratch("feeding");
-        let st = StateDir::open(&dir).expect("open");
-        assert_eq!(st.feed_intent(), None);
-        let intent = FeedIntent {
-            off: 4_211,
-            sid: "s-abcdef0123456789".to_string(),
-            key: "0123456789abcdef0123456789abcdef:77:4212".to_string(),
-            tries: 3,
-            first_at: 1_700_000_000_123,
-            doubt: true,
-        };
-        st.set_feed_intent(&intent).expect("journal");
-        assert_eq!(
-            StateDir::open(&dir).expect("reopen").feed_intent(),
-            Some(intent.clone())
-        );
-        st.clear_feed_intent();
-        assert_eq!(st.feed_intent(), None);
-
-        for damaged in [
-            "",
-            "off=1 sid=s-a",             // no key
-            "off=1 key=a:b:c",           // no sid
-            "sid=s-a key=a:b:c",         // no offset
-            "off=nan sid=s-a key=a:b:c", // an offset that is not one
-            "off=1 sid= key=a:b:c",      // an empty sid
-            "off=1 sid=s-a key=a:b",     // a two-part key is not a key
-            "off=1 sid=s-a key=a:b:c:d", // nor a four-part one
-        ] {
-            assert_eq!(FeedIntent::parse(damaged), None, "{damaged:?}");
-        }
-        // A line from before `tries=` existed counts as one attempt already
-        // made: the budget can only shrink on a format change, never grow.
-        assert_eq!(
-            FeedIntent::parse("off=1 sid=s-a key=a:b:c").map(|i| i.tries),
-            Some(1)
-        );
-        // AND THE TWO FIELDS THE DURATION BUDGET ADDED READ CONSERVATIVELY when
-        // they are absent: an unknown start is `0`, which
-        // `Bridge::resolve_pending_feed` stamps with the clock rather than
-        // treating as a budget spent in 1970, and an unknown history is DOUBT,
-        // which publishes `in-doubt` rather than talking an operator out of one.
-        let legacy = FeedIntent::parse("off=1 sid=s-a key=a:b:c tries=2").expect("parses");
-        assert_eq!(legacy.first_at, 0);
-        assert!(legacy.doubt);
-        // A round trip carries both.
-        let fresh = FeedIntent {
-            off: 9,
-            sid: "s-a".to_string(),
-            key: "a:b:c".to_string(),
-            tries: 1,
-            first_at: 42,
-            doubt: false,
-        };
-        assert_eq!(FeedIntent::parse(&fresh.render()), Some(fresh));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

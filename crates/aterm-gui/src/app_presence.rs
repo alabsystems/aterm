@@ -917,6 +917,14 @@ mod tests {
     /// the sessions the bridge touched, and this is the read side of that).
     #[test]
     fn a_turn_a_hold_and_a_delivery_reach_the_rim_and_the_band_at_change_rate() {
+        // Reads the process-global link through `presence_level`; takes the
+        // reset like every other reader (see review_r1's note, 2026-09-20).
+        crate::fabric::with_link_reset(
+            a_turn_a_hold_and_a_delivery_reach_the_rim_and_the_band_at_change_rate_body,
+        );
+    }
+
+    fn a_turn_a_hold_and_a_delivery_reach_the_rim_and_the_band_at_change_rate_body() {
         let (mut app, wid, sid, ctx) = app_with_stub();
         assert_eq!(app.presence_level(wid), Level::Quiet);
         assert_eq!(
@@ -1013,6 +1021,14 @@ mod tests {
     /// together fold the row — and the fold is ONE PTY re-grid.
     #[test]
     fn the_row_folds_only_on_a_keypress_while_calm_and_pays_one_regrid() {
+        // Reads the process-global link through `presence_level`; takes the
+        // reset like every other reader (see review_r1's note, 2026-09-20).
+        crate::fabric::with_link_reset(
+            the_row_folds_only_on_a_keypress_while_calm_and_pays_one_regrid_body,
+        );
+    }
+
+    fn the_row_folds_only_on_a_keypress_while_calm_and_pays_one_regrid_body() {
         let (mut app, wid, _sid, ctx) = app_with_stub();
         let regrids = presence_regrids();
         assert!(crate::fabric::apply_hold_for_test(
@@ -1680,6 +1696,18 @@ mod tests {
     /// reading tab A's story must not fold tab B's on focus alone.
     #[test]
     fn review_r1_focus_alone_never_reads_another_sessions_story() {
+        // The link is process-global (`fabric_state()`), and a `Quiet` verdict
+        // is exactly the one a sibling's attached or lost bridge turns into
+        // `Note`: measured on the merge gate's parallel run of this binary,
+        // 2026-09-20, this test read `Note` where it asserts `Quiet` and
+        // passed alone. Every test that reads the link takes the reset
+        // (`with_link_reset`'s own rule), the readers included.
+        crate::fabric::with_link_reset(
+            review_r1_focus_alone_never_reads_another_sessions_story_body,
+        );
+    }
+
+    fn review_r1_focus_alone_never_reads_another_sessions_story_body() {
         let (mut app, wid, sid_a, _ctx_a) = app_with_stub();
         let ia = app.windows[&wid].tab_set.tabs().len() - 1;
         for _ in 0..3 {
@@ -1713,6 +1741,14 @@ mod tests {
     /// they read a second tab.
     #[test]
     fn review_r1b_a_story_already_read_does_not_return_on_a_tab_switch() {
+        // Reads the process-global link through `presence_level`; takes the
+        // reset like every other reader (see review_r1's note, 2026-09-20).
+        crate::fabric::with_link_reset(
+            review_r1b_a_story_already_read_does_not_return_on_a_tab_switch_body,
+        );
+    }
+
+    fn review_r1b_a_story_already_read_does_not_return_on_a_tab_switch_body() {
         let (mut app, wid, sid_a, _ctx_a) = app_with_stub();
         let ia = app.windows[&wid].tab_set.tabs().len() - 1;
         for _ in 0..3 {

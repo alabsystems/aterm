@@ -385,15 +385,15 @@ pub(crate) struct AutoApplyEnvironmentBlock {
     blocked_at: std::time::Instant,
 }
 
-/// Activity revocation gets a much larger budget than a preflight block, and a
-/// long-tailed schedule. Rationale from the field: on the machine this feature
-/// exists for — a daily driver with an agent streaming shell output into it —
-/// revocation is the NORMAL outcome of any single attempt, not evidence of a
-/// problem. Three tries then permanent manual-only guaranteed the staged build
-/// sat unapplied until the next relaunch, which is exactly what happened.
-/// Every attempt is a lossless park/spawn/paint round trip, so the cost of
-/// being wrong is bounded and the backoff below keeps it from thrashing.
-const MAX_ACTIVITY_REVOKED_CYCLES: u8 = 8;
+/// The activity-revoked retry ladder has this many distinct rungs (2 s → 15 min,
+/// [`automatic_retry_delay`]); past the last one every further revocation waits
+/// the last rung again. Activity is never a reason to stop: on the machine this
+/// feature exists for — a daily driver with an agent streaming shell output into
+/// it — revocation is the NORMAL outcome of an attempt, not evidence of a
+/// problem, and the ladder in `native_update_auto_intent` is what makes the
+/// next attempt land. Every attempt is a lossless launch/park/paint round trip,
+/// so the spacing is what bounds the cost, not a budget.
+const ACTIVITY_REVOKED_LADDER_RUNGS: u8 = 8;
 
 /// Physical handoff failures get a SMALL budget on a LONG leash — not the zero
 /// they used to get.
@@ -671,14 +671,11 @@ impl PhysicalFailureSchedule {
 }
 
 /// How long the automatic lane waits between attempts once an artifact's cheap
-/// PREFLIGHT-BLOCK budget is spent.
-///
-/// The same number as [`crate::ACTIVITY_MANUAL_ONLY_LAPSE`] on purpose — both
-/// answer the same question ("how long before it is worth disturbing a machine
-/// that told us it was busy") — but a distinct name, because this one is a RETRY
-/// SPACING on a retained intent, not the lapse deadline of a latch. They are free
-/// to diverge; sharing a `const` would make that look like a bug.
-const PREFLIGHT_BLOCK_COOLDOWN: std::time::Duration = crate::ACTIVITY_MANUAL_ONLY_LAPSE;
+/// PREFLIGHT-BLOCK budget is spent. A probe is screen-silent
+/// (`ClosePreflightVisibility::Quiet`), so this is retry spacing on a retained
+/// intent and nothing more; ten minutes keeps a user with an unsaved Settings
+/// edit from waiting hours for a build that was ready.
+const PREFLIGHT_BLOCK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// WHICH LANE'S BUDGET A RETURNED HANDOFF FAILURE MAY SPEND, carried from the
 /// [`crate::native_updater_service::ApplyMode`] the attempt was authorized under.
@@ -957,39 +954,42 @@ enum AutomaticRetryKind {
     /// The overlap attempt parked, spawned, and was then revoked by USER OR
     /// TERMINAL ACTIVITY before Commit. The rollback is proven lossless (kill,
     /// reap, resume readers; zero bytes consumed by the parent post-park), so
-    /// — unlike `PhysicalFailure` — repeating at a later quiet window is as
-    /// safe as the first attempt. Budgeted and exponentially spaced so a busy
-    /// terminal converges to manual-only instead of parking forever.
+    /// — unlike `PhysicalFailure` — repeating later is as safe as the first
+    /// attempt. Exponentially spaced so a busy terminal is not launched at
+    /// continuously; never exhausted, because activity is never a reason to
+    /// stop (the ladder decides when the next attempt lands).
     ActivityRevoked,
     PhysicalFailure,
 }
 
-/// A bounded retry plan for cheap ordering/preflight races, for lossless
-/// activity-revoked overlap returns, and — on a deliberately short budget and long
-/// leash — for physical handoff failures, most of which are a missed deadline
-/// rather than a broken pair of builds (see [`MAX_PHYSICAL_FAILURE_CYCLES`]).
+/// A bounded retry plan for cheap ordering/preflight races and — on a
+/// deliberately short budget and long leash — for physical handoff failures,
+/// most of which are a missed deadline rather than a broken pair of builds (see
+/// [`MAX_PHYSICAL_FAILURE_CYCLES`]); and an UNBOUNDED, saturating spacing for
+/// lossless activity-revoked overlap returns.
 ///
 /// For [`AutomaticRetryKind::PhysicalFailure`] the `cycles` argument is the index
 /// WITHIN the current epoch, not the artifact's lifetime failure count: `None`
 /// here means "this epoch is spent", and whether that ends the epoch or the whole
-/// lane is [`App::spend_physical_failure_budget`]'s decision.
+/// lane is [`App::spend_physical_failure_budget`]'s decision. For
+/// [`AutomaticRetryKind::ActivityRevoked`] the answer is never `None`.
 #[must_use]
 fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::time::Duration> {
     let budget = match kind {
-        AutomaticRetryKind::ActivityRevoked => MAX_ACTIVITY_REVOKED_CYCLES,
-        AutomaticRetryKind::PhysicalFailure => MAX_PHYSICAL_FAILURE_CYCLES,
-        _ => MAX_AUTOMATIC_UPDATE_CYCLES,
+        AutomaticRetryKind::ActivityRevoked => None,
+        AutomaticRetryKind::PhysicalFailure => Some(MAX_PHYSICAL_FAILURE_CYCLES),
+        AutomaticRetryKind::PreflightBlocked => Some(MAX_AUTOMATIC_UPDATE_CYCLES),
     };
-    if cycles >= budget {
+    if budget.is_some_and(|budget| cycles >= budget) {
         return None;
     }
-    let seconds = match (kind, cycles) {
+    let seconds = match (kind, cycles.min(ACTIVITY_REVOKED_LADDER_RUNGS - 1)) {
         (AutomaticRetryKind::PreflightBlocked, 0 | 1) => 5,
         (AutomaticRetryKind::PreflightBlocked, _) => 15,
-        // Exponential spacing capped at 15 min: each revoked attempt costs a
-        // park/spawn/paint round trip, so back off hard while the terminal
-        // stays busy. The ≥500 ms quiet-epoch admission still gates every
-        // re-attempt, and the budget replenishes after a long idle gap.
+        // Exponential spacing that saturates at 15 min: each revoked attempt
+        // costs a launch/park/paint round trip, so back off hard while the
+        // terminal stays busy. The ladder's phase decides what the next attempt
+        // waits for, and the spacing starts over after a long idle gap.
         (AutomaticRetryKind::ActivityRevoked, 0) => 2,
         (AutomaticRetryKind::ActivityRevoked, 1) => 8,
         (AutomaticRetryKind::ActivityRevoked, 2) => 30,
@@ -5425,14 +5425,14 @@ impl App {
     /// Retain automatic apply intent for one exact (or superseding) staged build.
     /// Returns true only when this call armed a new intent.
     /// Let a manual-only latch lapse once its deadline passes, restoring
-    /// automatic apply and the ACTIVITY retry budget for that artifact.
+    /// automatic apply for that artifact.
     ///
-    /// EVERY latch this process installs now carries a deadline: an activity one
-    /// after [`crate::ACTIVITY_MANUAL_ONLY_LAPSE`], a physical one at the end of
-    /// its epoch ([`PHYSICAL_FAILURE_EPOCH_COOLDOWN`]). A `retry_at: None` latch
-    /// survives only as the fail-safe for a policy/outcome mismatch that no code
-    /// path is supposed to reach; it never lapses, which is the correct answer for
-    /// a state nobody understands.
+    /// Only the physical-failure schedule writes a latch: a retry inside its
+    /// epoch, a stand-down between epochs ([`PHYSICAL_FAILURE_EPOCH_COOLDOWN`]),
+    /// and `None` at convergence. A `retry_at: None` latch also survives as the
+    /// fail-safe for a policy/outcome mismatch that no code path is supposed to
+    /// reach; it never lapses, which is the correct answer for a state nobody
+    /// understands.
     ///
     /// Returns true when a latch was actually released.
     pub(crate) fn lapse_expired_auto_apply_manual_only(&mut self) -> bool {
@@ -5447,6 +5447,10 @@ impl App {
             );
             self.auto_apply_manual_only = None;
             self.auto_overlap_retry = None;
+            // The retry after a genuine failure starts a fresh ladder: it
+            // prefers a quiet moment again instead of landing on its first poll
+            // because the clock ran out while the latch held.
+            self.auto_apply_ladder = None;
             // `auto_apply_physical_retry` is deliberately NOT cleared. It is the
             // budget deciding how many physical retries remain, and since a
             // physical latch now lapses too, clearing it here would hand out fresh
@@ -5810,6 +5814,20 @@ impl App {
                 // distinct budget. Older wakes were suppressed by `arm` above.
                 self.auto_apply_manual_only = None;
                 let now = std::time::Instant::now();
+                // THE LADDER STARTS NOW — once per build. A re-arm of the same
+                // build (a duplicate stage wake, a superseded intent for the same
+                // bytes) keeps the anchor, so a busy terminal can only delay the
+                // landing inside the bound, never restart the clock.
+                if self
+                    .auto_apply_ladder
+                    .is_none_or(|ladder| ladder.build != build)
+                {
+                    self.auto_apply_ladder = Some(crate::AutoApplyLadder {
+                        build,
+                        armed_at: now,
+                        announced: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
+                    });
+                }
                 // Say so at the default log level. The automatic lane's waits and
                 // its first blocked attempt used to be debug-only, so an operator
                 // reading aterm.log could not tell an armed-and-waiting lane from a
@@ -5817,9 +5835,11 @@ impl App {
                 // applied, until a control apply exposed the reason).
                 aterm_log::info!(
                     "update auto-apply armed for build {build} ({}…): lands at the first \
-                     quiet moment; after {} s it stops waiting for a machine-wide idle \
-                     moment and lands at the next gap in typing and terminal output",
+                     quiet moment, and no later than {} s after arming whatever the \
+                     terminal is doing (idle preferred for {} s, then a gap in output, \
+                     then a gap in typing, then unconditionally)",
                     &digest[..digest.len().min(12)],
+                    crate::native_update_auto_intent::LANDS_WITHIN.as_secs(),
                     crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE.as_secs()
                 );
                 self.auto_apply_intent = Some(crate::AutoApplyIntent {
@@ -5827,12 +5847,6 @@ impl App {
                     dmg_sha256,
                     retry_at: now + crate::AUTOMATIC_UPDATE_QUIET_EPOCH,
                     attempts: 0,
-                    // The idle-preference deadline is armed ONCE per intent, off
-                    // the moment the build became eligible — not off the last
-                    // observed activity. Re-deriving it from activity is what an
-                    // unbounded wait already was: a machine that never goes quiet
-                    // would push the deadline out forever.
-                    apply_by: now + crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE,
                 });
                 // The status bar's "applies in place within ~2 min" was a POLICY line
                 // when the Staged report painted it; now it is an armed fact (or,
@@ -5844,12 +5858,86 @@ impl App {
         }
     }
 
+    /// Where the automatic lane stands on its ladder at `now`, for the build it
+    /// is working on (`auto_apply_ladder`). Anchored nowhere — nothing armed
+    /// through `arm_native_auto_apply` yet — the lane is at the first phase.
+    pub(crate) fn automatic_apply_phase(
+        &self,
+        now: std::time::Instant,
+    ) -> crate::native_update_auto_intent::ApplyPhase {
+        self.auto_apply_ladder.map_or(
+            crate::native_update_auto_intent::ApplyPhase::PreferIdle,
+            |ladder| {
+                crate::native_update_auto_intent::apply_phase(
+                    now.saturating_duration_since(ladder.armed_at),
+                )
+            },
+        )
+    }
+
+    /// The ladder phase an attempt under `mode` is gated by at `now`: the
+    /// anchored phase, raised to the mode's own promise — `AutomaticPastGrace`
+    /// never asks for a machine-wide idle moment, so an attempt authorized under
+    /// it is at least in the output-gap phase even with no anchor (a direct
+    /// caller, a test); `Automatic` is the anchored phase as it stands.
+    pub(crate) fn automatic_phase_for(
+        &self,
+        mode: ApplyMode,
+        now: std::time::Instant,
+    ) -> crate::native_update_auto_intent::ApplyPhase {
+        use crate::native_update_auto_intent::ApplyPhase;
+        let floor = if mode == ApplyMode::AutomaticPastGrace {
+            ApplyPhase::PreferOutputGap
+        } else {
+            ApplyPhase::PreferIdle
+        };
+        self.automatic_apply_phase(now).max(floor)
+    }
+
+    /// The four facts about the terminal the ladder reads, sampled at `now`.
+    /// The keystroke gate (and the warm-up hold it folds) is consulted only on
+    /// an automatic lane; an explicit apply never reads it and parks at once.
+    pub(crate) fn automatic_activity_facts(
+        &self,
+        mode: ApplyMode,
+        now: std::time::Instant,
+    ) -> crate::native_update_auto_intent::ActivityFacts {
+        crate::native_update_auto_intent::ActivityFacts {
+            quiet: self.automatic_update_activity_quiet(now),
+            hands_off_keys: mode.is_automatic() && self.update_apply_hands_off_keys(now),
+            output_quiet: self.automatic_update_output_quiet(now),
+            focused: self.any_os_window_focused(),
+        }
+    }
+
+    /// Say ONCE, at the default log level, that the lane moved to `phase` and
+    /// what it now waits for. The per-poll deferral used to be the line
+    /// (2026-09-20: 13,156 of them in one evening, two a second), which told an
+    /// operator nothing a phase change does not.
+    fn announce_apply_phase(&mut self, phase: crate::native_update_auto_intent::ApplyPhase) {
+        let Some(ladder) = self.auto_apply_ladder.as_mut() else {
+            return;
+        };
+        if ladder.announced >= phase {
+            return;
+        }
+        ladder.announced = phase;
+        aterm_log::info!(
+            "update auto-apply for build {}: {} s since arming with no landing; now waiting \
+             for {} (it lands no later than {} s after arming)",
+            ladder.build,
+            ladder.armed_at.elapsed().as_secs(),
+            phase.waits_for(),
+            crate::native_update_auto_intent::LANDS_WITHIN.as_secs()
+        );
+    }
+
     /// Attempt a retained automatic apply from an exact event or timer wake.
     /// Every caller honors the same retained deadline and activity gate, so a
     /// duplicate stage wake cannot bypass backoff or spend another attempt.
     pub(crate) fn try_pending_native_auto_apply(&mut self, announce: bool) {
         use crate::native_update_auto_intent::{
-            AttemptDisposition, AttemptResult, PollDecision, PollFacts, WaitReason,
+            ApplyPhase, AttemptDisposition, AttemptResult, PollDecision, PollFacts, WaitReason,
         };
 
         let Some(mut intent) = self.auto_apply_intent else {
@@ -5857,6 +5945,8 @@ impl App {
         };
         let now = std::time::Instant::now();
         let deadline_ready = now >= intent.retry_at;
+        let phase = self.automatic_apply_phase(now);
+        self.announce_apply_phase(phase);
         // A PROVENANCE REPAIR COUNTS AS WORK. Without this a real stage arriving while a
         // repair handoff is in flight would reach `apply_staged_update_now` and be told
         // "an update handoff is already in flight" — a FAILURE that spends retry budget.
@@ -5899,12 +5989,12 @@ impl App {
             work_active,
             applying,
             activity_quiet: self.automatic_update_activity_quiet(now),
-            activity_grace_expired: now >= intent.apply_by,
+            phase,
             staged_ready,
             staged_build,
             staged_exact_target,
         });
-        let (attempt_build, quiet) = match decision {
+        let (attempt_build, attempt_phase) = match decision {
             PollDecision::Clear => {
                 // The lane just dropped its promise: a Staged row still saying
                 // "applies in place within ~N min" restates to the posture that
@@ -5922,13 +6012,10 @@ impl App {
                 // attempts. Retain exact intent through arbitrarily many bounded
                 // active/drain transitions and consume zero retry budget.
                 intent.retry_at = match reason {
-                    // Re-poll on the quiet cadence, but never past the intent's
-                    // own idle-preference deadline: the retry that CROSSES
-                    // `apply_by` is the one allowed to land, so it must not be
-                    // scheduled after it.
+                    // Re-poll on the quiet cadence. The ladder's phases bound
+                    // how long this can go on; nothing here needs to.
                     WaitReason::Activity => {
                         crate::automatic_update_activity_retry_at(std::time::Instant::now())
-                            .min(intent.apply_by)
                     }
                     WaitReason::WorkActive | WaitReason::StagePending => {
                         now + std::time::Duration::from_secs(2)
@@ -5938,98 +6025,42 @@ impl App {
                 self.auto_apply_intent = Some(intent);
                 return;
             }
-            PollDecision::Attempt { build, quiet } => (build, quiet),
+            PollDecision::Attempt {
+                build,
+                quiet: _,
+                phase,
+            } => (build, phase),
         };
         intent.build = attempt_build;
         self.auto_apply_intent = None;
-        // A still-busy machine takes the lane that neither waits for idleness
-        // the same activity revocation every other lane does; both are automatic.
-        // (It used to say this lane does not let activity revoke the parked window.
-        // It does: `note_update_handoff_activity` is mode-blind by design, and
-        // `exact_activity` is a mandatory conjunct of Commit in every lane.)
-        let outcome = self.apply_native_update(if quiet {
+        // The mode carries the phase to the handoff: `Automatic` is the first
+        // phase, which asks for a quiet moment at the entry and again at the
+        // park; `AutomaticPastGrace` is every later phase, whose entry and park
+        // gates read the ladder. Both are revoked by activity mid-flight the
+        // same way (`note_update_handoff_activity` is mode-blind by design, and
+        // `exact_activity` is a mandatory conjunct of Commit in every lane).
+        let outcome = self.apply_native_update(if attempt_phase == ApplyPhase::PreferIdle {
             ApplyMode::Automatic
         } else {
             ApplyMode::AutomaticPastGrace
         });
         if let UpdateOutcome::Deferred { reason } = outcome {
-            let now = std::time::Instant::now();
-            // The idle-preference deadline is ABSOLUTE and is never pushed out
-            // here. It used to be rearmed on EVERY deferral, which restarted the
-            // whole 2-minute bound each time — and since `apply_by` is the only
-            // thing that promotes `Automatic` to `AutomaticPastGrace` above, a
-            // machine that keeps deferring could never reach the forced landing
-            // at all. The bound existed but was unreachable, which defeats the
-            // very escape hatch `AutomaticPastGrace` was introduced to provide.
-            let past_grace = now >= intent.apply_by;
-            // A TYPING-GAP REFUSAL IS NOT AN ATTEMPT, and must not be paced like
-            // one. It returned above `begin_apply_preflight`, so it cost no park,
-            // no spawn and no ticket — pacing it by the two-minute grace window
-            // would turn "wait for a gap between keystrokes" into "wait up to two
-            // minutes after one", and the gap it is waiting for is measured in
-            // seconds. Re-poll on the ordinary quiet cadence instead.
-            // A deferral by the person's own activity — a keystroke inside the
-            // gap, or output still streaming (2026-09-18) — is re-polled on the
-            // quiet cadence and counts toward the hold below; every other
-            // past-grace deferral is paced by the grace window.
-            let typing_gap = reason.contains("typing gap") || reason.contains("still streaming");
-            // The anti-spin concern that motivated the rearm is real, so it is
-            // answered by PACING instead: past the deadline every poll costs a
-            // genuine park/spawn round trip, so space those by the grace window
-            // rather than the 500 ms quiet cadence. Before the deadline the
-            // quiet cadence is what makes a prompt idle landing possible.
-            intent.retry_at = now
-                + if past_grace && !typing_gap {
-                    crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE
-                } else {
-                    crate::AUTOMATIC_UPDATE_QUIET_EPOCH
-                };
-            // …AND IT MAY NOT HOLD FOREVER. A refusal that can repeat without
-            // bound is a feature that silently stops working, so a lane held by
-            // typing for this long past its grace stands down to manual-only:
-            // the ordinary latch, which lapses and re-arms on its own — and a
-            // click from the Version menu applies the build in place at any
-            // time. Better than proving a point by freezing the terminal of
-            // someone who is plainly using it.
-            if typing_gap
-                && past_grace
-                && now.saturating_duration_since(intent.apply_by)
-                    >= crate::AUTOMATIC_UPDATE_TYPING_HOLD
-            {
-                aterm_log::info!(
-                    "update auto-apply for build {} stood down to manual-only: the keyboard \
-                     or the terminal's output has not paused for {:?} since its grace \
-                     expired; it re-arms by itself later, or apply it now from the Version \
-                     menu — in place, your shells keep running",
-                    intent.build,
-                    crate::AUTOMATIC_UPDATE_TYPING_HOLD
-                );
-                self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-                    build: intent.build,
-                    dmg_sha256: intent.dmg_sha256,
-                    // Activity-shaped, so it LAPSES — this says the keyboard was
-                    // busy, never anything about the artifact.
-                    retry_at: Some(now + crate::ACTIVITY_RETRY_BUDGET_REPLENISH),
-                });
-                self.auto_apply_intent = None;
-                // The status bar, if it is still up for this build, says so too.
-                self.restate_staged_bar_posture(intent.build);
-                return;
+            // A deferral is the ladder saying "not this instant". It returned
+            // above `begin_apply_preflight` — no park, no launch, no ticket, no
+            // budget — so it is re-polled on the quiet cadence: the gap it waits
+            // for is measured in seconds, and the ladder's phases bound how long
+            // the waiting can go on. It is NOT logged per poll; the phase change
+            // that ends the waiting is (`announce_apply_phase`). A path that
+            // already re-armed its own intent (an activity-revoked completion's
+            // spaced retry) keeps it.
+            if self.auto_apply_intent.is_none() {
+                intent.retry_at = std::time::Instant::now() + crate::AUTOMATIC_UPDATE_QUIET_EPOCH;
+                self.auto_apply_intent = Some(intent);
             }
-            self.auto_apply_intent = Some(intent);
-            if past_grace {
-                // Paced by the grace window, so this is one line per two minutes at
-                // most — and it is the line that says the lane is alive but held.
-                aterm_log::info!(
-                    "update auto-apply for build {} is past its idle grace and still \
-                     deferred: {reason}",
-                    intent.build
-                );
-            } else {
-                aterm_log::debug!(
-                    "automatic update retained exact intent after activity deferral: {reason}"
-                );
-            }
+            aterm_log::debug!(
+                "automatic update retained exact intent after a deferral in {attempt_phase:?}: \
+                 {reason}"
+            );
             return;
         }
         intent.attempts = intent.attempts.saturating_add(1);
@@ -6886,51 +6917,24 @@ impl App {
     }
 
     pub(crate) fn apply_native_update(&mut self, mode: ApplyMode) -> UpdateOutcome {
-        // HANDS OFF THE KEYS — the one refusal that outranks the past-grace force.
-        //
-        // Everything below this line eventually parks every PTY reader and hands
-        // the shells to a successor that must swap the bundle, re-exec and boot a
-        // GUI before anything echoes again. The owner's complaint is not that the
-        // window is long, it is that it lands MID-WORD. So both automatic lanes —
-        // including `AutomaticPastGrace`, which by design ignores the quiet epoch
-        // below — wait for a plain gap between keystrokes. An explicit
-        // "Update to Latest Now" is the user asking for the pause and is never held.
-        //
-        // This refuses; it never admits. It returns above `begin_apply_preflight`,
-        // so it mints no ticket, spends no retry budget, and cannot make an apply
-        // happen that today's code would refuse — the property that keeps it clear
-        // of this lane's adoption proof entirely.
-        if mode.is_automatic() && !self.update_apply_hands_off_keys(std::time::Instant::now()) {
-            return UpdateOutcome::Deferred {
-                reason: "a keystroke landed in an aterm window inside the typing gap".to_string(),
-            };
-        }
-        // Only the still-inside-the-window automatic lane defers here.
-        // `AutomaticPastGrace` already spent that window waiting for an idle
-        // moment that never came (see `AUTOMATIC_UPDATE_ACTIVITY_GRACE`).
-        if mode == ApplyMode::Automatic
-            && !self.automatic_update_activity_quiet(std::time::Instant::now())
-        {
-            return UpdateOutcome::Deferred {
-                reason: "terminal input/output is still inside the quiet epoch".to_string(),
-            };
-        }
-        // PAST GRACE IS NOT MID-LINE (2026-09-18). The forced lane gave up on a
-        // machine-wide idle moment, not on the terminal's own output: landing
-        // while a program streams stalls it against a full PTY buffer for the
-        // whole park->Commit freeze. Output pauses constantly (a prompt, an
-        // agent's tool call), so this holds the lane for moments; the typing
-        // hold bounds it like the keystroke gap it is paced with…
-        // …and only while the user is LOOKING at aterm: with no aterm window
-        // focused the stall is invisible to them (and the successor is not
-        // activated), while a stream they are watching must not skip a beat.
-        if mode == ApplyMode::AutomaticPastGrace
-            && self.any_os_window_focused()
-            && !self.automatic_update_output_quiet(std::time::Instant::now())
-        {
-            return UpdateOutcome::Deferred {
-                reason: "terminal output is still streaming".to_string(),
-            };
+        // THE LADDER'S ENTRY GATE. An automatic apply asks the ladder whether
+        // the terminal is in a state its current phase accepts — a quiet
+        // moment, then a gap in output, then a gap in typing, then anything —
+        // BEFORE a successor is launched or a ticket minted, so a refusal here
+        // costs nothing and spends nothing. The same predicate is re-read at
+        // the park (`prelaunch_park_admitted`), the instant the user feels. An
+        // explicit "Update to Latest Now" is the person asking for the pause
+        // and is never held.
+        if mode.is_automatic() {
+            let now = std::time::Instant::now();
+            if let Some(reason) = crate::native_update_auto_intent::automatic_park_refusal(
+                self.automatic_phase_for(mode, now),
+                self.automatic_activity_facts(mode, now),
+            ) {
+                return UpdateOutcome::Deferred {
+                    reason: reason.to_string(),
+                };
+            }
         }
         let start = self.native_updater_service.begin_apply_preflight(mode);
         let ticket = match start {
@@ -7277,11 +7281,12 @@ impl App {
 
     /// Consume one activity-revoked overlap retry cycle for this exact artifact
     /// and re-arm the automatic intent at its exponentially spaced deadline.
-    /// `None` = the budget is exhausted (or the artifact identity is malformed);
-    /// the caller then falls back to the manual-only latch. The cycle counter
+    /// `None` only when the artifact identity is malformed. The cycle counter
     /// lives on `auto_overlap_retry`, keyed by (build, dmg) — duplicate or
-    /// reordered completions for the same artifact can never mint fresh budget,
-    /// and a different artifact starts a fresh budget by construction.
+    /// reordered completions for the same artifact can never restart the
+    /// spacing, and a different artifact starts at the first rung by
+    /// construction. The ladder anchor is untouched: activity delays the
+    /// landing, it does not restart the clock.
     fn arm_activity_revoked_overlap_retry(
         &mut self,
         attempt: &crate::native_updater_service::ApplyAttemptTicket,
@@ -7296,15 +7301,15 @@ impl App {
         let cycles = self
             .auto_overlap_retry
             .filter(|retry| {
-                // REPLENISHING BUDGET: a busy stretch must not permanently
-                // retire an artifact. Once the terminal has gone long enough
-                // without a revoked attempt, start the schedule over.
+                // A busy stretch ends: once the terminal has gone long enough
+                // without a revoked attempt, the spacing starts over.
                 retry.covers(build, dmg_sha256, activation)
                     && now.duration_since(retry.last_attempt)
                         < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
             })
             .map_or(0, |retry| retry.cycles);
-        let delay = automatic_retry_delay(cycles, AutomaticRetryKind::ActivityRevoked)?;
+        let delay = automatic_retry_delay(cycles, AutomaticRetryKind::ActivityRevoked)
+            .expect("the activity-revoked spacing saturates and is never exhausted");
         self.auto_overlap_retry = Some(crate::AutoOverlapRetry {
             build,
             dmg_sha256,
@@ -7313,18 +7318,24 @@ impl App {
             last_attempt: now,
         });
         self.auto_apply_manual_only = None;
-        let retry_at = std::time::Instant::now() + delay;
+        if self
+            .auto_apply_ladder
+            .is_none_or(|ladder| ladder.build != build)
+        {
+            // A revocation with no anchor for this build (the attempt was armed
+            // before this process learned the ladder, or the anchor was cleared
+            // by a lapse in between): the ladder starts here.
+            self.auto_apply_ladder = Some(crate::AutoApplyLadder {
+                build,
+                armed_at: now,
+                announced: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
+            });
+        }
         self.auto_apply_intent = Some(crate::AutoApplyIntent {
             build,
             dmg_sha256,
-            retry_at,
+            retry_at: now + delay,
             attempts: cycles,
-            // The idle-preference window restarts AFTER the backoff, not from
-            // now: the intent is not even eligible until `retry_at`, so a grace
-            // measured from here would already be spent and the retry would
-            // force on its first poll — turning a backoff into an immediate
-            // re-attempt of the thing activity just revoked.
-            apply_by: retry_at + crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE,
         });
         Some(delay)
     }
@@ -7368,15 +7379,10 @@ impl App {
                 return UpdateOutcome::Failed { message };
             }
             // MIRRORS the `Rearmed` policy in
-            // `reconcile_returned_native_apply_with_facts`. That policy was
-            // unreachable: it is gated behind a completion carrying worker
-            // facts, and NO `UpdateHandoffCompletion` has ever carried them —
-            // every construction site sets `reconcile: None`, so this lane took
-            // every automatic overlap failure and installed a `retry_at: None`
-            // latch that `lapse_expired_auto_apply_manual_only` can never
-            // expire. One revoked overlap therefore retired automatic apply for
-            // the process lifetime, and the whole `MAX_ACTIVITY_REVOKED_CYCLES`
-            // schedule never ran once in production.
+            // `reconcile_returned_native_apply_with_facts` (the lane every
+            // completion actually takes: no `UpdateHandoffCompletion` carries
+            // worker facts). ACTIVITY re-arms on the spaced ladder — never a
+            // latch; a PHYSICAL failure spends its converging budget.
             if lane == HandoffFailureLane::ActivityRevoked
                 && let Some(delay) = self.arm_activity_revoked_overlap_retry(attempt)
             {
@@ -7386,16 +7392,19 @@ impl App {
                 );
                 return UpdateOutcome::Deferred { reason: message };
             }
-            if let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256()) {
+            if let HandoffFailureLane::Physical(shape) = lane
+                && let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256())
+            {
+                let schedule = self.spend_physical_failure_budget(
+                    attempt.target_build(),
+                    dmg_sha256,
+                    attempt.is_installed_activation(),
+                    shape,
+                );
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                     build: attempt.target_build(),
                     dmg_sha256,
-                    retry_at: self.physical_completion_retry_at(
-                        attempt.target_build(),
-                        dmg_sha256,
-                        attempt.is_installed_activation(),
-                        lane,
-                    ),
+                    retry_at: schedule.retry_at(),
                 });
             }
             self.auto_apply_intent = None;
@@ -7405,61 +7414,6 @@ impl App {
             self.publish_native_update_state();
         }
         UpdateOutcome::Failed { message }
-    }
-
-    /// When automatic apply may try this artifact again after a RETURNED handoff
-    /// that is not getting an activity-revoked re-arm.
-    ///
-    /// THIS IS THE LANE THE FINDING WAS ABOUT. All four physical outcomes come
-    /// back here, and this
-    /// used to answer `retry_at: None` for every one of them — a latch `arm`
-    /// honours as `SuppressManualOnly` forever and
-    /// `lapse_expired_auto_apply_manual_only` cannot release. So the commonest
-    /// physical failure there is (a 15 s handoff deadline missed on a cold page
-    /// cache) retired automatic in-session apply for that build until a strictly
-    /// newer one shipped: the exact "staged, only applies on relaunch" symptom the
-    /// seamless lane exists to delete, reachable from ONE unlucky moment.
-    ///
-    /// Two causes, two clocks, and only one of them may ever answer "never":
-    ///   * ACTIVITY exhausted its own (large, exponential) budget — the artifact
-    ///     is fine and the terminal was merely busy, so the short
-    ///     [`crate::ACTIVITY_MANUAL_ONLY_LAPSE`] applies and the answer is always
-    ///     a deadline;
-    ///   * a PHYSICAL failure — expensive to repeat, so it spends the shared
-    ///     budget: a retry inside the epoch, a stand-down between epochs, and
-    ///     `None` once [`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`] are gone. That last
-    ///     case is the deliberate difference from the previous design, which could
-    ///     only ever answer with a deadline and therefore retried a structurally
-    ///     broken artifact for the life of the process.
-    ///
-    /// Only the two AUTOMATIC lanes reach here — a person's failure returns
-    /// before the latch is stamped at all, because neither clock is about them.
-    fn physical_completion_retry_at(
-        &mut self,
-        build: u64,
-        dmg_sha256: [u8; 32],
-        activation: bool,
-        lane: HandoffFailureLane,
-    ) -> Option<std::time::Instant> {
-        debug_assert!(
-            lane.charges_the_automatic_lane(),
-            "a person-initiated failure must never reach the automatic schedule"
-        );
-        match lane {
-            HandoffFailureLane::ActivityRevoked => {
-                Some(std::time::Instant::now() + crate::ACTIVITY_MANUAL_ONLY_LAPSE)
-            }
-            HandoffFailureLane::Physical(shape) => self
-                .spend_physical_failure_budget(build, dmg_sha256, activation, shape)
-                .retry_at(),
-            // UNREACHABLE — both callers return before the latch is stamped for a
-            // person's failure, and the debug assert above says so. If a future
-            // caller forgets, charging nothing is the half that matters (a human's
-            // retries must never converge the background lane), and `None` is this
-            // file's standing answer for a state nobody understands: a latch that
-            // never lapses, rather than a schedule invented for it here.
-            HandoffFailureLane::Manual => None,
-        }
     }
 
     fn reconcile_returned_native_apply_with_facts(
@@ -7507,11 +7461,10 @@ impl App {
                     self.reduce_returned_apply_facts(facts);
                     return Some(UpdateOutcome::Failed { message });
                 }
-                // ACTIVITY-REVOKED + budget remaining: the exact stage was
-                // re-armed on disk and the rollback was lossless, so schedule
-                // one bounded quiet-window re-attempt instead of latching
-                // manual-only. Exhausted budget (or a genuine failure, where the
-                // lane is `Physical`) takes the sticky manual latch.
+                // ACTIVITY-REVOKED: the exact stage was re-armed on disk and the
+                // rollback was lossless, so schedule one spaced re-attempt —
+                // never a latch. A genuine failure (the lane is `Physical`)
+                // spends the converging budget and takes the manual latch.
                 if lane == HandoffFailureLane::ActivityRevoked
                     && let Some(delay) = self.arm_activity_revoked_overlap_retry(&attempt)
                 {
@@ -7523,18 +7476,19 @@ impl App {
                     );
                     return Some(UpdateOutcome::Deferred { reason: message });
                 }
-                if let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256()) {
-                    // Same two clocks as the sibling reaped-abort lane, through
-                    // the same helper — see `physical_completion_retry_at`.
+                if let HandoffFailureLane::Physical(shape) = lane
+                    && let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256())
+                {
+                    let schedule = self.spend_physical_failure_budget(
+                        attempt.target_build(),
+                        dmg_sha256,
+                        attempt.is_installed_activation(),
+                        shape,
+                    );
                     self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                         build: attempt.target_build(),
                         dmg_sha256,
-                        retry_at: self.physical_completion_retry_at(
-                            attempt.target_build(),
-                            dmg_sha256,
-                            attempt.is_installed_activation(),
-                            lane,
-                        ),
+                        retry_at: schedule.retry_at(),
                     });
                 }
                 self.auto_apply_intent = None;
@@ -12175,7 +12129,6 @@ fn apply(c: &mut Command) {
             dmg_sha256: [0xab; 32],
             retry_at,
             attempts: 3,
-            apply_by: retry_at + crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE,
         };
         app.auto_apply_intent = Some(retained);
 
@@ -12235,7 +12188,6 @@ fn apply(c: &mut Command) {
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
             attempts: 4,
-            apply_by: std::time::Instant::now() + std::time::Duration::from_secs(30),
         });
 
         let before = std::time::Instant::now();
@@ -12327,14 +12279,15 @@ fn apply(c: &mut Command) {
                 work_active: false,
                 applying: false,
                 activity_quiet: true,
-                activity_grace_expired: false,
+                phase: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
                 staged_ready: true,
                 staged_build: Some(target_build),
                 staged_exact_target: true,
             }),
             crate::native_update_auto_intent::PollDecision::Attempt {
                 build: target_build,
-                quiet: true
+                quiet: true,
+                phase: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
             }
         );
 
@@ -12342,19 +12295,19 @@ fn apply(c: &mut Command) {
         assert!(crate::automatic_update_activity_retry_at(retry_now) > retry_now);
     }
 
-    /// Seamless seam 4 (retry budget): an activity-revoked overlap schedules
-    /// bounded, exponentially spaced automatic re-attempts capped at 15 min,
-    /// then exhausts to `None` so the caller latches a LAPSING manual-only
-    /// state. Genuine physical failures never mint a timer retry at any cycle
-    /// count, and a preflight block keeps its own much smaller budget.
+    /// Seamless seam 4 (retry spacing): an activity-revoked overlap schedules
+    /// exponentially spaced automatic re-attempts that SATURATE at 15 min and
+    /// never exhaust — activity is a delay, not a verdict. Genuine physical
+    /// failures keep their small, exhausting budget, and a preflight block keeps
+    /// its own much smaller one.
     #[test]
-    fn activity_revoked_retry_budget_spaces_exponentially_then_exhausts() {
+    fn activity_revoked_retry_spacing_saturates_and_never_exhausts() {
         use std::time::Duration;
         let schedule = [2, 8, 30, 60, 120, 300, 600, 900];
         assert_eq!(
             schedule.len(),
-            usize::from(MAX_ACTIVITY_REVOKED_CYCLES),
-            "the schedule must cover exactly the budget"
+            usize::from(ACTIVITY_REVOKED_LADDER_RUNGS),
+            "the schedule must cover exactly the ladder's rungs"
         );
         for (cycles, seconds) in schedule.into_iter().enumerate() {
             assert_eq!(
@@ -12366,13 +12319,13 @@ fn apply(c: &mut Command) {
                 "cycle {cycles}"
             );
         }
-        assert_eq!(
-            automatic_retry_delay(
-                MAX_ACTIVITY_REVOKED_CYCLES,
-                AutomaticRetryKind::ActivityRevoked
-            ),
-            None
-        );
+        for cycles in [ACTIVITY_REVOKED_LADDER_RUNGS, 50, u8::MAX] {
+            assert_eq!(
+                automatic_retry_delay(cycles, AutomaticRetryKind::ActivityRevoked),
+                Some(Duration::from_secs(900)),
+                "cycle {cycles}: the last rung, forever — never `None`"
+            );
+        }
         // The preflight budget is deliberately NOT widened: a blocked preflight
         // is a real ordering fault, not "the terminal was busy".
         assert_eq!(
@@ -12382,31 +12335,21 @@ fn apply(c: &mut Command) {
             ),
             None
         );
-        // A physical failure gets a far smaller budget than activity revocation —
-        // it is not free to repeat — but it is no longer zero, and it is spent
-        // strictly sooner than the activity budget at every cycle.
+        // A physical failure is not free to repeat: its epoch budget is small
+        // and it IS spent.
         for cycles in 0..MAX_PHYSICAL_FAILURE_CYCLES {
             assert!(
                 automatic_retry_delay(cycles, AutomaticRetryKind::PhysicalFailure).is_some(),
                 "physical cycle {cycles} is inside the budget"
             );
         }
-        for cycles in MAX_PHYSICAL_FAILURE_CYCLES..=MAX_ACTIVITY_REVOKED_CYCLES {
+        for cycles in MAX_PHYSICAL_FAILURE_CYCLES..=ACTIVITY_REVOKED_LADDER_RUNGS {
             assert_eq!(
                 automatic_retry_delay(cycles, AutomaticRetryKind::PhysicalFailure),
                 None,
                 "a spent physical budget must never mint another timer retry"
             );
         }
-        // Both budgets are constants, so this ordering is decided at COMPILE time —
-        // a const block says so by failing the build rather than one test run.
-        const {
-            assert!(
-                MAX_PHYSICAL_FAILURE_CYCLES < MAX_ACTIVITY_REVOKED_CYCLES,
-                "a lossless revocation must always be retried more readily than a \
-                 physical failure"
-            )
-        };
     }
 
     /// A BUDGET WHOSE OWN SCHEDULE RESETS IT IS NOT A BUDGET.
@@ -12758,11 +12701,18 @@ fn apply(c: &mut Command) {
             "0123456789abcdef0123456789abcdef01234567",
             &"ab".repeat(32),
         );
+        let armed_at = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+            build: 77,
+            armed_at,
+            announced: crate::native_update_auto_intent::ApplyPhase::PreferIdle,
+        });
 
-        // Exhaust the bounded budget, so every cycle AND the fallback latch are
-        // covered: the first cycles must arm a retry, and once the budget is
-        // spent the latch that replaces it must still carry a deadline.
-        for cycle in 0..=usize::from(MAX_ACTIVITY_REVOKED_CYCLES) {
+        // Well past the ladder's rungs: EVERY completion re-arms a live intent
+        // on the spaced schedule, no cycle latches manual-only, and the ladder's
+        // anchor is untouched — activity delays the landing, it never restarts
+        // the clock or ends the lane.
+        for cycle in 0..(usize::from(ACTIVITY_REVOKED_LADDER_RUNGS) + 4) {
             ticket.make_current_apply_for_test(&mut app.native_updater_service);
             app.abort_reaped_native_apply_before_reconcile(
                 &ticket,
@@ -12770,31 +12720,23 @@ fn apply(c: &mut Command) {
                 HandoffFailureLane::ActivityRevoked,
             );
             assert!(
-                app.auto_apply_intent.is_some()
-                    || app
-                        .auto_apply_manual_only
-                        .is_some_and(|manual| manual.retry_at.is_some()),
-                "cycle {cycle}: an activity-revoked completion left neither a live \
-                 retry intent nor a latch that can lapse — automatic apply is \
-                 retired until relaunch"
+                app.auto_apply_intent.is_some(),
+                "cycle {cycle}: an activity-revoked completion must leave a live retry intent"
+            );
+            assert!(
+                app.auto_apply_manual_only.is_none(),
+                "cycle {cycle}: activity never latches manual-only"
+            );
+            assert_eq!(
+                app.auto_apply_ladder.map(|ladder| ladder.armed_at),
+                Some(armed_at),
+                "cycle {cycle}: the ladder's anchor survives a revocation"
             );
         }
-
-        // The budget is spent, so this is the fallback latch specifically.
-        let manual = app
-            .auto_apply_manual_only
-            .expect("a spent budget falls back to the manual-only latch");
-        assert!(
-            manual.retry_at.is_some(),
-            "an activity-caused latch MUST carry a lapse deadline; \
-             `retry_at: None` is reserved for genuine failures"
-        );
-        assert!(
-            app.lapse_expired_auto_apply_manual_only()
-                || manual
-                    .retry_at
-                    .is_some_and(|at| at > std::time::Instant::now()),
-            "the deadline must be either already lapsable or still in the future"
+        assert_eq!(
+            app.auto_overlap_retry.map(|retry| retry.cycles),
+            Some(ACTIVITY_REVOKED_LADDER_RUNGS + 4),
+            "the spacing keeps counting past the last rung"
         );
     }
 
@@ -12904,7 +12846,7 @@ fn apply(c: &mut Command) {
             Some(std::time::Duration::from_secs(300)),
             Some(std::time::Duration::from_secs(600)),
             Some(std::time::Duration::from_secs(900)),
-            None,
+            Some(std::time::Duration::from_secs(900)),
         ]
         .into_iter()
         .enumerate()
@@ -12915,13 +12857,13 @@ fn apply(c: &mut Command) {
                 "post-flip cycle {cycle}"
             );
         }
-        // The latch itself is the CALLER's move once this returns `None` (see
-        // this function's doc); what is pinned here is that the budget is spent
-        // in `MAX_ACTIVITY_REVOKED_CYCLES` attempts counted ACROSS the flip.
+        // What is pinned here is that the rungs are counted ACROSS the flip —
+        // nine attempts total, not eight per artifact identity — and that the
+        // last rung repeats rather than ending anything.
         assert_eq!(
             app.auto_overlap_retry.map(|retry| retry.cycles),
-            Some(MAX_ACTIVITY_REVOKED_CYCLES),
-            "eight attempts total, not eight per artifact identity"
+            Some(ACTIVITY_REVOKED_LADDER_RUNGS + 1),
+            "nine attempts total, not eight per artifact identity"
         );
         assert!(
             app.auto_overlap_retry.is_some_and(|retry| retry.activation),
@@ -12966,7 +12908,7 @@ fn apply(c: &mut Command) {
     }
 
     #[test]
-    fn overlap_retry_budget_rearms_intent_per_artifact_and_exhausts_to_manual_only() {
+    fn overlap_retry_spacing_rearms_intent_per_artifact_and_saturates() {
         let mut app = App::headless_for_test();
         let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
             77,
@@ -12988,25 +12930,23 @@ fn apply(c: &mut Command) {
             Some(std::time::Duration::from_secs(300)),
             Some(std::time::Duration::from_secs(600)),
             Some(std::time::Duration::from_secs(900)),
-            None,
+            Some(std::time::Duration::from_secs(900)),
         ];
         for (cycle, want) in expected.into_iter().enumerate() {
             let got = app.arm_activity_revoked_overlap_retry(&ticket);
             assert_eq!(got, want, "cycle {cycle}");
-            if want.is_some() {
-                let intent = app.auto_apply_intent.expect("intent re-armed");
-                assert_eq!(intent.build, 77);
-                assert_eq!(intent.dmg_sha256, [0xab; 32]);
-                assert!(
-                    app.auto_apply_manual_only.is_none(),
-                    "a live retry budget clears the manual-only latch"
-                );
-            }
+            let intent = app.auto_apply_intent.expect("intent re-armed");
+            assert_eq!(intent.build, 77);
+            assert_eq!(intent.dmg_sha256, [0xab; 32]);
+            assert!(
+                app.auto_apply_manual_only.is_none(),
+                "a live retry clears the manual-only latch"
+            );
         }
         assert_eq!(
             app.auto_overlap_retry.map(|retry| retry.cycles),
-            Some(MAX_ACTIVITY_REVOKED_CYCLES),
-            "duplicate completions cannot mint fresh budget"
+            Some(ACTIVITY_REVOKED_LADDER_RUNGS + 1),
+            "duplicate completions cannot restart the spacing"
         );
 
         // A different artifact (same build, new bytes) starts a fresh budget.
@@ -13054,7 +12994,7 @@ fn apply(c: &mut Command) {
             build,
             dmg_sha256: [0xab; 32],
             activation: false,
-            cycles: MAX_ACTIVITY_REVOKED_CYCLES,
+            cycles: ACTIVITY_REVOKED_LADDER_RUNGS,
             last_attempt: std::time::Instant::now(),
         });
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
@@ -13396,17 +13336,22 @@ fn apply(c: &mut Command) {
         );
     }
 
-    /// Make the retained intent eligible RIGHT NOW and past its idle-preference
-    /// deadline, so the attempt takes the `AutomaticPastGrace` lane. Whether the
-    /// machine running the suite happens to be quiet is then irrelevant.
+    /// Make the retained intent eligible RIGHT NOW and put its ladder at
+    /// `Land`, so the attempt takes the `AutomaticPastGrace` lane and no
+    /// activity gate holds it. Whether the machine running the suite happens to
+    /// be quiet is then irrelevant.
     fn force_auto_apply_attempt_now(app: &mut App) {
         let mut intent = app
             .auto_apply_intent
             .expect("an automatic intent must be armed to force an attempt");
-        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        intent.retry_at = past;
-        intent.apply_by = past;
+        let now = std::time::Instant::now();
+        intent.retry_at = now - std::time::Duration::from_secs(1);
         app.auto_apply_intent = Some(intent);
+        app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+            build: intent.build,
+            armed_at: now - crate::native_update_auto_intent::LANDS_WITHIN,
+            announced: crate::native_update_auto_intent::ApplyPhase::Land,
+        });
     }
 
     /// Drive the automatic lane through one whole preflight-block budget against
@@ -14697,10 +14642,11 @@ fn apply(c: &mut Command) {
         );
     }
 
-    /// The retry budget REPLENISHES after a long idle gap: a busy hour must not
-    /// permanently spend an artifact's automatic attempts.
+    /// The retry spacing starts over after a long idle gap: a busy hour widens
+    /// the spacing to its last rung, a quiet half hour brings it back to the
+    /// first.
     #[test]
-    fn an_idle_gap_replenishes_the_activity_revoked_retry_budget() {
+    fn an_idle_gap_restarts_the_activity_revoked_retry_spacing() {
         let mut app = App::headless_for_test();
         let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
             77,
@@ -14711,19 +14657,19 @@ fn apply(c: &mut Command) {
             build: 77,
             dmg_sha256: [0xab; 32],
             activation: false,
-            cycles: MAX_ACTIVITY_REVOKED_CYCLES,
+            cycles: ACTIVITY_REVOKED_LADDER_RUNGS,
             last_attempt: std::time::Instant::now(),
         });
         assert_eq!(
             app.arm_activity_revoked_overlap_retry(&ticket),
-            None,
-            "a freshly exhausted budget stays exhausted"
+            Some(std::time::Duration::from_secs(900)),
+            "past the last rung the spacing stays at the last rung"
         );
         app.auto_overlap_retry = Some(crate::AutoOverlapRetry {
             build: 77,
             dmg_sha256: [0xab; 32],
             activation: false,
-            cycles: MAX_ACTIVITY_REVOKED_CYCLES,
+            cycles: ACTIVITY_REVOKED_LADDER_RUNGS,
             last_attempt: std::time::Instant::now()
                 - crate::ACTIVITY_RETRY_BUDGET_REPLENISH
                 - std::time::Duration::from_secs(1),
@@ -14731,7 +14677,7 @@ fn apply(c: &mut Command) {
         assert_eq!(
             app.arm_activity_revoked_overlap_retry(&ticket),
             Some(std::time::Duration::from_secs(2)),
-            "after a long idle gap the schedule starts over"
+            "after a long idle gap the spacing starts over"
         );
     }
 
@@ -14775,7 +14721,6 @@ fn apply(c: &mut Command) {
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now(),
             attempts: 1,
-            apply_by: std::time::Instant::now() + crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE,
         });
         app.config.update = Some(crate::app_config::UpdateConfig {
             auto_apply: Some(false),
@@ -14801,7 +14746,6 @@ fn apply(c: &mut Command) {
             dmg_sha256: [0xab; 32],
             retry_at: retry,
             attempts: 1,
-            apply_by: retry + crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE,
         };
         assert_eq!(
             crate::fold_auto_apply_deadline(Some(intent), None),

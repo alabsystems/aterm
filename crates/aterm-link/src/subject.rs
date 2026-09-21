@@ -144,9 +144,19 @@ pub fn parse_in(fleet: &str, node: &str, subject: &str) -> Result<InAddr, Reject
     })
 }
 
-/// A parsed `/f/<F>/term/<node>/<sid>/in/<src>` drive subject — the ONLY shape
-/// the bridge ever converts to PTY input (§6.6). Seven segments again, and
+/// A parsed `/f/<F>/term/<node>/<sid>/in/<src>` drive subject — a shape this
+/// FLEET RESERVES and this node no longer serves. Seven segments again, and
 /// again by position: `f`, `<F>`, `term`, `<node>`, `<sid>`, `in`, `<src>`.
+///
+/// ROUND 21 CUT THE FACE AND KEPT THE SUBJECT. Nothing in this crate parses one
+/// off the wire any more — there is no `term` subscription and no function that
+/// writes to a PTY — but the shape stays defined here, and the node ring stays
+/// eight grants wide, for two reasons: an older node on this wire may still
+/// publish one, and a fleet that had forgotten what the subject looks like
+/// could not tell such a record from a stranger's forgery. The parse is still
+/// left-anchored and by position, which is the property that made an
+/// eight-segment forgery detectable; its only in-tree caller is now its own
+/// test, and that is the intended end state rather than an oversight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TermInAddr {
     pub sid: String,

@@ -456,13 +456,10 @@ fn a_label_whose_owning_pid_is_dead_is_swept_by_the_next_job() {
         let out = Command::new("/bin/launchctl").arg("list").output().unwrap();
         String::from_utf8_lossy(&out.stdout).contains(&orphan)
     };
-    // LAUNCHD IS ASYNCHRONOUS AT BOTH ENDS. `launchctl submit` returns once launchd has
-    // taken the request, not once `launchctl list` shows the job, and `remove` likewise
-    // returns before the label is gone. Measured 2026-09-17 inside the merge gate on a
-    // loaded 4-core Intel Mac: this case failed at "the orphan is registered before the
-    // sweep" — the submit had succeeded and the list simply had not caught up — while the
-    // same test passed twice on the quiet machine. So both ends are bounded waits, and a
-    // timeout says which end it was rather than blaming the sweep.
+    // launchd is asynchronous at both ends: `submit` returns once launchd has taken the
+    // request, not once `launchctl list` shows the job, and `remove` returns before the
+    // label is gone. Both ends are bounded waits so a loaded machine cannot fail the
+    // fixture, and a timeout says which end it was rather than blaming the sweep.
     let wait_listed = |want: bool, why: &str| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while listed() != want {

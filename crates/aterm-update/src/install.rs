@@ -64,8 +64,22 @@ const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from
 // launchd is the job's parent, not us, and `/usr/bin/ditto` is a base-OS binary
 // (measured the same day: ditto of a clean tree by a launchd job → clean; by this
 // process → tagged). So when this process measures itself tracked, the unpacks run as
-// one-shot launchd jobs. The renames that follow are safe as they are: a tracked
-// rename tags the DIRECTORY it moves, not the files inside it (measured).
+// one-shot launchd jobs.
+//
+// CORRECTED 2026-09-20. This block used to end "the renames that follow are safe as
+// they are: a tracked rename tags the DIRECTORY it moves, not the files inside it".
+// Both halves were true and the conclusion was still wrong, because the tag on a
+// bundle's ROOT DIRECTORY is by itself enough: measured on m16, the live
+// `/Applications/aterm.app` had a clean `Contents/MacOS/aterm` and a tagged root, and
+// a launchd job exec'ing that binary still wrote a TAGGED file, while a byte-identical
+// copy with only the root tag stripped wrote a clean one. So an untracked unpack
+// followed by a tracked rename produces exactly the bundle this machinery exists to
+// avoid — which is what shipped, and why every installed aterm stayed tracked.
+//
+// The moves that PLACE the unpacked bundle therefore take their own lane,
+// [`rename_untagged`], which exchanges rather than renames. See its documentation for
+// why that needs no helper process, and `tests/provenance_rename_probe.rs` for the
+// measurement of each operation involved.
 // ---------------------------------------------------------------------------
 
 /// Whether THIS process is provenance-tracked — MEASURED, by writing a probe file into
@@ -109,6 +123,94 @@ fn process_is_tracked(scratch: &Path) -> bool {
     })();
     let _ = std::fs::remove_file(&probe);
     verdict.unwrap_or(false)
+}
+
+/// Move `from` onto `to` without handing the moved directory this process's
+/// `com.apple.provenance` tag.
+///
+/// A tracked process tags every directory it RENAMES, and the tag on a bundle's ROOT
+/// is what makes every process LaunchServices starts from that bundle tracked in turn —
+/// so a tracked updater that renames the successor into place hands the tag to the app
+/// that replaces it, and to every app after that, forever. Unpacking already escapes
+/// through launchd; the moves that place the unpacked bundle did not, and they are the
+/// carrier (`tests/provenance_rename_probe.rs` measures each operation).
+///
+/// The escape needs no helper process. `renamex_np(RENAME_SWAP)` tags NEITHER side
+/// (measured), so creating the destination and EXCHANGING it with the clean payload
+/// lands the clean inode at the destination and leaves the tagged one — the empty
+/// directory this process just made — at the source, where it is dropped. Three
+/// syscalls, no launchd job, no deadline, no sidecar, nothing that can outlive us.
+///
+/// It DEGRADES TO A PLAIN RENAME, deliberately, in every case where an exchange would
+/// change what the caller's error handling was written against:
+///
+/// * `to` already exists — `rename` replaces an empty directory and fails `ENOTEMPTY`
+///   on a full one, semantics an exchange does not share. (`stage_from_zip` creates its
+///   extract directory before the `ditto`, so this is a real case, not a theoretical
+///   one.)
+/// * `from` and `to` are on different volumes — `RENAME_SWAP` is in-volume only, and
+///   `EXDEV` here is not an error to route around but a documented INSTANT failure that
+///   three restore paths read as "the bytes cannot reach the staging path"; turning it
+///   into anything slower or destructive is how this repair was got wrong once already.
+/// * this process is untracked — then a plain rename already lands clean, and it keeps
+///   the single-syscall move with no window of any kind.
+///
+/// The exchange therefore only ever replaces a move that was GUARANTEED to tag its
+/// result. Its one cost is a crash window of two adjacent syscalls, and there are TWO of
+/// them, at opposite ends: between the create and the exchange an empty directory sits
+/// at `to`, and between the exchange and the drop it sits at `from`. Both shapes are
+/// real on the staging path — `from` is `staged_app` on the main same-volume carrier,
+/// `to` is `staged_app` on all four restores.
+///
+/// Most readers of those paths VERIFY what they find ([`Ready::is_publishable`],
+/// [`verified_bundle_identity`]) and an empty directory simply fails. The one that asks
+/// only whether something is there is [`recover_orphaned_prepared_candidate`]'s opening
+/// guard, which is why that guard tests [`holds_a_stage`] and not mere shape: read it
+/// before adding another presence-only check against these paths.
+///
+/// NOTE it can only stop a tag being ADDED, never remove one already present — which is
+/// why every move in the chain from unpack to installed bundle takes this lane, not
+/// just the last.
+fn rename_untagged(from: &Path, to: &Path, scratch: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let exchangeable = to.parent().is_some_and(|parent| {
+            std::fs::symlink_metadata(to).is_err()
+                && same_volume(from, parent)
+                && process_is_tracked(scratch)
+        });
+        if exchangeable {
+            // Exclusive create: never adopt a directory that raced into existence,
+            // because the check above concluded there was nothing at `to` to preserve.
+            if std::fs::DirBuilder::new().create(to).is_ok() {
+                match rename_swap(from, to) {
+                    Ok(()) => {
+                        // `from` now holds the empty directory we made, and the move HAS
+                        // happened — so this cannot fail the call. Say so in the log
+                        // rather than reporting a clean rename that left its source
+                        // name behind, which `rename(2)` never does.
+                        if let Err(error) = std::fs::remove_dir(from) {
+                            crate::warn(&format!(
+                                "moved {} to {} but could not drop the emptied \
+                                 source name ({error}); it remains an empty directory",
+                                from.display(),
+                                to.display()
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    // Leave the destination exactly as absent as we found it, then let
+                    // the plain rename below produce the error the caller expects.
+                    Err(_) => {
+                        let _ = std::fs::remove_dir(to);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = scratch;
+    std::fs::rename(from, to)
 }
 
 /// Each copy owns a fresh private directory on the destination volume. A helper
@@ -248,7 +350,7 @@ fn copy_into_isolated_destination(
             if !is_non_symlink_dir(&attempt.payload) {
                 Err(format!("{what}: copied payload is not a real directory"))
             } else {
-                std::fs::rename(&attempt.payload, destination)
+                rename_untagged(&attempt.payload, destination, &attempt.root)
                     .map(|()| (status, stderr))
                     .map_err(|error| format!("{what}: promote completed copy: {error}"))
             }
@@ -1088,7 +1190,7 @@ fn recover_abandoned_preswap_trial_if_exact(
             let _ = remove_path_no_follow(&fixed);
         } else {
             let _ = remove_path_no_follow(&staging.staged_app);
-            if std::fs::rename(&fixed, &staging.staged_app).is_err() {
+            if rename_untagged(&fixed, &staging.staged_app, &staging.staged_dir()).is_err() {
                 // EXDEV (or any restore failure): the bytes cannot reach the
                 // staging path from here. Retire the publication and reclaim the
                 // fixed candidate so THIS launch settles at NoUpdate and the next
@@ -1295,7 +1397,7 @@ fn recover_orphaned_prepared_candidate(
     current_build: u64,
     ready: &Ready,
 ) -> Result<(), String> {
-    if is_non_symlink_dir(&staging.staged_app) || boot_sentinel(staging).read_state().is_some() {
+    if holds_a_stage(&staging.staged_app) || boot_sentinel(staging).read_state().is_some() {
         return Ok(());
     }
     // Past this point `ready.toml` advertises bytes that are NOT at `staged_app`, and
@@ -1330,7 +1432,13 @@ fn recover_orphaned_prepared_candidate(
         staging.retire_published();
         return Ok(());
     }
-    if let Err(error) = std::fs::rename(&fixed, &staging.staged_app) {
+    // An EMPTY PLACEHOLDER can be sitting at the staging path — that is precisely the
+    // crash cut the guard above now falls through on. Clear it first: `rename_untagged`
+    // declines to exchange onto a destination that exists, so leaving it would degrade
+    // this restore to a tracked plain rename and put the provenance tag straight back
+    // onto the bundle the exchange lane exists to keep clean. Site 4 already does this.
+    let _ = remove_path_no_follow(&staging.staged_app);
+    if let Err(error) = rename_untagged(&fixed, &staging.staged_app, &staging.staged_dir()) {
         // EXDEV on an external-volume install (fixed sits beside the bundle on
         // the install volume; staging lives under HOME), or any other restore
         // failure: an Err here made every launch defer behind a marker whose
@@ -1376,10 +1484,30 @@ fn is_non_symlink_dir(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
 }
 
+/// A STAGE, not merely a directory wearing the stage's name.
+///
+/// [`rename_untagged`] leaves an EMPTY directory at one end of its exchange for the two
+/// syscalls around it, so shape alone stopped separating "a staged bundle is present"
+/// from "a crash cut the move in half". Every other reader of this path verifies what
+/// it finds ([`Ready::is_publishable`], [`verified_bundle_identity`]) and so was never
+/// fooled; [`recover_orphaned_prepared_candidate`]'s opening guard is the one that asks
+/// only whether something is THERE, and an empty placeholder answering yes would turn
+/// the recovery off in exactly the case it exists to recover.
+///
+/// Non-empty, not "has an `Info.plist`", deliberately: this must catch the new state
+/// and change nothing else. What it lets through is still only a candidate — the code
+/// past the guard verifies it.
+fn holds_a_stage(path: &Path) -> bool {
+    is_non_symlink_dir(path)
+        && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 fn recover_prepared_candidate(prepared: &PreparedSwapCandidate, staging: &Staging) {
     if prepared.moved_from_stage {
         let _ = remove_path_no_follow(&staging.staged_app);
-        if let Err(error) = std::fs::rename(&prepared.fixed, &staging.staged_app) {
+        if let Err(error) =
+            rename_untagged(&prepared.fixed, &staging.staged_app, &staging.staged_dir())
+        {
             // A marker without its exact bytes must never survive a failed
             // pre-swap transaction.
             let _ = remove_path_no_follow(&prepared.fixed);
@@ -1411,7 +1539,7 @@ fn prepare_fixed_swap_candidate(
     // installs retain the conservative copy path.
     let moved_from_stage = same_volume(staged, installed);
     if moved_from_stage {
-        std::fs::rename(staged, &fixed)
+        rename_untagged(staged, &fixed, &staging.staged_dir())
             .map_err(|error| format!("move verified stage to fixed swap path: {error}"))?;
     } else {
         // The one genuinely slow step on this path: a several-hundred-megabyte
@@ -1450,8 +1578,11 @@ fn prepare_fixed_swap_candidate(
         return Err("fixed swap candidate is not on the installed volume".to_string());
     }
     // The candidate's sealed identity. On the same-volume path this is the
-    // identity the CALLER just read, because `rename(2)` moved the very inode it
-    // read it from: same bytes, same signature, same plist. Re-running the five
+    // identity the CALLER just read, because the move carried the very inode it read it
+    // from — true whether the move was taken as `rename(2)` or as [`rename_untagged`]'s
+    // `RENAME_SWAP` exchange, which exchanges the two directory entries and leaves both
+    // inodes untouched (measured; `tests/provenance_rename_probe.rs`). Same bytes, same
+    // signature, same plist. Re-running the five
     // codesign/spctl/PlistBuddy helpers over it would re-answer a question
     // nothing could have changed the answer to — the apply lock is held, the
     // parent is a private directory, and `checked_bundle_exchange` revalidates
@@ -1594,7 +1725,7 @@ fn ensure_fixed_rollback(installed: &Path, current_build: u64) -> Result<Verifie
 fn recover_prepared_stage(rollback: &Path, staging: &Staging) {
     if rollback != staging.staged_app {
         let _ = std::fs::remove_dir_all(&staging.staged_app);
-        if let Err(error) = std::fs::rename(rollback, &staging.staged_app) {
+        if let Err(error) = rename_untagged(rollback, &staging.staged_app, &staging.staged_dir()) {
             let _ = std::fs::remove_dir_all(rollback);
             staging.retire_published();
             crate::warn(&format!(
@@ -2192,7 +2323,7 @@ fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> 
     // observe "absent", but never an old marker paired with the new bundle.
     let _ = std::fs::remove_file(&staging.ready);
     let _ = std::fs::remove_dir_all(&staging.staged_app);
-    std::fs::rename(incoming, &staging.staged_app)
+    rename_untagged(incoming, &staging.staged_app, &staging.staged_dir())
         .map_err(|error| format!("publish staged bundle: {error}"))?;
 
     // The marker remains the commit point and is written last — DURABLY: it is the
@@ -2800,7 +2931,7 @@ pub fn stage_from_zip(
     // A rename inside `staged/` (same directory, so necessarily the same volume)
     // moves the bundle without re-copying it — nothing is re-materialized, so no
     // extended attribute or signature byte can be lost in transit.
-    if let Err(error) = std::fs::rename(&src, &incoming) {
+    if let Err(error) = rename_untagged(&src, &incoming, &staging.staged_dir()) {
         let _ = std::fs::remove_dir_all(&extract);
         return Err(format!("move extracted bundle into place: {error}"));
     }
@@ -4530,6 +4661,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// THE SAME MARKER, BUT THE STAGED BUNDLE IS AN EMPTY DIRECTORY rather than absent —
+    /// the state [`rename_untagged`] introduced and `rename(2)` never could.
+    ///
+    /// The exchange lane creates the destination, swaps, and drops the emptied source,
+    /// so a crash between any two of those leaves an EMPTY directory at one end. On the
+    /// main same-volume carrier that end is `staged_app` itself. This guard used to ask
+    /// only `is_non_symlink_dir`, which an empty directory satisfies, so the recovery
+    /// whose entire purpose is this crash cut would decline to run on it: the marker
+    /// stayed, `is_publishable` then failed on the empty bundle, and a complete verified
+    /// update sitting at the fixed path was thrown away and re-downloaded.
+    ///
+    /// The sibling test above covers ABSENCE. Nothing covered the placeholder.
+    #[test]
+    fn a_ready_marker_whose_staged_bundle_is_an_empty_placeholder_recovers_too() {
+        let (s, root) = temp_staging();
+        write_ready(&s, 7);
+        let installed = root.join("Applications").join("aterm.app");
+        std::fs::create_dir_all(&installed).unwrap();
+        let ready = Ready::read(&s.ready).unwrap();
+
+        // The crash cut: the name is there, the bundle is not.
+        std::fs::create_dir_all(&s.staged_app).unwrap();
+        assert!(
+            is_non_symlink_dir(&s.staged_app),
+            "shape alone says a stage is present — which is exactly the trap"
+        );
+        assert!(
+            !holds_a_stage(&s.staged_app),
+            "and the guard the recovery actually uses must see through it"
+        );
+
+        assert!(
+            recover_orphaned_prepared_candidate(&s, &installed, 6, &ready).is_ok(),
+            "an interrupted move is a self-healing condition"
+        );
+        assert!(
+            !s.ready.exists(),
+            "the recovery RAN: with nothing at the fixed path to restore, it retired \
+             the dangling marker instead of early-returning on the placeholder"
+        );
+        assert!(matches!(read_ready(&s, 6), ReadyState::Absent));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// The new attribution fields must be OPTIONAL on the wire: a `ready.toml` written
     /// before they existed has to keep parsing, or an upgrade would strand every
     /// already-staged build behind a `Corrupt` marker.
@@ -5098,6 +5273,183 @@ staged_at = "2026-08-17T00:00:00Z"
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// The untagged lane must be a drop-in for `rename`: same result, same content,
+    /// same mode, same errors. Everything it changes is invisible to the caller except
+    /// the extended attribute it declines to add, which only a tracked process and a
+    /// real `launchctl` can observe — `tests/provenance_rename_probe.rs` measures that
+    /// half. These pin the half that must hold on EVERY host, including CI.
+    #[test]
+    fn the_untagged_lane_moves_a_directory_exactly_as_rename_does() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = swap_root("untagged-move");
+        let from = root.join("payload");
+        std::fs::create_dir_all(from.join("Contents/MacOS")).unwrap();
+        std::fs::write(from.join("Contents/MacOS/exe"), b"BODY").unwrap();
+        std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let to = root.join("dest");
+        rename_untagged(&from, &to, &root).unwrap();
+
+        assert!(!from.exists(), "the source name is gone, as after a rename");
+        assert_eq!(
+            std::fs::read(to.join("Contents/MacOS/exe")).unwrap(),
+            b"BODY",
+            "the payload arrives byte for byte"
+        );
+        assert_eq!(
+            std::fs::metadata(&to).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the moved inode keeps its own mode — the placeholder's is discarded with it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `stage_from_zip` creates its extract directory before the `ditto`, so a promote
+    /// onto an EXISTING destination is a real case. `rename` replaces an empty one;
+    /// the lane must not turn that into an exchange, and must not fail it either.
+    #[test]
+    fn the_untagged_lane_keeps_renames_semantics_when_the_destination_exists() {
+        let root = swap_root("untagged-exists");
+        let from = root.join("payload");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("mark"), b"1").unwrap();
+
+        let empty = root.join("empty-dest");
+        std::fs::create_dir(&empty).unwrap();
+        rename_untagged(&from, &empty, &root).unwrap();
+        assert!(
+            empty.join("mark").exists(),
+            "an empty destination is replaced"
+        );
+
+        let occupied = root.join("occupied-dest");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("other"), b"1").unwrap();
+        let refused = rename_untagged(&empty, &occupied, &root);
+        assert!(
+            refused.is_err(),
+            "a non-empty destination still refuses the move, as rename(2) does"
+        );
+        assert!(
+            empty.join("mark").exists(),
+            "and the source is left where it was"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A missing source must report ENOENT and leave NOTHING behind. The exchange
+    /// creates the destination before it can discover the source is gone, so this pins
+    /// that the placeholder is swept rather than left as an empty bundle at a path a
+    /// later launch would read.
+    #[test]
+    fn the_untagged_lane_leaves_no_placeholder_when_the_move_cannot_happen() {
+        let root = swap_root("untagged-missing");
+        let from = root.join("absent");
+        let to = root.join("dest");
+        let error = rename_untagged(&from, &to, &root).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            !to.exists(),
+            "no empty directory is left at the destination for a reader to mistake \
+             for a staged bundle"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// EXDEV is load-bearing: three restore paths read an instant cross-volume failure
+    /// as "the bytes cannot reach the staging path" and retire the publication so the
+    /// next check re-stages. `RENAME_SWAP` is in-volume only, so the lane must hand back
+    /// `rename`'s own error immediately rather than route around it — the repair was got
+    /// wrong once by substituting `/bin/mv`, whose cross-device form is a recursive copy
+    /// that deletes the destination first.
+    ///
+    /// Deterministic half, running on every host: `same_volume` fails CLOSED on a path
+    /// it cannot stat, so a destination whose parent is absent takes the plain lane. The
+    /// lane must then create nothing at all — a placeholder left at a staging or
+    /// rollback path is exactly the failure mode that makes an empty bundle readable.
+    #[test]
+    fn the_untagged_lane_hands_an_unexchangeable_move_straight_to_rename() {
+        let root = swap_root("untagged-gate");
+        let from = root.join("payload");
+        std::fs::create_dir_all(&from).unwrap();
+        let to = root.join("no-such-parent").join("dest");
+
+        let error = rename_untagged(&from, &to, &root).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "the caller sees rename(2)'s own error, not a lane-specific one"
+        );
+        assert!(from.exists(), "the source is untouched");
+        assert!(
+            !to.parent().unwrap().exists(),
+            "the lane created no directory on a path it declined to exchange"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half, on a host that actually has a second writable volume: the failure
+    /// is EXDEV and it is instant.
+    ///
+    /// IGNORED, like the two probes in `tests/provenance_rename_probe.rs`, and for the
+    /// same reason — it measures the HOST, not this crate. Finding a second volume means
+    /// statting and trying an exclusive `mkdir` at the root of every mount, which on a
+    /// machine with a stalled network share is a suite that hangs rather than a test that
+    /// fails. Run it deliberately where a second writable volume exists:
+    ///
+    /// ```text
+    /// targo --unverified test -p aterm-update --lib untagged_lane_still_fails -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "probes every mounted volume for a second writable one; run with --ignored"]
+    fn the_untagged_lane_still_fails_fast_across_a_real_volume_boundary() {
+        let root = swap_root("untagged-exdev");
+        // `/Volumes` only: `/private/var/tmp` and `/System/Volumes/Data` share `st_dev`
+        // with `$TMPDIR` on every stock macOS host, so they could never be selected.
+        let Some(other) = std::fs::read_dir("/Volumes")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate.is_dir()
+                    && !same_volume(candidate, &root)
+                    && std::fs::DirBuilder::new()
+                        .create(candidate.join(format!(".aterm-vol-{}", std::process::id())))
+                        .inspect(|()| {
+                            let _ = std::fs::remove_dir(
+                                candidate.join(format!(".aterm-vol-{}", std::process::id())),
+                            );
+                        })
+                        .is_ok()
+            })
+        else {
+            eprintln!(
+                "SKIPPED: this host has no second WRITABLE volume, so the cross-volume \
+                 branch cannot be exercised here; the deterministic gate test covers the \
+                 decision, and the lane contains no copy of any kind"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        let from = root.join("payload");
+        std::fs::create_dir_all(&from).unwrap();
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let to = other.join(format!("aterm-exdev-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&to);
+
+        let started = std::time::Instant::now();
+        let error = rename_untagged(&from, &to, &root).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "cross-volume must fail immediately, never degrade into a copy"
+        );
+        assert!(from.exists(), "and must not have consumed the source");
+        assert!(!to.exists(), "nor left a placeholder on the far volume");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

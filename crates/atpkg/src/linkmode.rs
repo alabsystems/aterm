@@ -118,17 +118,12 @@ fn bin_tool_name(rel: &Path) -> Option<&str> {
 /// executable suffix split out so both halves are exercisable off the platform that
 /// has one (`EXE_SUFFIX` is `".exe"` on Windows and `""` everywhere else).
 ///
-/// BYTES, NEVER A CHAR SLICE (audit 2026-09-17). This compared `name[cut..]`, where
-/// `cut` is `len - ext.len()` — an offset into the BYTES that, on Windows, lands
-/// wherever the last four of them begin. A non-ASCII bin name puts that offset INSIDE
-/// a multi-byte character, and slicing a `str` there panics: `byte index 5 is not a
-/// char boundary`. `"日本語"` is nine bytes, so `len - 4` is 5, in the middle of its
-/// third character. A marker naming such a bin — a checkout whose binary is spelled in
-/// any non-Latin script — took [`link`], [`unlink`], [`refresh`], [`linked_bins`] and
-/// [`linked_tool_names`] down with it, since every one of them derives names here.
-/// Comparing the BYTES cannot panic, and the slice below stays safe by construction:
-/// the suffix matches only when those trailing bytes are ASCII, which makes `cut` a
-/// char boundary.
+/// Compare bytes, never slice the `str`: `len - ext.len()` is a byte offset a non-ASCII
+/// name can put inside a multi-byte character, and `&name[cut..]` panics there (`"日本語"`
+/// is nine bytes, so `len - 4` is 5). Everything that derives a name — [`link`],
+/// [`unlink`], [`refresh`], [`linked_bins`], [`linked_tool_names`] — comes through here.
+/// The slice below is safe by construction: the suffix matches only when those trailing
+/// bytes are ASCII, which makes `cut` a char boundary.
 fn strip_exe_suffix<'a>(name: &'a str, ext: &str) -> &'a str {
     if ext.is_empty() {
         return name;
@@ -142,14 +137,13 @@ fn strip_exe_suffix<'a>(name: &'a str, ext: &str) -> &'a str {
 }
 
 /// What stood at a `bin/<tool>` name before this [`link`] replaced it — enough to put it
-/// back EXACTLY, captured BEFORE the overwrite.
+/// back exactly, captured before the overwrite.
 ///
-/// A rollback restores what WAS there, never what this build would render for that name
-/// today: a store shim's body carries its own target, its own exported environment
-/// ([`crate::shim_env`]) and its own compat route, and a tombstone carries no target at
-/// all — so re-deriving one would quietly rewrite any of those.
+/// A rollback restores what was there, never what this build would render today: a store
+/// shim's body carries its own target, its own exported environment ([`crate::shim_env`])
+/// and its own compat route, and a tombstone carries no target at all.
 enum PriorShim {
-    /// Nothing stood there. The rollback REMOVES the shim this call created, which is the
+    /// Nothing stood there. The rollback removes the shim this call created, which is the
     /// only arm on which it deletes anything at all.
     Absent,
     /// A regular file — the store's exec stub, a tombstone, or a Windows `.cmd` — kept as
@@ -161,10 +155,9 @@ enum PriorShim {
 
 /// Read what stands at `shim` into a [`PriorShim`], or refuse to touch it.
 ///
-/// Only a REGULAR file is read: a FIFO at a shim name would park this process on the open
+/// Only a regular file is read: a FIFO at a shim name would park this process on the open
 /// forever, and neither a directory nor a device is a shim this manager laid. Those are an
-/// explicit error here — raised BEFORE the overwrite — rather than something replaced with
-/// no way back, the same shape the link marker's own readers use for a special file.
+/// error raised before the overwrite, rather than something replaced with no way back.
 fn capture_shim(shim: &Path) -> Result<PriorShim, LinkError> {
     let meta = match fs::symlink_metadata(shim) {
         Ok(meta) => meta,
@@ -209,7 +202,7 @@ fn rollback_tmp(shim: &Path) -> std::io::Result<PathBuf> {
 
 /// Put a captured regular-file shim back, through a temp + rename like every other shim
 /// writer here, so a name on the user's PATH is never briefly absent or half-written. The
-/// temp goes on EVERY error arm.
+/// temp goes on every error arm.
 fn restore_file(shim: &Path, bytes: &[u8], mode: &fs::Permissions) -> std::io::Result<()> {
     let tmp = rollback_tmp(shim)?;
     let _ = fs::remove_file(&tmp);
@@ -246,17 +239,13 @@ fn restore_symlink(shim: &Path, _target: &Path) -> std::io::Result<()> {
 }
 
 /// Undo the shim mutations of a failed [`link`], best-effort and newest first: a name this
-/// call BROUGHT INTO EXISTENCE is removed, and a name it OVERWROTE is put back byte for
-/// byte.
+/// call brought into existence is removed, a name it overwrote is put back byte for byte.
 ///
-/// IT MUST PUT BACK WHAT IT REPLACED, NOT ONLY WHAT IT CREATED (review, 2026-09-19). The
-/// rollback removed only the shims that were NEW, so the shim of a program that was already
-/// INSTALLED — the ordinary case for a dev link, and the only one in which a shim is
-/// overwritten at all — was left re-pointed at the dev binary with no marker recording it:
-/// exactly the untracked dev shim this rollback exists to prevent, and the one state
-/// `unlink` cannot undo, because `unlink` reads the marker that was never written. Only
-/// paths this call itself replaced are passed in, so the removal arm can still never widen
-/// into a name that already stood.
+/// Both arms matter. Removing only the new shims left an already-installed program's shim
+/// re-pointed at the dev binary with no marker recording it — the untracked dev shim this
+/// rollback exists to prevent, and the one state `unlink` cannot undo, since `unlink` reads
+/// that marker. Only paths this call itself replaced are passed in, so the removal arm can
+/// never widen into a name that already stood.
 fn roll_back(replaced: &[(PathBuf, PriorShim)]) {
     for (shim, prior) in replaced.iter().rev() {
         let _ = match prior {
@@ -310,10 +299,9 @@ pub fn link(
 
     let mut linked = Vec::new();
     let mut refused = Vec::new();
-    // Every shim this call MUTATES, paired with what stood there first, for the rollback
-    // below: a name it created is removed again, a name it overwrote is put back. A name
-    // that already stood is somebody else's (a store shim, a hand-made file), so undoing
-    // our own failure RESTORES it and never deletes it.
+    // Every shim this call mutates, paired with what stood there first, for the rollback
+    // below. A name that already stood is somebody else's (a store shim, a hand-made file),
+    // so undoing our own failure restores it and never deletes it.
     let mut replaced: Vec<(PathBuf, PriorShim)> = Vec::new();
     for rel in bins {
         let Some(name) = bin_tool_name(rel) else {
@@ -330,7 +318,7 @@ pub fn link(
             continue; // a not-yet-built bin is simply skipped (refresh picks it up later)
         }
         let shim = layout.shim(&tool);
-        // CAPTURED BEFORE THE OVERWRITE — once the dev shim is laid, the store shim's own
+        // Captured before the overwrite — once the dev shim is laid, the store shim's own
         // bytes are gone and nothing could say what they were.
         let prior = match capture_shim(&shim) {
             Ok(prior) => prior,
@@ -340,7 +328,7 @@ pub fn link(
             }
         };
         if let Err(e) = crate::platform::install_shim_to(&shim, &src) {
-            // The shim writer is temp + rename, so a failure here leaves THIS name as it
+            // The shim writer is temp + rename, so a failure here leaves this name as it
             // was; only the ones already replaced need undoing.
             roll_back(&replaced);
             return Err(LinkError::Io(e.to_string()));
@@ -353,13 +341,11 @@ pub fn link(
         return Err(LinkError::NoBins);
     }
 
-    // THE MARKER IS WHAT MAKES A DEV LINK TRACKED (audit 2026-09-17). The shims went in
-    // first and a failed marker write simply propagated, leaving a checkout wired into
-    // `bin/` that NOTHING recorded: `is_linked` said no, so `update`/`apply` would not
-    // hard-skip the program and would re-point the shims under the developer, and
-    // `unlink` — which reads the marker — had nothing to undo. Every shim this call
-    // touched is rolled back — the ones it created removed, the ones it OVERWROTE put
-    // back — so a link either stands recorded or does not stand.
+    // The marker is what makes a dev link tracked. Letting a failed marker write propagate
+    // left a checkout wired into `bin/` that nothing recorded: `is_linked` said no, so
+    // `update`/`apply` would re-point the shims under the developer, and `unlink` — which
+    // reads the marker — had nothing to undo. Every shim this call touched is rolled back,
+    // so a link either stands recorded or does not stand.
     if let Err(e) = write_marker(&layout.link_marker(program), &marker) {
         roll_back(&replaced);
         return Err(LinkError::Io(e.to_string()));
@@ -661,13 +647,11 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
         )
     })?;
     let tmp = parent.join(format!(".link.tmp-{}", std::process::id()));
-    // NO TEMP SURVIVES A FAILURE (audit 2026-09-17). This left `.link.tmp-<pid>` behind
-    // whenever hardening or the rename failed, and `links_dir` is enumerated by NAME:
-    // `linked_programs` admits every entry that is a safe path component, so the litter
-    // was reported as a dev-linked PROGRAM by `atpkg list`, by `which` and by the
-    // Packages screen — a program nobody linked and no `unlink` could remove. Born
-    // `0600` through `create_new` for the same reason the hooks are: `fs::write`
-    // creates at the umask default, leaving the marker world-readable until the chmod.
+    // No temp may survive a failure: `links_dir` is enumerated by name, and
+    // `linked_programs` admits every entry that is a safe path component, so a leftover
+    // `.link.tmp-<pid>` was reported as a dev-linked program by `atpkg list`, by `which` and
+    // by the Packages screen — one nobody linked and no `unlink` could remove. Born `0600`
+    // through `create_new` because `fs::write` creates at the umask default.
     let _ = fs::remove_file(&tmp);
     let staged = create_marker_temp(&tmp)
         .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
@@ -681,7 +665,7 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
     })
 }
 
-/// Create the link marker's temp EXCLUSIVELY and, on Unix, born `0600`.
+/// Create the link marker's temp exclusively and, on Unix, born `0600`.
 #[cfg(unix)]
 fn create_marker_temp(tmp: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -733,17 +717,13 @@ mod tests {
         d
     }
 
-    /// THE EXE SUFFIX IS STRIPPED BY BYTES, SO A NAME CAN NEVER BE CUT MID-CHARACTER.
-    ///
-    /// Driven with an explicit `".exe"` rather than `EXE_SUFFIX`, so the WINDOWS
-    /// behaviour is exercised on every host: the panic this replaces needed no Windows
-    /// to reproduce, only the byte offset the suffix's length implies. `"日本語"` is
-    /// nine bytes, so `len - 4` is 5 — inside its third character — and the old
-    /// `&name[cut..]` panicked with `byte index 5 is not a char boundary`.
+    /// The exe suffix is stripped by bytes, so a name can never be cut mid-character.
+    /// Driven with an explicit `".exe"` rather than `EXE_SUFFIX`, so the Windows behaviour
+    /// is exercised on every host: only the byte offset matters, and `&name[cut..]` panicked
+    /// on `"日本語"` (nine bytes, so `len - 4` is 5, inside its third character).
     #[test]
     fn the_exe_suffix_is_stripped_without_ever_slicing_mid_character() {
-        // The regression itself: a non-ASCII name whose length puts the cut inside a
-        // character. Every one of these panicked before.
+        // A non-ASCII name whose length puts the cut inside a character.
         assert_eq!(strip_exe_suffix("日本語", ".exe"), "日本語");
         assert_eq!(strip_exe_suffix("日本語.exe", ".exe"), "日本語");
         assert_eq!(strip_exe_suffix("日本語.EXE", ".exe"), "日本語");
@@ -757,30 +737,26 @@ mod tests {
         // The Unix suffix is empty: nothing is ever stripped.
         assert_eq!(strip_exe_suffix("ay", ""), "ay");
         assert_eq!(strip_exe_suffix("ay.exe", ""), "ay.exe");
-        // A name that is ONLY the suffix keeps it — `cut > 0` — since ".exe" names no
-        // tool and `ToolName::new("")` would refuse it anyway.
+        // A name that is only the suffix keeps it — `cut > 0` — since ".exe" names no tool.
         assert_eq!(strip_exe_suffix(".exe", ".exe"), ".exe");
         // And the derivation `link`/`unlink` share still agrees on a real bin path.
         assert_eq!(bin_tool_name(Path::new("target/release/ay")), Some("ay"));
     }
-    /// A MARKER THAT CANNOT BE WRITTEN LEAVES NO DEV SHIM AND NO TEMP (audit 2026-09-17).
+    /// A marker that cannot be written leaves no dev shim and no temp.
     ///
-    /// The marker is the ONLY thing that records a dev link. Writing the shims first and
-    /// letting a failed marker write propagate left a checkout wired into `bin/` that
-    /// nothing tracked: `is_linked` answered no, so `update`/`apply` would not hard-skip
-    /// the program and would re-point the shims under the developer, and `unlink` — which
-    /// reads the marker — had nothing to undo. The leaked `.link.tmp-<pid>` was worse
-    /// still: `linked_programs` admits every entry of the links dir whose name is a safe
-    /// path component, so the litter was reported as a dev-linked PROGRAM by `list`, by
-    /// `which` and by the Packages screen — one nobody linked and no `unlink` could remove.
+    /// The marker is the only thing that records a dev link, so a failed marker write that
+    /// propagated left a checkout wired into `bin/` that nothing tracked: `is_linked`
+    /// answered no and `unlink` had nothing to undo. A leaked `.link.tmp-<pid>` was worse —
+    /// `linked_programs` admits every safe-named entry of the links dir, so the litter was
+    /// reported as a dev-linked program that no `unlink` could remove.
     #[cfg(unix)]
     #[test]
     fn a_link_whose_marker_cannot_be_written_rolls_back_and_leaves_no_temp() {
         let l = layout("markerfail");
         let co = checkout("markerfail", &["ay"]);
         let bins = [PathBuf::from("target/release/ay")];
-        // The marker's destination is a NON-EMPTY DIRECTORY, so the rename cannot
-        // replace it — the arm that used to leak the temp with the shim already laid.
+        // The marker's destination is a non-empty directory, so the rename cannot replace
+        // it — the arm that used to leak the temp with the shim already laid.
         fs::create_dir_all(l.links_dir().join("ay").join("occupied")).unwrap();
 
         let out = link(&l, "ay", &co, &bins);
@@ -814,25 +790,20 @@ mod tests {
         let _ = fs::remove_dir_all(&co);
     }
 
-    /// AND IT PUTS BACK THE SHIM IT OVERWROTE, NOT ONLY THE ONES IT CREATED (review,
-    /// 2026-09-19).
+    /// And it puts back the shim it overwrote, not only the ones it created.
     ///
-    /// The rollback recorded a shim only when the name was NEW, so it undid nothing for a
-    /// program that was already INSTALLED — the ordinary case for a dev link, and the only
-    /// one in which a shim is overwritten at all. The failed marker write then left
-    /// `bin/ay` re-pointed at the dev checkout with nothing recording it: `is_linked`
-    /// answered no, so `update`/`apply` would not hard-skip the program, and `unlink` —
-    /// which reads the marker that was never written — could not put it back either. So
-    /// the exact outcome the rollback exists to prevent still happened, on every machine
-    /// where the program was installed. The store's shim must come out of a failed link
-    /// byte for byte.
+    /// Recording a shim only when the name was new undid nothing for an already-installed
+    /// program — the ordinary case for a dev link, and the only one in which a shim is
+    /// overwritten at all. A failed marker write then left `bin/ay` re-pointed at the dev
+    /// checkout with nothing recording it, which `unlink` cannot put back either. The
+    /// store's shim must come out of a failed link byte for byte.
     #[cfg(unix)]
     #[test]
     fn a_failed_link_restores_the_shim_it_overwrote() {
         let l = layout("overwrite");
         let co = checkout("overwrite", &["ay"]);
         let bins = [PathBuf::from("target/release/ay")];
-        // THE PROGRAM IS ALREADY INSTALLED: the store's own shim stands at `bin/ay`.
+        // The program is already installed: the store's own shim stands at `bin/ay`.
         fs::create_dir_all(l.bin_dir()).unwrap();
         let store_bin = l.prefix.join("store-build").join("ay");
         fs::create_dir_all(store_bin.parent().unwrap()).unwrap();
@@ -842,8 +813,8 @@ mod tests {
         let before = fs::read(&shim).unwrap();
         let mode_before = fs::metadata(&shim).unwrap().permissions().mode() & 0o777;
 
-        // The marker's destination is a NON-EMPTY DIRECTORY, so the marker write fails
-        // with the shim already re-pointed at the checkout.
+        // The marker's destination is a non-empty directory, so the marker write fails with
+        // the shim already re-pointed at the checkout.
         fs::create_dir_all(l.links_dir().join("ay").join("occupied")).unwrap();
 
         let out = link(&l, "ay", &co, &bins);

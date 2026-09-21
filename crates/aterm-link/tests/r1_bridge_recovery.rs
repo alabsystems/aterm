@@ -31,16 +31,6 @@ fn rows(w: &World, sid: &str) -> Vec<String> {
     w.inbox(sid)
 }
 
-/// The last-value `control` row for one session, as a string.
-fn control_row(w: &World, sid: &str) -> Option<String> {
-    let subject = format!("/f/{FLEET}/pub/{}/{sid}/control", w.node);
-    let mut c = w.god();
-    let (rows, _) = c.last(&subject, "", 8).ok()?;
-    rows.into_iter()
-        .find(|(_, s, _)| *s == subject)
-        .map(|(_, _, b)| String::from_utf8_lossy(&b).into_owned())
-}
-
 /// Wait for the bridge to die and its supervisor to bring a replacement up.
 fn restart_bridge(w: &World) {
     let pid = w.bridge_pid();
@@ -54,6 +44,146 @@ fn restart_bridge(w: &World) {
         w.verb("status")
             .header()
             .contains("fabric=connected")
+            .then_some(())
+    });
+}
+
+/// **THE FLEET FACE RESUMES FROM ITS LAST RECORD, NOT FROM OFFSET ZERO.**
+///
+/// The fleet face is a last-value face: `on_fleet_record` keeps only
+/// `fleet/h-*/halt`, and the standing verdict is the newest row per human. The
+/// attach already reads exactly that with a `Last` walk and REBUILDS the halt
+/// table from it (`read_fleet_halts` → `apply_fleet_halts`). Subscribing from
+/// zero afterwards then re-delivered every halt record ever published, to
+/// re-derive the state that read had just derived — and `state.rs` says what
+/// it cost in as many words, on the field that exists only to paper over it:
+///
+/// > The fleet face resubscribes from offset 0 on every reconnect, so without
+/// > this the node re-answers every halt in the fleet's history at every
+/// > reconnect.
+///
+/// HOW THIS TEST SEES IT — and the answer is worse than the wasted work.
+///
+/// The replay is not merely redundant, it is briefly WRONG. `on_fleet_record`
+/// applies each halt as it arrives, so a from-zero resume walks the fleet's
+/// history re-applying every barrier it ever carried: the first `state=on` in
+/// the log HOLDS every session on this instance, and they stay held until the
+/// replay reaches the matching `off`. `apply_fleet_halts` had already computed
+/// the correct standing verdict from the `Last` read moments earlier, so the
+/// hold this produces is one nothing on the bus justifies. Measured here: with
+/// the from-zero subscribe restored, the assertion that fails FIRST is not the
+/// ack count below but `hold=0` immediately after the restart — the session
+/// was held, by a barrier that had been lifted three records ago.
+///
+/// The second assertion is the cheaper symptom. `halt-acked` exists only to
+/// stop the node re-ANSWERING those replayed barriers; delete it and every one
+/// of them earns a fresh record on the node's retained `ack` subject. A bridge
+/// that resumes at the mark its own `Last` read returned is never offered them
+/// at all, so the ack face does not move.
+///
+/// It also pins the half that must NOT change: the standing verdict after the
+/// restart is still the newest row's, and a halt published while the bridge
+/// was away still arrives.
+#[test]
+fn the_fleet_face_resumes_from_its_last_record_and_does_not_re_answer_history() {
+    let w = World::boot("r21fleetresume", &[]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+
+    let mut god = w.god();
+    let subject = format!("/f/{FLEET}/fleet/h-x/halt");
+    let ack = format!("/f/{FLEET}/pub/{}/node/ack", w.node);
+
+    // A HISTORY WORTH REPLAYING: four barriers, ending lifted.
+    let mut seq = 0;
+    let mut offsets: Vec<u64> = Vec::new();
+    for (state, want_hold) in [("on", true), ("off", false), ("on", true), ("off", false)] {
+        seq += 1;
+        let (o, _) = god
+            .publish(
+                5_000,
+                seq,
+                &subject,
+                format!("v=1 t=1 state={state} reason=stop").as_bytes(),
+            )
+            .expect("publish the barrier");
+        offsets.push(o);
+        let want = if want_hold { "hold=1" } else { "hold=0" };
+        until(&format!("the fleet to reach {want}"), || {
+            w.verb(&format!("@{a} status"))
+                .header()
+                .contains(want)
+                .then_some(())
+        });
+    }
+
+    let ack_bodies = |w: &World| -> Vec<String> {
+        let mut c = w.god();
+        let (rows, _) = c.fetch(0, &ack, 256).expect("fetch the ack face");
+        rows.iter()
+            .map(|(o, _, b)| format!("@{o} {}", String::from_utf8_lossy(b)))
+            .collect()
+    };
+    // WAIT FOR THE NODE TO ANSWER THE LAST BARRIER BEFORE TAKING THE BASELINE.
+    // `on_fleet_record` applies the halt and THEN publishes the ack, so
+    // `hold=0` becomes visible one publish before the ack does; a baseline read
+    // in that gap undercounts by one and the comparison below then blames the
+    // resume for an ack the bridge was always going to write. Measured as a
+    // flake before this wait was added.
+    let last_barrier = *offsets.last().expect("four barriers were published");
+    until("the node to answer the last barrier", || {
+        ack_bodies(&w)
+            .iter()
+            .any(|b| b.contains(&format!("re={last_barrier}")))
+            .then_some(())
+    });
+    let before_bodies = ack_bodies(&w);
+    let acks_before = before_bodies.len();
+    assert!(
+        acks_before >= 2,
+        "the node answered the barriers while it was up: {before_bodies:#?}"
+    );
+
+    // REMOVE THE SUPPRESSOR. Nothing else changes; this only stops the node
+    // from recognising barriers it has already answered, which is precisely
+    // what a face that does not re-offer them does not need.
+    std::fs::remove_file(w.state.join("halt-acked")).expect("drop the halt-acked watermark");
+
+    restart_bridge(&w);
+
+    // NO SESSION IS HELD BY A BARRIER THAT WAS LIFTED. This is the assertion
+    // the from-zero resume actually fails: the replay re-applies the history's
+    // first `state=on` and the session is held until the walk reaches the `off`
+    // that lifted it. Read immediately after the attach, with no settling
+    // wait, because the window is the defect.
+    assert!(
+        w.verb(&format!("@{a} status")).header().contains("hold=0"),
+        "a lifted halt must not be re-applied by a reconnect replaying the \
+         fleet's history — log:\n{}",
+        w.log_tail()
+    );
+
+    // AND NOTHING WAS RE-ANSWERED. Give a replay every chance to appear first.
+    std::thread::sleep(Duration::from_millis(750));
+    let after_bodies = ack_bodies(&w);
+    let acks_after = after_bodies.len();
+    assert_eq!(
+        acks_after,
+        acks_before,
+        "the fleet face re-answered {} barrier(s) it had already answered — it is \
+         replaying the fleet's history from offset 0\nbefore: {before_bodies:#?}\nafter: \
+         {after_bodies:#?}\nbarrier offsets: {offsets:?}",
+        acks_after - acks_before
+    );
+
+    // A BARRIER PUBLISHED AFTER THE SNAPSHOT STILL ARRIVES: the mark is a
+    // splice, not a truncation.
+    god.publish(5_000, seq + 1, &subject, b"v=1 t=1 state=on reason=after")
+        .expect("publish after the restart");
+    until("the fresh barrier to hold the fleet", || {
+        w.verb(&format!("@{a} status"))
+            .header()
+            .contains("hold=1")
             .then_some(())
     });
 }
@@ -147,362 +277,6 @@ fn a_session_that_existed_when_the_bridge_started_is_still_refilled() {
             "row{n} must appear exactly once: {held:#?}"
         );
     }
-}
-
-/// **A KEYSTROKE REFUSED CLEANLY FOR LONGER THAN A SCHEDULER ROUND IS STILL
-/// THERE WHEN THE REFUSAL LIFTS.**
-///
-/// `FEED_TRIES_MAX` was 8, and 8 meant fourteen seconds while the retry ran on
-/// the idle roster round. Round 2 moved the retry onto its own 250 ms deadline —
-/// correctly — and the same 8 attempts silently became 1.75 s, with both
-/// constants' docs still saying "long enough for a hold or a lease to clear".
-/// Every transient verdict `Verdict::is_final` names outlives that by design:
-/// `LEASE_TTL_MS` is 30 s, an `ERR busy` is a whole `turn`, an `ERR halted` is
-/// lifted by a human. Exhausting the budget publishes `in-doubt` and CLEARS the
-/// journal, and §6.5 makes in-doubt terminal — so the keystroke was gone, and
-/// the fleet log said its fate was unknown when the bridge held eight
-/// unambiguous refusals saying it had not been typed.
-///
-/// The window is closed on the bridge's OWN progress: `tries=` in the journal,
-/// waited past the old count, so this test cannot pass by being slow.
-#[test]
-fn a_transient_refusal_outlives_the_old_count_and_the_keystroke_still_lands() {
-    let w = World::boot_with(
-        "r3feed",
-        &[],
-        &[("ATERM_LINK_FAULT", "refuse-feeds-while-marked")],
-    );
-    let marker = w.state.join("refuse-feeds");
-    std::fs::write(&marker, b"1\n").expect("arm the refusal window");
-    w.wait_ready();
-    let (a, _b) = w.two_sessions();
-    let epoch = until("the session's launch nonce", || {
-        w.sessions()
-            .into_iter()
-            .find(|(_, sid, _)| *sid == a)
-            .map(|(_, _, nonce)| nonce)
-    });
-
-    let mut god = w.god();
-    let control = format!("/f/{FLEET}/in/{}/{a}/h-andrew/control", w.node);
-    god.publish(
-        9_200,
-        1,
-        &control,
-        format!("v=1 t=1 epoch={epoch} text=claim").as_bytes(),
-    )
-    .expect("publish the claim");
-    until("the claim to stand on the bus", || {
-        control_row(&w, &a)
-            .filter(|r| r.contains("holder=h-andrew"))
-            .map(|_| ())
-    });
-
-    let drive = format!("/f/{FLEET}/term/{}/{a}/in/h-andrew", w.node);
-    let mut body = format!("v=1 t=1 epoch={epoch} len=3\n").into_bytes();
-    body.extend_from_slice(b"hi\r");
-    let (off, _) = god.publish(9_201, 2, &drive, &body).expect("publish a key");
-
-    // PAST THE OLD BUDGET, MEASURED THE WAY THE BRIDGE MEASURES IT. Eight was
-    // the whole budget; twelve journalled attempts is unambiguously past it, and
-    // every one of them was a clean pre-write refusal.
-    until(
-        "the bridge to retry past the old eight-attempt budget",
-        || {
-            let journal = std::fs::read_to_string(w.state.join("feeding")).ok()?;
-            let tries: u32 = journal
-                .split_whitespace()
-                .find_map(|t| t.strip_prefix("tries="))?
-                .parse()
-                .ok()?;
-            (journal.contains(&format!("off={off}")) && tries >= 12).then_some(())
-        },
-    );
-    // Nothing has been published about it yet: a transient refusal is not a
-    // verdict, and the journal is the only record of it.
-    assert!(
-        !w.ev()
-            .iter()
-            .any(|e| e.contains(&format!("re={off}")) && e.contains("face=term")),
-        "a keystroke still being retried has no verdict yet"
-    );
-
-    std::fs::remove_file(&marker).expect("lift the refusal");
-    let verdict = until(
-        "the keystroke to reach the PTY once the refusal lifts",
-        || {
-            w.ev()
-                .into_iter()
-                .find(|e| e.contains(&format!("re={off}")) && e.contains("face=term"))
-        },
-    );
-    assert!(
-        verdict.starts_with("applied "),
-        "a keystroke refused before any byte moved is not in doubt, and it is not \
-         lost: {verdict}"
-    );
-}
-
-/// **§6.6 ROW 5's MIRROR IS NEVER TAKEN OVER BY THE BRIDGE, AND IT IS WITHDRAWN
-/// WHEN THE LEASE IT MIRRORS ENDS.**
-///
-/// `apply_handoff` refuses to take aterm's cooperative lease for a mirrored
-/// `owner-cli:` holder and says why: re-acquiring it under a `fabric:` name is
-/// refused every sample and turns one local `lease acquire` into a stream of
-/// durable `ev lease-refused` records. That rule was written at ONE of four call
-/// sites; `renew_leases` took the same lease every ten seconds, and the moment
-/// the local driver's TTL lapsed it SUCCEEDED — leaving aterm reporting
-/// `driving=lease:fabric:owner-cli:drv-7` forever, the real driver's reconnect
-/// refused `ERR lease held`, and `lease release force` the only escape.
-///
-/// The other half of the same hole: nothing withdrew the mirror. Once
-/// `holders[sid]` named a mirror it was never the no-holder arm again, so a
-/// driver that exited left a bus row naming it as the holder for the life of
-/// the node.
-#[test]
-fn a_mirrored_local_lease_is_neither_taken_over_nor_left_standing() {
-    let w = World::boot("r3mirror", &[]);
-    w.wait_ready();
-    let (a, _b) = w.two_sessions();
-
-    // A LOCAL SOCKET DRIVER takes aterm's own cooperative lease, briefly.
-    let took = w.verb(&format!("@{a} lease acquire holder=drv-7 ttl=2000"));
-    assert!(took.ok(), "lease acquire: {}", took.header());
-    until("the fabric to mirror the local driver", || {
-        control_row(&w, &a)
-            .filter(|r| r.contains("holder=owner-cli:drv-7"))
-            .map(|_| ())
-    });
-
-    // THE MIRROR IS WITHDRAWN when the lease it mirrors lapses — through §6.6's
-    // own table, as the holder's own release.
-    until(
-        "the mirror to be withdrawn once the local lease lapses",
-        || {
-            control_row(&w, &a)
-                .filter(|r| r.contains("holder=-"))
-                .map(|_| ())
-        },
-    );
-    // AND THE BRIDGE NEVER HELD IT. `local_lease_holder` filters `fabric:`
-    // holders out, so a bridge that had taken this lease could not even see
-    // itself holding it; aterm can.
-    let status = w.verb(&format!("@{a} lease status"));
-    assert!(
-        !status.header().contains("fabric:owner-cli:"),
-        "the bridge must never hold a mirror of a lease it does not own: {}",
-        status.header()
-    );
-
-    // AND NOT ONE `ev lease-refused` FOR A MIRRORED HOLDER, across a bridge
-    // restart — `restore_control_rows` re-takes every restored row's lease on
-    // every attach, and it read the same rule from the same wrong place.
-    let long = w.verb(&format!("@{a} lease acquire holder=drv-8 ttl=60000"));
-    assert!(long.ok(), "lease acquire: {}", long.header());
-    until("the second driver to be mirrored", || {
-        control_row(&w, &a)
-            .filter(|r| r.contains("holder=owner-cli:drv-8"))
-            .map(|_| ())
-    });
-    restart_bridge(&w);
-    until("the restored row to still name the local driver", || {
-        control_row(&w, &a)
-            .filter(|r| r.contains("holder=owner-cli:drv-8"))
-            .map(|_| ())
-    });
-    let refused: Vec<String> = w
-        .ev()
-        .into_iter()
-        .filter(|e| e.starts_with("lease-refused") && e.contains("owner-cli:"))
-        .collect();
-    assert!(
-        refused.is_empty(),
-        "a mirrored lease is not a lease this bridge takes, so it can never be \
-         refused one: {refused:#?}"
-    );
-}
-
-/// **A `control` CLAIM WHOSE ROW WAS REFUSED DOES NOT MOVE THE KEYBOARD.**
-///
-/// `deliver_record` ran `on_control_message` before the `deliver` line was even
-/// built, and every refusal below it returns `Accounted` — so the group cursor
-/// commits past the record and no bridge offers it again. The handover then
-/// happened INSTEAD of the delivery, permanently: the human was told
-/// `state=refused` on their own lane for a claim that had just taken the
-/// keyboard, and the agent whose wheel moved saw no row at all.
-#[test]
-fn a_control_claim_whose_row_is_refused_leaves_the_keyboard_alone() {
-    let w = World::boot("r3ctlq", &[]);
-    w.wait_ready();
-    let (a, _b) = w.two_sessions();
-    let epoch = until("the session's launch nonce", || {
-        w.sessions()
-            .into_iter()
-            .find(|(_, sid, _)| *sid == a)
-            .map(|(_, _, nonce)| nonce)
-    });
-
-    // FILL h-andrew's PER-PEER QUOTA, so their next row — whatever kind it is —
-    // is refused at `deliver`.
-    let mut god = w.god();
-    let lane = format!("/f/{FLEET}/in/{}/{a}/h-andrew/note", w.node);
-    for seq in 1..=64u64 {
-        god.publish(
-            9_300,
-            seq,
-            &lane,
-            format!("v=1 t=1 text=fill{seq}").as_bytes(),
-        )
-        .expect("publish");
-    }
-    until("the ring to fill to the sender's quota", || {
-        (rows(&w, &a).len() >= 64).then_some(())
-    });
-
-    let control = format!("/f/{FLEET}/in/{}/{a}/h-andrew/control", w.node);
-    let (claim, _) = god
-        .publish(
-            9_300,
-            65,
-            &control,
-            format!("v=1 t=1 epoch={epoch} text=claim").as_bytes(),
-        )
-        .expect("publish the claim");
-    until("the claim to be refused for quota", || {
-        w.ev()
-            .into_iter()
-            .find(|e| {
-                e.starts_with("undeliverable ")
-                    && e.contains(&format!("off={claim}"))
-                    && e.contains("reason=quota")
-            })
-            .map(|_| ())
-    });
-
-    // THE ROW WAS NOT DELIVERED, SO THE KEYBOARD DID NOT MOVE. The verdict the
-    // sender was given and the state of the session now agree — and the check
-    // is not a race: the `undeliverable` above is published AFTER the endpoint
-    // refused, while the handoff this guards against ran BEFORE the line was
-    // even built.
-    let row = control_row(&w, &a);
-    assert!(
-        !row.as_deref().unwrap_or("").contains("holder=h-andrew"),
-        "a refused claim must not take the keyboard: {row:?}"
-    );
-    // NOR ANY OF THE HANDOFF'S OTHER EFFECTS. `on_control_message` is a
-    // mutation, not a classification: it also takes aterm's own cooperative
-    // lease for the claimant, which a local driver and a person at the glass
-    // both see in `who`.
-    let lease = w.verb(&format!("@{a} lease status"));
-    assert!(
-        !lease.header().contains("fabric:h-andrew"),
-        "a refused claim must not take the mirror lease either: {}",
-        lease.header()
-    );
-}
-
-/// **AN UNREADABLE `status` IS NOT A REVISION OF ZERO.**
-///
-/// `status_sample` answers `None` when the verb cannot be read, and both callers
-/// folded that into the value `0` — which lives in the same range as a real
-/// `revision=`. One failed read therefore installed a baseline of
-/// `revision = 0, seen = true`, the next SUCCESSFUL read was an advance from
-/// zero, and one settled second later §6.6 row 4 parked the session at `human?`,
-/// told the holder they had lost the wheel and refused their every `term/in`
-/// `reason=holder` — on a session nobody had touched.
-///
-/// `baseline_local` is called on every `Decision::Hold`, so the window is the
-/// exact instant a human claims a session.
-#[test]
-fn an_unreadable_status_does_not_park_a_session_nobody_touched() {
-    let w = World::boot_with(
-        "r3status",
-        &[],
-        &[("ATERM_LINK_FAULT", "fail-status-while-marked")],
-    );
-    w.wait_ready();
-    // ARMED BEFORE THE SESSION EXISTS, so BOTH callers meet the `None`: the
-    // sampler's first-ever sighting of this session (`observe_local_control`)
-    // and the claim's re-baseline (`baseline_local`). Each one folded the failed
-    // read into `revision = 0` on its own.
-    let marker = w.state.join("fail-status");
-    std::fs::write(&marker, b"1\n").expect("arm the failing status");
-    let (_first, a) = w.two_sessions();
-    let epoch = until("the session's launch nonce", || {
-        w.sessions()
-            .into_iter()
-            .find(|(_, sid, _)| *sid == a)
-            .map(|(_, _, nonce)| nonce)
-    });
-    // THE TEST IS ONLY MEANINGFUL IF THE SESSION HAS A REVISION TO LOSE: the
-    // damage is that a real reading is replaced by zero.
-    let revision: u64 = w
-        .verb(&format!("@{a} status"))
-        .header()
-        .split_whitespace()
-        .find_map(|t| t.strip_prefix("revision="))
-        .and_then(|v| v.parse().ok())
-        .expect("status carries a revision");
-    assert!(revision > 0, "a booted session has already been classified");
-    let mut god = w.god();
-    let control = format!("/f/{FLEET}/in/{}/{a}/h-andrew/control", w.node);
-    god.publish(
-        9_400,
-        1,
-        &control,
-        format!("v=1 t=1 epoch={epoch} text=claim").as_bytes(),
-    )
-    .expect("publish the claim");
-    until("the claim to stand on the bus", || {
-        control_row(&w, &a)
-            .filter(|r| r.contains("holder=h-andrew"))
-            .map(|_| ())
-    });
-    // THE WINDOW IS HELD OPEN FOR ONE `SETTLE_QUIET`, because that is what the
-    // rule the zero corrupts is made of: an advance counts only once the
-    // session has been seen QUIET for a second. This is the duration of an
-    // induced fault, not a wait for a race — nothing here is being synchronised
-    // with, and the assertions below are all `until`s over published state.
-    std::thread::sleep(Duration::from_millis(2_000));
-    std::fs::remove_file(&marker).expect("let `status` be read again");
-
-    // ROW 4'S WHOLE INPUT HERE IS THE BASELINE, and its verdict lands within
-    // one `SETTLE_QUIET` (1 s) of the first successful sample at `LOCAL_OBSERVE`
-    // (250 ms). This window is those two periods with an order of magnitude of
-    // margin — the pre-fix park is published inside 1.5 s of the marker coming
-    // off, reproducibly, because the damage is a stored zero and not a race.
-    let settle = std::time::Instant::now() + Duration::from_secs(6);
-    while std::time::Instant::now() < settle {
-        let row = control_row(&w, &a).unwrap_or_default();
-        assert!(
-            !row.contains("holder=human?"),
-            "a status that could not be read is not a change, and must not park a \
-             session nobody touched: {row}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    // AND THE WHEEL IS STILL THEIRS, proved the only way that matters. A parked
-    // row refuses this `reason=holder`; a held one applies it.
-    let before = w
-        .ev()
-        .into_iter()
-        .filter(|e| e.contains("face=term"))
-        .count();
-    let drive = format!("/f/{FLEET}/term/{}/{a}/in/h-andrew", w.node);
-    let mut body = format!("v=1 t=1 epoch={epoch} len=1\n").into_bytes();
-    body.extend_from_slice(b"\r");
-    god.publish(9_401, 2, &drive, &body).expect("publish a key");
-    let verdict = until("the keystroke's verdict", || {
-        w.ev()
-            .into_iter()
-            .filter(|e| e.contains("face=term"))
-            .nth(before)
-    });
-    assert!(
-        verdict.starts_with("applied "),
-        "the human still holds the keyboard: {verdict}"
-    );
 }
 
 /// **A POST THAT DIES AT THE DOOR TAKES ITS DURABLE RESERVATION WITH IT — AND

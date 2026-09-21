@@ -12518,11 +12518,24 @@ struct AutoApplyIntent {
     dmg_sha256: [u8; 32],
     retry_at: Instant,
     attempts: u8,
-    /// When the idle PREFERENCE stops being able to defer this intent (see
-    /// [`AUTOMATIC_UPDATE_ACTIVITY_GRACE`]). Set once when the intent is armed,
-    /// so a busy machine converges on a bounded wall-clock deadline instead of
-    /// re-deriving a fresh delay from every fresh keystroke.
-    apply_by: Instant,
+}
+
+/// THE LADDER'S ANCHOR for the build the automatic lane is working on: when it
+/// was first armed, and the last phase the log announced
+/// (`native_update_auto_intent::apply_phase` turns the age into the phase).
+///
+/// Kept beside the intent rather than inside it because the intent does not
+/// live as long as the ladder: an attempt consumes the intent, and an
+/// activity-revoked completion re-arms a fresh one. Anchored here, a busy
+/// terminal can only DELAY the landing inside the bound — never restart the
+/// clock. Replaced when a different build arms; cleared when a physical-failure
+/// latch lapses, so the retry after a genuine failure prefers a quiet moment
+/// again rather than landing on the first poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutoApplyLadder {
+    build: u64,
+    armed_at: Instant,
+    announced: native_update_auto_intent::ApplyPhase,
 }
 
 /// Automatic replacement PREFERS a short terminal-idle epoch before it stops
@@ -12532,23 +12545,11 @@ const AUTOMATIC_UPDATE_QUIET_EPOCH_NS: u64 = 500_000_000;
 const AUTOMATIC_UPDATE_QUIET_EPOCH: Duration =
     Duration::from_nanos(AUTOMATIC_UPDATE_QUIET_EPOCH_NS);
 
-/// How long an armed automatic apply will keep holding out for a quiet moment
-/// before it stops asking and just lands.
-///
-/// The quiet epoch above is sampled against a MACHINE-WIDE input clock (the
-/// kernel's HID idle time, via `platform::recent_user_input_event`) and every
-/// live PTY's latest output. On the daily driver this feature exists for — an agent streaming
-/// output into one pane while a human works in another app — that conjunction
-/// is essentially never true, so the previous unbounded wait meant a verified,
-/// staged, notarized build simply never applied itself: the user watched an
-/// "Update to Latest Now" button instead of getting an update. Two minutes is
-/// long enough that an ordinary pause still wins the race (and the update lands
-/// invisibly), and short enough that never pausing costs a single brief hitch
-/// rather than the whole feature. The lane it unblocks is the LOSSLESS seamless
-/// handoff, which parks readers, dups the PTY masters and hands the same shells
-/// to the successor; nothing running is killed, so overriding a *preference*
-/// here spends jank, never work.
-const AUTOMATIC_UPDATE_ACTIVITY_GRACE: Duration = Duration::from_secs(120);
+/// The first phase of the ladder: how long an armed automatic apply holds out
+/// for a machine-wide idle moment before it starts relaxing its preferences
+/// (`native_update_auto_intent::PREFER_IDLE_WINDOW`; the whole ladder and its
+/// bound live there).
+const AUTOMATIC_UPDATE_ACTIVITY_GRACE: Duration = native_update_auto_intent::PREFER_IDLE_WINDOW;
 
 /// HANDS OFF THE KEYS. How long after the user's last keystroke an automatic
 /// apply refuses to start.
@@ -12566,19 +12567,10 @@ const AUTOMATIC_UPDATE_ACTIVITY_GRACE: Duration = Duration::from_secs(120);
 /// gate and the update lands invisibly, exactly as it does today for a user who
 /// is reading rather than typing. It gates the AUTOMATIC lanes only; an explicit
 /// "Update to Latest Now" (or the Version menu's "apply now") is the user asking
-/// for the freeze and is never held.
+/// for the freeze and is never held — and the ladder's last phase
+/// (`ApplyPhase::Land`) stops honouring it too, because a refusal that can
+/// repeat forever is a feature that silently stops working.
 const AUTOMATIC_UPDATE_KEYSTROKE_GAP: Duration = Duration::from_millis(2_500);
-
-/// How long the keystroke gate may hold a PAST-GRACE automatic apply before the
-/// lane stands down to manual-only.
-///
-/// [`AUTOMATIC_UPDATE_KEYSTROKE_GAP`] is a refusal, and a refusal that can repeat
-/// forever is a feature that silently stops working. A user who literally never
-/// pauses for 2.5 s over this long is not going to be given a frozen terminal to
-/// prove a point: the intent stands down (the ordinary manual-only latch, which
-/// lapses and re-arms on its own — or on a click from the Version menu, still in
-/// place); the next launch picks the stage up only if no handoff ever ran.
-const AUTOMATIC_UPDATE_TYPING_HOLD: Duration = Duration::from_secs(10 * 60);
 
 /// True once the most recently consumed PTY burst is old enough for automatic
 /// update admission. A zero stamp means that session has produced no output.
@@ -12601,31 +12593,22 @@ pub(crate) fn automatic_update_activity_retry_at(now: Instant) -> Instant {
     now + AUTOMATIC_UPDATE_QUIET_EPOCH
 }
 
-/// Sticky suppression after this exact artifact exhausted its automatic budget or
-/// returned from physical handoff. Duplicate/reordered wakes cannot reset it.
+/// Sticky suppression after this exact artifact returned from a PHYSICAL
+/// handoff failure (a successor that died, a proof that did not match, a
+/// missed deadline). Duplicate/reordered wakes cannot reset it. Activity never
+/// writes it: a busy terminal delays the automatic lane along the ladder and
+/// nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AutoApplyManualOnly {
     build: u64,
     dmg_sha256: [u8; 32],
-    /// When this latch may LAPSE back into automatic apply.
-    ///
-    /// A GENUINE failure (child died, proof mismatch, native safety loss) now
-    /// sets a deadline too, but on a much shorter budget
-    /// (`MAX_PHYSICAL_FAILURE_CYCLES`, tens of minutes apart) and only until that
-    /// budget is spent, after which it is `None` and sticky. `None` used to be
-    /// unconditional for these, and because `TimedOut` is classified physical
-    /// while the handoff deadline has to cover an entire cold boot + bundle swap
-    /// followed by re-exec + repaint, one slow moment permanently retired automatic
-    /// in-session apply for that build. The budget lives on
-    /// `auto_apply_physical_retry`, NOT in this struct, because this struct is
-    /// cleared when the latch lapses.
-    ///
-    /// An ACTIVITY-shaped exhaustion sets a deadline instead. Activity
-    /// revocation is fully rolled back and says nothing about the artifact; it
-    /// only says the terminal was busy, which on the machine this feature
-    /// exists for is the permanent condition. A latch that never lapsed meant
-    /// three unlucky moments retired automatic apply until the next relaunch —
-    /// which is precisely the "staged, never applied" state the field reported.
+    /// When this latch may LAPSE back into automatic apply: the physical
+    /// schedule's next retry, or the stand-down between its epochs. `None` is
+    /// convergence — the schedule spent, nothing left to try until a strictly
+    /// newer build, a relaunch or the Version menu — and the fail-safe for a
+    /// policy/outcome mismatch no path is supposed to reach. The budget behind
+    /// the deadline lives on `auto_apply_physical_retry`, NOT here, because
+    /// this struct is cleared when the latch lapses.
     retry_at: Option<std::time::Instant>,
 }
 
@@ -12711,14 +12694,10 @@ struct HandoffPreverification {
 /// gate at swap time is unaffected either way.
 const HANDOFF_PREVERIFY_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// Idle gap after which an artifact's activity-revoked retry budget replenishes.
+/// Idle gap after which an artifact's activity-revoked retry spacing starts
+/// over from its first rung.
 const ACTIVITY_RETRY_BUDGET_REPLENISH: std::time::Duration =
     std::time::Duration::from_secs(30 * 60);
-
-/// How long an ACTIVITY-shaped manual-only latch holds before automatic apply
-/// is allowed to try again. Long enough not to thrash, short enough that a
-/// machine left running overnight still ends up updated.
-const ACTIVITY_MANUAL_ONLY_LAPSE: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
 /// Result produced by the bounded overlap waiter. `ProofReady` means only that
 /// the child painted and proved the exact adopted PTY set; the main thread must
@@ -14899,6 +14878,8 @@ struct App {
     /// Default-on automatic update intent. Retained across transient preflight/handoff
     /// failures and retried on one bounded event-loop deadline; `None` has zero idle cost.
     auto_apply_intent: Option<AutoApplyIntent>,
+    /// Where the automatic lane stands on its ladder; see [`AutoApplyLadder`].
+    auto_apply_ladder: Option<AutoApplyLadder>,
     auto_apply_manual_only: Option<AutoApplyManualOnly>,
     /// Exact environmental refusal, released only by a newer verified observation.
     auto_apply_environment_block: Option<app_native::AutoApplyEnvironmentBlock>,
@@ -15213,14 +15194,11 @@ impl App {
 
     /// The PTY half of [`Self::automatic_update_activity_quiet`] alone: every
     /// live session's latest output is at least one quiet epoch old. What the
-    /// PAST-GRACE automatic lane still waits for (2026-09-18): that lane gave up
-    /// waiting for a machine-wide idle moment (the daily driver — an agent
-    /// streaming in one pane while the human works in another app — never
-    /// offers one), but landing while a program is mid-line stalls that program
-    /// against a full PTY buffer for the whole park->Commit freeze, which the
-    /// owner ruled an interruption. Output pauses constantly (a prompt, a tool
-    /// call), so this holds the lane for moments, not minutes; the typing hold
-    /// still bounds it.
+    /// ladder's `PreferOutputGap` phase waits for while an aterm window is
+    /// focused (the owner's 2026-09-18 ruling: a stream the user is watching
+    /// should not stall for the freeze). A preference with an end: the next
+    /// phase stops consulting it, because an agent's spinner can keep a session
+    /// inside the epoch for hours.
     fn automatic_update_output_quiet(&self, now: Instant) -> bool {
         let now_ns = u64::try_from(now.saturating_duration_since(self.lat_epoch).as_nanos())
             .unwrap_or(u64::MAX);
@@ -17976,6 +17954,7 @@ impl App {
             job_probe: crate::quit_safety::JobProbe::default(),
             relaunch: None,
             auto_apply_intent: None,
+            auto_apply_ladder: None,
             auto_apply_manual_only: None,
             auto_apply_environment_block: None,
             auto_overlap_retry: None,
@@ -22034,16 +22013,15 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::AutoApply,
             );
         }
-        // The OTHER automatic-apply deadline. While a manual-only latch is held
-        // there is no intent to fold above — the latch is what replaced it — so
-        // folding only the intent left nothing scheduled to release the latch.
-        // `about_to_wait` lapses it on the way into every park, which hid this on
-        // a machine in use (any keystroke or byte of PTY output is a wake), but an
-        // IDLE machine produces no wake at all, so the latch outlived the session
-        // and the staged build waited for a relaunch. That is precisely the case
-        // `ACTIVITY_MANUAL_ONLY_LAPSE` is sized for ("left running overnight").
-        // Genuine-failure latches that carry no deadline fold nothing and still
-        // cost zero wakes.
+        // The OTHER automatic-apply deadline. While a physical-failure latch is
+        // held there is no intent to fold above — the latch is what replaced it
+        // — so folding only the intent left nothing scheduled to release the
+        // latch. `about_to_wait` lapses it on the way into every park, which hid
+        // this on a machine in use (any keystroke or byte of PTY output is a
+        // wake), but an IDLE machine produces no wake at all, so the latch
+        // outlived the session and the staged build waited for a relaunch. A
+        // converged latch carries no deadline, folds nothing and costs zero
+        // wakes.
         if let Some(lapse_at) = self
             .auto_apply_manual_only
             .and_then(|manual| manual.retry_at)
@@ -32183,6 +32161,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         job_probe: crate::quit_safety::JobProbe::default(),
         relaunch: None,
         auto_apply_intent: None,
+        auto_apply_ladder: None,
         auto_apply_manual_only: None,
         auto_apply_environment_block: None,
         auto_overlap_retry: None,
@@ -44781,8 +44760,11 @@ mod spec_xref_gate {
         // 2026-09-13: `RosterPairRedo` (`roster_pair_redo_model`, the machine
         // roster's redo transaction, b8adf2d44) adds one — 152 → 153; that
         // commit registered the machine without moving this pin.
+        // 2026-09-21: `NativeUpdateApplyLadder` (`native_update_apply_ladder_model`,
+        // the automatic-update ladder's bound and its stand-down mutant) adds
+        // one — 153 → 154.
         assert_eq!(
-            total, 153,
+            total, 154,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(

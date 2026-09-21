@@ -169,14 +169,10 @@ pub enum TxnOutcome {
     /// returns it.
     Blocked { dep: String, dep_state: String },
     /// The group is held on its current builds because `member`'s pinned `build` publishes
-    /// NO artifact for `triple` — proven from its release-verified manifest, bound to that
-    /// pin: the bootstrap's clean-skip doctrine ([`crate::flow::group_missing_triple`])
-    /// lifted to an INSTALLED tuple, since a tuple that cannot fully exist on this host is
-    /// a correct state, not a failure. Nothing was resolved, downloaded, staged or flipped,
-    /// and the next pass retries. Never over a Tombstone, and never over a force-upgrade
-    /// off a revoked current build — that aborts instead, with the revoked build's
-    /// commands disabled. Constructed by [`crate::flow`]'s group transaction directly —
-    /// [`transact`] never returns it.
+    /// no artifact for `triple` — a tuple that cannot fully exist on this host is a correct
+    /// state, not a failure, so nothing is staged or flipped and the next pass retries.
+    /// A Tombstone or a force-upgrade off a revoked current build aborts instead. Built by
+    /// [`crate::flow`]'s group transaction directly — [`transact`] never returns it.
     Unpublished {
         member: String,
         build: u64,

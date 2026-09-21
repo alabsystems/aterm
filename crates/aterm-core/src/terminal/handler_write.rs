@@ -1423,4 +1423,68 @@ mod tests {
         assert_eq!(char_width('\u{4E00}', false), 2); // CJK ideograph
         assert_eq!(char_width('\u{9FFF}', false), 2); // end of ideograph block
     }
+
+    /// End-to-end pin for the wide-glyph WRAP TAIL, driven as bytes so the SGR
+    /// state, the BCE cursor template and the glyph's own colours all come from
+    /// one source — which is exactly the coupling
+    /// `Grid::blank_wide_wrap_tail` relies on when it repopulates the truecolor
+    /// ring from the template.
+    ///
+    /// ```text
+    ///   ESC[48;2;10;20;30m  ESC[1;9H   中     -> cols 8-9 on the first bg
+    ///   ESC[48;2;200;100;50m ESC[1;10H 中     -> cannot fit; tail blanked, wraps
+    /// ```
+    ///
+    /// Blanking the tail `[9, 10)` bisects the first glyph and orphans its head
+    /// at col 8. The orphan must come out of that erase carrying the SECOND
+    /// background, like the tail beside it. Handing it `Cell::EMPTY` left a
+    /// default-coloured hole; handing it the BCE blank without extending the
+    /// ring made it resolve `[10, 20, 30]` — the DEAD glyph's bytes, a newly
+    /// wrong colour rather than merely a default one.
+    ///
+    /// Three rows on purpose: on a one-row grid the wrap scrolls the evidence
+    /// off the screen.
+    #[test]
+    fn a_wide_glyph_wrapping_off_the_last_column_repaints_the_orphan_it_bisects() {
+        let mut term = Terminal::new(3, 10);
+        term.process(b"\x1b[48;2;10;20;30m\x1b[1;9H\xe4\xb8\xad");
+        assert_eq!(
+            term.grid().bg_rgb_at(0, 8),
+            Some([10, 20, 30]),
+            "precondition: the first glyph sits at cols 8-9 on its own bg"
+        );
+
+        term.process(b"\x1b[48;2;200;100;50m\x1b[1;10H\xe4\xb8\xad");
+
+        let grid = term.grid();
+        assert_eq!(
+            grid.cell(1, 0).map(|c| c.char()),
+            Some('\u{4E2D}'),
+            "precondition: the second glyph wrapped to the next row"
+        );
+        let tail = grid.cell(0, 9).expect("the blanked tail cell exists");
+        let orphan = grid.cell(0, 8).expect("the orphaned head exists");
+        assert_eq!(orphan.char(), ' ', "the orphaned wide head is blanked");
+        assert!(
+            !orphan.is_empty(),
+            "a default-coloured orphan renders as a hole beside the blanked tail"
+        );
+        assert_eq!(
+            orphan.colors(),
+            tail.colors(),
+            "the orphan must carry the same BCE blank as the tail that bisected it"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 8),
+            Some([200, 100, 50]),
+            "the orphan must resolve the NEW background; without the ring \
+             extension it resolves the dead glyph's [10, 20, 30]"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 9),
+            Some([200, 100, 50]),
+            "the blanked tail must resolve it too — this site kept no ring at \
+             all, so even the cell inside the blanked span was stale"
+        );
+    }
 }

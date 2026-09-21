@@ -91,7 +91,7 @@
 //! 8. The rendezvous file, `fabric.toml` beside the instance control sockets
 //!    (`$XDG_RUNTIME_DIR/aterm`, else `~/Library/Application Support/aterm`),
 //!    0600: fleet, broker, node, cap file, state dir and the bridge command.
-//!    `aterm link ls|glance|tui` default their `--fleet --broker --cap-file
+//!    `aterm link ls` defaults its `--fleet --broker --cap-file
 //!    --state` from it, `aterm link mirror` its `--sock`, and `aterm fabric`
 //!    reads its command when aterm.toml has none.
 //! 9. Every running instance `aterm ctl instances` lists is armed with
@@ -169,7 +169,7 @@
 //!   connections into the sealed handshake at once, and a peer that can reach
 //!   the port can hold every one without the key (round 16 review, measured);
 //!   on the socket, this host's own bridges, `aterm fabric` and `aterm link
-//!   ls|glance|tui` never wait on those slots. The run PROVES the sealed wire
+//!   ls` never wait on those slots. The run PROVES the sealed wire
 //!   separately (the `wire` step: the handshake, the node's grants attached and
 //!   a read, at `<bind>` or its loopback twin when `<bind>` is
 //!   `0.0.0.0`/`[::]`), and the rendezvous file records it as `serves_tcp` and
@@ -187,7 +187,7 @@ use std::time::{Duration, Instant};
 
 use crate::ctl::Ctl;
 use crate::fabric::{self, kv};
-use crate::tui::safe;
+use crate::render::safe;
 
 /// The rendezvous file's name, beside the instance control sockets.
 pub const RENDEZVOUS_FILE: &str = "fabric.toml";
@@ -939,6 +939,22 @@ pub fn cksum(data: &[u8]) -> u32 {
 }
 
 /// The eight grants of a node's ring (§8.2), for `node` on `fleet`.
+///
+/// THE SET IS EXACT, AND SOMETHING ENFORCES THAT. [`crate::join::node_ring_of`]
+/// sorts a cap file's grants against this vector and refuses anything that is
+/// not it, in its own words "nothing missing, nothing extra" — so adding,
+/// dropping or rewording one entry here invalidates every cap already minted on
+/// every host of a fleet, and a joining host is refused with "they are not the
+/// eight of <node>'s ring".
+///
+/// THAT IS WHY THE LAST TWO SURVIVED ROUND 21, and it is worth saying here
+/// rather than leaving to be inferred from their absence elsewhere. Nothing this
+/// node runs reads `ro:/f/<F>/term/<node>/>` or writes
+/// `rw,p=<node>:/f/<F>/term/<node>/*/screen` any more — the cut took the drive
+/// face and the screen publisher with it. They stay because an older node on the
+/// wire may still publish on those subjects, because the read/write split is the
+/// §8.2 property that stops a node forging a driver into its own sessions, and
+/// because narrowing the ring would refuse every cap in the field.
 #[must_use]
 pub fn node_grants(fleet: &str, node: &str) -> Vec<String> {
     vec![
@@ -1023,7 +1039,7 @@ impl Rendezvous {
         }
         format!(
             "# Written by `aterm fabric on` — where this machine's fabric is. `aterm link\n\
-             # ls|glance|tui|mirror` and `aterm fabric` read it when their flags are omitted;\n\
+             # ls|mirror` and `aterm fabric` read it when their flags are omitted;\n\
              # `aterm fabric off` removes it. Not the source of truth: aterm launches its\n\
              # bridge from `[fabric] command` in aterm.toml, which `command` below mirrors.\n\
              fleet = {}\n\
@@ -1764,7 +1780,6 @@ fn wire_step(p: &Paths, out: &mut Out) -> bool {
         cap_files: vec![p.cap().to_string_lossy().into_owned()],
         state_dir: String::new(),
         accept_from: Vec::new(),
-        screen: Vec::new(),
         sock: None,
         token: None,
         presence: crate::presence::Mode::Meta,
@@ -3515,7 +3530,7 @@ pub fn doctor() -> ExitCode {
             match Rendezvous::read() {
                 Ok(Some(_)) => {}
                 Ok(None) => warnings.push(format!(
-                    "no rendezvous file at {}: `aterm link ls|glance|tui` need their flags \
+                    "no rendezvous file at {}: `aterm link ls` needs its flags \
                      spelled out here",
                     rendezvous_path().map_or_else(|| "-".to_string(), |p| p.display().to_string())
                 )),
@@ -4185,7 +4200,7 @@ mod tests {
     }
 
     /// THE RENDEZVOUS FILE CARRIES THE WIRE: a joined host's round-trips with
-    /// its key file, and `ls|glance|tui` default `--tcp --key-file` WITH the
+    /// its key file, and `ls` defaults `--tcp --key-file` WITH the
     /// broker — never onto a `--broker` the caller spelled out. The host that
     /// SERVES the sealed wire records it as `serves_tcp`/`serves_key_file`
     /// beside its socket, and its own tools default to the socket.

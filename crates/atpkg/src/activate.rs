@@ -219,7 +219,7 @@ pub(crate) fn install_tools_env(
     // flow's restore and linkmode's unlink (a rollback re-lays through
     // `flow::rollback_member`, which ensures the prior build's root itself). `Shallow`: a
     // few dozen `lstat`s when the root is already whole, and ZERO writes (a tippy running
-    // from it pins its own files' link counts and ctimes). Every other build answers `Plain` without
+    // from it pins its own link counts and ctimes). Every other build answers `Plain` without
     // creating anything, and a build without the copy keeps today's shims byte for byte. A
     // root that cannot be put in order costs this lay nothing: the shims render through
     // whatever whole root already stands, or plain — running the store path as they did
@@ -715,13 +715,11 @@ mod tests {
     /// The candidates are ordinary root-owned system dirs; the first that both reads as the
     /// system shape (a brew-owned `/usr/local` does not) and accepts a `mkdir` wins.
     #[cfg(unix)]
-    /// A SKIP HERE MUST BE PROVABLY LEGITIMATE. Every caller skips by returning,
-    /// which libtest reports as `ok` — so a fixture that silently stops working
-    /// deletes its callers' coverage without failing anything. Building the
-    /// shape needs a root-OWNED parent this process can still create in, which
-    /// is root's privilege; as an ordinary user the `None` is a fact about the
-    /// machine. Running AS ROOT it is not, so the callers assert that (see
-    /// [`system_fixture_is_available_when_this_process_could_build_one`]).
+    /// A skip here must be provably legitimate: callers skip by returning, which libtest
+    /// reports as `ok`, so a fixture that quietly stops working deletes their coverage
+    /// without failing anything. Only root can create in a root-owned parent, so an
+    /// ordinary user's `None` is a fact about the machine; from root it is a regression,
+    /// which [`system_fixture_is_available_when_this_process_could_build_one`] asserts.
     fn system_prefix_fixture(label: &str) -> Option<Layout> {
         for parent in ["/opt", "/usr/local", "/var/lib", "/usr/lib"] {
             let prefix =
@@ -886,14 +884,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// THE DELETING PREDICATE, PINNED ENTRY BY ENTRY.
-    ///
     /// [`prune_stale_shims`] is the one predicate in this module that removes files from the
-    /// user's `PATH`, and its own doc calls it "deliberately narrow". The pass around it now
-    /// shares ONE `bin/` listing ([`crate::ops::BinScan`]) for its READS; this enumerates the
-    /// shapes a real `bin/` holds and asserts exactly which of them a prune of `ay@19`
-    /// removes and which it leaves, so that change — and any later one that tries to put the
-    /// prune itself on a snapshot — cannot widen the blast radius without failing here.
+    /// user's `PATH`, so this enumerates the shapes a real `bin/` holds and pins exactly
+    /// which of them a prune of `ay@19` removes and which it leaves. A change that puts the
+    /// prune on the shared `bin/` listing ([`crate::ops::BinScan`]) cannot widen the blast
+    /// radius without failing here.
     #[cfg(unix)]
     #[test]
     fn the_prune_deletes_exactly_the_stale_and_leaves_everything_else() {
@@ -921,8 +916,8 @@ mod tests {
         lay("alab-aylint", &b18, "aylint"); // alias of a dropped tool
         lay("ny", &n7, "ny"); // another program's shim
         lay("alab-ny", &n7, "ny"); // another program's alias
-        // A dev link into a CHECKOUT that happens to carry a `store/ay/18/bin/ay` tail: the
-        // UNANCHORED parse answers `("ay", 18)` for it, so a prune using that would delete a
+        // A dev link into a checkout that happens to carry a `store/ay/18/bin/ay` tail: an
+        // unanchored parse answers `("ay", 18)` for it, so a prune using that would delete a
         // link into a tree this manager does not own. `store_build_of` is anchored.
         let checkout = layout.prefix.join("checkout/store/ay/18/bin");
         std::fs::create_dir_all(&checkout).unwrap();
@@ -1203,10 +1198,9 @@ mod tests {
     ///
     /// Skips when this run cannot build an all-root-owned chain (see
     /// [`system_prefix_fixture`]); the `$HOME` shape is covered above.
-    /// The fixture's `None` is a claim about THIS MACHINE, and it is only
-    /// credible from a process that could not have built the shape. Root could
-    /// have, so from root a `None` is the fixture regressing — and every test
-    /// that guards on it would go on reporting `ok` while asserting nothing.
+    /// The fixture's `None` is only credible from a process that could not have built the
+    /// shape. Root could have, so from root a `None` is the fixture quietly regressing while
+    /// every test that guards on it goes on reporting `ok`.
     #[cfg(unix)]
     #[test]
     fn system_fixture_is_available_when_this_process_could_build_one() {
@@ -1228,10 +1222,9 @@ mod tests {
     fn a_system_shaped_prefix_publishes_bin_and_channels_traversable() {
         let Some(layout) = system_prefix_fixture("mode-sys") else {
             // Not root: the shape is genuinely unbuildable here, and
-            // `system_fixture_is_available_when_this_process_could_build_one`
-            // is what keeps that excuse honest. Say so rather than vanishing —
-            // this is the ONLY assertion that tells the two prefix shapes apart,
-            // so a silent `ok` misreports it as covered.
+            // `system_fixture_is_available_when_this_process_could_build_one` keeps that
+            // excuse honest. Say so — this is the only assertion that tells the two prefix
+            // shapes apart, so a silent `ok` would misreport it as covered.
             eprintln!(
                 "SKIP: a_system_shaped_prefix_publishes_bin_and_channels_traversable \
                  needs a root-owned system prefix (run as root to gate it)"

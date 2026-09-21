@@ -1648,21 +1648,11 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
                 .to_string(),
         };
     }
-    // WHAT `migrate` WOULD SAY, ASKED FIRST — and it is the answer whatever else this pass
-    // measures. A directory it refuses (not build output, a symlink, a destination in the
-    // way) or calls already excluded cannot be changed into a migration by a lock that
-    // frees or an ignore rule that moves, while BOTH probes below cost real work on every
-    // pass: `build_in_progress` opens and `flock(2)`s up to three lock paths, and the git
-    // answer SPAWNS `git check-ignore`. The app's pass runs this over every target dir in a
-    // whole home directory, six-hourly, so an in-repo target that can never be migrated —
-    // the commonest being one whose `.noindex` name is already taken — paid a process spawn
-    // per pass forever to be told the same thing.
-    //
-    // The one ordering this changes is against the lock: such a directory now reports the
-    // refusal (a `Failed`, the line the window keys on) instead of the transient
-    // "a build holds …" skip it used to report while a build happened to be running — the
-    // same answer it gave the moment that build finished. Answers that CAN change with time
-    // still come after: `require_repo` above, and the migration itself below.
+    // What `migrate` would say, asked first — and it is the answer whatever else this pass
+    // measures. A directory it refuses, or calls already excluded, cannot become a migration
+    // because a lock frees or an ignore rule moves, while both probes below cost real work on
+    // every pass. Answers that can change with time still come after: `require_repo` above,
+    // and the migration itself below.
     let planned = match migrate(dir, true) {
         Ok(Migration::Planned { from, to }) => (from, to),
         Ok(Migration::AlreadyExcluded(p)) => return Applied::AlreadyExcluded(p),
@@ -1672,10 +1662,9 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
                 reason: "not applicable".to_string(),
             };
         }
-        // Unreachable by construction: `migrate(dir, true)` is a DRY RUN and renames
-        // nothing. Answered like `Planned` rather than asserted, so a future change to
-        // `migrate` costs this pass its plan, never its correctness — the real migration
-        // below is still the one that decides.
+        // Unreachable by construction: `migrate(dir, true)` is a dry run and renames nothing.
+        // Answered like `Planned` rather than asserted, so a future change to `migrate` costs
+        // this pass its plan, never its correctness.
         Ok(Migration::Migrated { from, to }) => (from, to),
         Err(e) => {
             return Applied::Failed {
@@ -1699,8 +1688,7 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
         _ => None,
     };
     // The config edit is decided BEFORE the rename, so a tree whose cargo cannot be
-    // re-pointed is never moved (`plan_repo_config`). Over the plan already taken above —
-    // a directory `migrate` refuses or calls excluded returned there with that answer.
+    // re-pointed is never moved (`plan_repo_config`).
     let mut config_plan = None;
     if let (Some(repo), Pointer::Config(_)) = (&repo, &pointer) {
         let (from, to) = (&planned.0, &planned.1);
@@ -1799,10 +1787,8 @@ pub fn apply_under(
     (outcomes, found.complete)
 }
 
-/// [`apply_under`], handing back the [`Scan`] the outcomes were computed over — so
-/// a caller that goes on to REPORT the machine's posture (the pass's own
-/// `machine-state:` record, 2026-09-16) reports from the walk it already paid for
-/// instead of a window spawning a second one to confirm it.
+/// [`apply_under`], handing back the [`Scan`] the outcomes were computed over, so a caller
+/// reporting the machine's posture uses the walk it already paid for instead of a second one.
 #[must_use]
 pub fn apply_under_scan(
     root: &Path,
@@ -1827,9 +1813,9 @@ pub fn apply_under_scan(
     (outcomes, found)
 }
 
-/// Re-lay the `target -> target.noindex` link a HALF-DONE migration left behind, if
-/// that is what this directory is — and where it cannot be re-laid, NAME the half-done
-/// migration instead of returning in silence ([`wedged_config_migration`]).
+/// Finish the HALF-DONE migration this directory is the leftover of: re-lay the
+/// `target -> target.noindex` link in a git checkout, and write the `.cargo/config.toml`
+/// pointer in a config-pointed tree ([`repair_config_migration`]).
 ///
 /// THE WINDOW. [`apply_one`] renames and then links, and it rolls the rename back on
 /// every error it can see — but not on a signal. The GUI's *Apply now* runs
@@ -1840,16 +1826,14 @@ pub fn apply_under_scan(
 /// and refused forever after ("a name in the way"). So the steady state of one
 /// ill-timed signal is the exact failure this module exists to prevent, permanently.
 ///
-/// The repair is the narrowest one that fixes it: only a `.noindex` directory, only in
-/// a repository whose pointer IS the symlink ([`Pointer::Symlink`] — a `.cargo/config.toml`
-/// tree needs no link and must not grow one), and only when the name beside it is
-/// ABSENT. A `target` that exists — as a link, a directory, anything — is not this case
-/// and is left alone.
+/// The LINK repair is the narrowest one that fixes it: only a `.noindex` directory, only
+/// in a repository whose pointer IS the symlink ([`Pointer::Symlink`] — a
+/// `.cargo/config.toml` tree needs no link and must not grow one), and only when the name
+/// beside it is ABSENT. A `target` that exists — as a link, a directory, anything — is not
+/// this case and is left alone.
 ///
-/// THE CONFIG-POINTED TREE IS THE CASE THE REPAIR CANNOT REACH, and until 2026-09-19 it
-/// fell out of this function with no outcome at all — nothing repaired it and nothing
-/// reported it, while the wedge it leaves is permanent. It is named now;
-/// [`wedged_config_migration`] says why naming is all this pass may do about it.
+/// A config-pointed tree is repaired by its POINTER instead — the half the interrupted pass
+/// never wrote, and no link ([`repair_config_migration`]).
 fn relink_migrated(dir: &Path, dry_run: bool) -> Option<Applied> {
     if !SUPPORTED || exclusion_of(dir) != Exclusion::NoindexSuffix {
         return None;
@@ -1861,18 +1845,18 @@ fn relink_migrated(dir: &Path, dry_run: bool) -> Option<Applied> {
     }
     let repo = repo_of(dir)?;
     let config = match pointer_for(Some(&repo)) {
-        // A git checkout: the link IS cargo's pointer, so re-laying it is the repair.
+        // A git checkout: the link is cargo's pointer, so re-laying it is the repair.
         Pointer::Symlink => None,
-        // Not under git: cargo's pointer is a config this pass may not write.
+        // Not under git: cargo's pointer is a config, and finishing the migration means
+        // writing it rather than laying a link.
         Pointer::Config(config) => Some(config),
-        // Unreachable by construction — `repo_of` above answered `Some`, so a
-        // `Cargo.toml` is beside this directory and `pointer_for` never says `None`.
-        // Answered rather than asserted: a future change there costs this pass a
-        // report, never its correctness.
+        // Unreachable by construction: `repo_of` above answered `Some`, so a `Cargo.toml`
+        // is beside this directory and `pointer_for` never says `None`. Answered rather than
+        // asserted, so a future change there costs a report, never correctness.
         Pointer::None => return None,
     };
     if let Some(config) = config {
-        return wedged_config_migration(&repo, &original, dir, &config);
+        return repair_config_migration(&repo, &original, dir, &config, dry_run);
     }
     if dry_run {
         return Some(Applied::Skipped {
@@ -1899,65 +1883,105 @@ fn relink_migrated(dir: &Path, dry_run: bool) -> Option<Applied> {
     }
 }
 
-/// The half-done migration that CANNOT be repaired, NAMED — the whole of what this pass
-/// may do about a config-pointed tree whose `target` never came back.
+/// Finish the half-done migration in a CONFIG-POINTED tree, which [`relink_migrated`]'s
+/// link cannot repair — such a tree must not grow a link
+/// (`the_relink_repair_touches_nothing_else`). What the interrupted pass was about to
+/// write is `[build] target-dir` in `.cargo/config.toml`, so this writes exactly that,
+/// through the same [`plan_repo_config`] / [`write_repo_config`] an uninterrupted
+/// migration uses, and reports the same [`Applied::Migrated`] row: nothing downstream
+/// learns a new shape, and the rename it completes already happened.
 ///
-/// [`relink_migrated`]'s repair is a link, and a config-pointed tree must not grow one
-/// (that is the ruling `the_relink_repair_touches_nothing_else` pins). The other repair —
-/// writing the `.cargo/config.toml` the interrupted pass never wrote — is NOT this
-/// module's to make: `803628296` exists precisely because the doctor was once caught
-/// re-pointing a user's target directory, and a config written here re-aims cargo for
-/// every invocation in that tree, including every one outside aterm. So this writes
-/// nothing, lays nothing, and says so.
-///
-/// AN [`Applied::Failed`], NOT AN [`Applied::Skipped`]. A skip is the pass declining to
-/// touch a directory, ordinary and silent, and "most of them resolve themselves on a
-/// later pass" — this one resolves itself never, and silence is exactly what made it
-/// cost a user their exclusion. A failure is the row the verb exits non-zero on and the
-/// one [`crate::doctor`]'s pass turns into its `machine settings failed —` line, which
-/// is the point: on disk the tree looks HIDDEN (the build output sits under the
-/// `.noindex` name and the scan counts it as such) right up until cargo — unpointed —
-/// recreates a real, INDEXED `target/`, after which every later pass refuses forever
-/// ("already exists and is never merged into") and the doctor's counts never clear. The
-/// user needs the sentence BEFORE that build, not after it.
-///
-/// NARROW, so a healthy tree is never accused. [`plan_repo_config`] is asked what the
-/// pointer edit WOULD be — it plans and writes nothing — and only a `Write` is this
-/// case: cargo is not aimed at the migrated directory at all. A `Leave` is an existing
-/// `target-dir` that names something else, which covers BOTH the repo this pass already
-/// migrated (whose value IS the `.noindex` name) and the repo that deliberately builds
-/// on another disk — cargo never used this directory, so nothing is wedged. An `Err` is
-/// a config that could not be pointed even when asked (a legacy `.cargo/config` cargo
-/// reads first, an unreadable or unparseable file); what it describes is a different
-/// problem, and guessing here would put a failure on a tree whose cargo may be aimed
-/// perfectly well.
-fn wedged_config_migration(
+/// NARROW, so a healthy or foreign tree is never touched: only a plan that WRITES a
+/// pointer into a file holding none is the wedge. Everything else is somebody's decision —
+/// [`RepoConfig::Leave`] is a tree already pointed (at this directory, or deliberately at
+/// another disk), an `Err` plan a config this pass may not edit, and an existing
+/// `target-dir` a build the user aimed — so those stay as the reporting-only pass left
+/// them, silent or named ([`wedged_config_migration`]).
+fn repair_config_migration(
     repo: &Path,
     original: &Path,
     dir: &Path,
     config: &Path,
+    dry_run: bool,
 ) -> Option<Applied> {
-    if !matches!(
-        plan_repo_config(repo, original, dir),
-        Ok(RepoConfig::Write { .. })
+    // Only a `Write` plan is a half-done migration at all: `Leave` is a tree cargo is
+    // already pointed somewhere for, and `Err` one whose config cannot be edited safely.
+    // Both are left in the silence the reporting-only pass left them in.
+    let plan = match plan_repo_config(repo, original, dir) {
+        Ok(plan @ RepoConfig::Write { .. }) => plan,
+        _ => return None,
+    };
+    // A `target-dir` already in the file is a pointer the user set, and writing over it
+    // would re-aim their build — that shape is named, never finished.
+    if matches!(
+        plan,
+        RepoConfig::Write {
+            rewritten: true,
+            ..
+        }
     ) {
-        return None;
+        return Some(wedged_config_migration(repo, original, dir, config));
     }
-    Some(Applied::Failed {
+    if dry_run {
+        return Some(Applied::Skipped {
+            path: original.to_path_buf(),
+            reason: format!(
+                "a migration was interrupted before anything pointed cargo at {} — a pass \
+                 would write that pointer into {}",
+                dir.display(),
+                config.display()
+            ),
+        });
+    }
+    match write_repo_config(repo, plan) {
+        // The rename happened before the kill and this pass did the missing half, so the
+        // row is the one an uninterrupted migration reports.
+        Ok(note) => Some(Applied::Migrated {
+            from: original.to_path_buf(),
+            to: dir.to_path_buf(),
+            config: note,
+        }),
+        Err(why) => Some(Applied::Failed {
+            path: original.to_path_buf(),
+            reason: format!(
+                "a migration was interrupted before anything pointed cargo at {}, and \
+                 writing that pointer failed: {why} — point cargo at the migrated \
+                 directory yourself ([build] target-dir = \"{}\" in {}), or remove or \
+                 rename {}, then re-run.",
+                dir.display(),
+                target_dir_value(repo, dir),
+                config.display(),
+                dir.display(),
+            ),
+        }),
+    }
+}
+
+/// The one half-done migration this pass may not finish, named: a config-pointed tree
+/// whose `.cargo/config.toml` ALREADY sets `target-dir`, at the name the rename took
+/// away. Writing the interrupted pass's pointer over it would re-aim a build the user
+/// chose, so [`repair_config_migration`] stops here and says so instead.
+///
+/// An [`Applied::Failed`], not an [`Applied::Skipped`]: a skip resolves itself on a later
+/// pass, this never does, and the user needs the sentence before the next build recreates a
+/// real, indexed `target/`.
+fn wedged_config_migration(repo: &Path, original: &Path, dir: &Path, config: &Path) -> Applied {
+    Applied::Failed {
         path: original.to_path_buf(),
         reason: format!(
             "a migration was interrupted between the rename and the config edit: {} holds \
-             this repo's build output and nothing points cargo at it, so the next build \
-             recreates {} and Spotlight indexes it. Re-pointing cargo is not this pass's \
-             to do — point it at the migrated directory yourself ([build] target-dir = \
-             \"{}\" in {}), or remove or rename {}, then re-run.",
+             this repo's build output while {} still points cargo at {}, so the next build \
+             recreates it and Spotlight indexes it. Overwriting a target-dir you set is not \
+             this pass's to do — point it at the migrated directory yourself ([build] \
+             target-dir = \"{}\" in {}), or remove or rename {}, then re-run.",
             dir.display(),
+            config.display(),
             original.display(),
             target_dir_value(repo, dir),
             config.display(),
             dir.display(),
         ),
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2038,11 +2062,8 @@ impl Timing {
     }
 }
 
-/// The refinement for a control file that never arrived, from what `mdutil -s` said
-/// about the volume: the switch is [`Unmeasured::IndexingDisabled`], the read-only hold
-/// is [`Unmeasured::IndexReadOnly`] (2026-09-16), and an enabled or unreadable index
-/// refines nothing — the plain "still not indexed" sentence stands. Pure, so the
-/// three arms are pinned by a table rather than by a run against the machine.
+/// The refinement for a control file that never arrived: the switch is
+/// [`Unmeasured::IndexingDisabled`], the read-only hold [`Unmeasured::IndexReadOnly`].
 fn refine_unindexed(
     state: Option<crate::platform::IndexState>,
     scope: &Path,
@@ -2068,10 +2089,8 @@ pub enum Unmeasured {
     /// `mdutil -s` says indexing is off for this volume. A refinement of the message only —
     /// the verdict is `Unknown` either way.
     IndexingDisabled(PathBuf),
-    /// `mdutil -s` says the volume's index is READ-ONLY (2026-09-16): mds holds it so
-    /// while the volume is low on space, and it takes no new entries until the hold
-    /// lifts — so a planted probe never arrives, as under the switch, but nothing about
-    /// the directory was decided. A refinement of the message only.
+    /// `mdutil -s` says the volume's index is read-only: a planted probe never arrives, as
+    /// under the switch, but nothing about the directory was decided. Message only.
     IndexReadOnly(PathBuf),
     /// `dir` has no parent, so there is nowhere to plant a same-volume control.
     NoParent(PathBuf),
@@ -3032,14 +3051,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A REFUSAL IS THE ANSWER WHATEVER ELSE THE PASS MEASURES, so `apply_one` asks for it
-    /// first. A directory `migrate` refuses — here the commonest one, a `.noindex` name
-    /// already taken — cannot be turned into a migration by a lock that frees or an ignore
-    /// rule that moves, and the two probes it used to pay before hearing that are the
-    /// expensive ones: `build_in_progress` `flock(2)`s up to three paths and the git answer
-    /// SPAWNS `git check-ignore`, over every target dir in a home directory, six-hourly.
-    /// The refusal is the more honest report too — it is exactly what the pass said the
-    /// moment the build finished, rather than a transient "a build holds …" skip.
+    /// A refusal is the answer whatever else the pass measures, so `apply_one` asks for it
+    /// first: a directory `migrate` refuses cannot become a migration when a lock frees or an
+    /// ignore rule moves, and the probes it would otherwise pay first are the expensive ones
+    /// (`flock(2)` on three paths and a spawned `git check-ignore`, per target dir, six-hourly).
     #[cfg(unix)]
     #[test]
     fn apply_one_answers_a_refusal_before_the_lock_and_git_probes() {
@@ -3078,7 +3093,7 @@ mod tests {
         drop(held);
 
         // The idempotent case answers at once for the same reason: a tree an earlier pass
-        // already migrated is a SUCCESS, whatever is building inside it.
+        // already migrated is a success, whatever is building inside it.
         let done = root.join("done");
         std::fs::create_dir_all(done.join(".git")).unwrap();
         std::fs::write(done.join("Cargo.toml"), "[package]\nname = \"y\"\n").unwrap();
@@ -3994,8 +4009,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The repair is NARROW. A `.noindex` dir whose sibling exists is not this case; a
-    /// tree that is not a git checkout points cargo by config and must not grow a link.
+    /// The repair is NARROW, and it is the RIGHT repair for each tree. A `.noindex` dir
+    /// whose sibling exists is not this case at all; a tree that is not a git checkout
+    /// points cargo by config, so it is finished by writing that pointer and must still
+    /// never grow a link.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_relink_repair_touches_nothing_else() {
@@ -4013,42 +4030,55 @@ mod tests {
         std::os::unix::fs::symlink("target.noindex", linked.join("target")).unwrap();
 
         let (outcomes, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        // (a) is repaired, and (b) is whole already — so exactly one repair, and it is (a).
+        let migrated: Vec<&Applied> = outcomes.iter().filter(|o| o.migrated()).collect();
         assert_eq!(
-            outcomes.iter().filter(|o| o.migrated()).count(),
-            0,
-            "nothing to repair here: {outcomes:?}"
+            migrated.len(),
+            1,
+            "only (a) has a repair to make: {outcomes:?}"
         );
+        assert_eq!(migrated[0].path(), plain.join("target"), "{outcomes:?}");
+        // THE RULING: (a) is repaired by its POINTER. A link is what a git checkout gets,
+        // and a config-pointed tree must never grow one.
         assert!(
             std::fs::symlink_metadata(plain.join("target")).is_err(),
             "a config-pointed tree grew a link it does not want"
         );
+        assert_eq!(
+            std::fs::read_to_string(plain.join(".cargo/config.toml")).unwrap(),
+            "[build]\ntarget-dir = \"target.noindex\"\n",
+            "the interrupted migration's pointer was not written: {outcomes:?}"
+        );
+        assert_eq!(
+            std::fs::read_link(linked.join("target")).unwrap(),
+            Path::new("target.noindex"),
+            "(b)'s link moved"
+        );
+        assert!(
+            !linked.join(".cargo").exists(),
+            "(b) grew a config it does not want"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// THE HALF-MIGRATED CONFIG-POINTED REPO IS NAMED, NOT PASSED OVER IN SILENCE.
-    ///
-    /// The kill that `a_half_finished_migration_is_relinked_by_the_next_pass` repairs in
-    /// a git checkout is UNREPAIRABLE here: the repair is a link, and a config-pointed
-    /// tree must not grow one (`the_relink_repair_touches_nothing_else`), while writing
-    /// the `.cargo/config.toml` that was never written would re-point cargo for every
-    /// invocation in that tree — the act 803628296 exists to have stopped doing. So the
-    /// one safe thing left is to SAY SO, before the next build locks the wedge in.
-    ///
-    /// Until this, pass 1 produced ZERO outcomes for such a repo: nothing repaired it
-    /// and nothing reported it. The user then built, cargo — unpointed — recreated a
-    /// real `target/`, Spotlight indexed it (the exact harm this module exists to
-    /// prevent), and every later pass answered the same refusal forever while the
-    /// doctor's exposed/hidden counts never cleared.
+    /// A HALF-MIGRATED CONFIG-POINTED REPO IS FINISHED BY PASS 1. The kill that
+    /// `a_half_finished_migration_is_relinked_by_the_next_pass` repairs in a git checkout
+    /// lands here as a renamed directory nothing points cargo at, and the repair is the
+    /// pointer the interrupted pass was about to write — never a link, which such a tree
+    /// must not grow (`the_relink_repair_touches_nothing_else`). Every shape that is NOT
+    /// that wedge is left exactly as it was: already pointed, pointed at another disk, a
+    /// git checkout, not yet migrated, and a `target-dir` the user set (named, not
+    /// overwritten).
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_half_migrated_config_repo_is_named_by_the_pass() {
+    fn a_half_migrated_config_repo_is_finished_by_the_pass() {
         let root = scratch("wedged-config");
-        // (a) THE WEDGE: renamed, and the config was never written.
+        // (a) The wedge: renamed, and the config was never written.
         let wedged = root.join("wedged");
         std::fs::create_dir_all(&wedged).unwrap();
         std::fs::write(wedged.join("Cargo.toml"), b"[package]\nname='x'\n").unwrap();
         tagged_target(&wedged.join("target.noindex"));
-        // (b) HEALTHY, already migrated: the config names the migrated directory, and
+        // (b) Healthy, already migrated: the config names the migrated directory, and
         // there is no `target` beside it because a config-pointed tree never grows one.
         let pointed = root.join("pointed");
         std::fs::create_dir_all(pointed.join(".cargo")).unwrap();
@@ -4059,56 +4089,109 @@ mod tests {
         )
         .unwrap();
         tagged_target(&pointed.join("target.noindex"));
-        // (c) HEALTHY git checkout, already migrated: the link stands where the dir was.
+        // (c) Healthy git checkout, already migrated: the link stands where the dir was.
         let git = root.join("git");
         std::fs::create_dir_all(git.join(".git")).unwrap();
         std::fs::write(git.join("Cargo.toml"), b"[package]\nname='z'\n").unwrap();
         tagged_target(&git.join("target.noindex"));
         std::os::unix::fs::symlink("target.noindex", git.join("target")).unwrap();
-        // (d) HEALTHY config repo, NOT yet migrated: the ordinary path, which must still
+        // (d) Healthy config repo, not yet migrated: the ordinary path, which must still
         // migrate and still write the config it is allowed to write.
         let fresh = root.join("fresh");
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::write(fresh.join("Cargo.toml"), b"[package]\nname='w'\n").unwrap();
         tagged_target(&fresh.join("target"));
+        // (e) Pointed at another disk on purpose: the migrated directory was never the one
+        // cargo used, so there is no interrupted migration here to finish.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(".cargo")).unwrap();
+        std::fs::write(elsewhere.join("Cargo.toml"), b"[package]\nname='v'\n").unwrap();
+        std::fs::write(
+            elsewhere.join(".cargo/config.toml"),
+            b"[build]\ntarget-dir = \"/Volumes/build/v\"\n",
+        )
+        .unwrap();
+        tagged_target(&elsewhere.join("target.noindex"));
+        // (f) A `target-dir` the user set, naming the old directory: finishing over it
+        // would re-aim a build they chose, so this one is still only NAMED.
+        let owned = root.join("owned");
+        std::fs::create_dir_all(owned.join(".cargo")).unwrap();
+        std::fs::write(owned.join("Cargo.toml"), b"[package]\nname='u'\n").unwrap();
+        std::fs::write(
+            owned.join(".cargo/config.toml"),
+            b"[build]\ntarget-dir = \"target\"\n",
+        )
+        .unwrap();
+        tagged_target(&owned.join("target.noindex"));
 
         let (outcomes, complete) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
         assert!(complete);
-        // ONE report, and it is the wedge — a FAILURE, the vocabulary the window's
-        // `machine settings failed —` line and the verb's exit code already key on.
-        let failures: Vec<(&Path, &str)> = outcomes.iter().filter_map(Applied::failure).collect();
+
+        // (a) IS REPAIRED, and it reports the row an uninterrupted migration reports.
+        let migrated: Vec<&Applied> = outcomes.iter().filter(|o| o.migrated()).collect();
+        assert_eq!(migrated.len(), 2, "(a) and (d) migrate: {outcomes:?}");
+        let repaired = migrated
+            .iter()
+            .find(|o| o.path() == wedged.join("target"))
+            .unwrap_or_else(|| panic!("the wedge was not repaired: {outcomes:?}"));
         assert_eq!(
-            failures.len(),
-            1,
-            "pass 1 names the half-migrated config repo: {outcomes:?}"
+            **repaired,
+            Applied::Migrated {
+                from: wedged.join("target"),
+                to: wedged.join("target.noindex"),
+                config: ConfigNote::Written(wedged.join(".cargo/config.toml")),
+            },
+            "{outcomes:?}"
         );
-        let (path, reason) = failures[0];
-        assert_eq!(path, wedged.join("target"), "{outcomes:?}");
-        // It names BOTH paths and what to do about either of them.
-        let orphan = wedged.join("target.noindex").display().to_string();
-        assert!(reason.contains(&orphan), "{reason}");
-        assert!(
-            reason.contains(&wedged.join("target").display().to_string()),
-            "{reason}"
+        assert_eq!(
+            std::fs::read_to_string(wedged.join(".cargo/config.toml")).unwrap(),
+            "[build]\ntarget-dir = \"target.noindex\"\n",
+            "the pointer the interrupted migration was about to write"
         );
-        assert!(reason.contains("target-dir"), "{reason}");
-        assert!(reason.contains("remove or rename"), "{reason}");
-        // AND IT WROTE NOTHING. No config into a tree that never had one, no link, and
-        // the orphaned cache exactly where it was.
-        assert!(
-            !wedged.join(".cargo").exists(),
-            "a config was written into a tree that never had one"
-        );
+        // The repair is the pointer alone: no link, and nothing moved or removed.
         assert!(
             std::fs::symlink_metadata(wedged.join("target")).is_err(),
             "a config-pointed tree grew a link it does not want"
         );
         assert!(wedged.join("target.noindex").is_dir(), "the orphan moved");
-        // The two already-migrated repos are untouched and unreported.
+
+        // Idempotent: the second pass reads it as already pointed and does nothing.
+        let (again, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        assert_eq!(
+            again
+                .iter()
+                .filter(|o| o.path().starts_with(&wedged))
+                .count(),
+            0,
+            "the repaired tree is reported again: {again:?}"
+        );
+
+        // (f) is the one shape that is still only named — a failure, the vocabulary the
+        // window's `machine settings failed —` line and the verb's exit code key on.
+        let failures: Vec<(&Path, &str)> = outcomes.iter().filter_map(Applied::failure).collect();
+        assert_eq!(failures.len(), 1, "only (f) is named: {outcomes:?}");
+        let (path, reason) = failures[0];
+        assert_eq!(path, owned.join("target"), "{outcomes:?}");
         assert!(
-            std::fs::read_to_string(pointed.join(".cargo/config.toml"))
-                .unwrap()
-                .contains("target-dir = \"target.noindex\""),
+            reason.contains(&owned.join("target.noindex").display().to_string()),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&owned.join("target").display().to_string()),
+            "{reason}"
+        );
+        assert!(reason.contains("target-dir"), "{reason}");
+        assert!(reason.contains("remove or rename"), "{reason}");
+        assert_eq!(
+            std::fs::read_to_string(owned.join(".cargo/config.toml")).unwrap(),
+            "[build]\ntarget-dir = \"target\"\n",
+            "a target-dir the user set was overwritten"
+        );
+
+        // (b), (c) and (e) are untouched and unreported.
+        assert_eq!(
+            std::fs::read_to_string(pointed.join(".cargo/config.toml")).unwrap(),
+            "[build]\ntarget-dir = \"target.noindex\"\n",
             "the healthy config was rewritten"
         );
         assert!(
@@ -4120,10 +4203,30 @@ mod tests {
             Path::new("target.noindex"),
             "the healthy git checkout's link moved"
         );
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join(".cargo/config.toml")).unwrap(),
+            "[build]\ntarget-dir = \"/Volumes/build/v\"\n",
+            "a config pointing at another disk was rewritten"
+        );
+        assert!(
+            std::fs::symlink_metadata(elsewhere.join("target")).is_err(),
+            "the tree pointed at another disk grew a link"
+        );
+        for tree in [&pointed, &git, &elsewhere] {
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(
+                        |o| o.path().starts_with(tree) && (o.migrated() || o.failure().is_some())
+                    )
+                    .count(),
+                0,
+                "{} was reported: {outcomes:?}",
+                tree.display()
+            );
+        }
+
         // And the ordinary config migration still happens, config and all.
-        let migrated: Vec<&Applied> = outcomes.iter().filter(|o| o.migrated()).collect();
-        assert_eq!(migrated.len(), 1, "{outcomes:?}");
-        assert_eq!(migrated[0].path(), fresh.join("target"), "{outcomes:?}");
         assert!(fresh.join("target.noindex").is_dir());
         assert!(
             std::fs::read_to_string(fresh.join(".cargo/config.toml"))
@@ -4134,9 +4237,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The read-only refinement's sentence (2026-09-16): it names the hold, says what
-    /// lifts it, and tells the reader migrating meanwhile is safe — never "nothing needs
-    /// migrating there", which is the switch's sentence and would be false here.
+    /// The read-only refinement's sentence names the hold, says what lifts it, and says
+    /// migrating meanwhile is safe — never the switch's "nothing needs migrating there".
     #[test]
     fn the_unindexed_refinement_maps_each_volume_state() {
         use crate::platform::IndexState;

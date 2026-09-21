@@ -1050,23 +1050,15 @@ pin = {{ trust = 7100, nn = 108 }}
         );
     }
 
-    /// THE SET A PUBLISHER MUST CARRY: over every triple an index names, the builds
-    /// clients resolve are `pin` UNION every `pin_by_target` overlay — never one of the
-    /// two, and never one target's view.
+    /// The set a publisher must carry: over every triple an index names, the builds clients
+    /// resolve are `pin` union every `pin_by_target` overlay, never one of the two. This is the
+    /// law behind `atpkg_index_pin_union` (tools/atpkg-publish-lib.sh), which the public
+    /// mirror's work list derives from; reading `pin` alone leaves a toolchain that publishes
+    /// entirely as an overlay pinned but never mirrored. Both halves below make it necessary:
     ///
-    /// This is the law tools/atpkg-mirror-public.sh's work list is derived from
-    /// (`atpkg_index_pin_union`, tools/atpkg-publish-lib.sh). The mirror read the `pin`
-    /// line alone until 2026-09-16, so a toolchain sealed on a triple that does not own
-    /// `pin` — which publishes ENTIRELY as an overlay, by
-    /// tools/atpkg-publish-rustc-group.sh's design — was signed into the staging registry,
-    /// pinned by a PUBLIC index, and then never mirrored: every client on that triple
-    /// asked the public owner for a release that is not there. The two halves below are
-    /// exactly what makes a union necessary, and a change to either invalidates that
-    /// reader:
-    ///
-    ///   * an overlay build is resolvable and appears in NO `pin` row (so `pin` alone is
+    ///   * an overlay build is resolvable and appears in no `pin` row (so `pin` alone is
     ///     not enough), and
-    ///   * the `pin` build an overlay MASKS is still resolvable from every other triple
+    ///   * the `pin` build an overlay masks is still resolvable from every other triple
     ///     (so the overlays alone are not enough, and a masked build may never be dropped).
     #[test]
     fn the_builds_clients_resolve_are_pin_union_every_overlay() {

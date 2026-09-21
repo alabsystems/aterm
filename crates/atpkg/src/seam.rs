@@ -20,18 +20,15 @@
 //! 2,428 differing bytes, every one inside the signature). tippy refused a correct
 //! toolchain on that proof. The store is also content-addressed (`aterm pkg verify`),
 //! so nothing may be laid inside a build after it is staged. The view answers both:
-//! `<prefix>/rustup/<name>/bin/` holds a copy-on-write CLONE ([`crate::clone`]) of each
+//! `<prefix>/rustup/<name>/bin/` holds a copy-on-write clone ([`crate::clone`]) of each
 //! tool in `store/trust/current/bin/` under its own name, plus each stock name as a clone
-//! of its Trust tool ([`STOCK_NAMES`]) — byte-identical to it, nothing to authenticate,
-//! nothing of the store written: not a byte, not a link count, not a ctime — and `lib/`,
-//! `libexec/`, `share/`, `etc/` cloned the same way, every regular file a clone, every
-//! symlink recreated, so the view is a complete sysroot and every frontend read from it
-//! answers the VIEW as its sysroot. It used to be a HARD-LINK mirror of the store's own
-//! inodes, and every link and unlink moved a live store inode (the owner, 2026-09-16:
-//! *"doing that with hardlinks sounds like bugs and indeed: bugs"* — the defects are in
-//! [`crate::clone`]'s doc). The untracked lane still builds it ([`refresh_view`]): a file
-//! a provenance-tracked process creates is tagged, and a toolchain run from tagged files
-//! tags what it writes. That last clause is why they are mirrored and not symlinked:
+//! of its Trust tool ([`STOCK_NAMES`]) — byte-identical, nothing to authenticate, nothing
+//! of the store written. `lib/`, `libexec/`, `share/` and `etc/` are cloned the same way,
+//! every symlink recreated, so the view is a complete sysroot and every frontend read from
+//! it answers the view as its sysroot. Clones, not hard links, for the reasons in
+//! [`crate::clone`]'s doc. The untracked lane still builds it ([`refresh_view`]): a file a
+//! provenance-tracked process creates is tagged, and a toolchain run from tagged files tags
+//! what it writes. Mirrored and not symlinked because
 //! rustc finds its sysroot through the real path of the driver dylib it loaded, so a
 //! symlinked `lib/` made `rustc --print sysroot` answer the STORE, and every script
 //! that finds the frontends beside that answer (`$(rustc --print sysroot)/bin/targo`,
@@ -39,10 +36,9 @@
 //! measured 2026-09-15, the day the symlink form shipped. It is CHECKED by every
 //! attach and every re-assertion and REBUILT only when it no longer matches
 //! ([`refresh_view`], [`view_matches`]), so it follows `current` across updates and
-//! rollbacks without touching a live view file when nothing moved — tippy pins its
-//! own executable's and its siblings' link count and ctime, and the rebuild-every-call
-//! form aborted every tippy in flight at each repair or update pass (measured
-//! 2026-09-15).
+//! rollbacks without touching a live view file when nothing moved — tippy pins its own
+//! executable's and its siblings' link count and ctime, so rebuilding on every call aborts
+//! every tippy in flight.
 //!
 //! The installed bundles 8571, 8589, 8590 and 8595 predate the Trust-names-only
 //! distribution and still ship `bin/rustc` (and `bin/cargo`) as separate copies, which
@@ -51,31 +47,17 @@
 //! [`crate::compat`]: a per-build exec root laid by the same construction
 //! ([`lay_view`]) and reached through a guard line in the `bin/` shims.
 //!
-//! WHEN TRUST IS DEV-LINKED, THE VIEW PRESENTS THE CHECKOUT (2026-09-16). `aterm pkg
-//! link trust <checkout>` puts the checkout's tools on PATH and every other surface
-//! reads the link as the newer decision that outranks the store — `which`, `list`,
-//! doctor — but the seam kept building its view from `store/trust/current`, so
-//! `cargo +trust`, `rustup run trust` and every repo pinning `channel = "trust"` ran
-//! the INSTALLED compiler while `targo` on PATH ran the checkout's: two compilers
-//! under one name, doctor calling the seam healthy (2026-09-15 audit). Now
-//! [`view_source`] asks the link marker first: a dev-linked trust whose checkout is a
-//! sysroot (a `bin/` and a `lib/`) is what the view presents — `bin/` one EXEC STUB
-//! per tool (the `bin/` shim body, [`crate::platform::install_shim_to`]: a `/bin/sh`
-//! line that `exec`s `<checkout>/bin/<tool>`) plus the stock names as stubs to their
-//! Trust tools, and the mirrored directories as directory SYMLINKS to the checkout's.
-//! Stubs, not symlinks, for `bin/`: targo and tippy refuse to run when the executable
-//! the OS reports for them is a symlink (measured — see that function's doc; on macOS
-//! `current_exe()` names the link, not its target), and a stub's `exec` makes the
-//! process image the checkout's plain file at its real path, beside its real siblings.
-//! Not hard links: a dev tree is rebuilt in place, and a hard link to a file the build
-//! replaces goes stale silently, while a stub names the path and runs whatever stands
-//! there. The checkout is not the sealed store, so nothing about content-addressing
-//! applies, and `rustc --print sysroot` through a linked `lib/` answers the CHECKOUT,
-//! which is the truth for every script that finds the frontends beside that answer.
-//! `link` and `unlink` re-assert the seam themselves, so the view follows the decision
-//! the moment it is made, and `unlink` returns the store's clone view. A dev-linked
-//! trust whose checkout is not a sysroot is refused and recorded, the view left as it
-//! stands — rustup cannot present a cargo project's `target/release`.
+//! When trust is dev-linked, the view presents the checkout. The link outranks the store
+//! everywhere else, so a seam still building from `store/trust/current` would run the
+//! installed compiler for `cargo +trust`, `rustup run trust` and every repo pinning
+//! `channel = "trust"` — two compilers under one name. [`view_source`] therefore asks the
+//! link marker first: a checkout that is a sysroot (a `bin/` and a `lib/`) is what the view
+//! presents, `bin/` one exec stub per tool ([`crate::platform::install_shim_to`]) plus the
+//! stock names, and the mirrored directories as symlinks to the checkout's. Stubs, because
+//! targo and tippy refuse to run when the OS reports their executable as a symlink; not
+//! hard links, because a dev tree is rebuilt in place and a hard link to a replaced file
+//! goes stale silently. `link` and `unlink` re-assert the seam themselves, and a checkout
+//! that is not a sysroot is refused and recorded, the view left as it stands.
 //!
 //! The rules, all fail-closed:
 //!
@@ -94,7 +76,7 @@
 //! * A view that already matches its build is left untouched. One that does not has
 //!   each part that differs — a mirrored directory, or `bin/` — built beside the live one
 //!   and swapped in by `rename(2)`, and the parts that still match are not re-laid. A
-//!   clone that cannot be made (the store on another volume) REFUSES the attach: atpkg
+//!   clone that cannot be made (the store on another volume) refuses the attach: atpkg
 //!   never byte-copies a toolchain in place of a clone.
 //! * A successful attach is RECORDED in `status.toml` as `seams = ["rustup:trust"]`
 //!   (load, modify, save through the atomic writer — other fields are never clobbered).
@@ -249,13 +231,13 @@ pub const STOCK_NAMES: &[(&str, &str)] = &[
     ("rustdoc", "trustdoc"),
 ];
 
-/// The directories beside `bin/` a sysroot is read through, CLONED into the view
+/// The directories beside `bin/` a sysroot is read through, cloned into the view
 /// (file by file, not a directory symlink — see the module doc) so a tool run from it
 /// finds its own `lib/rustlib`, `libexec/` helpers and `share/` docs, and reports the
 /// view as its sysroot.
 const VIEW_DIRS: &[&str] = &["lib", "libexec", "share", "etc"];
 
-/// Mirror `src` at `dst`: directories created, regular files CLONED
+/// Mirror `src` at `dst`: directories created, regular files cloned
 /// ([`crate::clone::clone_file`]), symlinks recreated with the same target, anything else
 /// skipped. `dst` must not exist.
 fn mirror_tree(layout: &Layout, src: &Path, dst: &Path) -> io::Result<()> {
@@ -305,11 +287,10 @@ pub struct Refreshed {
 /// the same construction under another name — against the build it was laid from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Depth {
-    /// `bin/`'s whole name -> file map (every tool a clone of the store's, every stock
-    /// name a clone of its Trust tool, nothing extra), the mirrored directories present
-    /// as real directories, and the regular files directly in `lib/` — the driver dylibs
-    /// every frontend loads — clones of the store's. A few dozen `lstat`s: cheap enough
-    /// for every update pass.
+    /// `bin/`'s whole name -> file map (every tool a clone of the store's, every stock name
+    /// a clone of its Trust tool, nothing extra), the mirrored directories present as real
+    /// directories, and the regular files directly in `lib/` — the driver dylibs every
+    /// frontend loads — clones of the store's. A few dozen `lstat`s.
     Shallow,
     /// Everything [`Depth::Shallow`] checks, and every entry under the mirrored
     /// directories: each regular file a clone of the store's, each symlink the same target,
@@ -365,11 +346,10 @@ fn bin_plan(src_bin: &Path) -> io::Result<BinPlan> {
 }
 
 /// Lay a view's `bin/` at `dst_bin` (created here; it must not hold entries yet) from the
-/// build's `bin/` at `src_bin`: one clone per [`BinPlan`] entry, so each tool is a clone
-/// of the store's file and each stock name a clone of its Trust tool — byte-identical to
-/// it, which is what bundle 8595's tippy asks of a `rustc` beside its `trustc`. A
-/// stock-name copy the bundle shipped is never cloned at all. Returns the tool count and
-/// the stock names laid.
+/// build's `bin/` at `src_bin`: one clone per [`BinPlan`] entry, so each tool is a clone of
+/// the store's file and each stock name a clone of its Trust tool — byte-identical to it,
+/// which is what bundle 8595's tippy asks of a `rustc` beside its `trustc`. A stock-name
+/// copy the bundle shipped is never cloned. Returns the tool count and the stock names.
 ///
 /// # Errors
 /// The build's `bin/` cannot be listed, or a clone cannot be made — the store on another
@@ -392,10 +372,9 @@ fn lay_bin(
 /// [`lay_bin`]. The one construction a rustup view and a [`crate::compat`] exec root
 /// share; the caller owns the name it lays at (a dot-temp it renames into place).
 ///
-/// `bin/` LAST, on purpose: a lay that fails under `lib/` (an unreadable entry, a clone
+/// `bin/` last, on purpose: a lay that fails under `lib/` (an unreadable entry, a clone
 /// refused) returns before a single tool was laid, so a half-built tree never presents a
-/// runnable frontend. (Under the hard-link construction this order was also what kept a
-/// failing retry from moving the store inodes tippy pins; a clone moves none.)
+/// runnable frontend.
 ///
 /// # Errors
 /// `dest` already exists, or anything [`lay_bin`] and [`mirror_tree`] refuse. A partial
@@ -480,7 +459,7 @@ pub(crate) fn first_mismatch(build: &Path, view: &Path, depth: Depth) -> Option<
 /// build's `bin/`, every entry a clone of its store file. `bin/` is judged apart from the
 /// mirrored directories so a rebuild can leave a `bin/` that still matches alone — its
 /// entries are the files tippy pins. A hard link to the store (the construction before
-/// clones) is NOT a match, so a view laid that way is rebuilt once.
+/// clones) is not a match, so a view laid that way is rebuilt once.
 #[cfg(unix)]
 pub(crate) fn bin_mismatch(build: &Path, view: &Path) -> Option<PathBuf> {
     let view_bin = view.join("bin");
@@ -510,11 +489,10 @@ pub(crate) fn bin_mismatch(build: &Path, view: &Path) -> Option<PathBuf> {
 }
 
 /// [`Depth::Deep`]'s byte check over the stock names: each of [`STOCK_NAMES`] the view
-/// presents must hold its Trust tool's BYTES. The attribute identity cannot see the one
+/// presents must hold its Trust tool's bytes. The attribute identity cannot see the one
 /// wrong answer that matters — bundle 8595's separately signed `bin/rustc` has `trustc`'s
-/// length, mode and time and 2,428 different bytes, and it is exactly the file the view
-/// exists not to present (its tippy refuses it). Three files, about 38 MB on 8595, read
-/// only at [`Depth::Deep`].
+/// length, mode and time and different bytes, and it is exactly the file the view exists
+/// not to present. Read only at [`Depth::Deep`].
 #[cfg(unix)]
 pub(crate) fn stock_bytes_mismatch(build: &Path, view: &Path) -> Option<PathBuf> {
     for (public, trust) in STOCK_NAMES {
@@ -572,15 +550,13 @@ fn dir_mismatch(build: &Path, view: &Path, dir: &str, depth: Depth) -> Option<Pa
 
 /// `lstat` says a real directory — a symlink to one is not.
 ///
-/// NOT Unix-gated, and that is load-bearing: [`crate::compat::ensure_root_with`] asks it on
-/// every target (its untracked-lane `Allow` arm, which decides whether a root already STANDS)
-/// and carries no `cfg` of its own, so a `#[cfg(unix)]` here left `atpkg` failing to compile
-/// for `x86_64-pc-windows-msvc` with E0425 — the `win` cell's own triple, measured
-/// 2026-09-16. The body means the same sentence on every target: `symlink_metadata` does not
-/// follow a Windows reparse point either, and a junction or a directory symlink answers
-/// `is_symlink()`, never `is_dir()`. A `#[cfg(not(unix))]` twin returning `false` would have
-/// compiled and been WRONG — it makes the "the root that stands is kept" branch unreachable
-/// off Unix. `crates/atpkg/tests/platform_cfg_parity.rs` is the standing guard for the class.
+/// Not Unix-gated, and that is load-bearing: [`crate::compat::ensure_root_with`] asks it on
+/// every target and carries no `cfg` of its own, so a `#[cfg(unix)]` here fails to compile
+/// for `x86_64-pc-windows-msvc`. The body means the same sentence everywhere:
+/// `symlink_metadata` does not follow a Windows reparse point either, and a junction or a
+/// directory symlink answers `is_symlink()`, never `is_dir()` — so a `not(unix)` twin
+/// returning `false` would compile and be wrong, making "the root that stands is kept"
+/// unreachable off Unix. Pinned by `crates/atpkg/tests/platform_cfg_parity.rs`.
 pub(crate) fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
@@ -671,13 +647,12 @@ fn tree_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
 pub const HIDDEN_VERB: &str = "__refresh-view";
 
 /// First line of a spec file — a version stamp, so a stale copy of this binary never
-/// misreads a newer spec. `v2` (2026-09-16): the job lays CLONES; a helper binary from
-/// before that would lay hard links the clone identity rejects on every pass, so it must
-/// refuse the spec instead.
+/// misreads a newer spec. `v2`: the job lays clones; an older helper binary would lay hard
+/// links the clone identity rejects on every pass, so it must refuse the spec instead.
 const SPEC_HEADER: &str = "atpkg-view-spec v2";
 
 /// What the view helper is asked to lay: the rustup view for a seam name, or a trust
-/// build's EXEC ROOT ([`crate::compat`]) — the same clone construction, so the same lane:
+/// build's exec root ([`crate::compat`]) — the same clone construction, so the same lane:
 /// the files it creates must not carry a tracked process's provenance tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewJob {
@@ -886,14 +861,10 @@ pub fn run_helper(args: &[std::ffi::OsString]) -> std::process::ExitCode {
 /// Build, or rebuild, the view for `name` from `store/trust/current` — through the
 /// UNTRACKED launchd lane when this process is provenance-tracked.
 ///
-/// A FILE A TRACKED PROCESS CREATES IS TAGGED. macOS tags what a provenance-tracked
-/// process writes (`crate::provenance`, measured 2026-09-12), and a toolchain run from
-/// tagged files tags what it writes in turn. The view's first form was a hard-link mirror
-/// built in-process by the app's own `atpkg` (0.86.0, 2026-09-15): a hard link counts as
-/// a write, so it re-tagged every executable of the clean `trust/8595` bundle ITSELF on
-/// the app's first pass (ctime 04:47:16 on all 21 files; `aterm pkg doctor`: "carries
-/// com.apple.provenance on 21 of 21 file(s)"). A clone never writes the store, but the
-/// clone's own new files would carry the tag just the same. So the view is
+/// A file a tracked process creates is tagged. macOS tags what a provenance-tracked
+/// process writes (`crate::provenance`), and a toolchain run from tagged files tags what it
+/// writes in turn. A clone never writes the store, but the clone's own new files would
+/// carry the tag just the same. So the view is
 /// built the way the bundle is staged and the shims are laid: by a launchd job
 /// running this binary (in place, from a clean copy, or from a copy of its whole
 /// bundle — [`crate::stage_helper::plan_helper`]), with the outcome MEASURED on a
@@ -936,12 +907,10 @@ pub fn refresh_view_with(
         // binary, not a failure): in place, as always.
         _ => return refresh_view_in_process(layout, name),
     };
-    // A DEV-LINKED VIEW IS STUBS AND LINKS INTO THE CHECKOUT: laying it writes, renames
-    // and links nothing in the store. This view lane still serves it while a store
-    // build stands — the clone view it takes down is that build's, and the lane's
-    // witness is a file of that build — and cannot when none does (no witness); the
-    // stubs themselves then go through the shim lane inside `lay_executables`, one
-    // untracked job for all of them, exactly as a tracked pass lays every shim.
+    // A dev-linked view is stubs and links into the checkout, so laying it writes nothing
+    // in the store. This lane still serves it while a store build stands (the lane's witness
+    // is a file of that build) and cannot when none does; the stubs then go through the shim
+    // lane inside `lay_executables`, one untracked job for all of them.
     let linked = matches!(view_source(layout), ViewSource::Linked(_));
     if linked && std::fs::symlink_metadata(store_current(layout)).is_err() {
         return refresh_view_in_process(layout, name);
@@ -963,7 +932,7 @@ pub fn refresh_view_with(
             }
             crate::lay::TrackedPolicy::Allow => {
                 // KEEP THE VIEW THAT IS THERE (audit 2026-09-14): an in-process rebuild
-                // lays every file of the view from this tracked process — and so TAGS
+                // lays every file of the view from this tracked process — and so tags
                 // them, and everything the toolchain then writes — to gain a view one
                 // build fresher. A stale view runs the previous compiler until the next pass;
                 // a tagged store cannot cut a release until it is re-seeded. Only when
@@ -1027,9 +996,8 @@ fn existing_view(layout: &Layout, name: &str) -> Option<Refreshed> {
 }
 
 /// Which `store/trust/<build>` a view's `trustc` was laid from — the build whose own
-/// `bin/trustc` it has the length, mode and modification time of: a clone of it, or the
-/// hard link a view laid before clones still is. `None` when no build matches (a view
-/// from a build gc reclaimed).
+/// `bin/trustc` it has the length, mode and modification time of. `None` when no build
+/// matches (a view from a build gc reclaimed).
 #[cfg(unix)]
 fn build_of_view(layout: &Layout, view_trustc: &Path) -> Option<PathBuf> {
     let store = layout.prefix.join("store").join("trust");
@@ -1047,10 +1015,10 @@ fn build_of_view(_layout: &Layout, _view_trustc: &Path) -> Option<PathBuf> {
 }
 
 /// Build the view through an untracked launchd job running `helper` on
-/// [`HIDDEN_VERB`], then MEASURE: the view's clone of a file of the live build's `bin/`
+/// [`HIDDEN_VERB`], then measure: the view's clone of a file of the live build's `bin/`
 /// that is clean must be clean too (a tag on it would be the tag the lane exists to
-/// prevent). `Err(reason)` is "the
-/// lane could not do it"; the caller's policy decides what happens next.
+/// prevent). `Err(reason)` is "the lane could not do it"; the caller's policy decides
+/// what happens next.
 #[cfg(target_os = "macos")]
 fn refresh_view_untracked(helper: &Path, layout: &Layout, name: &str) -> Result<Refreshed, String> {
     let current = store_current(layout);
@@ -1068,10 +1036,10 @@ fn refresh_view_untracked(helper: &Path, layout: &Layout, name: &str) -> Result<
     decode_refreshed(&line)
 }
 
-/// Run one [`ViewJob`] through the untracked launchd lane and MEASURE: the laid clone of a
+/// Run one [`ViewJob`] through the untracked launchd lane and measure: the laid clone of a
 /// clean file of `build`'s `bin/` must not have gained com.apple.provenance (a tag on it
-/// would be the tag the lane exists to prevent). Returns the helper's one result line. `Err(reason)` is "the lane could not
-/// do it"; the caller's policy decides what happens next.
+/// would be the tag the lane exists to prevent). Returns the helper's one result line;
+/// `Err(reason)` is "the lane could not do it", and the caller's policy decides what next.
 #[cfg(target_os = "macos")]
 pub(crate) fn run_view_job(
     helper: &Path,
@@ -1085,13 +1053,10 @@ pub(crate) fn run_view_job(
             helper.display()
         ));
     }
-    // The witness is chosen BEFORE the job: a store file that is clean, whose clone in
-    // the laid tree must be clean after it. A clone copies its source's extended
-    // attributes, so a store file that is already tagged (a bundle seeded in-process
-    // before the lanes existed) proves nothing either way; when none is clean the
-    // measurement is skipped — there is nothing left to protect. A clone that was
-    // already tagged before this job (a view an earlier in-process pass laid) is not this
-    // job's doing either, so the witness asks only for a tag the job ADDED.
+    // The witness is chosen before the job: a store file that is clean, whose clone in the
+    // laid tree must be clean after it. A clone copies its source's extended attributes, so
+    // an already-tagged store file proves nothing either way and the measurement is skipped
+    // when none is clean. The witness asks only for a tag this job added.
     let dest_bin = match job {
         ViewJob::Seam { name } => view_dir(layout, name),
         ViewJob::Root { .. } => crate::compat::trust_build_of(layout, build).map_or_else(
@@ -1175,8 +1140,8 @@ fn refresh_view_untracked(
 /// and `st_ctime` of a live store inode, and tippy's identity guard snapshots exactly
 /// those for its own executable and its siblings (trust `feb929a7ff~1`,
 /// `path_identity.rs`): a link+unlink of `tippy-driver` during a tippy run aborted it
-/// with "changed identity, length, or contents", measured 2026-09-15. Clones no longer
-/// touch the store at all, but a tippy running FROM the view pins the view's own files
+/// with "changed identity, length, or contents". Clones no longer touch the store at all,
+/// but a tippy running from the view pins the view's own files
 /// the same way, so a rebuild still aborts it. A matching view therefore costs only
 /// `lstat`s, and even the view's own directories are not re-created or chmodded.
 ///
@@ -1196,8 +1161,9 @@ fn refresh_view_untracked(
 /// `.DS_Store` Finder left under `share/` re-mirrors `share/` alone), then `bin/`
 /// ([`lay_bin`]) only when [`bin_mismatch`] or the stock-name byte check says it differs
 /// — so a rebuild over a directory beside `bin/` never replaces a `bin/` file a running
-/// tippy pins, and a mirror that fails returns before `bin/` is touched. A build whose `bin/` holds a symlink does not get that entry:
-/// every Trust frontend refuses a symlinked sibling, so the view never presents one.
+/// tippy pins, and a mirror that fails returns before `bin/` is touched. A build whose
+/// `bin/` holds a symlink does not get that entry: every Trust frontend refuses a
+/// symlinked sibling, so the view never presents one.
 ///
 /// # Errors
 /// `store/trust/current` is not a link atpkg can read, `<prefix>/rustup` or the view is
@@ -1205,10 +1171,9 @@ fn refresh_view_untracked(
 /// cannot be made — the last is the store on another volume, and it refuses rather than
 /// byte-copying the toolchain.
 pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refreshed> {
-    // FIRST, before every early return below: the debris a KILLED rebuild left under
-    // another pid. It is not a mismatch (`first_mismatch` ignores it on purpose), so a
-    // view that already matches — the common case, and the one that returns two lines
-    // down — is exactly where an abandoned sysroot's clones would otherwise sit forever.
+    // First, before every early return below: the debris a killed rebuild left under
+    // another pid. It is not a mismatch (`first_mismatch` ignores it on purpose), so a view
+    // that already matches is exactly where an abandoned sysroot's clones would sit forever.
     sweep_view_debris(&view_dir(layout, name));
     #[cfg(unix)]
     if let ViewSource::Linked(checkout) = view_source(layout) {
@@ -1273,11 +1238,10 @@ pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refres
     let staged = view.join(format!(".bin.tmp-{pid}"));
     let _ = std::fs::remove_dir_all(&staged);
     let (tools, stock) = lay_bin(layout, &src_bin, &staged)?;
-    // A live `bin/` that did not match is ALWAYS replaced — even one presenting the same
+    // A live `bin/` that did not match is always replaced, even one presenting the same
     // name -> file map (the hard links a view held before clones, which `bin_mismatch`
-    // rejects precisely so they are retired). `changed` says only whether what the view
-    // presents is different, so a migration that swaps like for like stays silent — and
-    // a stock name whose BYTES were not its Trust tool's is a change, attributes or not.
+    // rejects so they are retired). `changed` says only whether what the view presents is
+    // different, so a migration that swaps like for like stays silent.
     let changed = stock_differed || !same_bin(&live, &staged);
     let old = view.join(format!(".bin.old-{pid}"));
     let _ = std::fs::remove_dir_all(&old);
@@ -1296,13 +1260,11 @@ pub fn refresh_view_in_process(layout: &Layout, name: &str) -> io::Result<Refres
 
 /// Whether `name` is the dot-named scratch a view rebuild makes for itself:
 /// `.<stem>.tmp-<pid>` or `.<stem>.old-<pid>`, where `<stem>` is `bin` or one of
-/// [`VIEW_DIRS`] and `<pid>` a non-empty run of ASCII digits — the PRODUCER's exact
-/// shape, the one [`refresh_view_in_process`] and [`take_down`] render.
+/// [`VIEW_DIRS`] and `<pid>` a non-empty run of ASCII digits — the producer's exact shape.
 ///
-/// As narrow as [`crate::store::stage_scratch_of`], and for its reason: this authorizes
-/// an unguarded `remove_dir_all` inside a directory a user can also put things in
-/// (`~/.rustup/toolchains/<name>/`), so "looks like something we made" is not a good
-/// enough test — `.lib.old-notes/` is not ours to delete.
+/// As narrow as [`crate::store::stage_scratch_of`], and for its reason: this authorizes an
+/// unguarded `remove_dir_all` inside `~/.rustup/toolchains/<name>/`, where a user can also
+/// put things — `.lib.old-notes/` is not ours to delete.
 fn is_view_debris(name: &str) -> bool {
     let Some(rest) = name.strip_prefix('.') else {
         return false;
@@ -1322,34 +1284,22 @@ fn is_view_debris(name: &str) -> bool {
     !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Remove the staging debris a KILLED rebuild left in `view` — every [`is_view_debris`]
+/// Remove the staging debris a killed rebuild left in `view` — every [`is_view_debris`]
 /// entry, whatever shape it is (a mirrored tree, a directory link, a file).
 ///
-/// WHY IT IS NEEDED. A rebuild stages into `.<stem>.tmp-<pid>` and retires what stood at
-/// the name through `.<stem>.old-<pid>`, removing both as it goes — but only its OWN
-/// pid's, and only on the path it completes. A pass killed between those renames (a `^C`,
-/// the window's apply deadline, a power loss) parks a whole superseded sysroot under a
-/// name no later pass ever looks at: [`first_mismatch`] ignores top-level entries beside
-/// `bin/` deliberately (counting debris would rebuild the view forever), so the tree is
-/// not a mismatch, the view reads as current, and the clones it holds keep a superseded
-/// build's blocks allocated for as long as the prefix lives — one more per crash.
+/// A rebuild removes its own `.<stem>.tmp-<pid>` / `.<stem>.old-<pid>` as it goes, but only
+/// on the path it completes. A pass killed between those renames parks a whole superseded
+/// sysroot under a name no later pass looks at — [`first_mismatch`] ignores top-level
+/// entries beside `bin/`, since counting debris would rebuild the view forever — so the
+/// view reads as current while those clones keep a superseded build's blocks allocated.
 ///
-/// WHY IT IS SAFE HERE — AND THE LOCK IS NOT, BY ITSELF, THE REASON. A view is laid under
-/// the store-wide writer lock, as every verb that lays or discards a build is
-/// ([`crate::lock::try_lock_store`]), so the pass that left this debris has exited. GONE IS
-/// NOT QUIET, though, and this lane is the exact machinery that proved it: the view lane
-/// hands its work to a LAUNCHD job ([`crate::stage_helper::Job::prepare`], stem
-/// `view-helper`), which is launchd's child and not the submitter's, and its helper holds
-/// no store lock of its own. A `kill -9` of the pass therefore drops the lock while the
-/// helper keeps writing into the very `.<stem>.tmp-<pid>` / `.<stem>.old-<pid>` names swept
-/// here. That is the same disproof `crate::store::sweep_stage_scratch` and `crate::gc`'s
-/// pass took on 2026-09-17 — this sweep was written the same day from the lock-alone
-/// argument they had just abandoned — so the orphaned lane jobs are stopped, and waited
-/// out, BEFORE a single entry is removed ([`crate::stage_helper::stop_orphaned_lane_jobs`]).
-/// Best-effort throughout: what will not go is left for the next pass, exactly as a failed
-/// in-pass removal already is.
+/// The store lock is not by itself why this is safe: the view lane hands its work to a
+/// launchd job whose helper holds no lock of its own, so a `kill -9` of the pass drops the
+/// lock while the helper keeps writing into the very names swept here. Orphaned lane jobs
+/// are stopped and waited out first ([`crate::stage_helper::stop_orphaned_lane_jobs`]).
+/// Best-effort: what will not go is left for the next pass.
 fn sweep_view_debris(view: &Path) {
-    // STOP FIRST, DELETE SECOND: a launchd-parented lane helper outlives the pass that
+    // Stop first, delete second: a launchd-parented lane helper outlives the pass that
     // submitted it, and the store lock that pass dropped says nothing about the helper.
     crate::stage_helper::stop_orphaned_lane_jobs();
     let Ok(entries) = std::fs::read_dir(view) else {
@@ -1375,15 +1325,14 @@ pub enum ViewSource {
     /// Trust is dev-linked and the recorded checkout is a sysroot (a `bin/` and a
     /// `lib/`): the view is exec stubs into its `bin/` and links to its directories.
     Linked(PathBuf),
-    /// Trust is dev-linked but the checkout is not one atpkg can present — not a sysroot
-    /// (a cargo project's `target/release`, a tree that lost its `lib/`), or a tree
-    /// inside atpkg's own prefix (the view itself, say — stubs into which would exec
-    /// themselves forever, and laying them would take the store's view down). [`attach`]
-    /// refuses it, naming the path.
+    /// Trust is dev-linked but the checkout is not one atpkg can present — not a sysroot (a
+    /// cargo project's `target/release`, a tree that lost its `lib/`), or a tree inside
+    /// atpkg's own prefix, whose stubs would exec themselves forever. [`attach`] refuses it,
+    /// naming the path.
     LinkedNoSysroot(PathBuf),
 }
 
-/// Which source the view presents NOW — the link marker outranks the store, as it does
+/// Which source the view presents now — the link marker outranks the store, as it does
 /// for `which` and `list`. Read-only; a marker that cannot be read is no link.
 #[must_use]
 pub fn view_source(layout: &Layout) -> ViewSource {
@@ -1401,12 +1350,11 @@ pub fn view_source(layout: &Layout) -> ViewSource {
     }
 }
 
-/// Whether the view at `view` already presents `checkout` as [`refresh_linked_view`]
-/// lays it: `bin/` a real directory holding exactly the stubs [`linked_stubs`] would lay
-/// — byte for byte, so a hand-edited body or one an older atpkg rendered is re-laid,
-/// not kept forever on the strength of its `exec` line — and each of [`VIEW_DIRS`] a
-/// directory link to the checkout's (or absent when the checkout has none). A link
-/// planted at `bin/` is not a match, whatever stands behind it — the store path's rule.
+/// Whether the view at `view` already presents `checkout` as [`refresh_linked_view`] lays
+/// it: `bin/` a real directory holding exactly the stubs [`linked_stubs`] would lay, byte
+/// for byte (so a hand-edited body, or one an older atpkg rendered, is re-laid), and each of
+/// [`VIEW_DIRS`] a directory link to the checkout's, or absent when the checkout has none.
+/// A link planted at `bin/` is not a match, whatever stands behind it.
 #[cfg(unix)]
 fn linked_view_matches(checkout: &Path, view: &Path, plan: &BinPlan) -> bool {
     for dir in VIEW_DIRS {
@@ -1425,10 +1373,9 @@ fn linked_view_matches(checkout: &Path, view: &Path, plan: &BinPlan) -> bool {
 }
 
 /// The stubs a linked view's `bin/` at `dst_bin` holds for `plan`: one
-/// [`crate::lay::Executable`] per entry, the `bin/` shim body that execs the checkout's
-/// file ([`crate::platform::shim_executable_to_env`], with no exported environment — a
-/// dev checkout's target never routes through an exec root, so no guard line is
-/// rendered).
+/// [`crate::lay::Executable`] per entry, the `bin/` shim body that execs the checkout's file
+/// ([`crate::platform::shim_executable_to_env`], with no exported environment — a dev
+/// checkout's target never routes through an exec root, so no guard line is rendered).
 #[cfg(unix)]
 fn linked_stubs(dst_bin: &Path, plan: &BinPlan) -> io::Result<Vec<crate::lay::Executable>> {
     plan.entries
@@ -1473,9 +1420,7 @@ fn bin_holds_exactly(bin: &Path, plan: &BinPlan) -> bool {
 
 /// Move `at` (a directory, a link, anything) aside under `view` and remove it — how
 /// [`refresh_linked_view`] takes down what stood at a name before it lays its own. The
-/// store's clone view taken down this way removes only the view's own files (a view laid
-/// as hard links before clones would unlink the store inodes' extra names: their link
-/// counts drop and their ctimes move, their bytes never do).
+/// store's clone view taken down this way removes only the view's own files.
 #[cfg(unix)]
 fn take_down(view: &Path, at: &Path, stem: &str, pid: &str) -> io::Result<()> {
     if std::fs::symlink_metadata(at).is_err() {
@@ -1490,13 +1435,12 @@ fn take_down(view: &Path, at: &Path, stem: &str, pid: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Lay the view for a dev-linked `checkout` (see the module doc): the mirrored
-/// directories as links to the checkout's, `bin/` staged beside the live one as one
-/// exec stub per plan entry — laid in ONE [`crate::lay::lay_executables`] call, so a
-/// provenance-tracked process uses one untracked job for all of them, as every
-/// shim-laying pass does — and swapped in by `rename(2)` when it differs. Writes,
-/// renames and links no file of the store: a store view standing there is taken down
-/// ([`take_down`]), never followed.
+/// Lay the view for a dev-linked `checkout` (see the module doc): the mirrored directories
+/// as links to the checkout's, `bin/` staged beside the live one as one exec stub per plan
+/// entry — laid in one [`crate::lay::lay_executables`] call, so a provenance-tracked process
+/// uses one untracked job for all of them — and swapped in by `rename(2)` when it differs.
+/// Writes no file of the store: a store view standing there is taken down ([`take_down`]),
+/// never followed.
 #[cfg(unix)]
 fn refresh_linked_view(layout: &Layout, name: &str, checkout: &Path) -> io::Result<Refreshed> {
     let view = view_dir(layout, name);
@@ -1938,9 +1882,9 @@ pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attache
             path: p.path,
         });
     }
-    // THE LINK OUTRANKS THE STORE: a dev-linked trust is presented whether or not a
-    // store build stands; one whose checkout rustup could not present is refused
-    // before the view is touched; otherwise the store's build must be there.
+    // The link outranks the store: a dev-linked trust is presented whether or not a store
+    // build stands; one whose checkout rustup could not present is refused before the view
+    // is touched; otherwise the store's build must be there.
     match view_source(layout) {
         ViewSource::Linked(_) => {}
         ViewSource::LinkedNoSysroot(checkout) => {
@@ -2291,12 +2235,10 @@ fn record(layout: &Layout, name: &str) -> io::Result<()> {
     crate::status::write(layout, &s)
 }
 
-/// Drop `rustup:<name>` from `status.toml`'s `seams` (no record ⇒ nothing to do), and
-/// the `refused:rustup:<name>: <why>` entry standing beside it, if any: the record
-/// follows the disk on detach as it does on attach, so a refusal the last pass recorded
-/// (a dev-link whose checkout stopped being a sysroot) does not outlive the seam the
-/// user then removed (2026-09-16). The refusal is matched through its `: ` separator,
-/// so `trust` never takes `trust-dev`'s.
+/// Drop `rustup:<name>` from `status.toml`'s `seams` (no record ⇒ nothing to do), and the
+/// `refused:rustup:<name>: <why>` entry beside it, if any: the record follows the disk on
+/// detach as on attach, so a recorded refusal does not outlive the seam the user removed.
+/// Matched through the `: ` separator, so `trust` never takes `trust-dev`'s.
 fn unrecord(layout: &Layout, name: &str) -> io::Result<()> {
     let key = record_key(name);
     let refused = refusal_prefix(name);
@@ -2396,7 +2338,7 @@ pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
     // foreign entry is now SAID and RECORDED each pass instead of silently skipped:
     // m21 ran seven weeks with `~/.rustup/toolchains/trust` pointing at a dev stage2,
     // `seams = []`, and every pass walking an empty name set (2026-09-10 audit).
-    // …and when trust is DEV-LINKED to a sysroot with no store build at all: the link
+    // …and when trust is dev-linked to a sysroot with no store build at all: the link
     // is a decision to present that compiler, and rustup's `trust` is where a repo
     // pinning the channel looks for it.
     if !names.contains(DEFAULT_SEAM)
@@ -3405,8 +3347,8 @@ mod tests {
         assert!(fx.seams_recorded().is_empty());
     }
 
-    /// THE VIEW. One clone per tool under its own name, each stock name a clone of its
-    /// Trust tool — its bytes on a new inode, never the store's own inode — `lib/` a real
+    /// The view: one clone per tool under its own name, each stock name a clone of its
+    /// Trust tool — its bytes on a new inode, never the store's own — `lib/` a real
     /// directory of clones, and not one store file gaining a link.
     #[cfg(unix)]
     #[test]
@@ -3483,7 +3425,7 @@ mod tests {
         );
     }
 
-    /// The view follows `current`: after an update the stock names are clones of the NEW
+    /// The view follows `current`: after an update the stock names are clones of the new
     /// build's tools.
     #[cfg(unix)]
     #[test]
@@ -3537,13 +3479,11 @@ mod tests {
         dir
     }
 
-    /// THE LINK OUTRANKS THE STORE (2026-09-16). A dev-linked trust is what rustup's
-    /// `trust` presents: the view becomes exec stubs into the checkout's `bin/` — each
-    /// tool, each stock name to its Trust tool — and links to its directories, said in
-    /// one line naming the checkout, under an entry that never moves; a tool the
-    /// checkout rebuilds under the same name is what the stub runs a moment later, with
-    /// no re-lay; a quiet pass says nothing; and `unlink` returns the store's clone view,
-    /// said the same way.
+    /// The link outranks the store. A dev-linked trust is what rustup's `trust` presents:
+    /// the view becomes exec stubs into the checkout's `bin/` — each tool, each stock name
+    /// to its Trust tool — and links to its directories, said in one line naming the
+    /// checkout. A tool the checkout rebuilds under the same name is what the stub runs a
+    /// moment later, with no re-lay; `unlink` returns the store's clone view.
     #[cfg(unix)]
     #[test]
     fn a_dev_linked_trust_is_what_rustup_presents_until_it_is_unlinked() {
@@ -3688,9 +3628,9 @@ mod tests {
         assert!(reassert(&fx.layout, &fx.rustup).is_empty());
     }
 
-    /// A dev-linked trust whose checkout is NOT a sysroot (a cargo project's
-    /// `target/release`, a tree that lost its `lib/`) is refused and RECORDED — the
-    /// view left presenting the store — and the refusal clears once the link goes.
+    /// A dev-linked trust whose checkout is not a sysroot (a cargo project's
+    /// `target/release`, a tree that lost its `lib/`) is refused and recorded — the view
+    /// left presenting the store — and the refusal clears once the link goes.
     #[cfg(unix)]
     #[test]
     fn a_dev_link_to_a_tree_that_is_no_sysroot_is_refused_and_recorded() {
@@ -3737,10 +3677,10 @@ mod tests {
         );
     }
 
-    /// Two shapes the linked lay must never accept (2026-09-16 review): a checkout INSIDE
-    /// atpkg's own prefix — the view itself, say — whose stubs would exec themselves
-    /// forever, and a stub whose body was edited by hand, which a target-only comparison
-    /// would keep forever; the first is refused as no sysroot, the second re-laid.
+    /// Two shapes the linked lay must never accept: a checkout inside atpkg's own prefix —
+    /// the view itself, say — whose stubs would exec themselves forever, and a stub whose
+    /// body was edited by hand, which a target-only comparison would keep forever. The
+    /// first is refused as no sysroot, the second re-laid.
     #[cfg(unix)]
     #[test]
     fn a_checkout_inside_the_prefix_is_refused_and_an_edited_stub_is_relaid() {
@@ -3789,7 +3729,7 @@ mod tests {
         assert!(reassert(&fx.layout, &fx.rustup).is_empty());
     }
 
-    /// A dev-linked sysroot with NO store build gets the seam too: the link is a
+    /// A dev-linked sysroot with no store build gets the seam too: the link is a
     /// decision to present that compiler, and the seam is created pointing at a view
     /// of the checkout — the one case `attach_refuses_when_trust_is_not_installed`
     /// does not cover.
@@ -3815,9 +3755,9 @@ mod tests {
         );
         assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
 
-        // The checkout stops being a sysroot: the next pass refuses and RECORDS it —
-        // and the unlink the refusal names takes the record with the seam, so nothing
-        // says "refused" about a seam that is gone (2026-09-16 review).
+        // The checkout stops being a sysroot: the next pass refuses and records it, and the
+        // unlink the refusal names takes the record with the seam, so nothing says
+        // "refused" about a seam that is gone.
         std::fs::remove_dir_all(checkout.join("lib")).unwrap();
         let lines = reassert(&fx.layout, &fx.rustup);
         assert!(
@@ -3951,13 +3891,11 @@ mod tests {
         assert_ne!(inode_stamps(&build), store_before, "the stamps are blind");
     }
 
-    /// `view_matches` is exact about what a view presents: a stock name that is a HARD LINK
-    /// to its Trust tool (the construction before clones) fails both depths; one with its
-    /// Trust tool's length, mode and time but other bytes (the shape of the bundle's own
-    /// separately signed copy, the very file tippy refuses) passes the attribute check and
-    /// fails the deep byte check; an extra file deep in `lib/` fails only the deep walk; a
-    /// changed symlink target and a stray `bin/` entry fail too. Each is healed by the next
-    /// refresh, which then matches.
+    /// `view_matches` is exact about what a view presents: a stock name that is a hard link
+    /// to its Trust tool fails both depths; one with its Trust tool's length, mode and time
+    /// but other bytes (the bundle's own separately signed copy, the very file tippy
+    /// refuses) passes the attribute check and fails the deep byte check; an extra file deep
+    /// in `lib/` fails only the deep walk. Each is healed by the next refresh.
     #[cfg(unix)]
     #[test]
     fn view_matches_rejects_a_linked_or_rebytten_stock_name_and_a_planted_file() {
@@ -4039,13 +3977,11 @@ mod tests {
         assert!(view_matches(&build, &view, Depth::Deep));
     }
 
-    /// A KILLED REBUILD'S DEBRIS IS THE NEXT PASS'S TO SWEEP. A rebuild stages into
-    /// `.<stem>.tmp-<pid>` and retires the standing tree through `.<stem>.old-<pid>`,
-    /// removing only its own pid's; a pass killed between the two renames parks a whole
-    /// superseded sysroot under a name nothing later looks at — `first_mismatch` ignores
-    /// top-level entries beside `bin/` on purpose — so the view reads as current while
-    /// the clones keep a reclaimed build's blocks allocated. The next refresh removes
-    /// them, and only them: a name the producer cannot render is not ours to delete.
+    /// A killed rebuild's debris is the next pass's to sweep: a pass killed between the two
+    /// renames parks a whole superseded sysroot under a name nothing later looks at
+    /// (`first_mismatch` ignores top-level entries beside `bin/` on purpose), so the view
+    /// reads as current while those clones keep a reclaimed build's blocks allocated. The
+    /// next refresh removes them, and only them.
     #[cfg(unix)]
     #[test]
     fn a_killed_rebuilds_debris_is_swept_by_the_next_refresh() {

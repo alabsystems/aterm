@@ -22,23 +22,19 @@
 //! # The exec root
 //!
 //! For such a build atpkg lays `<prefix>/compat/trust/<build>/` by the construction the
-//! rustup view uses ([`crate::seam::lay_view`]): `bin/` holds a copy-on-write CLONE
-//! ([`crate::clone`]) of each regular file of the build's `bin/`, each stock name
-//! (`rustc`, `cargo`, `rustdoc`) a clone of its Trust tool — so `rustc` holds `trustc`'s
-//! bytes, which is the one thing that build's tippy asks — and `lib/`, `libexec/`,
-//! `share/` and `etc/` cloned the same way, every regular file a clone and every symlink
-//! recreated. Nothing in the store is written: not a byte, not a link count, not a
-//! ctime. A [`ROOT_MARKER`] is written last, before the root is committed by
-//! `rename(2)`, so a root without one is never routed. Run from that tree, `tippy`,
-//! `targo tippy`, `targo-tippy`, `tippy-driver` and `$(trustc --print sysroot)/bin/tippy`
-//! all lint (measured 2026-09-16 on bundle 8595 itself: its tippy caught a planted
-//! `useless_vec` from the clone, and refused the same crate from the store).
+//! rustup view uses ([`crate::seam::lay_view`]): `bin/` holds a copy-on-write clone
+//! ([`crate::clone`]) of each regular file of the build's `bin/`, each stock name (`rustc`,
+//! `cargo`, `rustdoc`) a clone of its Trust tool — so `rustc` holds `trustc`'s bytes, which
+//! is the one thing that build's tippy asks — and `lib/`, `libexec/`, `share/` and `etc/`
+//! cloned the same way, every regular file a clone and every symlink recreated. Nothing in
+//! the store is written: not a byte, not a link count, not a ctime. A [`ROOT_MARKER`] is
+//! written last, before the root is committed by `rename(2)`, so a root without one is
+//! never routed.
 //!
-//! It used to be a HARD-LINK mirror of the store's own inodes. Every lay, rebuild and
-//! retire then moved a live store inode's link count and ctime, which tippy pins, and a
-//! link from a tracked process tagged the store — the owner, 2026-09-16: *"doing that with
-//! hardlinks sounds like bugs and indeed: bugs"*. A root laid that way has no marker and
-//! is not a clone, so it is never routed and the next `repair` rebuilds it.
+//! It used to be a hard-link mirror of the store's own inodes, so every lay, rebuild and
+//! retire moved a live store inode's link count and ctime — both of which tippy pins — and a
+//! link from a tracked process tagged the store. A root laid that way has no marker and is
+//! not a clone, so it is never routed and the next `repair` rebuilds it.
 //!
 //! `lib/` is mirrored, not symlinked, for the reason the view's is: a frontend finds its
 //! sysroot through the real path of the driver dylib it loaded, so a symlinked `lib/`
@@ -61,9 +57,8 @@
 //! guard re-checks at every exec, with `test` builtins only, that the root's file is a
 //! regular executable file and not a symlink, that the store file it stands for still
 //! exists, and that the root's [`ROOT_MARKER`] stands — so a root half-way through a
-//! rebuild, retired, or never finished runs the store path, as today. The BYTES are proved
-//! where they can be afforded: when the root is laid, and at [`Depth::Deep`] by `repair`
-//! and doctor.
+//! rebuild, retired, or never finished runs the store path. The bytes are proved where they
+//! can be afforded: when the root is laid, and at [`Depth::Deep`] by `repair` and doctor.
 //! Every reader of a shim keeps reading the store target.
 //!
 //! # Rules
@@ -79,12 +74,11 @@
 //!   stay plain; a toolchain is never byte-copied in its place).
 //! * A root that already matches its build is NEVER touched ([`ensure_root`] returns
 //!   [`Ensured::Present`] after `lstat`s and [`needs_root`]'s byte compare, writing
-//!   nothing). tippy pins its executable's and siblings' link count and ctime, and a
-//!   tippy running FROM the root pins the root's own files, so rebuilding a root under it
-//!   aborts it — the rule [`crate::seam::refresh_view`] follows for the same reason. What
-//!   still replaces a root's files is rare and one-time: rebuilding one that no longer
-//!   matches (including every root laid as hard links before clones), and removing one
-//!   with its build. The store's own files are never touched by any of it.
+//!   nothing). tippy pins its executable's and siblings' link count and ctime, and a tippy
+//!   running from the root pins the root's own files, so rebuilding a root under it aborts
+//!   it — the rule [`crate::seam::refresh_view`] follows. What still replaces a root's files
+//!   is rare and one-time: rebuilding one that no longer matches, and removing one with its
+//!   build. The store's own files are never touched.
 //! * `lstat` everywhere: a symlink at a root's name is UNLINKED, never followed; nothing
 //!   is removed or laid under a `compat` or `compat/trust` that is not a real directory;
 //!   and a committed root is renamed aside before it is removed, so no shim can route into
@@ -129,14 +123,13 @@
 //!
 //! # Not decided here
 //!
-//! A root laid by a provenance-TRACKED process (the pass the GUI spawns) would be TAGGED:
-//! every file such a process creates carries com.apple.provenance, and a toolchain run
-//! from tagged files tags what it writes. (The hard-link form tagged the STORE itself —
-//! measured 2026-09-15, the 0.86.0 rustup view re-tagged every executable of `trust/8595`
-//! on the app's first pass; a clone never writes the store.) So a tracked process lays
-//! roots through the view's untracked launchd lane ([`ensure_root_with`],
-//! `crate::seam::run_view_job`) and keeps a standing root rather than lay one from this
-//! process when that lane cannot run. Not covered: `cargo +trust clippy` (the bundle ships no `cargo-clippy`), and every
+//! A root laid by a provenance-tracked process (the pass the GUI spawns) would be tagged:
+//! every file such a process creates carries com.apple.provenance, and a toolchain run from
+//! tagged files tags what it writes. (The hard-link form tagged the store itself; a clone
+//! never writes the store.) So a tracked process lays roots through the view's untracked
+//! launchd lane ([`ensure_root_with`], `crate::seam::run_view_job`) and keeps a standing
+//! root rather than lay one from this process when that lane cannot run. Not covered:
+//! `cargo +trust clippy` (the bundle ships no `cargo-clippy`), and every
 //! consumer that runs `store/trust/current/bin` by absolute path (aterm-verify's store
 //! discovery, `tools/bootstrap-publisher.sh`, the release gates).
 //!
@@ -173,7 +166,7 @@ pub fn root_dir(layout: &Layout, build: u64) -> PathBuf {
     roots_dir(layout).join(build.to_string())
 }
 
-/// The file written LAST into a root before it is committed by `rename(2)`: a root without
+/// The file written last into a root before it is committed by `rename(2)`: a root without
 /// it — half-way through a lay, laid as hard links before clones, or planted — is never
 /// routed ([`route_for_shim`], and the shim's own guard, `platform::sh_shim_content_routed`)
 /// and never reads as matching ([`root_first_mismatch`]).
@@ -208,7 +201,7 @@ pub fn root_first_mismatch(build_dir: &Path, root: &Path, depth: Depth) -> Optio
     crate::seam::first_mismatch(build_dir, root, depth)
 }
 
-/// Whether the root at `root` IS `build_dir` at `depth` ([`root_first_mismatch`] found
+/// Whether the root at `root` is `build_dir` at `depth` ([`root_first_mismatch`] found
 /// nothing).
 #[must_use]
 pub fn root_matches(build_dir: &Path, root: &Path, depth: Depth) -> bool {
@@ -522,21 +515,19 @@ fn trust_tool_build(layout: &Layout, target: &Path) -> Option<u64> {
 ///   even a directory mode — [`Ensured::Present`].
 /// * Otherwise the root is laid at `.<n>.tmp-<pid>`, any standing root is renamed to
 ///   `.<n>.old-<pid>`, the temp renamed into place and the old one removed —
-///   [`Ensured::Built`]. When the standing root's `bin/` still matches the build
-///   ([`crate::seam::bin_mismatch`] and the stock names' bytes) and only a directory beside
-///   it differs, the temp gets the mirrored directories alone
-///   ([`crate::seam::lay_view_dirs`]) and the live `bin/` is MOVED into it by `rename(2)` —
-///   so a `.DS_Store` under `share/` never replaces a `bin/` file a tippy running from the
-///   root pins. The [`ROOT_MARKER`] is written into the temp last, before the swap. Between
-///   the renames the root, or its `bin/`, is briefly absent, and a shim exec'd in that
-///   instant runs the store path, as today.
+///   [`Ensured::Built`]. When the standing root's `bin/` still matches the build and only a
+///   directory beside it differs, the temp gets the mirrored directories alone
+///   ([`crate::seam::lay_view_dirs`]) and the live `bin/` is moved into it by `rename(2)`, so
+///   a `.DS_Store` under `share/` never replaces a `bin/` file a running tippy pins. The
+///   [`ROOT_MARKER`] goes into the temp last. Between the renames the root, or its `bin/`,
+///   is briefly absent, and a shim exec'd in that instant runs the store path.
 ///
 /// # Errors
 /// `build_dir` is not a trust build of this layout, [`needs_root`] could not read the
 /// build, `compat` or `compat/trust` is not a directory atpkg may write (a [`Blocked`]
 /// when something other than a real directory stands at either name), the root cannot
 /// be removed, or it cannot be laid — a clone refused (the store on another volume), a
-/// directory unreadable, the marker unwritable. On an error while laying or swapping a root, whatever stood at the
+/// directory unreadable, the marker unwritable. On an error, whatever stood at the
 /// root is left where it was (a lay's temp tree is removed). The one exception is the
 /// retire of a build that needs none: its root is renamed to `.<n>.old-<pid>` FIRST, so
 /// when that tree then will not delete the error comes back with the name already empty
@@ -560,10 +551,9 @@ pub fn ensure_root(layout: &Layout, build_dir: &Path, depth: Depth) -> io::Resul
 }
 
 /// [`ensure_root`] with the untracked lane's three inputs explicit. The root is one clone
-/// per file of the build — the rustup view's construction — and every file a
-/// provenance-TRACKED process creates is tagged, so a tracked process hands the laying to
-/// the launchd job the view uses ([`crate::seam::run_view_job`], a `ViewJob::Root`),
-/// measured on the root's clone of a store file clean before the job. When the lane cannot
+/// per file of the build, and every file a provenance-tracked process creates is tagged, so
+/// a tracked process hands the laying to the launchd job the view uses
+/// ([`crate::seam::run_view_job`], a `ViewJob::Root`). When the lane cannot
 /// run: a root that already STANDS is kept as it is (one build behind at worst, refreshed
 /// next pass) rather than lay a tagged one from this process; with no root at all the
 /// in-process build is worth its tag under [`crate::lay::TrackedPolicy::Allow`] (tippy
@@ -731,7 +721,7 @@ pub fn ensure_root_in_process(
                 let _ = std::fs::rename(&tmp_bin, &root_bin);
             }
         };
-        // The marker LAST, so no name ever holds a routable root that is not whole.
+        // The marker last, so no name ever holds a routable root that is not whole.
         if let Err(e) = std::fs::write(root_marker(&tmp), ROOT_MARKER_BODY) {
             restore_bin();
             let _ = remove_entry(&tmp);
@@ -795,13 +785,12 @@ fn retire(root: &Path, aside: &Path) -> io::Result<bool> {
     }
 }
 
-/// Whether `target`, in a build's `bin/` at `bin`, is a stock name ([`crate::seam::STOCK_NAMES`])
-/// that is a separate file from its Trust tool — the bundle's own COPY (8595 ships
-/// `rustc`, `cargo` and `rustdoc` that way). A root presents the stock name as the Trust
-/// tool, so a shim forwarding to the copy is never routed and never counted unrouted. A
-/// stock name that IS its Trust tool's file in the store (a pack that kept one hard link)
-/// is not a copy. This asks about the STORE bundle's shape, so it compares the store's own
-/// inodes.
+/// Whether `target`, in a build's `bin/` at `bin`, is a stock name
+/// ([`crate::seam::STOCK_NAMES`]) that is a separate file from its Trust tool — the bundle's
+/// own copy. A root presents the stock name as the Trust tool, so a shim forwarding to the
+/// copy is never routed and never counted unrouted. A stock name that is its Trust tool's
+/// own file in the store (a pack that kept one hard link) is not a copy, so this compares
+/// the store's own inodes.
 #[cfg(unix)]
 fn is_stock_copy(bin: &Path, target: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -833,17 +822,15 @@ fn is_stock_copy(bin: &Path, target: &Path) -> bool {
 ///   the root's [`ROOT_MARKER`] is a regular file;
 /// * `<root>/bin/<file>` is a clone of `target` ([`crate::clone::is_clone_of`]: a regular
 ///   file with its length, mode and time, not its inode);
-/// * `<root>/bin/rustc` is a clone of the store `trustc` — the property the root exists
-///   for;
-/// * `target` is not a stock-name COPY the bundle ships beside its Trust tool (`rustdoc`
-///   as a separate file from `trustdoc`): the root presents that name as the Trust tool,
-///   which is not what such a shim forwards to;
+/// * `<root>/bin/rustc` is a clone of the store `trustc` — the property the root exists for;
+/// * `target` is not a stock-name copy the bundle ships beside its Trust tool (`rustdoc` as
+///   a separate file from `trustdoc`): the root presents that name as the Trust tool, which
+///   is not what such a shim forwards to;
 /// * `<root>/lib` is a real directory whenever the build has a `lib/`.
 ///
-/// It does not re-walk the root or read bytes: [`ensure_root`] proves the root when it
-/// lays it, and `repair` and doctor at [`Depth::Deep`]; the shim's guard re-checks the
-/// file and the marker at every exec. It does not ask [`needs_root`] either — that reads
-/// bytes, and a root stands only where it held.
+/// It does not re-walk the root or read bytes: [`ensure_root`] proves the root when it lays
+/// it, and `repair` and doctor at [`Depth::Deep`]; the shim's guard re-checks the file and
+/// the marker at every exec.
 #[must_use]
 pub fn route_for_shim(shim: &Path, target: &Path) -> Option<PathBuf> {
     #[cfg(unix)]
@@ -1020,27 +1007,22 @@ pub fn strays(layout: &Layout) -> Vec<(PathBuf, Stray)> {
 ///
 /// # Why it is safe here
 ///
-/// Callers hold the store lock, as every verb that lays or discards a build does — but
-/// that lock speaks only for the processes that TAKE it, and the lane that lays a root is
-/// not one of them. A provenance-tracked pass hands the lay to a LAUNCHD job
-/// ([`ensure_root_with`] submits a [`crate::seam::ViewJob::Root`], whose helper runs
-/// [`ensure_root_in_process`] in a process of launchd's, under the `view-helper` stem),
-/// so the helper is launchd's child rather than the submitter's and holds no lock of its
-/// own. A `kill -9` of that pass drops the store lock while its helper keeps laying into
-/// the very `.<n>.tmp-<pid>` and `.<n>.old-<pid>` names this sweep removes as debris: the
-/// tree came back within the helper's next write, and nothing under `compat/` is ever
-/// named again unless that same build number is laid once more.
+/// Callers hold the store lock, but that lock speaks only for the processes that take it,
+/// and the lane that lays a root is not one of them: a provenance-tracked pass hands the lay
+/// to a launchd job ([`ensure_root_with`] submits a [`crate::seam::ViewJob::Root`]), so the
+/// helper is launchd's child and holds no lock of its own. A `kill -9` of that pass drops
+/// the store lock while its helper keeps laying into the very `.<n>.tmp-<pid>` and
+/// `.<n>.old-<pid>` names this sweep removes as debris.
 ///
-/// So the orphaned lane jobs are STOPPED, and waited out, before a single entry is read —
-/// exactly as [`crate::store::sweep_stage_scratch`], `gc`'s partial sweep and
-/// `seam`'s view-debris sweep do it. The set of labels stopped is unchanged and
-/// unwidened: only this prefix, only these stems, and a job whose owner pid is ALIVE
+/// So the orphaned lane jobs are stopped, and waited out, before a single entry is read — as
+/// [`crate::store::sweep_stage_scratch`], `gc`'s partial sweep and `seam`'s view-debris
+/// sweep do it. Only this prefix, only these stems, and a job whose owner pid is alive
 /// (another pass in flight, or a pid since reused) is left alone.
 #[must_use]
 pub fn sweep(layout: &Layout) -> Report {
     #[cfg(unix)]
     {
-        // STOP FIRST, DELETE SECOND: a launchd-parented lane helper outlives the pass that
+        // Stop first, delete second: a launchd-parented lane helper outlives the pass that
         // submitted it, and the store lock that pass dropped says nothing about the helper.
         crate::stage_helper::stop_orphaned_lane_jobs();
         let mut report = Report::default();
@@ -1326,7 +1308,7 @@ pub struct Inspection {
     /// Where the root stands.
     pub state: RootState,
     /// File names of the `bin/` shims whose target is a regular file in this build's
-    /// `bin/`, sorted — less those forwarding to a stock-name COPY the bundle ships beside a
+    /// `bin/`, sorted — less those forwarding to a stock-name copy the bundle ships beside a
     /// Trust tool the root presents under that name, which [`route_for_shim`] never routes.
     /// A shim whose target is gone is a
     /// broken shim, named elsewhere.
@@ -1344,7 +1326,7 @@ pub struct Inspection {
 /// build — doctor cannot vouch for PATH tippy then, and says so rather than print
 /// nothing. `lstat`s, [`needs_root`]'s byte compare of
 /// two ~330 KiB files on 8595, a [`Depth::Deep`] walk of the root ([`root_first_mismatch`],
-/// ~0.1 s over 8595's 4,112 files, plus the stock names' ~38 MB of bytes) and a bounded read
+/// plus the stock names' bytes) and a bounded read
 /// of each trust shim — it writes
 /// nothing, creates nothing, and runs no tool: a probe that EXECUTED tippy would answer
 /// through tippy's ancestor-directory checks, which refuse intermittently on their own
@@ -1408,11 +1390,9 @@ pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>
             // showed it with a `bin/rustdoc` copy exposed, 2026-09-15). It runs the store
             // copy, which no tippy authenticates, exactly as before roots existed.
             //
-            // Only a COPY ([`is_stock_copy`], the one predicate the writer asks too): a stock
-            // name that IS its Trust tool's file in the store is that tool, so the writer
-            // routes its shim and a plain one is unrouted like any other (a reviewer's probe
-            // showed the name-only skip reading healthy while a reconcile still routed it,
-            // 2026-09-15).
+            // Only a copy ([`is_stock_copy`], the one predicate the writer asks too): a
+            // stock name that is its Trust tool's own file in the store is that tool, so the
+            // writer routes its shim and a plain one is unrouted like any other.
             if is_stock_copy(&bin, &target) {
                 continue;
             }
@@ -1619,14 +1599,12 @@ mod tests {
         out
     }
 
-    /// Make `path` unreadable, answering the permissions it HAD — restore with
-    /// [`restore_mode`], NEVER with a literal. A file `std::fs::write` lays carries
-    /// `0o666 & !umask`: `0o644` under the `022` most shells set, `0o664` under the `002` a
-    /// Debian-style per-user-group login gives, and this fleet runs both. A literal restore
-    /// therefore does not put the file back — it CHANGES the store file — and a view whose
-    /// entries are identified by length, permission bits and mtime
-    /// ([`crate::clone::is_clone_of`]) is then correctly re-laid. That reads exactly like the
-    /// destructive production defect these tests pin, from a fixture that never staged it.
+    /// Make `path` unreadable, answering the permissions it had — restore with
+    /// [`restore_mode`], never with a literal. `std::fs::write` lays a file `0o666 & !umask`,
+    /// which is `0o644` or `0o664` depending on the host, and a view entry is identified by
+    /// length, permission bits and mtime ([`crate::clone::is_clone_of`]) — so a literal
+    /// restore changes the store file and correctly re-lays the view, which reads exactly
+    /// like the destructive defect these tests pin.
     #[must_use]
     fn unreadable(path: &Path) -> std::fs::Permissions {
         let had = std::fs::symlink_metadata(path).unwrap().permissions();
@@ -1699,13 +1677,12 @@ mod tests {
         assert_eq!(needs_root(&copy).unwrap(), Some(trustc_len));
     }
 
-    /// THE ROOT: every regular file of the build's `bin/` is a clone of the store's, each
-    /// stock name a clone of its Trust tool (so `rustc` holds `trustc`'s bytes, and never the
-    /// bundle copy's), `lib/`, `libexec/`, `share/`, `etc/` cloned with the symlink recreated,
-    /// and the marker written. Laying it moves NOTHING in the store — no `st_nlink`,
-    /// `st_ctime` or `st_mtime` — which the hard-link construction could not say. And THE
-    /// NO-CHURN RULE: once it stands, a second ensure at either depth is `Present` and moves
-    /// nothing anywhere — in the store, in the root, or on `compat/trust` itself.
+    /// The root: every regular file of the build's `bin/` is a clone of the store's, each
+    /// stock name a clone of its Trust tool (so `rustc` holds `trustc`'s bytes, never the
+    /// bundle copy's), `lib/`, `libexec/`, `share/`, `etc/` cloned with the symlink
+    /// recreated, and the marker written. Laying it moves nothing in the store — no
+    /// `st_nlink`, `st_ctime` or `st_mtime`. And the no-churn rule: once it stands, a second
+    /// ensure at either depth is `Present` and moves nothing anywhere.
     #[test]
     fn ensure_root_clones_every_file_and_then_touches_nothing() {
         let fx = Fx::new("ensure");
@@ -1799,7 +1776,7 @@ mod tests {
         assert_eq!(stamps(&build), store_before);
     }
 
-    /// A root that stopped matching is REBUILT: a tool replaced by other bytes, or by the
+    /// A root that stopped matching is rebuilt: a tool replaced by other bytes, or by the
     /// store's own inode (the hard link a root held before clones), at either depth; a root
     /// whose marker is gone; a file planted deep in `lib/` at `Deep` only (a shallow pass
     /// leaves it, and writes nothing). Dot debris a crashed run left is swept.
@@ -2898,12 +2875,11 @@ mod tests {
         let read = needs_root(&build);
         restore_mode(&trustc, &trustc_mode);
         assert!(read.is_err(), "{read:?}");
-        // THE FIXTURE PROVES ITS OWN PRECONDITION. Both chmod round-trips above must leave
+        // The fixture proves its own precondition. Both chmod round-trips above must leave
         // the store exactly as they found it: the view's `bin/rustc` and `bin/trustc` are
-        // clones of the store's `bin/trustc`, and a clone is identified by length,
-        // permission bits and mtime, so a restore that invented a mode instead of measuring
-        // one leaves the root CORRECTLY stale — and every `!changed()` below would then read
-        // as the destructive defect this test pins rather than as a broken fixture.
+        // clones of the store's `bin/trustc`, and a clone is identified by length, permission
+        // bits and mtime, so a restore that invented a mode leaves the root correctly stale,
+        // and every `!changed()` below would read as the defect this test pins.
         assert_eq!(
             root_first_mismatch(&build, &root_dir(&fx.layout, 8595), Depth::Deep),
             None,
@@ -3145,7 +3121,7 @@ mod tests {
     /// matches the build and only a directory beside it differs — a `.DS_Store` under
     /// `share/` at `Deep`, a driver dylib at the top of `lib/` replaced by other bytes at
     /// `Shallow` — the root is rebuilt (`Built`, the stray gone, the dylib a clone of the
-    /// store's again), its live `bin/` directory is MOVED into the new tree (the same
+    /// store's again), its live `bin/` directory is moved into the new tree (the same
     /// directory inode, so a tippy running from the root keeps its files), and no store
     /// `bin/` file's link count or ctime moved. A mismatch inside `bin/` itself still lays a
     /// fresh `bin/`.

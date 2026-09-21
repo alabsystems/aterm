@@ -1,88 +1,42 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! SHIPPED TRIPLE => COMPILABLE TRIPLE: every target this client publishes rows for must be
+//! Shipped triple => compilable triple: every target this client publishes rows for must be
 //! one `crates/aterm-libc` will compile at all.
 //!
-//! THE CLASS THIS GUARDS. [`atpkg::TARGETS`] is the schema's roster of served triples, and it
-//! is quoted three more times in lanes nobody compiles: `cli::current_triple` reports one of
-//! them for the running client, `tools/atpkg-auto-vendor.sh` maps each to a vendor platform
-//! token, and `apps/aterm-win/build.ps1` picks an `aarch64-pc-windows-` prefix by itself when
-//! it detects ARM64 Windows. None of those four lanes can tell whether the triple it names can
-//! be BUILT, and on 2026-09-16 one of them could not:
+//! [`atpkg::TARGETS`] is quoted in three lanes nobody compiles — `cli::current_triple`,
+//! `tools/atpkg-auto-vendor.sh`'s vendor-platform map, `apps/aterm-win/build.ps1` — and none
+//! of them can tell whether the triple it names can be built. `crates/aterm-libc` (published
+//! into the build as `libc`, which `[patch.crates-io]` puts under every consumer) admits a
+//! fixed list of targets and answers every other one with `compile_error!`, so a shipped
+//! triple missing from that list fails to type-check the whole aterm graph.
 //!
-//!   * `aarch64-pc-windows-msvc` — a `TARGETS` row, a `current_triple` arm and a vendor-map
-//!     entry since each of those lists was written — stopped in the first first-party crate
-//!     the graph reaches. `crates/aterm-libc` (published into the build as the package `libc`,
-//!     which `[patch.crates-io]` puts under every consumer in the workspace) admits a fixed
-//!     list of targets and answers every other one with
-//!     `compile_error!("aterm-libc has no generated ABI cell for this target")`. The list
-//!     carried `all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")` and
-//!     no aarch64 twin, so the ENTIRE aterm graph failed to type-check for that triple before
-//!     a line of aterm was read. The index schema, the client's self-report and the vendor
-//!     authoring lane all served a triple no first-party crate could be built for.
+//! Two laws. (1) For every triple in [`atpkg::TARGETS`] the `compile_error!` predicate must
+//! evaluate false. (2) For every shipped Unix triple some `#[cfg(...)] mod <cell>;` must
+//! evaluate true: a bare escape row claims the target needs no POSIX ABI declarations, true
+//! for Windows and wasm32 but never on Unix, where those declarations are the crate. Without
+//! law 2 the cheap way to green law 1 on a future `aarch64-unknown-linux-musl` is a bare row,
+//! which ships a libc with no libc in it.
 //!
-//! WHY HERE. `crates/aterm-libc`'s escape list is the one place in the tree that ENUMERATES
-//! the targets aterm's own code may be compiled for, and `atpkg::TARGETS` is the one place
-//! that enumerates the targets aterm SHIPS to. A guard is only worth writing where two such
-//! lists must agree and nothing makes them; this file is that seam, and it sits beside
-//! `platform_cfg_parity.rs`, which guards the neighbouring class (a reference that stops
-//! resolving on the other side of a `cfg`) for the same reason and on the same terms.
+//! `cargo xtask gate cells` really cross-compiles and stays the authority; this guard is pure
+//! `std`, reads only committed sources under `CARGO_MANIFEST_DIR`, and proves only that the
+//! escape list does not refuse a shipped triple outright.
 //!
-//! WHY NOT ONLY IN `gate cells`. `cargo xtask gate cells` really cross-compiles, and it stays
-//! the authority — but its matrix is `aterm_forge::resolve::default_cells()`, and when this
-//! file was written that matrix was `mac-arm`, `linux`, `win` and the two wasm rows: THREE of
-//! the six shipped triples had no cell at all, `aarch64-pc-windows-msvc` among them. All six
-//! are cells since 2026-09-18, and `shipped_triples_have_a_compile_cell.rs` beside this one is
-//! the law that keeps them there. The gate is still opt-in for the whole matrix, needs each
-//! triple's std installed and costs minutes. This file is the cheap standing guard that rides
-//! along with `cargo test -p atpkg` on whatever box the change is being written on: pure
-//! `std`, no subprocess, no network, no new dependency, reading only committed sources under
-//! `CARGO_MANIFEST_DIR`. It cannot replace a real cross-compile and does not claim to — what
-//! it proves is that the escape list does not REFUSE a shipped triple outright, which is the
-//! failure that was live.
-//!
-//! THE TWO LAWS.
-//!
-//!   1. For every triple in [`atpkg::TARGETS`], `aterm-libc`'s `compile_error!` predicate must
-//!      evaluate FALSE. A triple the shipping lanes name may not be one the build refuses.
-//!   2. For every SHIPPED UNIX triple, some `#[cfg(...)] mod <cell>;` in that same file must
-//!      evaluate TRUE. An escape-list row with no cell behind it claims the target needs no
-//!      POSIX ABI declarations whatsoever — true for Windows and wasm32, where every `libc::`
-//!      consumer is already `cfg`-gated away and the unconditional `core::ffi` re-exports are
-//!      the whole of the crate, and false for every Unix target, where the declarations ARE
-//!      the crate. Without this law the cheapest way to make law 1 green on a future
-//!      `aarch64-unknown-linux-musl` would be to add a bare escape row, which compiles and
-//!      silently ships a libc with no libc in it.
-//!
-//! SCOPE AND LIMITS, said out loud so a green run is not read as more than it is:
-//!
-//!   * The cfg algebra understood here is `all` / `any` / `not`, the bare `unix` and `windows`
-//!     predicates, and `target_arch` / `target_os` / `target_env` / `target_family` /
-//!     `target_vendor` equalities. A predicate outside that grammar is an ERROR, never a
-//!     silent pass: this guard is about a list that must be complete, so a row it cannot read
-//!     is a row it must not vouch for.
-//!   * A triple's cfg values are DERIVED from its spelling by [`TargetCfg::derive`], from a
-//!     table of the os/vendor tokens this repository ships. An unknown token is likewise an
-//!     error, so a seventh `TARGETS` row cannot be added without either being understood or
-//!     being noticed.
-//!   * Only `crates/aterm-libc` is judged. It is the bottom of the first-party graph — the
-//!     crate every other one reaches through `[patch.crates-io]` — so a triple it refuses is
-//!     a triple nothing above it can be compiled for. A crate HIGHER up that fails on one
-//!     target is the class `platform_cfg_parity.rs` and `gate cells` cover.
-//!
-//! `the_evaluator_agrees_with_the_compiler_that_built_it` is the non-vacuity anchor: whatever
-//! box runs this test is itself a proof that the escape list admits that box's triple, and the
-//! evaluator has to agree with it. A parser that quietly matched nothing would fail there.
+//! The cfg grammar read here is `all` / `any` / `not`, bare `unix`/`windows`, and
+//! `target_arch`/`target_os`/`target_env`/`target_family`/`target_vendor` equalities; a
+//! predicate outside it, or a triple token [`TargetCfg::derive`] does not know, is an error
+//! rather than a silent pass. Only `crates/aterm-libc` is judged — the bottom of the
+//! first-party graph, so a triple it refuses is one nothing above it can be built for.
+//! `the_evaluator_agrees_with_the_compiler_that_built_it` is the non-vacuity anchor: this box
+//! compiled, so the escape list admits its triple, and the evaluator must say so too.
+//! agree — a parser that quietly matched nothing fails there.
 
 use std::path::{Path, PathBuf};
 
-// ---------------------------------------------------------------------------
-// THE SOURCE UNDER TEST
-// ---------------------------------------------------------------------------
+// The source under test
 
 /// The `compile_error!` string `aterm-libc` answers an unsupported target with. Quoted so the
-/// attribute above it can be found by what it GUARDS rather than by line number.
+/// attribute above it can be found by what it guards rather than by line number.
 const REFUSAL: &str = "aterm-libc has no generated ABI cell for this target";
 
 fn repo_root() -> PathBuf {
@@ -100,9 +54,7 @@ fn libc_source() -> String {
         .unwrap_or_else(|e| panic!("cannot read {} ({e})", path.display()))
 }
 
-// ---------------------------------------------------------------------------
-// LEXING: `#[cfg(...)]` attributes and the item each one gates
-// ---------------------------------------------------------------------------
+// Lexing: `#[cfg(...)]` attributes and the item each one gates
 
 /// One column-0 `#[cfg(…)]` attribute and the item line it is attached to.
 ///
@@ -111,7 +63,7 @@ fn libc_source() -> String {
 /// be inside a generated cell module, which is not this guard's business.
 #[derive(Debug, Clone)]
 struct Gated {
-    /// The predicate INSIDE `cfg(…)`, with interior newlines collapsed to spaces.
+    /// The predicate inside `cfg(…)`, with interior newlines collapsed to spaces.
     predicate: String,
     /// The first non-attribute, non-comment, non-blank line beneath the attribute.
     item: String,
@@ -218,9 +170,7 @@ fn cell_mods(src: &str) -> Vec<Gated> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// THE CFG ALGEBRA
-// ---------------------------------------------------------------------------
+// The cfg algebra
 
 /// The cfg values one target triple presents to `#[cfg(…)]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,13 +184,11 @@ struct TargetCfg {
 }
 
 impl TargetCfg {
-    /// Derive a triple's cfg values from its spelling.
-    ///
-    /// `<arch>-<vendor>-<os>[-<env>]`, with the os/vendor token table below covering exactly
-    /// what this repository ships. Deriving rather than tabulating is deliberate: a table of
-    /// six triples would have to be edited in lockstep with [`atpkg::TARGETS`], and a guard
-    /// whose own roster can go stale beside the roster it guards is the defect it is here to
-    /// prevent. An UNKNOWN token is an error, so nothing is guessed either.
+    /// Derive a triple's cfg values from `<arch>-<vendor>-<os>[-<env>]`, over the os/vendor
+    /// token table below. Derived rather than tabulated on purpose: a table of six triples
+    /// would have to be edited in lockstep with [`atpkg::TARGETS`], and a guard whose own
+    /// roster can go stale beside the roster it guards is the defect it prevents. An unknown
+    /// token is an error, so nothing is guessed either.
     fn derive(triple: &str) -> Result<Self, String> {
         let parts: Vec<&str> = triple.split('-').collect();
         if parts.len() < 3 || parts.len() > 4 {
@@ -259,7 +207,7 @@ impl TargetCfg {
             "darwin" => ("macos", "unix"),
             "linux" => ("linux", "unix"),
             "windows" => ("windows", "windows"),
-            // `wasm32-unknown-unknown`: `target_os = "unknown"` and NO `target_family`.
+            // `wasm32-unknown-unknown`: `target_os = "unknown"` and no `target_family`.
             "unknown" => ("unknown", ""),
             other => {
                 return Err(format!(
@@ -294,7 +242,7 @@ impl TargetCfg {
     }
 }
 
-/// Split a predicate list on its TOP-LEVEL commas: `all(a, b), c` is two arguments, not three.
+/// Split a predicate list on its top-level commas: `all(a, b), c` is two arguments, not three.
 fn arguments(inner: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0usize;
@@ -324,9 +272,8 @@ fn arguments(inner: &str) -> Vec<String> {
 
 /// Does `predicate` hold for `target`?
 ///
-/// `Err` for anything outside the grammar in this file's header. FAIL-CLOSED ON PURPOSE: the
-/// question asked here is "is this list complete", so a row the evaluator cannot read must
-/// stop the test rather than be waved through as covered.
+/// `Err` for anything outside the grammar in this file's header — fail-closed on purpose: a
+/// row the evaluator cannot read must stop the test rather than be waved through as covered.
 fn holds(predicate: &str, target: &TargetCfg) -> Result<bool, String> {
     let p = predicate.trim();
     if let Some(inner) = p.strip_prefix("all(").and_then(|s| s.strip_suffix(')')) {
@@ -384,7 +331,7 @@ fn refuses(escape: &str, target: &TargetCfg) -> Result<bool, String> {
     holds(escape, target)
 }
 
-/// The cfg values of the target this test binary was COMPILED for, read from the compiler
+/// The cfg values of the target this test binary was compiled for, read from the compiler
 /// rather than from any table here. The non-vacuity anchor's other half.
 fn compiled_target() -> TargetCfg {
     let arch = if cfg!(target_arch = "x86_64") {
@@ -436,14 +383,10 @@ fn compiled_target() -> TargetCfg {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LAW 1 — a shipped triple is never refused outright
-// ---------------------------------------------------------------------------
+// Law 1 — a shipped triple is never refused outright
 
-/// THE DEFECT THIS WAS WRITTEN FOR. `aarch64-pc-windows-msvc` is a `TARGETS` row, a
-/// `current_triple` arm and a vendor-map entry, and `crates/aterm-libc` answered it with
-/// `compile_error!` — so nothing in the first-party graph could be compiled for a triple three
-/// shipping lanes served.
+/// The defect this was written for: a triple three shipping lanes served, answered by
+/// `crates/aterm-libc` with `compile_error!` — so nothing first-party could compile for it.
 #[test]
 fn every_shipped_triple_is_one_aterm_libc_will_compile() {
     let src = libc_source();
@@ -467,14 +410,11 @@ fn every_shipped_triple_is_one_aterm_libc_will_compile() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// LAW 2 — a shipped Unix triple has a real cell, not just an escape row
-// ---------------------------------------------------------------------------
+// Law 2 — a shipped Unix triple has a real cell, not just an escape row
 
 /// A bare escape row says "this target needs no POSIX ABI declarations at all". True on
-/// Windows and wasm32, where every `libc::` consumer in the graph is `cfg`-gated away and the
-/// unconditional `core::ffi` re-exports are the whole crate. Never true on Unix — so the
-/// cheap way to satisfy law 1 for a future Unix triple must not be available.
+/// Windows and wasm32, where every `libc::` consumer is `cfg`-gated away and the
+/// unconditional `core::ffi` re-exports are the whole crate; never true on Unix.
 #[test]
 fn every_shipped_unix_triple_has_a_generated_cell() {
     let src = libc_source();
@@ -510,14 +450,12 @@ fn every_shipped_unix_triple_has_a_generated_cell() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// NON-VACUITY
-// ---------------------------------------------------------------------------
+// Non-vacuity
 
-/// The strongest check available without a second machine: THIS test binary exists, so the
-/// compiler that built it did not hit the `compile_error!` — and the evaluator must agree with
-/// that verdict on this very box. A parser that quietly matched nothing, or an evaluator that
-/// answered `true` for everything, dies here.
+/// The strongest check available without a second machine: this test binary exists, so the
+/// compiler that built it did not hit the `compile_error!`, and the evaluator must agree on
+/// this very box. A parser that matched nothing, or one that answers `true` to everything,
+/// dies here.
 #[test]
 fn the_evaluator_agrees_with_the_compiler_that_built_it() {
     let src = libc_source();
@@ -590,8 +528,8 @@ fn the_scan_still_sees_the_escape_list() {
     }
 }
 
-/// THE RED PROOF, against the shape of the real defect rather than a mutated constant: the
-/// escape list as it stood before 2026-09-16, with the x86_64 Windows row and no aarch64 twin.
+/// The red proof, against the shape of the real defect rather than a mutated constant: the
+/// escape list as it stood before the fix, with the x86_64 Windows row and no aarch64 twin.
 #[test]
 fn the_law_names_the_triple_the_list_forgot() {
     let before = "\
@@ -653,7 +591,7 @@ compile_error!(\"aterm-libc has no generated ABI cell for this target\");
     );
 }
 
-/// An unreadable row is an ERROR, not a pass. A guard about completeness that shrugs at the
+/// An unreadable row is an error, not a pass. A guard about completeness that shrugs at the
 /// rows it cannot parse reports green on a list it never read.
 #[test]
 fn a_predicate_outside_the_grammar_stops_the_test() {
@@ -665,7 +603,7 @@ fn a_predicate_outside_the_grammar_stops_the_test() {
     let err = holds("all(unix, target_pointer_width = \"64\")", &linux)
         .expect_err("an unreadable conjunct poisons the `all`");
     assert!(err.contains("target_pointer_width"), "{err}");
-    // …while the grammar it DOES know answers.
+    // …while the grammar it does know answers.
     assert!(holds("all(unix, target_arch = \"x86_64\")", &linux).expect("grammar"));
     assert!(!holds("any(windows, target_os = \"macos\")", &linux).expect("grammar"));
     assert!(holds("not(windows)", &linux).expect("grammar"));
@@ -679,7 +617,7 @@ fn an_unknown_triple_spelling_is_refused_rather_than_guessed() {
     assert!(err.contains("freebsd"), "{err}");
     let err = TargetCfg::derive("nonsense").expect_err("not a triple");
     assert!(err.contains("arch"), "{err}");
-    // The six committed spellings all derive, and each one derives DIFFERENTLY.
+    // The committed spellings all derive, and each one derives differently.
     let mut seen: Vec<TargetCfg> = Vec::new();
     for t in atpkg::TARGETS {
         let d = TargetCfg::derive(t).unwrap_or_else(|e| panic!("{e}"));

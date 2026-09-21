@@ -688,27 +688,21 @@ pub fn arm_parent_watchdog() {
         });
 }
 
-/// Stop every lane job whose SUBMITTING process is gone, and WAIT for launchd to forget
-/// it. Removing every `systems.alab.atpkg.<stem>-<pid>-<seq>-<nonce>` label whose `<pid>`
-/// no longer exists: a parent that died before its `Drop` (a test killed under a timeout,
-/// a `kill -9`) left its job registered, and until 2026-09-13 launchd kept such labels —
-/// and re-spawned them — indefinitely.
+/// Stop every lane job whose submitting process is gone, and wait for launchd to forget
+/// it: every `systems.alab.atpkg.<stem>-<pid>-<seq>-<nonce>` label whose `<pid>` no longer
+/// exists, left registered by a parent that died before its `Drop`.
 ///
-/// WHY IT WAITS, and why anything that deletes from the store calls it FIRST. A helper is
+/// Why it waits, and why anything that deletes from the store calls it first: a helper is
 /// launchd's child, not the submitter's, so a killed stager releases the store lock while
-/// the job it submitted keeps extracting into `<build>.incoming-<the dead stager's pid>`
-/// ([`LANE_PARENT_ENV`]'s watchdog ends such a helper within a poll, and one running from
-/// a binary that predates the watchdog never ends at all). The successor took the lock and
-/// swept that scratch out from under the live helper, stopping it only later — when its
-/// own lane prepared a job (audit 2026-09-16). `launchctl remove` merely SIGNALS the
-/// wrapper, whose trap kills the helper, and the label disappears once both have exited:
-/// polled for up to [`TEARDOWN_BOUND`], exactly as [`Job::teardown`] waits out a job of
-/// this process's own.
+/// the job it submitted keeps extracting into `<build>.incoming-<the dead stager's pid>`.
+/// The successor would otherwise sweep that scratch out from under a live helper.
+/// `launchctl remove` only signals the wrapper, whose trap kills the helper, so the label
+/// disappears once both have exited — polled for up to [`TEARDOWN_BOUND`], as
+/// [`Job::teardown`] waits out a job of this process's own.
 ///
-/// A label whose pid is alive is left alone (another install in flight, or a pid reused by
-/// something else: not ours to judge), and so is every label that is not one of ours
-/// ([`owner_pid_of_label`] enforces the stem). Best effort: a `launchctl` that cannot list
-/// is simply no sweep.
+/// A label whose pid is alive is left alone (another install in flight, or a reused pid),
+/// and so is every label that is not one of ours ([`owner_pid_of_label`] enforces the
+/// stem). Best effort: a `launchctl` that cannot list is simply no sweep.
 #[cfg(target_os = "macos")]
 pub(crate) fn stop_orphaned_lane_jobs() {
     let Ok(out) = std::process::Command::new("/bin/launchctl")
@@ -809,7 +803,7 @@ pub(crate) fn lanes_scratch() -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 impl Job {
     /// Create the job's `0700` scratch under `scratch`, named `<stem>-<pid>-<seq>-<nonce>`
-    /// (the label is `systems.alab.atpkg.` + that name). First STOPS the jobs earlier
+    /// (the label is `systems.alab.atpkg.` + that name). First stops the jobs earlier
     /// parents left behind ([`stop_orphaned_lane_jobs`]).
     pub(crate) fn prepare(scratch: &Path, stem: &str) -> Result<Self, String> {
         stop_orphaned_lane_jobs();

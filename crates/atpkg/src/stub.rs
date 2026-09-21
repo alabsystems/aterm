@@ -621,12 +621,11 @@ pub(crate) fn pending_stub_executable_at(
     )
 }
 
-/// [`pending_stub_executable_at`] with its two ENVIRONMENT measurements handed in — the
-/// stub's own `com.apple.provenance`, and whether a lay from THIS process would land clean
-/// — exactly as [`crate::lay::lay_executables_with`] takes its tracking measurement, so
-/// both halves of the re-lay rule are exercisable from a test on a machine that can
-/// produce only one of them. Both stay lazy: the xattr is read only for a byte-identical
-/// stub, and the lane probe only when that stub is tagged.
+/// [`pending_stub_executable_at`] with its two environment measurements handed in — the
+/// stub's own `com.apple.provenance`, and whether a lay from this process would land clean
+/// — so both halves of the re-lay rule are exercisable on a machine that can produce only
+/// one of them. Both stay lazy: the xattr is read only for a byte-identical stub, the lane
+/// probe only when that stub is tagged.
 pub(crate) fn pending_stub_executable_at_with(
     layout: &Layout,
     tool: &ToolName,
@@ -648,16 +647,11 @@ pub(crate) fn pending_stub_executable_at_with(
             // whole-bundle copy per call. A body that differs — the embedded atpkg
             // path, the kind or the requires changed — is rewritten.
             //
-            // A TAGGED stub is rewritten only when the rewrite would CLEAR the tag
-            // ([`identical_stub_needs_relay`], which was written for this call site and
-            // which the reroute stubs and the agents twins already read). A
-            // provenance-tracked process with no untracked lane
-            // ([`crate::lay::Lane::Unavailable`] — a test harness, a foreign embedding of
-            // this crate) lays every byte tagged by construction, so re-laying its own
-            // tagged stub converges on nothing: same bytes, same tag, every pass for ever,
-            // one launchd job or whole-bundle copy each time, and the byte-identical skip
-            // was dead there. A tracked process that HAS a lane still re-lays: the lane
-            // writes the file clean, which is a real repair.
+            // A tagged stub is rewritten only when the rewrite would clear the tag
+            // ([`identical_stub_needs_relay`]): a tracked process with no untracked lane
+            // ([`crate::lay::Lane::Unavailable`]) lays every byte tagged, so re-laying its
+            // own tagged stub converges on nothing. One that has a lane still re-lays,
+            // because the lane writes the file clean.
             if stub_is_current(
                 &shim,
                 &body,
@@ -677,15 +671,11 @@ pub(crate) fn pending_stub_executable_at_with(
 /// Whether the pending stub at `shim` is CURRENT — the exact bytes this pass would
 /// render (`body`), and not in need of a re-lay. `needs_relay` is the caller's answer to
 /// "must a byte-identical stub be written again anyway?"
-/// ([`identical_stub_needs_relay`]): a stub carrying `com.apple.provenance` is a file the
-/// kernel execs, so it tracks every program it runs (law m21, [`crate::lay`]) and wants
-/// replacing — but only by a pass that can actually lay it clean, because a rewrite that
-/// lands tagged again repairs nothing and re-lays identical bytes for ever.
-///
-/// Handed in rather than measured here so both halves of the rule are exercisable from a
-/// test whose own writes are tagged by the session running it — the tag can be neither
-/// minted nor removed by hand, and [`crate::lay::lay_executables_with`] takes its
-/// tracking measurement as a parameter for exactly this reason.
+/// ([`identical_stub_needs_relay`]): a stub carrying `com.apple.provenance` tracks every
+/// program it runs (law m21, [`crate::lay`]) and wants replacing, but only by a pass that
+/// can lay it clean — a rewrite that lands tagged again repairs nothing. Handed in rather
+/// than measured here so both halves of the rule are testable on a machine whose own writes
+/// are tagged; the tag can be neither minted nor removed by hand.
 fn stub_is_current(shim: &Path, body: &str, needs_relay: bool) -> bool {
     !needs_relay && std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
 }
@@ -1309,15 +1299,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A TAGGED BUT IDENTICAL STUB IS REWRITTEN ONLY WHEN THE REWRITE WOULD CLEAR THE TAG.
-    /// The pending path used to pass the raw `com.apple.provenance` measurement as its
-    /// "not current" input, so a provenance-tracked process with NO untracked lane
-    /// ([`crate::lay::Lane::Unavailable`] — a test harness, a foreign embedding of this
-    /// crate), which lays every byte tagged by construction, rewrote and fsynced the same
-    /// stub on every pass for ever: same bytes, same tag, one launchd job or whole-bundle
-    /// copy each time, converging on nothing. [`identical_stub_needs_relay`] was written
-    /// for exactly this call site (and is what the reroute stubs and the agents twins
-    /// already read); this pins that the pending stubs read it too.
+    /// A tagged but identical stub is rewritten only when the rewrite would clear the tag.
+    /// Passing the raw `com.apple.provenance` measurement as the "not current" input made a
+    /// tracked process with no untracked lane ([`crate::lay::Lane::Unavailable`]) rewrite
+    /// and fsync the same stub on every pass for ever; this pins that the pending stubs
+    /// read [`identical_stub_needs_relay`] instead.
     #[cfg(unix)]
     #[test]
     fn a_tagged_identical_stub_is_relaid_only_when_the_relay_would_clear_the_tag() {
@@ -1369,10 +1355,8 @@ mod tests {
     /// name), so a steady-state seed or install pass hands `lay_executables` an empty
     /// list — no launchd job and no bundle copy from a tracked app. A stub whose body
     /// changed (kind flip, new requires) is still rewritten — and so is one that carries
-    /// `com.apple.provenance` WHEN this pass could lay it clean: a tagged stub is a file
-    /// the kernel execs, so it tracks every program it runs, and re-laying it is how the
-    /// untracked lane gets to replace it with a clean one ([`stub_is_current`],
-    /// [`identical_stub_needs_relay`], `reroute::lay`, law m21).
+    /// `com.apple.provenance` when this pass could lay it clean, which is how the untracked
+    /// lane replaces a tagged stub ([`stub_is_current`], [`identical_stub_needs_relay`]).
     ///
     /// THE TAG IS AN ENVIRONMENT FACT, NOT A CHOICE (audit 2026-09-15). Every file this
     /// test writes inherits the tag when the session running it is provenance-tracked (an
@@ -1385,12 +1369,10 @@ mod tests {
     ///   the measurement instead of letting it take one — identical-and-clean is current,
     ///   identical-but-tagged is not, a changed body is never current;
     /// * the END TO END half (a real file through the reconcile and the adoption lay)
-    ///   asserts the full outcome for what this session actually produces, reading the
-    ///   SAME TWO measurements the rule reads: the inode is KEPT when this session's writes
-    ///   come back clean (nothing to repair) and kept when they come back tagged with no
-    ///   lane that could clean them (a re-lay would land tagged again — `08faa0245`), and
-    ///   the stub is re-laid — same bytes, new inode, `Ok(Some)` — only when it is tagged
-    ///   AND a lay of ours would clear it. Which case ran is printed, never assumed.
+    ///   asserts the full outcome for what this session actually produces, reading the same
+    ///   two measurements the rule reads: the inode is kept when this session's writes come
+    ///   back clean, and kept when they come back tagged with no lane that could clean them;
+    ///   the stub is re-laid only when it is tagged and a lay of ours would clear it.
     #[cfg(unix)]
     #[test]
     fn an_identical_stub_is_left_alone_and_a_changed_one_is_rewritten() {
@@ -1427,14 +1409,9 @@ mod tests {
         // session really produces: an untracked one keeps the inode (temp+rename would
         // give it a new one), a tracked one re-lays the same bytes.
         let tagged = crate::provenance::carries_provenance(&shim);
-        // THE RULE READS TWO MEASUREMENTS, so this half must read both (`08faa0245`): a
-        // tagged identical stub is re-laid only when a lay from THIS process would come
-        // back clean. A provenance-tracked test binary with no untracked lane
-        // (`lay::Lane::Unavailable`) is exactly the case that commit fixed — it lays every
-        // byte tagged, so a re-lay converges on nothing and the stub is LEFT ALONE.
-        // Measured 2026-09-17 on a provenance-tracked Intel Mac, where this test read the
-        // pre-08faa0245 outcome and failed with "a tagged stub is re-laid even
-        // byte-identical" while the code was doing the new, right thing.
+        // The rule reads two measurements, so this half must read both: a tagged identical
+        // stub is re-laid only when a lay from this process would come back clean. A tracked
+        // binary with no untracked lane lays every byte tagged, so the stub is left alone.
         let clean_lay = crate::lay::lay_clears_provenance();
         eprintln!(
             "an_identical_stub_is_left_alone: this session writes {} files and a lay from it \

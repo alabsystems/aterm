@@ -285,22 +285,14 @@ pub fn spotlight_index_state(path: &Path) -> Option<crate::platform::IndexState>
     }
 }
 
-/// What one `mdutil -s <volume>` answer says — the one question
-/// [`spotlight_index_state`]'s caller has (a probe it planted never showed up in the
-/// index; is that the volume's state, or a busy machine?).
+/// What one `mdutil -s <volume>` answer says, for [`spotlight_index_state`]: is a probe that
+/// never showed up the volume's state, or a busy machine?
 ///
-/// The answer is the STATUS LINE after the volume's name (`<volume>:` on its own line,
-/// then one tab-indented line): "Indexing enabled.", "Indexing disabled.", "Indexing
-/// and searching disabled." — and "Index is read-only." (measured 2026-09-16 on the
-/// owner's data volume, macOS 26.6.2, at 96% full: mds's low-disk-space hold — the index
-/// stands and answers searches, but takes no new entries, so a planted probe never
-/// arrives; it lifts when space is freed). Only the status line is read — the volume's
-/// name is echoed above it and a volume called `disabled-drive` must not read as a
-/// state — and an `Error:` line is no state at all, whatever path it quotes
-/// (`mdutil -s /no/such` prints `Error: invalid path `/no/such'.` on ONE line, with no
-/// name line above it — the shape the no-mount-point fallback gets). Within the status
-/// line "disabled" is matched by substring, so the third answer reads as disabled
-/// whichever word it leads with.
+/// Only the status line (tab-indented, after the `<volume>:` name line) is read, so a volume
+/// named `disabled-drive` does not read as a state and an `Error:` line is no state at all.
+/// "Index is read-only." is its own state — a low-disk-space hold under which a planted probe
+/// never arrives. "disabled" matches by substring, so "Indexing and searching disabled." reads
+/// as disabled.
 #[cfg(target_os = "macos")]
 fn mdutil_index_state(stdout: &[u8]) -> Option<crate::platform::IndexState> {
     use crate::platform::IndexState;
@@ -900,11 +892,8 @@ mod tests {
     use super::*;
 
     /// The four answers `mdutil -s` gives, and the one it gives when it cannot say.
-    /// "Index is read-only." (2026-09-16) is its own state: the volume takes no new
-    /// entries, so a planted probe never arrives, but it is mds's low-disk-space hold,
-    /// not a setting — the verify's refinement must say that rather than blame a busy
-    /// machine OR tell the reader nothing needs migrating. Only the status line is
-    /// read: a volume whose NAME carries a state word is not that state.
+    /// "Index is read-only." is its own state — a low-disk-space hold, not a setting. Only
+    /// the status line is read: a volume whose name carries a state word is not that state.
     #[cfg(target_os = "macos")]
     #[test]
     fn every_mdutil_state_line_is_read() {
@@ -948,8 +937,6 @@ mod tests {
     /// Measured 2026-09-02 on macOS 26.6.2 (25G83):
     ///   mdutil -s /System/Volumes/Data       -> Indexing enabled.
     ///   mdutil -s /Users//example/aterm        -> Error: unknown indexing state.
-    /// The same volume answered "Index is read-only." on 2026-09-16 (its low-disk-space
-    /// hold), which is why the probe reads a three-state answer now.
     #[test]
     fn the_indexing_switch_is_asked_at_the_mount_point_not_at_a_deep_path() {
         let deep = std::fs::canonicalize(std::env::temp_dir()).unwrap();

@@ -238,54 +238,38 @@ fn lock_path_of(prefix: &Path) -> String {
 /// Generous for a loaded CI box; the grace itself is 2 s.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(15);
 
-/// The slack a pass that does NOT wait may have over its control before it is called
-/// a wait. Thirty times the ~25 ms such a pass costs on an idle machine (measured
-/// 2026-09-19, six runs of this suite: 21.7-25.0 ms for all three cases below), and
-/// still comfortably under the 2 s [`atpkg::lock::WAIT_ANNOUNCE_GRACE`] — the
-/// shortest wait that could hide from the `lock-waiting:` assertions these cases
-/// already make.
+/// The slack a pass that does NOT wait may have over its control before it is called a
+/// wait: many times what such a pass costs on an idle machine, and still well under the
+/// 2 s [`atpkg::lock::WAIT_ANNOUNCE_GRACE`] — the shortest wait that could hide from the
+/// `lock-waiting:` assertions these cases already make.
 const NO_WAIT_SLACK: Duration = Duration::from_millis(750);
 
 /// How many times a no-wait comparison may be re-measured before its verdict is
 /// believed. A wait is deterministic; a scheduling spike is not.
 const NO_WAIT_ATTEMPTS: usize = 3;
 
-/// One more pass in `fx`, run purely for its wall time, both pipes drained (the
-/// two-pipe rule) and its output thrown away — the CONTENT of these passes is
-/// asserted once, on the run the case itself made.
+/// One more pass in `fx`, run purely for its wall time, both pipes drained (the two-pipe
+/// rule) and its output discarded — the content is asserted on the run the case made.
 fn elapsed_of(fx: &Fixture, args: &[&str]) -> Duration {
     let child = stream(fx.spawn(args));
     let (_, elapsed, _, _) = child.finish(Duration::from_secs(30));
     elapsed
 }
 
-/// THE NO-WAIT PROPERTY, WITH PROCESS STARTUP TAKEN OUT OF THE MEASUREMENT.
+/// The no-wait property, with process startup taken out of the measurement.
 ///
-/// Three cases below assert that a pass came back WITHOUT queueing at the store
-/// lock. What they asserted until 2026-09-19 was that the whole child — fork, exec,
-/// dyld, the dispatch edge, the `[machine]` refusal a temp HOME earns, the verb —
-/// finished inside 2 s. On an idle machine that child costs ~25 ms, so the budget
-/// read as 80x of headroom; under the full suite's own load the same no-wait child
-/// was measured at ~2.17 s and the budget went red. Almost none of that is the lock
-/// question: it is what a loaded Mac charges to start a 15 MB unoptimized binary.
-/// The suite then reported a defect in the lock edge, which is the one thing the
-/// measurement had not measured.
+/// Timing the whole child measures mostly fork/exec/dyld for a 15 MB unoptimized binary,
+/// which under load swamps the lock question and turns the budget into a reading of how busy
+/// the Mac is. So the pass is priced against a control run of the same binary differing in
+/// exactly the variable the case is about — a held lock versus a free one, `--wait-lock`
+/// present versus absent — and nothing else, so the difference between them is the lock
+/// question and [`NO_WAIT_SLACK`] can be far tighter than a whole-child budget.
 ///
-/// So the pass is priced against a CONTROL run of the SAME binary that differs in
-/// exactly the variable the case is about — a held lock versus a free one, the
-/// `--wait-lock` flag present versus absent — and nothing else. Both pay the
-/// identical startup on the identical machine, so the DIFFERENCE between them is
-/// the lock question and nothing else, and [`NO_WAIT_SLACK`] can be far tighter
-/// than the 2 s it replaces while never again being a reading of how busy the Mac
-/// is.
-///
-/// Retried, because a difference of two wall-clock samples can still lose to a
-/// spike that lands on one of them: up to [`NO_WAIT_ATTEMPTS`] measurements,
-/// failing only when EVERY one of them saw the pass outrun its control. That
-/// cannot hide a regression. No holder in these fixtures ever lets go, so a pass
-/// that enters the wait loop stays there for its whole bound (30 s) or announces
-/// itself at the 2 s grace — and the announcement is asserted away separately, by
-/// marker, which no amount of load can perturb.
+/// Retried up to [`NO_WAIT_ATTEMPTS`] times, failing only when every measurement saw the pass
+/// outrun its control, since a spike can land on one sample. That cannot hide a regression:
+/// no holder in these fixtures ever lets go, so a pass that enters the wait loop stays there
+/// for its whole bound (30 s) or announces itself at the 2 s grace — and the announcement is
+/// asserted separately, by marker, which no load can perturb.
 fn assert_no_wait(
     label: &str,
     first: Duration,
@@ -481,8 +465,7 @@ fn a_typed_seed_stays_fail_fast_with_exit_75() {
         Some(i32::from(atpkg::lock::CONTENDED_EXIT)),
         "{status}; stderr: {stderr}"
     );
-    // IT DID NOT WAIT, priced against the SAME verb over a FREE lock: the only
-    // difference between the two is the thing this case is about.
+    // It did not wait, priced against the same verb over a free lock.
     let free = Fixture::new("typed-control");
     free.decline();
     assert_no_wait(
@@ -510,8 +493,7 @@ fn an_unwritable_prefix_never_waits_and_keeps_exit_1() {
     let child = stream(fx.spawn(&["seed", "--wait-lock", "30"]));
     let (status, elapsed, stdout, stderr) = child.finish(Duration::from_secs(10));
     assert_eq!(status.code(), Some(1), "{status}; stderr: {stderr}");
-    // IT DID NOT WAIT, priced against the SAME pass without the flag — the only
-    // thing that could make an `Io` refusal queue instead of coming straight back.
+    // It did not wait, priced against the same pass without the flag.
     assert_no_wait(
         "an Io refusal under --wait-lock",
         elapsed,
@@ -808,8 +790,7 @@ fn a_declined_seed_without_contention_is_unchanged() {
     let child = stream(fx.spawn(&["seed", "--wait-lock", "30"]));
     let (status, elapsed, stdout, stderr) = child.finish(Duration::from_secs(10));
     assert!(status.success(), "{status}; stderr: {stderr}");
-    // THE FLAG CHANGES NOTHING, priced against the same uncontended pass without
-    // it: whatever this machine charges for a child, both of them paid it.
+    // The flag changes nothing, priced against the same uncontended pass without it.
     assert_no_wait(
         "an uncontended seed under --wait-lock",
         elapsed,

@@ -84,10 +84,10 @@ pub(crate) const HOLD_NOTICE: Duration = Duration::from_secs(30);
 pub(crate) const HOLD_MANAGED: Duration = Duration::from_secs(15);
 /// How long a STAGED update bar stays up while the AUTOMATIC lane is armed to
 /// apply it — the pull-down IS the "update ready" surface now (2026-09-07),
-/// so it holds until the apply lands (at the first quiet moment; past its
-/// two-minute grace the lane waits only for a gap in typing and output, and the
-/// typing hold can stand it down for up to ten) rather than folding after eight
-/// seconds and leaving the moment to a floating card.
+/// so it holds until the apply lands (at the first quiet moment, and within the
+/// ladder's 15-minute bound regardless — `native_update_auto_intent::LANDS_WITHIN`)
+/// rather than folding after eight seconds and leaving the moment to a floating
+/// card.
 pub(crate) const HOLD_STAGED_AUTOMATIC: Duration = Duration::from_secs(10 * 60);
 /// How long a STAGED bar holds when the build applies only on a press: long
 /// enough to be seen and clicked, short enough that a declined update does not
@@ -177,17 +177,17 @@ pub(crate) enum Lane {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyPosture {
     /// `update.auto_apply` on (the default) and no veto: the seamless lane lands
-    /// it at the first quiet moment, forced no later than
-    /// `AUTOMATIC_UPDATE_ACTIVITY_GRACE`.
+    /// it at the first quiet moment, and no later than the ladder's bound
+    /// (`native_update_auto_intent::LANDS_WITHIN`) whatever the terminal does.
     Automatic,
     /// `[update] auto_apply = false`.
     ManualByConfig,
     /// An environment veto for this run: `ATERM_NO_AUTO_APPLY` or the
     /// `ATERM_DEBUG_RELAUNCH_NUDGE` screenshot seam.
     VetoedByEnv { var: &'static str },
-    /// The automatic lane stood down for THIS build (failed / blocked attempts,
-    /// or the typing hold). `lapses`: the latch carries a deadline and re-arms by
-    /// itself.
+    /// The automatic lane stood down for THIS build after a physical handoff
+    /// failure. `lapses`: the schedule carries a retry deadline and re-arms by
+    /// itself; otherwise it has converged and only a person moves it.
     ManualOnlyLatched { lapses: bool },
     /// The in-session handoff cannot run in this process — `why` names the
     /// reason ([`HandoffUnavailable`]: the `ATERM_NO_SEAMLESS_UPDATE` opt-out,
@@ -467,15 +467,15 @@ fn staged_hold(posture: Option<ApplyPosture>) -> Duration {
 #[must_use]
 pub(crate) fn staged_detail(build: u64, posture: ApplyPosture) -> String {
     let how = match posture {
-        // The mechanism, not a number (2026-09-18): the lane lands at the first
-        // quiet moment — seconds, usually — and past its grace it waits for a gap
-        // in typing and output; "within ~2 min" read as a wait beside a click
-        // affordance, and it was false whenever the typing hold ran past it.
-        ApplyPosture::Automatic => {
-            "applies by itself at the next quiet moment — nothing to do; your shells keep \
-             running"
-                .to_string()
-        }
+        // The mechanism AND the bound: the lane lands at the first quiet moment
+        // — seconds, usually — and the ladder guarantees a landing inside
+        // `LANDS_WITHIN` whatever the terminal is doing, so that is the one
+        // number this sentence may quote.
+        ApplyPosture::Automatic => format!(
+            "applies by itself at the next quiet moment, and within {} min regardless — \
+             nothing to do; your shells keep running",
+            crate::native_update_auto_intent::LANDS_WITHIN.as_secs() / 60
+        ),
         ApplyPosture::ManualByConfig => format!(
             "auto-apply is off — {APPLY_FROM_MENU} or Software Update (in place; your shells \
              keep running)"
@@ -4563,8 +4563,8 @@ mod tests {
         assert_eq!(bar.text.title, "aterm v0.48.0 is ready");
         assert_eq!(
             bar.text.detail,
-            "build 99 — verified; applies by itself at the next quiet moment — nothing to do; \
-             your shells keep running"
+            "build 99 — verified; applies by itself at the next quiet moment, and within 15 min \
+             regardless — nothing to do; your shells keep running"
         );
         assert!(!bar.text.title.contains("click"), "{}", bar.text.title);
         assert_eq!(bar.fill, None, "no meter on a staged row");

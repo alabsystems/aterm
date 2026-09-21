@@ -8,7 +8,7 @@
 # at a word boundary.
 #
 # [[trick]]     id = one of: sit down sleep stretch jump play roll purr groom
-#               speak look paw hide boo scold treat
+#               speak sing look paw hide boo scold treat
 #   words    = PLAIN surfaces: may fire unaddressed, on a line that holds
 #              nothing but pet vocabulary (tentatively - the fire is revoked if
 #              the line then turns into prose).
@@ -167,11 +167,20 @@ notes    = "mlem / blep are cat-speak for the tongue at work. clean (`clean up t
 [[trick]]
 id       = "speak"
 lang     = "en"
-words    = ["meow", "mew", "miaow", "mrow", "mrrow", "mrrp", "nya", "nyan", "speak", "sing", "chirp", "trill", "ekekek", "yowl", "bark", "arf", "bork", "awoo", "howl", "meowdy", "mrp", "prrt", "brrt", "chatter", "caterwaul", "bowwow", "yip", "roar"]
+words    = ["meow", "mew", "miaow", "mrow", "mrrow", "mrrp", "nya", "nyan", "speak", "chirp", "trill", "ekekek", "yowl", "bark", "arf", "bork", "awoo", "howl", "meowdy", "mrp", "prrt", "brrt", "chatter", "bowwow", "yip", "roar"]
 address  = ["talk", "voice"]
 gated    = false
 cjk      = false
-notes    = "meow / mew / miaow are the ONLY surfaces allowed to overlap the shared sparkle lexicon (feline): the cat's own voice, answered in kind. `woof` and `miau` are shared surfaces and are NOT here (law 5); bark / arf / bork / awoo carry the dog. `ruff` is NOT here - it is the Python linter. `say` is NOT here - it is the macOS speech command. ekekek = the chatter at a bird through the window. talk (`talk me through it`; also a Unix command) and voice are address."
+notes    = "meow / mew / miaow are the ONLY surfaces allowed to overlap the shared sparkle lexicon (feline): the cat's own voice, answered in kind. `woof` and `miau` are shared surfaces and are NOT here (law 5); bark / arf / bork / awoo carry the dog. `ruff` is NOT here - it is the Python linter. `say` is NOT here - it is the macOS speech command. ekekek = the chatter at a bird through the window. talk (`talk me through it`; also a Unix command) and voice are address. `sing` and `caterwaul` moved to the `sing` trick below: one note is a speak, a RUN of them is a song, and asking for the song must not get you the note (law 6 - one word, one role)."
+
+[[trick]]
+id       = "sing"
+lang     = "en"
+words    = ["sing", "caterwaul", "yodel", "serenade", "warble", "croon", "karaoke", "singalong", "lalala"]
+address  = ["song", "music", "tune", "melody", "opera", "hum", "chorus", "anthem"]
+gated    = false
+cjk      = false
+notes    = "The SONG, not the note: `speak` deals one meow, this deals a run of them. `sing` is plain - it is the word the owner asked for, and no ordinary command or assistant message opens with it (not a LINE_OPENER). caterwaul / yodel / serenade / warble / croon / karaoke / singalong / lalala are all words nobody types at a prompt for any other reason. The address side is NOUNS: `tune` (`tune the GC`, `tune this query`), `music` and `opera` (the browser) and `song` open ordinary lines, so each needs the pet named."
 
 [[trick]]
 id       = "look"
@@ -347,11 +356,20 @@ notes    = "bare 'lame' (lick) omitted: ordinary English word and an insult; lav
 [[trick]]
 id       = "speak"
 lang     = "es"
-words    = ["habla", "miau", "maúlla", "maulla", "canta", "ladra", "guau"]
+words    = ["habla", "miau", "maúlla", "maulla", "ladra", "guau"]
 address  = []
 gated    = false
 cjk      = false
 notes    = "habla is the dog-school 'speak'; ladra/guau for the dog skin"
+
+[[trick]]
+id       = "sing"
+lang     = "es"
+words    = ["canta"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "canta is the bare imperative; `cantar` is left out (the infinitive opens `cantar de ...` lines rarely enough to matter but buys nothing the imperative does not)."
 
 [[trick]]
 id       = "look"
@@ -551,11 +569,20 @@ notes    = "Gated: `toilette` is a word English speakers really type, so it load
 [[trick]]
 id       = "speak"
 lang     = "fr"
-words    = ["parle", "miaule", "miaou", "chante", "aboie", "ouaf", "wouf"]
+words    = ["parle", "miaule", "miaou", "aboie", "ouaf", "wouf"]
 address  = []
 gated    = false
 cjk      = false
 notes    = "'dis' omitted (opens chat sentences and is a tech token)"
+
+[[trick]]
+id       = "sing"
+lang     = "fr"
+words    = ["chante"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "chante is both the imperative and the 3sg; neither opens an ordinary command line."
 
 [[trick]]
 id       = "look"
@@ -762,11 +789,20 @@ notes    = "toeletta = the cat's wash"
 [[trick]]
 id       = "speak"
 lang     = "it"
-words    = ["parla", "miagola", "miao", "canta", "abbaia"]
+words    = ["parla", "miagola", "miao", "abbaia"]
 address  = []
 gated    = false
 cjk      = false
 notes    = "'bau' (woof) omitted: the same surface is ro 'boo'; 'voce' omitted (pt 'você' typed bare)"
+
+[[trick]]
+id       = "sing"
+lang     = "it"
+words    = ["canta"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "canta is the imperative; same surface as es/ca, which is a same-role merge and not a conflict."
 
 [[trick]]
 id       = "look"
@@ -928,11 +964,20 @@ notes    = "bare 'lava' omitted (English word)"
 [[trick]]
 id       = "speak"
 lang     = "pt"
-words    = ["fala", "miau", "canta", "ladra", "au-au", "auau"]
+words    = ["fala", "miau", "ladra", "au-au", "auau"]
 address  = []
 gated    = false
 cjk      = false
 notes    = "'late' (bark) omitted: English word; 'mia' (meow!) omitted: it is an Italian filler"
+
+[[trick]]
+id       = "sing"
+lang     = "pt"
+words    = ["canta"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "canta is the tu imperative; the voce form `cante` is left out (it folds onto nothing useful and pt speakers reach this with canta)."
 
 [[trick]]
 id       = "look"
@@ -1105,11 +1150,20 @@ notes    = "baie/băiță = bath"
 [[trick]]
 id       = "speak"
 lang     = "ro"
-words    = ["vorbește", "vorbeste", "miaună", "miauna", "miau", "cântă", "canta", "latră", "latra", "ham-ham"]
+words    = ["vorbește", "vorbeste", "miaună", "miauna", "miau", "latră", "latra", "ham-ham"]
 address  = ["spune"]
 gated    = false
 cjk      = false
 notes    = "bare 'ham' omitted (English word) but the doubled ham-ham (woof) is safe; spune opens chat requests"
+
+[[trick]]
+id       = "sing"
+lang     = "ro"
+words    = ["cântă", "canta"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "the bare spelling is listed beside the marked one, so a user typing without diacritics still reaches the song."
 
 [[trick]]
 id       = "look"
@@ -1291,11 +1345,20 @@ notes    = "raspall = brush"
 [[trick]]
 id       = "speak"
 lang     = "ca"
-words    = ["parla", "miola", "miau", "marrameu", "canta", "borda", "bup-bup"]
+words    = ["parla", "miola", "miau", "marrameu", "borda", "bup-bup"]
 address  = []
 gated    = false
 cjk      = false
 notes    = "marrameu is the cat's yowl (moved here from the vocatives); 'mèu' omitted: it folds onto the pt filler 'meu'"
+
+[[trick]]
+id       = "sing"
+lang     = "ca"
+words    = ["canta"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "canta is the imperative, shared with es/it as a same-role merge."
 
 [[trick]]
 id       = "look"
@@ -1505,11 +1568,20 @@ notes    = "bare 'putz' omitted (Yiddish-English vulgarism); 'lecken' omitted ('
 [[trick]]
 id       = "speak"
 lang     = "de"
-words    = ["miau", "miauen", "maunz", "maunzen", "mauzen", "singen", "sprich", "wuff", "wau", "bellen"]
+words    = ["miau", "miauen", "maunz", "maunzen", "mauzen", "sprich", "wuff", "wau", "bellen"]
 address  = ["laut"]
 gated    = false
 cjk      = false
 notes    = "'Gib Laut!' is the dog speak cue but 'Laut Doku ...' opens sentences, so address; 'miau' is NOT in the shared sparkle lexicon today (checked) although the seed's law-5 comment names it"
+
+[[trick]]
+id       = "sing"
+lang     = "de"
+words    = ["singen"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "singen is the infinitive the dog-school cue uses. `sing` / `singe` are NOT here: `sing` is the English plain surface (English opens the file and wins it), and `singe` is an English dictionary word, which law 7 would make us gate."
 
 [[trick]]
 id       = "speak"
@@ -1743,20 +1815,29 @@ notes    = "imperative 'was' omitted (the English verb 'was'); 'bad' omitted (En
 [[trick]]
 id       = "speak"
 lang     = "nl"
-words    = ["miauw", "miauwen", "mauw", "mauwen", "zingen", "praat", "praten", "spreek", "blaf", "blaffen", "woef"]
+words    = ["miauw", "miauwen", "mauw", "mauwen", "praat", "praten", "spreek", "blaf", "blaffen", "woef"]
 address  = ["zeg"]
 gated    = false
 cjk      = false
 notes    = "'Zeg, ...' opens sentences; 'waf' dropped (WAF / the waf build tool are developer tokens, and 'woef' is the commoner bark)"
 
 [[trick]]
-id       = "speak"
+id       = "sing"
+lang     = "nl"
+words    = ["zingen"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "zingen is the infinitive; the imperative `zing` is an English word too and keeps its own gated row below, exactly as it had under speak."
+
+[[trick]]
+id       = "sing"
 lang     = "nl"
 words    = ["zing"]
 address  = []
 gated    = true
 cjk      = false
-notes    = "'zing' is an English word"
+notes    = "zing is the Dutch imperative AND an English word (to zing), so it stays gated exactly as it was under speak - law 7. The ungated Dutch song word is zingen, in the row above."
 
 [[trick]]
 id       = "look"
@@ -1936,11 +2017,20 @@ notes    = "'katten putsar sig' is the Swedish verb for cat grooming; 'bad' omit
 [[trick]]
 id       = "speak"
 lang     = "sv"
-words    = ["mjau", "mjao", "jama", "sjung", "sjunga", "prata", "snacka", "tala", "skäll", "voff", "vov"]
+words    = ["mjau", "mjao", "jama", "prata", "snacka", "tala", "skäll", "voff", "vov"]
 address  = ["säg"]
 gated    = false
 cjk      = false
 notes    = "'jama' is THE verb for meowing (an obscure web2 headword); bare 'jam' omitted (English)"
+
+[[trick]]
+id       = "sing"
+lang     = "sv"
+words    = ["sjung", "sjunga"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "sjung is the imperative, sjunga the infinitive."
 
 [[trick]]
 id       = "look"
@@ -2147,11 +2237,20 @@ notes    = "'bade' omitted (English past tense of bid), 'puss' omitted (en vocat
 [[trick]]
 id       = "speak"
 lang     = "no"
-words    = ["mjau", "mjaue", "syng", "synge", "snakk", "snakke", "bjeff", "bjeffe", "voff", "lyd"]
+words    = ["mjau", "mjaue", "snakk", "snakke", "bjeff", "bjeffe", "voff", "lyd"]
 address  = []
 gated    = false
 cjk      = false
 notes    = "'Gi lyd!' is the dog cue ('gi' is a filler); 'prat' omitted (British insult)"
+
+[[trick]]
+id       = "sing"
+lang     = "no"
+words    = ["syng", "synge"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "syng is the imperative, synge the infinitive; shared with da as a same-role merge."
 
 [[trick]]
 id       = "speak"
@@ -2410,11 +2509,20 @@ notes    = "'bad'/'bade' omitted (English); bare 'slik' omitted (it also means '
 [[trick]]
 id       = "speak"
 lang     = "da"
-words    = ["miav", "mjav", "miave", "syng", "synge", "snak", "snakke", "vov", "vovvov", "vuf", "lyd"]
+words    = ["miav", "mjav", "miave", "snak", "snakke", "vov", "vovvov", "vuf", "lyd"]
 address  = []
 gated    = false
 cjk      = false
 notes    = "'gø' (bark) omitted: folds onto en filler 'go'; 'tal' omitted ('Tal vez ...' opens Spanish sentences); 'tale'/'sig' omitted (English / shell token)"
+
+[[trick]]
+id       = "sing"
+lang     = "da"
+words    = ["syng", "synge"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "syng / synge are shared with no: the same imperative under the same trick, which merges."
 
 [[trick]]
 id       = "look"
@@ -2637,11 +2745,20 @@ notes    = "imperative 'suki' (groom the fur) DROPPED: it is Polish/Russian 'bit
 [[trick]]
 id       = "speak"
 lang     = "fi"
-words    = ["miau", "nau", "kurnau", "naukaise", "maukaise", "laula", "puhu", "hauku", "hau", "vuh", "juttele"]
+words    = ["miau", "nau", "kurnau", "naukaise", "maukaise", "puhu", "hauku", "hau", "vuh", "juttele"]
 address  = ["sano"]
 gated    = false
 cjk      = false
 notes    = "'kurnau' is the storybook Finnish cat; 'mau' omitted (pt 'bad'); 'Puhu!' is the speak cue; 'Sano ...' (tell me ...) opens chat messages; 'hau' is an obscure web2 headword"
+
+[[trick]]
+id       = "sing"
+lang     = "fi"
+words    = ["laula"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "laula is the imperative; shared with et, a same-role merge."
 
 [[trick]]
 id       = "look"
@@ -2821,11 +2938,20 @@ notes    = "'bað' keeps its ð, so it never folds onto en 'bad'"
 [[trick]]
 id       = "speak"
 lang     = "is"
-words    = ["mjá", "mjálma", "mjálmaðu", "syngdu", "syngja", "talaðu", "tala", "geltu", "voff"]
+words    = ["mjá", "mjálma", "mjálmaðu", "talaðu", "tala", "geltu", "voff"]
 address  = ["segðu"]
 gated    = false
 cjk      = false
 notes    = "'Segðu mér ...' opens chat messages"
+
+[[trick]]
+id       = "sing"
+lang     = "is"
+words    = ["syngdu", "syngja"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "syngdu is the imperative with the suffixed pronoun, syngja the infinitive."
 
 [[trick]]
 id       = "look"
@@ -2990,11 +3116,20 @@ notes    = "bare 'мой' (wash!) omitted: it is also 'my' and lives in filler"
 [[trick]]
 id       = "speak"
 lang     = "ru"
-words    = ["голос", "мяу", "мяукни", "мяукай", "спой", "гав"]
+words    = ["голос", "мяу", "мяукни", "мяукай", "гав"]
 address  = ["скажи", "говори"]
 gated    = false
 cjk      = false
 notes    = "голос is THE dog command; скажи/говори open ordinary sentences"
+
+[[trick]]
+id       = "sing"
+lang     = "ru"
+words    = ["спой", "пой"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "спой is the perfective imperative already in the file; пой is the imperfective one a person actually types at a cat, and it is not a shared sparkle surface (checked)."
 
 [[trick]]
 id       = "look"
@@ -3149,11 +3284,20 @@ notes    = ""
 [[trick]]
 id       = "speak"
 lang     = "uk"
-words    = ["голос", "няв", "няв-няв", "нявкай", "нявкни", "мяу", "співай", "заспівай", "гав", "гавкай"]
+words    = ["голос", "няв", "няв-няв", "нявкай", "нявкни", "мяу", "гав", "гавкай"]
 address  = ["скажи", "кажи", "говори"]
 gated    = false
 cjk      = false
 notes    = "няв is THE Ukrainian meow; голос the dog command"
+
+[[trick]]
+id       = "sing"
+lang     = "uk"
+words    = ["співай", "заспівай"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects, as the file already carried them."
 
 [[trick]]
 id       = "look"
@@ -3308,11 +3452,20 @@ notes    = "first word of 'myj się'"
 [[trick]]
 id       = "speak"
 lang     = "pl"
-words    = ["głos", "glos", "miau", "miaucz", "zamiaucz", "śpiewaj", "zaśpiewaj", "szczekaj"]
+words    = ["głos", "glos", "miau", "miaucz", "zamiaucz", "szczekaj"]
 address  = ["mów", "powiedz", "gadaj"]
 gated    = false
 cjk      = false
 notes    = "'daj głos' -> głos is THE dog command"
+
+[[trick]]
+id       = "sing"
+lang     = "pl"
+words    = ["śpiewaj", "zaśpiewaj"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects; the marks-required law means the bare `spiewaj` does not fire, which is the same bargain every other Polish row makes."
 
 [[trick]]
 id       = "look"
@@ -3490,11 +3643,20 @@ notes    = ""
 [[trick]]
 id       = "speak"
 lang     = "cs"
-words    = ["štěkej", "mňau", "mňoukej", "zamňoukej", "zpívej", "zazpívej", "haf"]
+words    = ["štěkej", "mňau", "mňoukej", "zamňoukej", "haf"]
 address  = ["mluv", "řekni", "povídej"]
 gated    = false
 cjk      = false
 notes    = "štěkej is THE dog command"
+
+[[trick]]
+id       = "sing"
+lang     = "cs"
+words    = ["zpívej", "zazpívej"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects."
 
 [[trick]]
 id       = "look"
@@ -3672,11 +3834,20 @@ notes    = ""
 [[trick]]
 id       = "speak"
 lang     = "sk"
-words    = ["štekaj", "mňau", "mňaukaj", "zamňaukaj", "spievaj", "zaspievaj", "hlas", "hav"]
+words    = ["štekaj", "mňau", "mňaukaj", "zamňaukaj", "hlas", "hav"]
 address  = ["hovor", "povedz", "rozprávaj"]
 gated    = false
 cjk      = false
 notes    = "hlas is the dog 'speak' command"
+
+[[trick]]
+id       = "sing"
+lang     = "sk"
+words    = ["spievaj", "zaspievaj"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects."
 
 [[trick]]
 id       = "look"
@@ -3854,11 +4025,20 @@ notes    = "first word of 'измий се'"
 [[trick]]
 id       = "speak"
 lang     = "bg"
-words    = ["мяу", "мяукай", "измяукай", "пей", "запей", "лай", "глас", "джаф"]
+words    = ["мяу", "мяукай", "измяукай", "лай", "глас", "джаф"]
 address  = ["говори", "кажи"]
 gated    = false
 cjk      = false
 notes    = "глас is the dog 'speak' command; бау is kept for boo"
+
+[[trick]]
+id       = "sing"
+lang     = "bg"
+words    = ["пей", "запей"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects."
 
 [[trick]]
 id       = "look"
@@ -4013,11 +4193,20 @@ notes    = "first word of 'operi se' / 'umij se'"
 [[trick]]
 id       = "speak"
 lang     = "hr"
-words    = ["mjau", "mijau", "mjauči", "mjaukni", "pjevaj", "zapjevaj", "laj", "glas", "vau-vau"]
+words    = ["mjau", "mijau", "mjauči", "mjaukni", "laj", "glas", "vau-vau"]
 address  = ["govori", "reci", "kaži", "pričaj"]
 gated    = false
 cjk      = false
 notes    = "glas is the dog 'speak' command; bare 'vau' dropped (web2 headword)"
+
+[[trick]]
+id       = "sing"
+lang     = "hr"
+words    = ["pjevaj", "zapjevaj"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects; the ijekavian stem, sr carries the ekavian one."
 
 [[trick]]
 id       = "look"
@@ -4206,11 +4395,20 @@ notes    = ""
 [[trick]]
 id       = "speak"
 lang     = "sr"
-words    = ["mjau", "mjauči", "mjaukni", "pevaj", "zapevaj", "laj", "glas", "av-av", "мјау", "мјаучи", "мјаукни", "певај", "запевај", "лај", "глас", "ав-ав"]
+words    = ["mjau", "mjauči", "mjaukni", "laj", "glas", "av-av", "мјау", "мјаучи", "мјаукни", "лај", "глас", "ав-ав"]
 address  = ["govori", "reci", "kaži", "pričaj", "говори", "реци", "кажи", "причај"]
 gated    = false
 cjk      = false
 notes    = ""
+
+[[trick]]
+id       = "sing"
+lang     = "sr"
+words    = ["pevaj", "zapevaj", "певај", "запевај"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects in both scripts, as every other sr row is written."
 
 [[trick]]
 id       = "look"
@@ -4381,11 +4579,20 @@ notes    = ""
 [[trick]]
 id       = "speak"
 lang     = "el"
-words    = ["νιάου", "μιάου", "νιαούρισε", "τραγούδα", "γάβγισε", "γαβ"]
+words    = ["νιάου", "μιάου", "νιαούρισε", "γάβγισε", "γαβ"]
 address  = ["μίλα", "πες"]
 gated    = false
 cjk      = false
 notes    = "νιάου is THE Greek meow"
+
+[[trick]]
+id       = "sing"
+lang     = "el"
+words    = ["τραγούδα"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "τραγούδα is the imperative."
 
 [[trick]]
 id       = "look"
@@ -4540,11 +4747,20 @@ notes    = "mosakodik is what a washing cat does"
 [[trick]]
 id       = "speak"
 lang     = "hu"
-words    = ["nyávogj", "miau", "miáú", "nyau", "énekelj", "dalolj", "ugass", "vau-vau"]
+words    = ["nyávogj", "miau", "miáú", "nyau", "ugass", "vau-vau"]
 address  = ["beszélj", "mondd", "szólj"]
 gated    = false
 cjk      = false
 notes    = "bare 'vau' dropped (web2 headword)"
+
+[[trick]]
+id       = "sing"
+lang     = "hu"
+words    = ["énekelj", "dalolj"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "énekelj is the ordinary imperative, dalolj the folksier one."
 
 [[trick]]
 id       = "look"
@@ -4621,7 +4837,7 @@ lang     = "hu"
 words    = ["kérlek", "légyszi", "ó", "jaj", "már", "az", "egy", "én", "kicsi", "olyan", "nagyon", "és", "milyen", "vagy", "oké", "le", "fel"]
 gated    = false
 cjk      = false
-notes    = "le / fel are the verbal particles of 'ülj le', 'kelj fel' (without them the phrase is revoked); dropped: pici (web2), kis (Finnish cat call), hát (Vietnamese sing)"
+notes    = "le / fel are the verbal particles of 'ülj le', 'kelj fel' (without them the phrase is revoked); dropped: pici (web2), kis (Finnish cat call), hát (the key `hat` is Vietnamese's sing imperative - and hu opens the file FIRST, so listing it here would take the key and leave Vietnamese with no word for the song at all)"
 
 [[filler]]
 lang     = "hu"
@@ -4715,11 +4931,20 @@ notes    = "'yalan' omitted (also 'a lie')"
 [[trick]]
 id       = "speak"
 lang     = "tr"
-words    = ["miyav", "miyavla", "mırnav", "konuş", "şarkı", "havla", "hav", "hav-hav"]
+words    = ["miyav", "miyavla", "mırnav", "konuş", "havla", "hav", "hav-hav"]
 address  = ["söyle"]
 gated    = false
 cjk      = false
 notes    = "konuş is THE dog command; first word of 'şarkı söyle'"
+
+[[trick]]
+id       = "sing"
+lang     = "tr"
+words    = ["şarkı"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "şarkı is the noun `song`; the natural command `şarkı söyle` is two tokens and cannot be a surface (law 3), so the noun carries it and `söyle` stays an address word of speak."
 
 [[trick]]
 id       = "look"
@@ -4908,11 +5133,20 @@ notes    = ""
 [[trick]]
 id       = "speak"
 lang     = "lt"
-words    = ["miau", "miauk", "kniauk", "dainuok", "padainuok", "lok", "balsas", "balsą", "au-au"]
+words    = ["miau", "miauk", "kniauk", "lok", "balsas", "balsą", "au-au"]
 address  = ["kalbėk", "sakyk"]
 gated    = false
 cjk      = false
 notes    = "kniauk is THE Lithuanian mew; balsas the dog 'speak' command"
+
+[[trick]]
+id       = "sing"
+lang     = "lt"
+words    = ["dainuok", "padainuok"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects."
 
 [[trick]]
 id       = "look"
@@ -5083,11 +5317,20 @@ notes    = ""
 [[trick]]
 id       = "speak"
 lang     = "lv"
-words    = ["ņau", "ņaudi", "paņaudi", "mjau", "dziedi", "padziedi", "rej", "balss", "vau-vau"]
+words    = ["ņau", "ņaudi", "paņaudi", "mjau", "rej", "balss", "vau-vau"]
 address  = ["runā"]
 gated    = false
 cjk      = false
 notes    = "ņau is THE Latvian meow; balss the dog 'speak' command; bare 'vau' dropped (web2 headword)"
+
+[[trick]]
+id       = "sing"
+lang     = "lv"
+words    = ["dziedi", "padziedi"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "both aspects."
 
 [[trick]]
 id       = "look"
@@ -5283,11 +5526,20 @@ notes    = "'laku' (lick!) dropped: it is the first word of hr/sr 'laku noć' (g
 [[trick]]
 id       = "speak"
 lang     = "et"
-words    = ["näu", "näu-näu", "näugu", "mjäu", "laula", "haugu", "hääl"]
+words    = ["näu", "näu-näu", "näugu", "mjäu", "haugu", "hääl"]
 address  = ["räägi", "ütle"]
 gated    = false
 cjk      = false
 notes    = "näu is THE Estonian meow (folds with Latvian ņau, same trick); hääl the dog 'speak' command; 'auh' dropped (web2 headword)"
+
+[[trick]]
+id       = "sing"
+lang     = "et"
+words    = ["laula"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "laula is the imperative, shared with fi as a same-role merge."
 
 [[trick]]
 id       = "look"
@@ -5461,11 +5713,20 @@ notes    = "lick / bathe / bath (حمام = same word and trick in fa). نظف (
 [[trick]]
 id       = "speak"
 lang     = "ar"
-words    = ["مياو", "ميو", "نياو", "مواء", "هاو", "هوهو", "انبح", "غن"]
-address  = ["تكلم", "تكلمي", "اتكلم", "احكي", "قل", "قول", "قولي", "غني"]
+words    = ["مياو", "ميو", "نياو", "مواء", "هاو", "هوهو", "انبح"]
+address  = ["تكلم", "تكلمي", "اتكلم", "احكي", "قل", "قول", "قولي"]
 gated    = false
 cjk      = false
 notes    = "مياو = Arabic meow; هاو / هوهو / انبح carry the dog. speak / say / tell open requests: address; غني also spells 'rich'."
+
+[[trick]]
+id       = "sing"
+lang     = "ar"
+words    = ["غن"]
+address  = ["غني"]
+gated    = false
+cjk      = false
+notes    = "غن is the masculine imperative; غني is the feminine one AND the ordinary adjective `rich`, which is why the file already had it as an address word - it keeps that role here."
 
 [[trick]]
 id       = "look"
@@ -5621,10 +5882,19 @@ notes    = "wash / bath / shower / lick / brush. נקה (clean!) is an assistant
 id       = "speak"
 lang     = "he"
 words    = ["מיאו", "מיאוו", "נבח", "נבחי", "תנבח", "הב", "תיילל", "תייללי"]
-address  = ["דבר", "דברי", "תדבר", "תדברי", "שיר", "שירי", "תשיר", "תשירי", "קול"]
+address  = ["דבר", "דברי", "תדבר", "תדברי", "קול"]
 gated    = false
 cjk      = false
 notes    = "הב / נבח carry the dog; תיילל = yowl. דבר ('thing') and שיר ('song') are address. SKEPTIC: קול (dog-school speak) to address: also the typed reply 'cool' and the noun 'voice'."
+
+[[trick]]
+id       = "sing"
+lang     = "he"
+words    = []
+address  = ["שיר", "שירי", "תשיר", "תשירי"]
+gated    = false
+cjk      = false
+notes    = "all four stay ADDRESS, exactly as the speak row had them: שיר is the everyday noun `song` / `poem` and would open ordinary lines. Hebrew reaches the song only with the pet named, which is the honest answer for this vocabulary."
 
 [[trick]]
 id       = "look"
@@ -5779,11 +6049,20 @@ notes    = "لیس بزن / بلیس = lick; حمام / حموم = bath (same in
 [[trick]]
 id       = "speak"
 lang     = "fa"
-words    = ["میو", "میومیو", "میاو", "واق", "هاپ", "آواز"]
-address  = ["بگو", "بخون", "حرف", "صدا", "پارس"]
+words    = ["میو", "میومیو", "میاو", "واق", "هاپ"]
+address  = ["بگو", "حرف", "صدا", "پارس"]
 gated    = false
 cjk      = false
 notes    = "میو = Persian meow; واق / هاپ = woof. بگو / بخون / حرف / صدا open requests: address. SKEPTIC: پارس (bark) to address: devs write 'parse' as پارس."
+
+[[trick]]
+id       = "sing"
+lang     = "fa"
+words    = ["آواز"]
+address  = ["بخون"]
+gated    = false
+cjk      = false
+notes    = "آواز is `song` / `voice`; بخون is the colloquial `sing` but also `read`, so it keeps the address role the speak row gave it."
 
 [[trick]]
 id       = "look"
@@ -5938,11 +6217,20 @@ notes    = "چاٹ = lick, نہا = bathe, دھو = wash. صاف کرو is an as
 [[trick]]
 id       = "speak"
 lang     = "ur"
-words    = ["میاؤں", "میاؤ", "میاوں", "بول", "بولو", "گاؤ", "بھونک", "بھونکو", "بھوں"]
+words    = ["میاؤں", "میاؤ", "میاوں", "بول", "بولو", "بھونک", "بھونکو", "بھوں"]
 address  = ["بات"]
 gated    = false
 cjk      = false
 notes    = "میاؤں = Urdu meow. بول also spells 'urine' (clinical) in ar/fa: kept. بات کرو starts with a noun: address. SKEPTIC: intimate گا dropped (a vulgar token in Persian); گاؤ carries 'sing'."
+
+[[trick]]
+id       = "sing"
+lang     = "ur"
+words    = ["گاؤ"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "گاؤ is the imperative."
 
 [[trick]]
 id       = "look"
@@ -6097,11 +6385,20 @@ notes    = "lick / bathe / wash / comb. साफ करो is an assistant requ
 [[trick]]
 id       = "speak"
 lang     = "hi"
-words    = ["म्याऊं", "म्याऊँ", "म्याऊ", "बोल", "बोलो", "गा", "गाओ", "भौंक", "भौंको", "भौं", "myaun", "gaao", "bhow"]
-address  = ["गाना", "बात"]
+words    = ["म्याऊं", "म्याऊँ", "म्याऊ", "बोल", "बोलो", "भौंक", "भौंको", "भौं", "myaun", "bhow"]
+address  = ["बात"]
 gated    = false
 cjk      = false
 notes    = "Three meow spellings; बोल / बोलो = speak, गा = sing, भौंक / भौं = bark / woof. गाना and बात are nouns: address. SKEPTIC: romanized bol dropped (Turkish 'bol', fold of Polish 'ból'); bolo is gated."
+
+[[trick]]
+id       = "sing"
+lang     = "hi"
+words    = ["गा", "गाओ", "gaao"]
+address  = ["गाना"]
+gated    = false
+cjk      = false
+notes    = "गा / गाओ are the imperatives and gaao the roman-script spelling the file already carried; गाना is the noun `song` (and `to sing`), which opens ordinary lines, so it stays address."
 
 [[trick]]
 id       = "speak"
@@ -6279,11 +6576,20 @@ notes    = "lick; চান / স্নান (West Bengal), গোসল (Bangl
 [[trick]]
 id       = "speak"
 lang     = "bn"
-words    = ["মিউ", "মিঁউ", "ম্যাও", "মিয়াও", "মিয়াও", "ডাক", "ডাকো", "গা", "গাও", "ঘেউ", "ঘেউঘেউ"]
-address  = ["বল", "বলো", "গান", "কথা"]
+words    = ["মিউ", "মিঁউ", "ম্যাও", "মিয়াও", "মিয়াও", "ডাক", "ডাকো", "ঘেউ", "ঘেউঘেউ"]
+address  = ["বল", "বলো", "কথা"]
 gated    = false
 cjk      = false
 notes    = "মিউ / ম্যাও = Bengali meow; ডাক = call out; ঘেউ ঘেউ = woof. বল / বলো, গান, কথা open requests: address."
+
+[[trick]]
+id       = "sing"
+lang     = "bn"
+words    = ["গা", "গাও"]
+address  = ["গান"]
+gated    = false
+cjk      = false
+notes    = "গা / গাও are the imperatives; গান is the noun `song` and stays address."
 
 [[trick]]
 id       = "look"
@@ -6438,11 +6744,20 @@ notes    = "lick / bathe / wash / wipe. சுத்தம் பண்ணு is
 [[trick]]
 id       = "speak"
 lang     = "ta"
-words    = ["மியாவ்", "ம்யாவ்", "பேசு", "பாடு", "கத்து", "குரை", "லொள்", "வவ்"]
+words    = ["மியாவ்", "ம்யாவ்", "பேசு", "கத்து", "குரை", "லொள்", "வவ்"]
 address  = ["சொல்லு", "சொல்"]
 gated    = false
 cjk      = false
 notes    = "மியாவ் = Tamil meow; கத்து = cry out; குரை = bark; லொள் / வவ் = woof. சொல்லு opens requests, சொல் also 'word': address."
+
+[[trick]]
+id       = "sing"
+lang     = "ta"
+words    = ["பாடு"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "பாடு is the imperative."
 
 [[trick]]
 id       = "look"
@@ -6600,11 +6915,20 @@ notes    = "舔毛 / 洗脸 are what a cat does; 洗白白 is bath baby-talk. �
 [[trick]]
 id       = "speak"
 lang     = "zh"
-words    = ["喵喵", "喵喵喵", "喵呜", "喵嗚", "喵喵叫", "叫一声", "叫一聲", "唱歌", "汪汪", "汪汪汪"]
+words    = ["喵喵", "喵喵喵", "喵呜", "喵嗚", "喵喵叫", "叫一声", "叫一聲", "汪汪", "汪汪汪"]
 address  = ["喵", "叫", "说话", "說話", "说", "說"]
 gated    = false
 cjk      = true
 notes    = "喵 is not a shared sparkle surface (the shared zh feline forms are 猫 / 猫咪 ...), so the cat's own voice is free here. 说话 / 说 open ordinary lines: address."
+
+[[trick]]
+id       = "sing"
+lang     = "zh"
+words    = ["唱歌"]
+address  = ["唱"]
+gated    = false
+cjk      = true
+notes    = "唱歌 is the whole verb-object `sing a song`. 唱 alone is one committed ideograph, so the loader's own law already makes it need the pet named - it is listed as address to say so out loud."
 
 [[trick]]
 id       = "look"
@@ -6759,11 +7083,20 @@ notes    = "毛づくろい is THE word. ぺろぺろ (lick-lick) is NOT here: i
 [[trick]]
 id       = "speak"
 lang     = "ja"
-words    = ["にゃー", "にゃあ", "にゃん", "にゃーん", "にゃ", "ニャー", "ニャン", "みゃー", "みゃあ", "鳴いて", "ないて", "鳴け", "吠えろ", "ほえろ", "ワン", "わん", "ワンワン", "わんわん", "歌って", "うたって", "お返事", "おへんじ"]
+words    = ["にゃー", "にゃあ", "にゃん", "にゃーん", "にゃ", "ニャー", "ニャン", "みゃー", "みゃあ", "鳴いて", "ないて", "鳴け", "吠えろ", "ほえろ", "ワン", "わん", "ワンワン", "わんわん", "お返事", "おへんじ"]
 address  = ["話して", "はなして", "しゃべって", "言って"]
 gated    = false
 cjk      = true
 notes    = "にゃー / にゃん are not shared sparkle surfaces (the shared ja feline forms are ねこ / にゃんこ ...). にゃんにゃん is NOT here: it is slang for sex. 吠えろ / ワン carry the dog."
+
+[[trick]]
+id       = "sing"
+lang     = "ja"
+words    = ["歌って", "うたって"]
+address  = []
+gated    = false
+cjk      = true
+notes    = "the te-form request, in kanji and kana, exactly as the speak row carried it."
 
 [[trick]]
 id       = "look"
@@ -6918,11 +7251,20 @@ notes    = "그루밍 is what Korean cat owners call it; 고양이 세수 (`a ca
 [[trick]]
 id       = "speak"
 lang     = "ko"
-words    = ["야옹", "야옹야옹", "냐옹", "냥냥", "미야옹", "애옹", "짖어", "왈왈", "노래해", "대답해", "멍멍"]
-address  = ["노래", "불러", "얘기해", "냥", "대답"]
+words    = ["야옹", "야옹야옹", "냐옹", "냥냥", "미야옹", "애옹", "짖어", "왈왈", "대답해", "멍멍"]
+address  = ["얘기해", "냥", "대답"]
 gated    = false
 cjk      = true
 notes    = "야옹 is not a shared sparkle surface (the shared ko feline forms are 고양이 / 야옹이 / 냥이). 애옹 is the internet meow. 짖어 = the dog's `speak`. Skeptic: bare noun 대답 (`answer`) opens ordinary requests, moved to address; 대답해 stays plain. Added 멍멍 (woof; not a shared surface - the shared canine forms are 멍멍이 / 강아지)."
+
+[[trick]]
+id       = "sing"
+lang     = "ko"
+words    = ["노래해"]
+address  = ["노래", "불러"]
+gated    = false
+cjk      = true
+notes    = "노래해 is the plain imperative; 노래 is the bare noun `song` and 불러 is also `call (someone)`, so both keep the address role the speak row gave them."
 
 [[trick]]
 id       = "look"
@@ -7077,11 +7419,20 @@ notes    = "เลียขน (`lick the fur`) is THE Thai word for a cat groom
 [[trick]]
 id       = "speak"
 lang     = "th"
-words    = ["เมี๊ยว", "เมี้ยว", "เมี๊ยวๆ", "ม๊าว", "หง่าว", "ร้องเพลง", "โฮ่ง", "โฮ่งๆ", "บ๊อกๆ"]
+words    = ["เมี๊ยว", "เมี้ยว", "เมี๊ยวๆ", "ม๊าว", "หง่าว", "โฮ่ง", "โฮ่งๆ", "บ๊อกๆ"]
 address  = ["พูด", "พูดสิ", "ร้อง", "ตอบ"]
 gated    = false
 cjk      = true
 notes    = "The standard spelling เหมียว is a SHARED feline surface (and is how Thais name a cat), so it is a vocative here and the voice uses the informal spellings เมี๊ยว / เมี้ยว / ม๊าว and the yowl หง่าว."
+
+[[trick]]
+id       = "sing"
+lang     = "th"
+words    = ["ร้องเพลง"]
+address  = []
+gated    = false
+cjk      = true
+notes    = "ร้องเพลง is unambiguously `sing a song`. ร้อง alone is left with speak: on its own it is `cry out` as often as `sing`."
 
 [[trick]]
 id       = "look"
@@ -7240,7 +7591,16 @@ words    = ["kêu", "sủa", "gâu"]
 address  = ["nói"]
 gated    = false
 cjk      = false
-notes    = "`meo` cannot be a speak word: it is the fold of the vocative mèo (cat), so the bare spelling is a (gated) vocative instead. kêu = call out, sủa / gâu carry the dog. Skeptic: dropped hát (key `hat` is hu filler `hát`: cross-language conflict) and ngao (marginal, also `clam`, and its unmarked key catches the slang insult `ngáo`)."
+notes    = "`meo` cannot be a speak word: it is the fold of the vocative mèo (cat), so the bare spelling is a (gated) vocative instead. kêu = call out, sủa / gâu carry the dog. Skeptic: dropped ngao (marginal, also `clam`, and its unmarked key catches the slang insult `ngáo`). hát was dropped here too, against the hu filler `hát` - but that filler was dropped on the SAME grounds, so the key `hat` is free and hát is now the vi `sing` word below. Two notes that each deferred to the other left the word nowhere; measured, not assumed."
+
+[[trick]]
+id       = "sing"
+lang     = "vi"
+words    = ["hát"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "vi had NO word for the song at all - its speak row is kêu / sủa / gâu. hát is the bare imperative. It folds to `hat`, so MARKS-REQUIRED keeps a typed English `hat` from firing it, and the hu filler that once claimed the key was itself dropped for this word (see both notes above)."
 
 [[trick]]
 id       = "look"
@@ -7472,11 +7832,20 @@ notes    = "mandi = bath; dandan = preen. rapikan / bersihkan (`tidy this`, `cle
 [[trick]]
 id       = "speak"
 lang     = "id"
-words    = ["ngeong", "mengeong", "miaw", "nyanyi", "bernyanyi", "gonggong", "menggonggong", "guk-guk"]
+words    = ["ngeong", "mengeong", "miaw", "gonggong", "menggonggong", "guk-guk"]
 address  = ["bicara", "ngomong", "suara"]
 gated    = false
 cjk      = false
 notes    = "`meong` is a SHARED feline surface (and what Indonesians call a cat), so it is a vocative; the voice is ngeong / mengeong / miaw. gonggong / guk-guk carry the dog."
+
+[[trick]]
+id       = "sing"
+lang     = "id"
+words    = ["nyanyi", "bernyanyi"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "the bare and the ber- forms, as the speak row carried them."
 
 [[trick]]
 id       = "look"
@@ -7681,11 +8050,20 @@ notes    = "basuh (muka) = wash (the face); kemas = tidy. Skeptic: dropped cuci 
 [[trick]]
 id       = "speak"
 lang     = "ms"
-words    = ["ngiau", "mengiau", "nyanyi", "menyanyi", "salak", "menyalak"]
+words    = ["ngiau", "mengiau", "salak", "menyalak"]
 address  = ["cakap", "bercakap", "suara"]
 gated    = false
 cjk      = false
 notes    = "ngiau is the Malay meow (`miau` and `meow` are shared surfaces / English)."
+
+[[trick]]
+id       = "sing"
+lang     = "ms"
+words    = ["nyanyi", "menyanyi"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "nyanyi is shared with id under the same trick, which merges."
 
 [[trick]]
 id       = "look"
@@ -7892,11 +8270,20 @@ notes    = "ligo = bath, hilamos = wash the face."
 [[trick]]
 id       = "speak"
 lang     = "tl"
-words    = ["ngiyaw", "miyaw", "kahol", "tahol", "aw-aw", "kanta", "kumanta", "awit"]
+words    = ["ngiyaw", "miyaw", "kahol", "tahol", "aw-aw"]
 address  = ["salita", "magsalita"]
 gated    = false
 cjk      = false
 notes    = "ngiyaw is the Tagalog meow; tahol / kahol carry the dog."
+
+[[trick]]
+id       = "sing"
+lang     = "tl"
+words    = ["kanta", "kumanta", "awit"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "kanta / kumanta are the everyday verb, awit the native noun `song`."
 
 [[trick]]
 id       = "look"
@@ -8094,11 +8481,20 @@ notes    = "oga = bathe, nawa = wash the face and hands."
 [[trick]]
 id       = "speak"
 lang     = "sw"
-words    = ["nyau", "lia", "imba", "bweka"]
+words    = ["nyau", "lia", "bweka"]
 address  = ["sema", "ongea"]
 gated    = false
 cjk      = false
 notes    = "nyau is the Swahili meow; bweka carries the dog."
+
+[[trick]]
+id       = "sing"
+lang     = "sw"
+words    = ["imba"]
+address  = []
+gated    = false
+cjk      = false
+notes    = "imba is the imperative."
 
 [[trick]]
 id       = "look"
@@ -8287,11 +8683,20 @@ notes    = "ងូតទឹក = bath, លាងមុខ = wash the face."
 [[trick]]
 id       = "speak"
 lang     = "km"
-words    = ["ម៉ែវ", "ម៉េវ", "ច្រៀង", "ព្រុស"]
+words    = ["ម៉ែវ", "ម៉េវ", "ព្រុស"]
 address  = ["និយាយ"]
 gated    = false
 cjk      = true
 notes    = "ម៉ែវ / ម៉េវ are the Khmer meow (best-effort spellings); ព្រុស carries the dog."
+
+[[trick]]
+id       = "sing"
+lang     = "km"
+words    = ["ច្រៀង"]
+address  = []
+gated    = false
+cjk      = true
+notes    = "ច្រៀង is the verb `sing`."
 
 [[trick]]
 id       = "look"

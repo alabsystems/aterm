@@ -1102,9 +1102,22 @@ pub const METEOR_POOL: usize = 2 * FLIGHT_MAX_LIVE;
 pub const LANDING_POOL: usize = FLIGHT_MAX_LIVE + 1;
 
 /// Depth of the per-tick hand-off scratch ([`Meteors::sow_into`]): every live
-/// meteor's whole shed plus a fan each, plus one mini-fan. Reserved once so
-/// staging never allocates (§18).
-pub const SOW_SCRATCH: usize = METEOR_POOL * (SHED_MAX as usize + 1) + 1;
+/// meteor's whole shed plus a fan each, plus one mini-fan — AND the sing-along
+/// bar's party fan ([`Meteors::party`]), which can land on the same frame as
+/// all of them. Reserved once so staging never allocates (§18). The party's
+/// `+ 1` is not decoration: `sown` is drained every tick, so this capacity IS
+/// the per-frame budget, and a bar arriving on a frame already at the
+/// documented worst case would reallocate — breaching the zero-allocation law
+/// (§18) that `tests/rainbow_kitty_v2_frame_cost.rs` gates.
+///
+/// HONESTLY: this `+ 1` is worst-case ARITHMETIC, not a number that test
+/// reaches. Its new `sing-along bars` scenario does fire real parties through
+/// the counting allocator — nothing did before, which is why the party could
+/// overrun this reservation unobserved — but a held key for three seconds
+/// does not also put every live meteor at `SHED_MAX`. Revert this to `+ 1`
+/// and the suite stays green; the guard is the enumeration in the sentence
+/// above, and the enumeration now names the party.
+pub const SOW_SCRATCH: usize = METEOR_POOL * (SHED_MAX as usize + 1) + 2;
 
 // ---- the splash (2026-09-08; out from under the text in the second round)
 

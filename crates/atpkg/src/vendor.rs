@@ -247,16 +247,10 @@ pub const MANAGER_TABLE: &[Manager] = &[
         install: &["pipx", "install", "{}"],
         elevated: false,
         id_chars: "._-",
-        // EVERY ARCHIVE SUFFIX pip READS (audit 2026-09-17), not the four that were
-        // here. `pipx install` hands its argument to pip, which resolves a name OR
-        // loads a local path/URL, and pip reads far more than wheels and gzipped
-        // tarballs: its own tables are `.whl`/`.zip`, `.tar.gz`/`.tgz`/`.tar`,
-        // `.tar.bz2`/`.tbz`, and `.tar.xz`/`.txz`/`.tlz`/`.tar.lz`/`.tar.lzma`. A
-        // signed row spelling `evil.tar` or `evil.tar.bz2` passed this charset whole —
-        // first and last bytes alphanumeric, every byte in `._-` — so the admission
-        // read it as a package NAME while pip would have installed whatever file of
-        // that name the pass's working directory happened to hold. The list may only
-        // ever GROW: each entry is one more spelling refused.
+        // Every archive suffix pip reads, not just wheels and gzipped tarballs: `pipx
+        // install` hands its argument to pip, which also loads a local path, so a signed
+        // row spelling `evil.tar` passes this charset whole and would install whatever
+        // file of that name the pass's cwd holds. The list may only ever grow.
         local_file: &[
             ".whl",
             ".zip",
@@ -1889,7 +1883,7 @@ mod tests {
             ("pipx", "evil.tar.gz"),
             ("pipx", "evil.tgz"),
             ("pipx", "evil.zip"),
-            // Every other archive pip reads is a local file too (2026-09-17).
+            // Every other archive pip reads is a local file too.
             ("pipx", "evil.tar"),
             ("pipx", "evil.tar.bz2"),
             ("pipx", "evil.tbz"),
@@ -1898,8 +1892,7 @@ mod tests {
             ("pipx", "evil.tar.lz"),
             ("pipx", "evil.tlz"),
             ("pipx", "evil.tar.lzma"),
-            // Already refused before that widening, and pinned so it stays so: the
-            // suffix compare lowercases, so shouting does not smuggle one past.
+            // The suffix compare lowercases, so shouting does not smuggle one past.
             ("pipx", "EVIL.TAR.GZ"),
             ("pipx", "EVIL.TAR.BZ2"),
             ("pipx", "black."),

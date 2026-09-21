@@ -688,15 +688,26 @@ arrayvec = { path = "crates/aterm-arrayvec" }
 # tools/linux-runtime.sh. Neither is a copy of its sibling: the mac compat slice
 # has 12 linker-symbol redirections, while arm64 Linux has different open flags,
 # syscall numbers, layouts, and HWCAP declarations required by cpufeatures and
-# ring. The type-level oracle and separate symbol gate cover both distinctions.
-# Windows and wasm are primitive-only target smokes, not declaration cells: the
-# shim exports the 14 unconditional `core::ffi` aliases but no generated,
-# target-specific libc ABI declarations there. A new non-primitive target-side
-# use therefore fails closed at compilation. The oracle proves that exact
-# emitted surface; it does not claim a live compile of every Windows/wasm
-# `--all-targets` consumer, because existing platform-only tests and native C
-# build dependencies stop those complete graphs on this host before every
-# consumer can emit an artifact.
+# ring. WHO DECIDES EACH CELL, since 2026-09-20: libc-oracle/run.sh — the
+# type-level oracle plus gen/symgate.py's emitted-source and symbol gates —
+# decides ONE cell per merge-gate run, the one the box is native to, under
+# Trust alone (no rustup, no stock toolchain: the owner's direction), so a
+# cell is covered exactly when a fleet box hosts its triple —
+# FLEET_HOST_TRIPLES in crates/xtask/src/gate.rs: aarch64-apple-darwin,
+# x86_64-apple-darwin, x86_64-unknown-linux-gnu. aarch64-unknown-linux-gnu has
+# no fleet host, and neither do x86_64-pc-windows-msvc and
+# wasm32-unknown-unknown, so those three cells are decided by NO gate until a
+# box hosts them or Trust ships their std. What still pins their SOURCE:
+# symgate.py's sibling-body check holds each same-OS pair's hand-written body
+# section byte-identical (text, so it runs on every box; it binds arm64 Linux
+# to the body x86_64 Linux executes, and does not decide that cell), and
+# libc-oracle/conformance/src/lib.rs's cell_zero pins Windows and wasm to the
+# primitive-only surface — the 14 unconditional `core::ffi` aliases and no
+# generated, target-specific libc ABI declaration — for whatever does compile
+# it, which today is nothing in the merge contract. The oracle never claimed a
+# live compile of every Windows/wasm `--all-targets` consumer: existing
+# platform-only tests and native C build dependencies stop those complete
+# graphs on this host before every consumer can emit an artifact.
 libc = { path = "crates/aterm-libc" }
 
 # `log` is the same argument as `tracing` above, at a different address. Nothing

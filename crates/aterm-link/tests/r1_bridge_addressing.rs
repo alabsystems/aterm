@@ -65,64 +65,6 @@ fn a_node_cannot_attest_a_human_in_from() {
     );
 }
 
-/// **A human's `control claim` moves the keyboard on the DOCUMENTED DEFAULT.**
-///
-/// `--accept-from` is empty by default, and `classify_kind` demoted any
-/// `task`/`control` whose `<src>` was not literally on it. `deliver_record`
-/// decides whether a record moves the keyboard from the CLASSIFIED kind, so a
-/// human's `claim` became `kind=note demoted=control`, never reached
-/// `decide_control`, and every following `term/in` under it was refused
-/// `reason=holder`. §6.6 row 1 grants an `h-*` claim "unconditionally" and §9.3
-/// makes the remote keyboard structural; §8.4's own spelling of the mitigation,
-/// `--accept-from h-*`, is refused at startup because `*` is not in a principal.
-/// Every handoff test in this crate boots with the human hard-coded onto the
-/// allowlist, so nothing guarded the case the design actually describes.
-#[test]
-fn a_humans_claim_moves_the_keyboard_on_a_default_configuration() {
-    let w = World::boot("r1claim", &[]);
-    w.wait_ready();
-    let (a, _b) = w.two_sessions();
-    let epoch = until("the session's launch nonce", || {
-        w.sessions()
-            .into_iter()
-            .find(|(_, sid, _)| *sid == a)
-            .map(|(_, _, nonce)| nonce)
-    });
-
-    let mut god = w.god();
-    let subject = format!("/f/{FLEET}/in/{}/{a}/h-andrew/control", w.node);
-    god.publish(
-        6_500,
-        1,
-        &subject,
-        format!("v=1 t=1 epoch={epoch} text=claim").as_bytes(),
-    )
-    .expect("publish the claim");
-
-    let row = format!("/f/{FLEET}/pub/{}/{a}/control", w.node);
-    let stood = until("the human's claim to move the holder", || {
-        let (rows, _) = w.god().last(&row, "", 8).ok()?;
-        rows.into_iter()
-            .find(|(_, s, _)| *s == row)
-            .map(|(_, _, b)| String::from_utf8_lossy(&b).into_owned())
-    });
-    assert!(
-        stood.contains("holder=h-andrew"),
-        "§6.6 row 1 grants an h-* claim unconditionally: {stood}"
-    );
-    // AND IT IS STILL DELIVERED as a row: the agent must see that the human took
-    // the wheel, and it arrives as what it is rather than demoted.
-    let delivered = until("the claim to be delivered as a control row", || {
-        w.inbox(&a)
-            .into_iter()
-            .find(|r| r.contains("from=h-andrew"))
-    });
-    assert!(
-        delivered.contains("kind=control") && !delivered.contains("demoted="),
-        "a human is accepted beside whatever --accept-from lists: {delivered}"
-    );
-}
-
 /// **An unlisted principal's `answer` is NOT demoted.**
 ///
 /// §8.4's allowlist covers `{task, control}` and this crate said so twice, in
@@ -223,12 +165,16 @@ fn a_post_to_say_reaches_the_say_face() {
 /// §3.3 makes `ev` a per-owner face and §10 says an applied `term/in` "leaves an
 /// `ev` record `applied re=M seq=<n>` on the session's `ev` face". A3 published
 /// every one of them on `…/node/ev` with the session named only inside the
-/// pct-encoded payload — so `replay::session_of` answered `None`, the causal
-/// pointer §10 asks for belonged to no partition in this crate's own
-/// consistent-cut machinery and contributed no `CrossEdge`, and a reader scoped
-/// to `ro:/f/<F>/pub/<n>/<sid>/>` could not see its own session's verdicts at
-/// all. The check is `session_of` itself, so the test agrees with the replay
-/// rather than with its own idea of a subject.
+/// pct-encoded payload — so the causal pointer §10 asks for belonged to no
+/// partition any reader could name, and a reader scoped to
+/// `ro:/f/<F>/pub/<n>/<sid>/>` could not see its own session's verdicts at all.
+///
+/// THE ORACLE IS THE CRATE'S OWN SUBJECT BUILDER, so the test agrees with the
+/// code rather than with its own idea of a subject. It used to be
+/// `replay::session_of`, for exactly that reason; round 21 cut `replay.rs` (the
+/// auditor that read it was never built), and `subject::session_face` is the
+/// function that MINTS this subject in the bridge, which is a tighter pin than
+/// a parser that merely accepted it.
 #[test]
 fn a_sessions_ev_records_are_attributable_to_that_session() {
     let w = World::boot("r1evface", &[]);
@@ -262,9 +208,9 @@ fn a_sessions_ev_records_are_attributable_to_that_session() {
         "{ev}"
     );
     assert_eq!(
-        aterm_link::replay::session_of(&subj, &body).as_deref(),
-        Some(ghost),
-        "§10's causal record must belong to a partition the replay can name"
+        subj,
+        aterm_link::subject::session_face(FLEET, &w.node, ghost, "ev"),
+        "§10's causal record must sit on the face the crate mints for that session"
     );
 }
 

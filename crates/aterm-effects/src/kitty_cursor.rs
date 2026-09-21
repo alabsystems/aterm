@@ -1531,7 +1531,7 @@ impl CursorCat {
             EyesFrame::Happy
         } else if !plain_face {
             EyesFrame::Open
-        } else if self.blink_active(now) && self.sing <= 0.33 {
+        } else if self.blink_active(now) && !crate::companion::sing_face_live(self.sing) {
             // A BLINK OUTRANKS THE CRUISING FACE. This arm used to sit BELOW the
             // happy face and was additionally gated on `disp < BLINK_CEIL` — but
             // `disp` is pinned at 1.0 at every human cadence whenever the cat is
@@ -1541,6 +1541,16 @@ impl CursorCat {
             // the cheapest life in the sprite. SINGING still outranks it: the
             // open-mouth meow head is a different baked head, and blinking
             // through a song reads as a glitch rather than as breathing.
+            //
+            // THE FOURTH SPELLING. This read `self.sing <= 0.33` while
+            // `render_look` swaps the head at `>= 0.33` (the custody law,
+            // `companion::sing_face_live`), so at EXACTLY the gate value both
+            // were true, this arm won, and the open-mouth head blinked — the
+            // very frame the sentence above forbids. Measured: 15 of 190
+            // frames at `drive == 0.33`, none at 0.34. The round that unified
+            // three spellings of this number in `render_look` left this one
+            // behind; the law owns it now, so the two cannot disagree again —
+            // at the boundary, or anywhere a later edit moves the gate to.
             EyesFrame::Blink
         } else if crate::companion::sing_face_live(self.sing) || self.disp >= HAPPY_GATE {
             // Singing is sung with happy eyes (over the open-mouth meow head
@@ -4182,6 +4192,61 @@ mod tests {
             on_beat.bob, mid_beat.bob,
             "the dance bob rides the beat clock"
         );
+    }
+
+    /// THE SINGING HEAD NEVER BLINKS — at the GATE VALUE, which is where the
+    /// fourth spelling of this threshold hid. `render_look` swaps the
+    /// open-mouth head on `companion::sing_face_live` (`drive >= 0.33`) while
+    /// `resolve_pose`'s blink arm read the literal the other way round
+    /// (`sing <= 0.33`), so at exactly 0.33 both were true, the blink arm was
+    /// checked first and won, and the frame carried the open-mouth head with
+    /// `EyesFrame::Blink` — the one frame that arm's own comment forbids
+    /// (the eyes are baked INTO the variant tile, so it is a distinct head on
+    /// glass, not a no-op). Measured before the fix: 15 blinking frames of
+    /// 190 at `drive == 0.33`, zero at 0.34.
+    ///
+    /// The sweep is two-sided on purpose. BELOW the gate the cat must still
+    /// blink — the cheapest life in the sprite — so a "fix" that simply
+    /// forbade blinking whenever `sing > 0.0` would pass the first half of
+    /// this test and fail the second.
+    #[test]
+    fn the_singing_head_never_blinks_at_the_gate_value() {
+        for drive in [0.33_f32, 0.3300001, 0.34, 0.5, 1.0] {
+            let mut c = CursorCat::default();
+            let t = Instant::now();
+            let armed_at = arm_singing_after_travel(&mut c, t);
+            let mut singing_head = 0;
+            let mut blinked_singing = 0;
+            for i in 0..190 {
+                let now = armed_at + Duration::from_secs_f32(FADE_IN + 0.016 * i as f32);
+                c.set_singing(now, sync(drive, 0.0));
+                let f = c.frame(now);
+                if f.alpha != 0 && f.render_look().variant == CatGlyphId::S115 {
+                    singing_head += 1;
+                    blinked_singing += u32::from(f.pose.eyes == EyesFrame::Blink);
+                }
+            }
+            assert!(
+                singing_head > 0,
+                "drive={drive}: the fixture never reached the singing head"
+            );
+            assert_eq!(
+                blinked_singing, 0,
+                "drive={drive}: the open-mouth singing head blinked"
+            );
+        }
+        // …and the control: a cat that is NOT singing still blinks, so the
+        // assertion above is about the gate and not about blinking at all.
+        let mut c = CursorCat::default();
+        let t = Instant::now();
+        let armed_at = arm_singing_after_travel(&mut c, t);
+        let mut blinks = 0;
+        for i in 0..600 {
+            let now = armed_at + Duration::from_secs_f32(FADE_IN + 0.016 * i as f32);
+            c.set_singing(now, sync(0.0, 0.0));
+            blinks += u32::from(c.frame(now).pose.eyes == EyesFrame::Blink);
+        }
+        assert!(blinks > 0, "fixture: a cat off the song must still blink");
     }
 
     /// The delete "oops" OUTRANKS the song (the wrong-note gag priority the

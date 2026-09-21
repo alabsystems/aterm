@@ -153,72 +153,162 @@ impl Row {
 
     /// Clear cells from start to `end` (exclusive) with a BCE fill cell (#7522).
     ///
-    /// Like `clear_range()` but fills with `fill` instead of `Cell::EMPTY`.
+    /// Like `clear_range()` but fills with `fill` instead of `Cell::EMPTY`, and
+    /// blanks any orphaned wide half at the two boundaries to `Cell::EMPTY`.
+    /// That is the RECTANGLE-OP rule (DECERA/DECFRA); the erases that follow
+    /// xterm's `ClearRight` want the orphan to carry the BCE blank instead and
+    /// call [`Row::clear_range_with_orphan`] directly. See its docs for why the
+    /// two differ.
     #[inline]
     pub(crate) fn clear_range_with(&mut self, start: u16, end: u16, fill: Cell) {
+        let _ = self.clear_range_with_orphan(start, end, fill, Cell::EMPTY);
+    }
+
+    /// Clear cells from start to `end` (exclusive) with `fill`, giving an
+    /// orphaned wide half at either boundary the cell `orphan`.
+    ///
+    /// Returns the column range actually WRITTEN — `[start, end)` widened by one
+    /// on each side where a wide pair was bisected and its orphan rewritten. The
+    /// caller needs that to keep the out-of-line truecolor side tables in step
+    /// with the cells (see `Grid::fill_bce_rgb_range`).
+    ///
+    /// "Written", NOT "carrying `fill`": the widening happens whenever an orphan
+    /// was rewritten at all, `orphan = Cell::EMPTY` included. A caller that reads
+    /// the range as the span now holding the fill will over-paint its side table
+    /// by one column on each bisected edge — under the rectangle-op rule that
+    /// column is deliberately blank and OUTSIDE the rect (#7522).
+    ///
+    /// # Why the orphan cell is a parameter (xterm has TWO rules)
+    ///
+    /// An erase bisects a wide pair, and xterm rewrites the surviving half. WHAT
+    /// it writes there depends on which operation is erasing:
+    ///
+    /// - **EL / ED** reach `util.c` `ClearRight`, whose wide fixup sends
+    ///   both orphan spans through `ClearInLine2` -> `ClearCells` (`screen.c`),
+    ///   the same function the erased span itself goes through. `ClearCells`
+    ///   writes `' '`, `FillIAttr(..., flags | TERM_COLOR_FLAGS(xw), ...)` and
+    ///   `ld->color[col] = xtermColorPair(xw)` — so the orphan gets the CURRENT
+    ///   colour pair, i.e. the BCE background, exactly like the erased span. The
+    ///   only difference between the orphan call and the main call is the
+    ///   `CHARDRAWN` bit in `flags`, which carries no colour. Such callers pass
+    ///   `orphan = fill`. ECH reaches the same `ClearRight` in xterm
+    ///   (`do_erase_char` is a protected-mode wrapper around it), but in aterm
+    ///   it does NOT reach this helper: `Grid::erase_chars` goes through
+    ///   `Row::erase_chars_with`, which already writes `fill` into both orphans
+    ///   itself. The rule is the same; the code path is not.
+    /// - **DECERA / DECFRA** reach `screen.c` `ScrnFillRectangle`, whose wide
+    ///   fixup is `Clear1Cell(ld, left - 1)` / `Clear1Cell(ld, right + 1)` — a
+    ///   bare cell clear that never touches the fill character or the colour
+    ///   pair. The orphan sits OUTSIDE the rectangle, and for DECFRA the fill
+    ///   cell carries a GLYPH: writing it there bled the fill one column past
+    ///   the rect (#7522). Such callers pass `orphan = Cell::EMPTY`, which is
+    ///   what plain `clear_range_with` does.
+    ///
+    /// The SELECTIVE erases (DECSEL / DECSED) are NOT in the first bullet: they
+    /// take aterm's `selective_clear_range` path, which never reaches this
+    /// helper and writes `Cell::EMPTY` orphans with no BCE at all. xterm makes no
+    /// such distinction — `charproc.c:4001` (EL, `OFF_PROTECT`) and
+    /// `charproc.c:5156` (DECSEL, `DEC_PROTECT`) both call `do_erase_line`, and
+    /// `ClearInLine2` splits the run around protected cells but still clears each
+    /// unprotected segment through `ClearCells`. That divergence predates this
+    /// helper and is out of its scope; the list above is the rule for the callers
+    /// that DO reach here, not a claim about every erase aterm implements.
+    ///
+    /// `orphan` is therefore either `Cell::EMPTY` or `fill`; nothing else has an
+    /// xterm analogue, and the `len` bookkeeping below relies on it (a blank
+    /// fill implies a blank orphan).
+    #[inline]
+    pub(crate) fn clear_range_with_orphan(
+        &mut self,
+        start: u16,
+        end: u16,
+        fill: Cell,
+        orphan: Cell,
+    ) -> core::ops::Range<u16> {
+        debug_assert!(
+            orphan.is_empty() || orphan == fill,
+            "Row::clear_range_with_orphan: orphan must be Cell::EMPTY (rect ops) \
+             or the fill cell (BCE erases); no other value has an xterm analogue"
+        );
         let start = start as usize;
         let cols = self.cells.len();
         let end = (end as usize).min(cols);
-        if start < end {
-            let old_len = self.len as usize;
-
-            // Left-boundary wide fixup (same as clear_range, with the fill cell): key
-            // on the left neighbor being WIDE (bit 9), NOT WIDE_CONTINUATION of
-            // cells[start] — bit 10 aliases PROTECTED, so the raw check corrupts the
-            // out-of-range cells[start-1] for a DECSCA-protected cell (round-5 DECCRA
-            // fix, generalized to this DECERA/DECFRA/EL/ED-backing helper).
-            if start > 0 && self.cells[start - 1].flags().contains(CellFlags::WIDE) {
-                // The orphaned WIDE head at start-1 is OUTSIDE the fill rect, so
-                // it must not inherit the DECFRA/BCE fill glyph or attributes —
-                // clear it to EMPTY exactly like clear_range() does. Writing
-                // `fill` here bled the fill one column left of the rect (#7522).
-                self.cells[start - 1] = Cell::EMPTY;
-            }
-
-            let mut cleared_right_orphan = false;
-            if end > start && end < cols && self.cells[end - 1].flags().contains(CellFlags::WIDE) {
-                // Same reasoning on the right: cells[end] is the orphaned
-                // continuation OUTSIDE the rect and must be cleared, not filled.
-                self.cells[end] = Cell::EMPTY;
-                cleared_right_orphan = true;
-            }
-
-            self.cells[start..end].fill(fill);
-            self.flags |= RowFlags::DIRTY;
-            if !fill.is_empty() {
-                // Visible fill — a BCE background, a DECFRA fill character,
-                // or attribute flags: len must cover the filled range so the
-                // read path (row_text/render_row) does not drop it (a DECFRA
-                // fill with default colors is still content, per VT420/VT520
-                // DECFRA the filled characters are displayed).
-                //
-                // The visible fill guarantees content through end-1, so len >= end;
-                // pre-existing content past the rect extends len to old_len. The one
-                // exception: when the ONLY cell past the fill was the wide-continuation
-                // orphan we just cleared to EMPTY (old_len == end + 1), that cell is no
-                // longer content, so len is exactly `end`. Without this, the row keeps a
-                // bogus trailing cell in its logical length — row_text and scrollback
-                // materialization slice through self.len, so it would surface as a stale
-                // trailing space one column past the rect (#7522).
-                let new_end = if cleared_right_orphan && old_len == end + 1 {
-                    end
-                } else {
-                    end.max(old_len)
-                };
-                self.len = super::u16_from_usize(new_end);
-            } else if start < old_len
-                && (end >= old_len || (cleared_right_orphan && old_len == end + 1))
-            {
-                // Recalc when the fill reached the old content end, OR when the
-                // right wide-orphan we cleared at index `end` was the row's last
-                // content cell (old_len == end + 1). In both cases [start, old_len)
-                // is now fully empty, so recalculate_len_up_to(start) yields the
-                // tight len. Mirrors the visible-fill orphan case above; without the
-                // second term an EL/DECERA that erases a trailing wide char left len
-                // stale-high and surfaced phantom trailing spaces (#7522).
-                self.recalculate_len_up_to(start);
-            }
+        if start >= end {
+            return super::u16_from_usize(start)..super::u16_from_usize(start);
         }
+        let old_len = self.len as usize;
+        let mut written_start = start;
+        let mut written_end = end;
+
+        // Left-boundary wide fixup (same as clear_range, with the orphan cell):
+        // key on the left neighbor being WIDE (bit 9), NOT WIDE_CONTINUATION of
+        // cells[start] — bit 10 aliases PROTECTED, so the raw check corrupts the
+        // out-of-range cells[start-1] for a DECSCA-protected cell (round-5 DECCRA
+        // fix, generalized to this DECERA/DECFRA/EL/ED-backing helper).
+        if start > 0 && self.cells[start - 1].flags().contains(CellFlags::WIDE) {
+            // The orphaned WIDE head at start-1 is OUTSIDE the written range, so
+            // it gets `orphan`, never `fill`: EMPTY for the rect ops (writing the
+            // DECFRA glyph there bled the fill one column left, #7522), the BCE
+            // blank for the erases that follow ClearRight.
+            self.cells[start - 1] = orphan;
+            written_start = start - 1;
+        }
+
+        let mut cleared_right_orphan = false;
+        if end > start && end < cols && self.cells[end - 1].flags().contains(CellFlags::WIDE) {
+            // Same reasoning on the right: cells[end] is the orphaned
+            // continuation OUTSIDE the written range.
+            self.cells[end] = orphan;
+            cleared_right_orphan = true;
+            written_end = end + 1;
+        }
+
+        self.cells[start..end].fill(fill);
+        self.flags |= RowFlags::DIRTY;
+        // Is the right-hand orphan we just rewrote CONTENT? It is when the BCE
+        // blank carries a visible background; it is not when it is Cell::EMPTY.
+        let right_orphan_is_content = cleared_right_orphan && !orphan.is_empty();
+        if !fill.is_empty() {
+            // Visible fill — a BCE background, a DECFRA fill character,
+            // or attribute flags: len must cover the filled range so the
+            // read path (row_text/render_row) does not drop it (a DECFRA
+            // fill with default colors is still content, per VT420/VT520
+            // DECFRA the filled characters are displayed).
+            //
+            // The visible fill guarantees content through end-1, so len >= end;
+            // pre-existing content past the rect extends len to old_len. The one
+            // exception: when the ONLY cell past the fill was the wide-continuation
+            // orphan we just cleared to EMPTY (old_len == end + 1), that cell is no
+            // longer content, so len is exactly `end`. Without this, the row keeps a
+            // bogus trailing cell in its logical length — row_text and scrollback
+            // materialization slice through self.len, so it would surface as a stale
+            // trailing space one column past the rect (#7522). When the orphan
+            // instead received the VISIBLE BCE blank it is content in its own
+            // right, and len has to stretch one column further to cover it.
+            let new_end = if right_orphan_is_content {
+                (end + 1).max(old_len)
+            } else if cleared_right_orphan && old_len == end + 1 {
+                end
+            } else {
+                end.max(old_len)
+            };
+            self.len = super::u16_from_usize(new_end);
+        } else if start < old_len
+            && (end >= old_len || (cleared_right_orphan && old_len == end + 1))
+        {
+            // Recalc when the fill reached the old content end, OR when the
+            // right wide-orphan we cleared at index `end` was the row's last
+            // content cell (old_len == end + 1). In both cases [start, old_len)
+            // is now fully empty, so recalculate_len_up_to(start) yields the
+            // tight len. Mirrors the visible-fill orphan case above; without the
+            // second term an EL/DECERA that erases a trailing wide char left len
+            // stale-high and surfaced phantom trailing spaces (#7522).
+            //
+            // A blank `fill` implies a blank `orphan` (see the debug_assert), so
+            // there is no visible-orphan case to handle in this branch.
+            self.recalculate_len_up_to(start);
+        }
+        super::u16_from_usize(written_start)..super::u16_from_usize(written_end)
     }
 
     /// Fix orphaned wide character halves at rectangular operation boundaries.

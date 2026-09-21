@@ -139,10 +139,13 @@ pub struct Body {
     /// on the `ask`/`task` at `re=`. One of [`VERDICTS`]; anything else is left
     /// in `unknown` by the decoder and never reaches a `deliver` line.
     pub verdict: Option<String>,
-    /// The target session's public launch nonce — MANDATORY on `term/in` and
-    /// `control` (§7). A freshness fence, not a secret.
+    /// The target session's public launch nonce (§7). §6.6 made it MANDATORY on
+    /// `term/in` and `control` and fenced on it; round 21 cut the drive face, so
+    /// nothing in this crate checks it any more — the codec carries it
+    /// losslessly and `ls` renders it. A freshness fence, not a secret.
     pub epoch: Option<String>,
-    /// An optional `<seq>:<fp16>` freshness fence on `term/in` only.
+    /// The `<seq>:<fp16>` freshness fence §6.6 defined for `term/in`. Carried
+    /// and rendered since round 21, never checked.
     pub gen: Option<String>,
     /// The relay chain. Any `via=` at all makes the message `trust=relayed` and
     /// `kind=note demoted=<k>`, whatever the recipient's allowlist says (§6.7).

@@ -296,13 +296,10 @@ fn a_clean_identical_pending_stub_is_left_alone_and_a_tagged_one_is_re_laid() {
         "the in-process rewrite carries the tag exactly when this process is tracked"
     );
     if tracked {
-        // Byte-identical NOW, and tagged: re-laid only when a lay from THIS process would
-        // come back clean (`08faa0245`). This binary is not `atpkg`/`aterm`, so it has no
-        // lane at all and its own writes land tagged — re-laying would clear nothing and
-        // repeat for ever, so the stub is LEFT ALONE. Measured rather than assumed, both
-        // because the rule reads this and because a future lane here must move the
-        // assertion, not go unnoticed: on a provenance-tracked Intel Mac (2026-09-17) this
-        // case asserted the pre-08faa0245 outcome and failed with the inode unchanged.
+        // Byte-identical and tagged: re-laid only when a lay from this process would come
+        // back clean. This binary has no lane of its own, so its writes land tagged —
+        // re-laying would clear nothing and repeat for ever. Hence the branch on the
+        // measured `lay_clears_provenance()` rather than one fixed expectation.
         let clean_lay = atpkg::lay::lay_clears_provenance();
         write_pending_stub_kind(&layout, &tool, StubKind::Extra)
             .expect("a pass over a tagged identical stub still succeeds");

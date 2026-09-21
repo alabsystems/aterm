@@ -1,52 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `glance.json` — the fleet roster on disk, for a reader that has no broker
-//! connection and must not grow one (§9.3, A8).
+//! THE PRESENCE ROW, READ ONCE FOR THE WHOLE CRATE — `Last{/f/<F>/pub/*/*/presence}`
+//! parsed into rows that `aterm fabric status`, `aterm link ls`, `notify --on
+//! attention` and the bridge's own roster all read the bus through.
 //!
-//! ```text
-//! aterm-link glance --fleet <F> --broker <ep> [--tcp --key-file P] --cap-file <p>… [--state DIR]
-//! ```
+//! IT WAS `glance.json` UNTIL ROUND 21, and the file is what went. This module
+//! shipped a WRITER — one `Last` round trip, an atomic write of
+//! `<state>/fabric/glance.json`, a JSON emitter and a hand-rolled JSON parser to
+//! read it back — so that the macOS menu bar could show `ls`'s rows without
+//! holding a capability or blocking a UI thread on a broker round trip (§9.3).
+//! Its own header said, from the day it was written, **NO SUCH READER IS
+//! BUILT**: `status_item.rs` had no `FabricGlance`, no mention of the file and
+//! no read of any fabric state, and none appeared. A format with no reader is a
+//! format nobody is holding to anything, so the writer, the emitter, the parser
+//! and the `aterm link glance` subcommand are gone.
 //!
-//! The file exists so that the macOS menu bar CAN show the same rows
-//! `aterm-link ls` prints without growing a broker connection: a menu bar is a
-//! UI thread, and it may not attach a capability, complete a sealed handshake,
-//! or block on a `Last`. So one process that already holds the fleet's caps does
-//! the round trip and leaves the answer in `<state>/fabric/glance.json`, and a
-//! reader does a `read` and a parse.
+//! WHAT WAS NEVER CRUFT is everything below: [`Row::parse`], [`read`],
+//! [`ABSENT`], [`ATTENTION_CAP`] and [`json_string`] are the crate's ONE reader
+//! of a presence row, and `fabric.rs`, `notify.rs`, `bridge.rs`, `cli.rs` and
+//! `presence.rs` all call into them. The §5 audit row that named this file
+//! 960 lines of cruft was reading the header's own "not built" and stopping
+//! there; the writer was 350 of those lines and the reader is the rest.
 //!
-//! **NO SUCH READER IS BUILT.** §9.3 designs one — a `FabricGlance` folded in
-//! beside `status_item.rs`'s existing `FleetGlance` — and A8 owns neither
-//! `crates/aterm-gui/src/status_item.rs` nor any other UI file: that file today
-//! has no `FabricGlance`, no mention of `glance.json`, and no read of any fabric
-//! state. What ships in this module is the WRITER and the format; nothing
-//! renders it yet. Said here rather than left to be inferred, because aterm has
-//! no evidence manifest and this doc IS the claim.
-//!
-//! ## The one property this file has to keep
+//! ## The one property this module has to keep
 //!
 //! **A row IS the `Last{/f/<F>/pub/*/*/presence}` answer, not a summary of it.**
 //! Every `key=value` token of the presence body is carried through verbatim,
 //! under its own name, together with the subject it came from and the offset it
 //! was read at. Nothing is renamed, nothing is computed, and a token this build
-//! has never heard of survives to the reader — because the alternative is a
-//! menu bar that disagrees with `ls` about the same fleet and no way to tell
-//! which one is lying. [`Row::fields`] is therefore a map, not a struct.
+//! has never heard of survives to the reader — because the alternative is two
+//! readers of the same fleet disagreeing about it with no way to tell which one
+//! is lying. [`Row::fields`] is therefore a map, not a struct.
 //!
 //! **WITH EXACTLY FOUR EXCEPTIONS, AND THEY ARE THE CAP-FORCED ONES.** The four
-//! names in [`RESERVED`] — `subject`, `offset`, `node` and `owner` — are the row
-//! keys this file writes from the SUBJECT the broker handed back, and a body
-//! token of one of those names is DROPPED rather than carried ([`fields_of`],
-//! and again at the splice in [`Glance::to_json`]). A body is whatever a node
-//! holding `rw,p=<n>:/f/<F>/pub/<n>/>` chose to write, so carrying it under
-//! those names emitted the key TWICE in one object — and every mainstream JSON
-//! reader is last-wins, this crate's own [`Glance::from_json`] included, so the
-//! publisher's `owner=` beat the broker's. `offset=` was worse than shadowing:
-//! the body's value is emitted as a JSON *string*, which [`Glance::from_json`]
-//! cannot read as a number, so ONE row denied the whole roster to every reader.
-//! Four names of a publisher's is the price of the other three facts being
-//! true; the drop is the one place this file renames or removes anything, and
-//! it is listed here because this doc is the format's only specification.
+//! names in [`RESERVED`] — `subject`, `offset`, `node` and `owner` — are read
+//! from the SUBJECT the broker handed back, and a body token of one of those
+//! names is DROPPED rather than carried ([`fields_of`]). A body is whatever a
+//! node holding `rw,p=<n>:/f/<F>/pub/<n>/>` chose to write, so a carried
+//! `owner=` or `node=` would let a node publish itself as somebody else's
+//! session on somebody else's host. Four names of a publisher's is the price of
+//! the other three facts being true.
+//!
+//! The drop mattered twice over while the JSON writer existed: the same token
+//! spliced into the emitted object produced a SECOND key of that name, and
+//! every mainstream reader is last-wins, so the publisher's value beat the
+//! broker's. Round 21 cut the writer; the drop stays, because it is what makes
+//! `Row::node` and `Row::owner` mean what every caller reads them to mean.
 //!
 //! Two fields are guaranteed present even when the publisher omitted them, and
 //! they are the two the human actually reads: `attention=` (why a session wants
@@ -101,11 +101,13 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
 
 use crate::transport::Conn;
 
-/// The most rows one `glance.json` may hold. See the module note on bounds.
+/// The most rows one roster read may hold. See the module note on bounds.
+///
+/// It bounded `glance.json`'s size until round 21 cut that writer; it still
+/// bounds [`read`], which is what every caller now goes through.
 pub const MAX_ROWS: usize = 4096;
 
 /// The byte cap on ANY one key or value this file carries, INCLUDING the `…`
@@ -347,149 +349,7 @@ pub fn read(conn: &mut Conn, fleet: &str) -> io::Result<Glance> {
     })
 }
 
-/// `<state>/fabric/glance.json` — where the file is written, and the path a
-/// menu-bar reader would read (§9.3). No reader exists yet; see the header.
-#[must_use]
-pub fn path(state_root: &Path) -> PathBuf {
-    state_root.join("fabric").join("glance.json")
-}
-
-impl Glance {
-    /// Render the file.
-    #[must_use]
-    pub fn to_json(&self) -> String {
-        let mut s = String::from("{\n  \"v\": 1,\n  \"fleet\": ");
-        s.push_str(&json_string(&self.fleet));
-        s.push_str(",\n  \"truncated\": ");
-        s.push_str(if self.truncated { "true" } else { "false" });
-        s.push_str(",\n  \"rows\": [");
-        for (i, row) in self.rows.iter().enumerate() {
-            s.push_str(if i == 0 { "\n" } else { ",\n" });
-            s.push_str("    {\"subject\": ");
-            s.push_str(&json_string(&row.subject));
-            s.push_str(", \"offset\": ");
-            s.push_str(&row.offset.to_string());
-            s.push_str(", \"node\": ");
-            s.push_str(&json_string(&row.node));
-            s.push_str(", \"owner\": ");
-            s.push_str(&json_string(&row.owner));
-            for (k, v) in &row.fields {
-                // The second half of the [`RESERVED`] rule, at the one place the
-                // duplicate key would physically be written. `fields_of` cannot
-                // put one here, but a `Row` assembled any other way can, and the
-                // emitter is where "each key once" is actually a property.
-                if RESERVED.contains(&k.as_str()) {
-                    continue;
-                }
-                s.push_str(", ");
-                s.push_str(&json_string(k));
-                s.push_str(": ");
-                s.push_str(&json_string(v));
-            }
-            s.push('}');
-        }
-        if !self.rows.is_empty() {
-            s.push_str("\n  ");
-        }
-        s.push_str("]\n}\n");
-        s
-    }
-
-    /// Write the file atomically under `state_root`.
-    ///
-    /// ATOMIC BY RENAME, and the temp file is named with this process's pid so
-    /// two writers cannot interleave into one temp. A reader therefore sees the
-    /// previous complete file or the next complete file, never a prefix — which
-    /// matters because the reader is a UI thread with no way to retry a parse
-    /// that failed halfway.
-    ///
-    /// # Errors
-    ///
-    /// Creating the directory, writing the temp file, or the rename.
-    pub fn write_atomic(&self, state_root: &Path) -> io::Result<PathBuf> {
-        let final_path = path(state_root);
-        let dir = final_path
-            .parent()
-            .ok_or_else(|| io::Error::other("glance.json has no parent directory"))?;
-        std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".glance.json.{}.tmp", std::process::id()));
-        // `sync_all` before the rename: the rename is what publishes the file,
-        // and publishing a name that points at unwritten blocks is the classic
-        // way a crash leaves a valid-looking empty roster behind.
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(self.to_json().as_bytes())?;
-            f.sync_all()?;
-        }
-        match std::fs::rename(&tmp, &final_path) {
-            Ok(()) => Ok(final_path),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
-    }
-
-    /// Read a `glance.json` back.
-    ///
-    /// The parser accepts EXACTLY the shape [`Glance::to_json`] writes — a flat
-    /// object per row, string and number values only — and answers `None` for
-    /// anything else. It exists so a test (and a reader that would rather not
-    /// grow a JSON dependency) can compare the file against the `Last` answer it
-    /// claims to equal; it is not a general JSON parser and does not pretend to
-    /// be one.
-    #[must_use]
-    pub fn from_json(text: &str) -> Option<Glance> {
-        let mut p = Parser {
-            b: text.as_bytes(),
-            i: 0,
-        };
-        let mut fleet = String::new();
-        let mut truncated = false;
-        let mut rows = Vec::new();
-        p.ws();
-        p.byte(b'{')?;
-        loop {
-            p.ws();
-            if p.peek() == Some(b'}') {
-                p.i += 1;
-                break;
-            }
-            let key = p.string()?;
-            p.ws();
-            p.byte(b':')?;
-            p.ws();
-            match key.as_str() {
-                "fleet" => fleet = p.string()?,
-                "truncated" => truncated = p.bool()?,
-                "v" => {
-                    // A file from a fold version this build does not know is
-                    // refused, not guessed at (§10: two readers with different
-                    // fold versions disagree loudly, never silently).
-                    if p.number()? != 1 {
-                        return None;
-                    }
-                }
-                "rows" => rows = p.rows()?,
-                _ => return None,
-            }
-            p.ws();
-            if p.peek() == Some(b',') {
-                p.i += 1;
-            }
-        }
-        p.ws();
-        if p.i != p.b.len() {
-            return None;
-        }
-        Some(Glance {
-            fleet,
-            rows,
-            truncated,
-        })
-    }
-}
+impl Glance {}
 
 /// Render one JSON string. Every byte outside printable ASCII becomes a `\u`
 /// escape, so a value that arrived off the bus can never close the string, open
@@ -514,201 +374,44 @@ pub(crate) fn json_string(s: &str) -> String {
     out
 }
 
-/// The recursive-descent reader for [`Glance::from_json`]'s pinned shape.
-struct Parser<'a> {
-    b: &'a [u8],
-    i: usize,
-}
-
-impl Parser<'_> {
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.i).copied()
-    }
-
-    fn ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.i += 1;
-        }
-    }
-
-    fn byte(&mut self, want: u8) -> Option<()> {
-        (self.peek()? == want).then(|| self.i += 1)
-    }
-
-    fn bool(&mut self) -> Option<bool> {
-        for (lit, val) in [(&b"true"[..], true), (&b"false"[..], false)] {
-            if self.b[self.i..].starts_with(lit) {
-                self.i += lit.len();
-                return Some(val);
-            }
-        }
-        None
-    }
-
-    fn number(&mut self) -> Option<u64> {
-        let start = self.i;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.i += 1;
-        }
-        (self.i > start).then_some(())?;
-        std::str::from_utf8(&self.b[start..self.i])
-            .ok()?
-            .parse()
-            .ok()
-    }
-
-    fn string(&mut self) -> Option<String> {
-        self.byte(b'"')?;
-        let mut out = String::new();
-        loop {
-            match self.peek()? {
-                b'"' => {
-                    self.i += 1;
-                    return Some(out);
-                }
-                b'\\' => {
-                    self.i += 1;
-                    match self.peek()? {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'u' => {
-                            let hex = self.b.get(self.i + 1..self.i + 5)?;
-                            let unit =
-                                u16::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
-                            // A surrogate pair is two `\u` escapes; decode them
-                            // together or a non-BMP char round-trips as U+FFFD.
-                            let ch = if (0xd800..0xdc00).contains(&unit) {
-                                if self.b.get(self.i + 5..self.i + 7)? != b"\\u" {
-                                    return None;
-                                }
-                                let hex2 = self.b.get(self.i + 7..self.i + 11)?;
-                                let low = u16::from_str_radix(std::str::from_utf8(hex2).ok()?, 16)
-                                    .ok()?;
-                                self.i += 6;
-                                char::decode_utf16([unit, low]).next()?.ok()?
-                            } else {
-                                char::from_u32(u32::from(unit))?
-                            };
-                            out.push(ch);
-                            self.i += 4;
-                        }
-                        _ => return None,
-                    }
-                    self.i += 1;
-                }
-                c if c < 0x20 => return None,
-                _ => {
-                    let rest = std::str::from_utf8(&self.b[self.i..]).ok()?;
-                    let ch = rest.chars().next()?;
-                    out.push(ch);
-                    self.i += ch.len_utf8();
-                }
-            }
-        }
-    }
-
-    fn rows(&mut self) -> Option<Vec<Row>> {
-        self.byte(b'[')?;
-        let mut rows = Vec::new();
-        loop {
-            self.ws();
-            if self.peek()? == b']' {
-                self.i += 1;
-                return Some(rows);
-            }
-            rows.push(self.row()?);
-            self.ws();
-            if self.peek()? == b',' {
-                self.i += 1;
-            }
-        }
-    }
-
-    fn row(&mut self) -> Option<Row> {
-        self.byte(b'{')?;
-        let mut subject = None;
-        let mut offset = None;
-        let mut node = None;
-        let mut owner = None;
-        let mut fields = BTreeMap::new();
-        loop {
-            self.ws();
-            if self.peek()? == b'}' {
-                self.i += 1;
-                break;
-            }
-            let key = self.string()?;
-            self.ws();
-            self.byte(b':')?;
-            self.ws();
-            match key.as_str() {
-                "subject" => subject = Some(self.string()?),
-                "node" => node = Some(self.string()?),
-                "owner" => owner = Some(self.string()?),
-                "offset" => offset = Some(self.number()?),
-                _ => {
-                    fields.insert(key, self.string()?);
-                }
-            }
-            self.ws();
-            if self.peek()? == b',' {
-                self.i += 1;
-            }
-        }
-        Some(Row {
-            subject: subject?,
-            offset: offset?,
-            node: node?,
-            owner: owner?,
-            fields,
-        })
-    }
-}
-
-/// `aterm-link glance` — the entry `main.rs` registers.
-///
-/// One `Last` round trip and one atomic write; the flag parsing it shares with
-/// `tui` lives in [`crate::tui`], which is where both subcommands' command line
-/// is documented.
-#[must_use]
-pub fn main(args: &[String]) -> std::process::ExitCode {
-    crate::tui::main_entry(args, true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// **THE HEADER'S CLAIM ABOUT THE MENU BAR, PINNED TO THE MENU BAR.**
+    /// **THE WRITER IS GONE, AND NOTHING QUIETLY WANTS IT BACK.**
     ///
-    /// aterm has no evidence manifest, so this module's doc is its claim, and
-    /// the claim it used to make — that `status_item.rs` folds these rows into a
-    /// `FabricGlance` — named a type that does not exist. The pin binds the two
-    /// files: while `status_item.rs` has no `FabricGlance`, the header must keep
-    /// saying the reader is not built, and the day one lands this fails and the
-    /// paragraph gets rewritten in the present tense it deserves.
+    /// This test used to pin the header's "NO SUCH READER IS BUILT" claim to
+    /// `status_item.rs`, so that the day a `FabricGlance` landed in the menu bar
+    /// the paragraph would be rewritten in the present tense it deserved. No
+    /// reader ever landed, and round 21 cut the writer instead — so the pin is
+    /// inverted: the two files must stay apart, and if the UI grows a reader it
+    /// must not be for a file this crate no longer produces.
     ///
     /// `include_str!` across crates is the house pattern for pinning a claim to
     /// the code that would falsify it (`aterm-gui/src/control.rs` pins
     /// `aterm-control/src/selection.rs` the same way); it is test-only and adds
     /// no dependency.
     #[test]
-    fn the_header_does_not_promise_a_menu_bar_reader_that_is_not_there() {
+    fn nothing_reads_a_glance_file_this_crate_no_longer_writes() {
         let ui = include_str!("../../aterm-gui/src/status_item.rs");
         let me = include_str!("glance.rs");
+        assert!(
+            !ui.contains("FabricGlance") && !ui.contains("glance.json"),
+            "status_item.rs reads a glance file, and round 21 removed the writer: \
+             restore the writer or point the reader at `glance::read`"
+        );
         // Assembled, not written out: a literal would be found in this
         // function's own source and the pin would match itself.
-        let marker = ["NO", "SUCH", "READER", "IS", "BUILT."].join(" ");
-        let reader = ui.contains("FabricGlance") || ui.contains("glance.json");
-        assert!(
-            !reader,
-            "status_item.rs grew a fabric-glance reader; glance.rs's header \
-             still says one is not built"
-        );
-        assert!(
-            me.contains(&marker),
-            "no reader of glance.json exists, so this module's header must say so"
-        );
+        for gone in [
+            ["fn", "write_atomic"].join(" "),
+            ["fn", "to_json"].join(" "),
+            ["fn", "from_json"].join(" "),
+        ] {
+            assert!(
+                !me.contains(&gone),
+                "`{gone}` is back in a module whose file format has no reader"
+            );
+        }
     }
 
     fn row(subject: &str, body: &str) -> Row {
@@ -807,45 +510,22 @@ mod tests {
         assert_eq!(r.field("fabric"), ABSENT);
     }
 
-    /// A HOSTILE VALUE CANNOT ESCAPE ITS STRING. The bus carries pct-encoded
-    /// tokens, but nothing on the READ side enforces that, and the file is
-    /// rendered by a menu bar: a quote, a backslash or a newline that survived
-    /// into the JSON would be a value that writes the next key.
-    #[test]
-    fn a_value_cannot_break_out_of_the_json() {
-        let mut g = Glance {
-            fleet: "f1".into(),
-            rows: vec![row("/f/f1/pub/n-a/node/presence", "state=live")],
-            truncated: false,
-        };
-        g.rows[0].fields.insert(
-            "attention".into(),
-            "\" , \"owner\": \"n-evil\" \\ \n \u{1b}]0;x\u{7}".into(),
-        );
-        let text = g.to_json();
-        assert_eq!(
-            text.matches("\"owner\"").count(),
-            1,
-            "one owner key:\n{text}"
-        );
-        assert!(!text.contains('\u{1b}'), "an ESC reached the file");
-        let back = Glance::from_json(&text).expect("round trip");
-        assert_eq!(back, g, "the escape must be lossless, not lossy");
-    }
-
-    /// **A BODY TOKEN CANNOT SHADOW A CAP-FORCED ROW FACT.** The value route is
-    /// the test above; this is the KEY route, which needs no escaping at all.
+    /// **A BODY TOKEN CANNOT SHADOW A CAP-FORCED ROW FACT.**
     ///
-    /// `subject`, `offset`, `node` and `owner` are written from the subject the
+    /// `subject`, `offset`, `node` and `owner` are read from the subject the
     /// broker handed back — `node` and `owner` cap-forced, the other two the
-    /// reader's own. A body is whatever a node holding its own `pub/<n>/` grant
-    /// chose to write, and splicing it into the SAME object emitted a second key
-    /// of that name AFTER the honest one: every mainstream JSON reader is
-    /// last-wins, [`Glance::from_json`] included, so a node published itself as
-    /// somebody else's session on somebody else's host. `offset=` did not even
-    /// need a lie — the body's value is emitted as a string, `Parser::row` wants
-    /// a number, and the whole `glance.json` then parsed as `None`: one hostile
-    /// row denying the fleet roster to every reader.
+    /// reader's own — and a body token of one of those names is DROPPED rather
+    /// than carried. A body is whatever a node holding its own `pub/<n>/` grant
+    /// chose to write, so without the drop a node could publish itself as
+    /// somebody else's session on somebody else's host.
+    ///
+    /// ROUND 21 CUT THE OTHER HALF OF THIS TEST WITH THE WRITER IT GUARDED. The
+    /// `glance.json` emitter spliced these fields into the same JSON object,
+    /// where a surviving body token became a SECOND key of that name after the
+    /// honest one — and every mainstream reader is last-wins. There is no
+    /// emitter now; what remains is the parser's own drop, which is the half
+    /// that was always load-bearing for `fabric status`, `notify --on
+    /// attention` and `ls`.
     #[test]
     fn no_body_token_can_shadow_a_cap_forced_row_fact() {
         let r = row(
@@ -860,101 +540,5 @@ mod tests {
         // The tokens that are NOT reserved are untouched: this drops four names,
         // not a publisher's row.
         assert_eq!(r.field("state"), "live");
-
-        let g = Glance {
-            fleet: "f1".into(),
-            rows: vec![r],
-            truncated: false,
-        };
-        let text = g.to_json();
-        for k in RESERVED {
-            // The KEY, not the name anywhere in the text: `"owner": "node"` is
-            // a legitimate VALUE that spells one of these.
-            assert_eq!(
-                text.matches(&format!("\"{k}\": ")).count(),
-                1,
-                "{k} appears twice:\n{text}"
-            );
-        }
-        // ONE ROW MUST NOT DENY THE FILE. The `offset=` case failed the parse of
-        // every row, not just its own.
-        assert_eq!(Glance::from_json(&text).as_ref(), Some(&g));
-
-        // And the emitter refuses one too, so the property does not depend on
-        // where the `Row` came from — a hand-built or future-parsed row cannot
-        // write the duplicate key either.
-        let mut hand = g.clone();
-        hand.rows[0].fields.insert("offset".into(), "x".into());
-        hand.rows[0].fields.insert("owner".into(), "n-evil".into());
-        let text = hand.to_json();
-        assert_eq!(text.matches("\"offset\": ").count(), 1, "{text}");
-        assert_eq!(text.matches("\"owner\": ").count(), 1, "{text}");
-        assert_eq!(Glance::from_json(&text).as_ref(), Some(&g));
-    }
-
-    /// The file round-trips, empty and full, and the parser refuses what it does
-    /// not understand rather than half-reading it.
-    #[test]
-    fn the_file_round_trips_and_refuses_what_it_cannot_read() {
-        let empty = Glance {
-            fleet: "f1".into(),
-            rows: Vec::new(),
-            truncated: false,
-        };
-        assert_eq!(Glance::from_json(&empty.to_json()).as_ref(), Some(&empty));
-        let full = Glance {
-            fleet: "f1".into(),
-            rows: vec![
-                row(
-                    "/f/f1/pub/n-a/node/presence",
-                    "v=1 state=live fabric=connected",
-                ),
-                row(
-                    "/f/f1/pub/n-b/s-0123456789abcdef0123/presence",
-                    "v=1 state=live attention=review%20the%20diff fabric=connected",
-                ),
-            ],
-            truncated: true,
-        };
-        assert_eq!(Glance::from_json(&full.to_json()).as_ref(), Some(&full));
-        for bad in [
-            "",
-            "{",
-            "{}x",
-            "{\"v\": 2, \"fleet\": \"f1\", \"truncated\": false, \"rows\": []}",
-            "{\"v\": 1, \"nope\": 1}",
-            "{\"v\": 1, \"rows\": [{\"subject\": \"/f/f1/pub/n-a/node/presence\"}]}",
-        ] {
-            assert!(Glance::from_json(bad).is_none(), "{bad:?}");
-        }
-    }
-
-    /// The write is atomic and lands where the menu bar looks.
-    #[test]
-    fn the_write_lands_at_the_path_the_menu_bar_reads() {
-        let dir = std::env::temp_dir().join(format!("atl-glance-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let g = Glance {
-            fleet: "f1".into(),
-            rows: vec![row(
-                "/f/f1/pub/n-a/node/presence",
-                "state=live fabric=connected",
-            )],
-            truncated: false,
-        };
-        let written = g.write_atomic(&dir).expect("write");
-        assert_eq!(written, path(&dir));
-        assert_eq!(written, dir.join("fabric").join("glance.json"));
-        let text = std::fs::read_to_string(&written).expect("read back");
-        assert_eq!(Glance::from_json(&text).as_ref(), Some(&g));
-        // No temp file is left behind.
-        let strays: Vec<_> = std::fs::read_dir(dir.join("fabric"))
-            .expect("dir")
-            .filter_map(Result::ok)
-            .map(|e| e.file_name())
-            .filter(|n| n != "glance.json")
-            .collect();
-        assert!(strays.is_empty(), "{strays:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

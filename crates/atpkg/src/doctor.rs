@@ -47,11 +47,9 @@ const GIB: u64 = 1 << 30;
 ///   the tombstone shim with a real symlink.
 ///
 /// Deliberately NOT a fault: `active`, `dev-linked (skipped)` (a §13 hard-skip the user
-/// asked for), `held: …` (a tuple whose new pin is not published for this target, staying
-/// whole on its current builds), and any future informational state. The list is
-/// allow-by-prefix so an unrecognized state reads as benign rather than as a failure — a
-/// diagnostic that invents faults from states it does not understand trains people to
-/// ignore it.
+/// asked for), `held: …` (a tuple whose new pin is not published for this target), and any
+/// future informational state. Allow-by-prefix, so an unrecognized state reads as benign
+/// rather than as a failure.
 fn is_problem_state(state: &str) -> bool {
     state.starts_with("error:")
         || state.starts_with("unavailable:")
@@ -872,7 +870,7 @@ pub fn run_with(
         }
     }
 
-    // (5f) tippy's COMPILER IS A PLAIN FILE, AND THE RUSTUP VIEW IS A CLONE OF THE BUILD.
+    // (5f) tippy's compiler is a plain file, and the rustup view is a clone of the build.
     //
     // History, because the check that stood here until 2026-09-14 was about a file
     // that no longer ships. The bundle carried `rustc` as a second COPY of `trustc` for
@@ -882,7 +880,7 @@ pub fn run_with(
     // one inside the signature blob). So this report compared the two modulo their
     // signatures to say whether tippy would refuse. Trust now ships its tools under
     // Trust's names only, tippy runs `trustc` directly, and the stock names live in
-    // atpkg's rustup VIEW ([`crate::seam::refresh_view`]) as copy-on-write clones of the
+    // atpkg's rustup view ([`crate::seam::refresh_view`]) as copy-on-write clones of the
     // Trust tools — so a bundle published from 2026-09-14 on has no two files to compare.
     //
     // The bundles already INSTALLED do. 8571, 8589, 8590 and 8595 still ship `bin/rustc`
@@ -890,21 +888,19 @@ pub fn run_with(
     // it — and that removed comparison was then the only thing that could see it, so
     // doctor said "healthy" over a PATH tippy that stopped at a setup error on every run
     // (measured on 8595, 2026-09-15). The store is never modified; atpkg lays a per-build
-    // EXEC ROOT — a copy-on-write clone of the build where `rustc` holds `trustc`'s bytes —
-    // and routes the trust shims through it ([`crate::compat`]). What this check says about
-    // it is file facts read with `lstat` and byte compares — never a run of tippy, whose
-    // ancestor-directory checks refuse intermittently on their own and would make the
-    // verdict flap.
+    // exec root — a copy-on-write clone of the build where `rustc` holds `trustc`'s bytes —
+    // and routes the trust shims through it ([`crate::compat`]). What this check says is
+    // file facts read with `lstat` and byte compares, never a run of tippy, whose
+    // ancestor-directory checks refuse intermittently and would make the verdict flap.
     //
     // (a) `trustc` must be a plain file: tippy (and tippy-driver) refuse a symbolic
     //     link for the selected compiler, measured. It withholds "healthy" while tippy
     //     is in the bundle to be refused.
     // (b) For every recorded seam, each stock name rustup resolves must be a clone of the
     //     store's Trust tool holding its bytes — or `cargo +trust` / `rustc +trust` run
-    //     something other than the managed toolchain, or nothing. A view laid as hard links
-    //     before clones is not one, and reads as a mismatch until repair rebuilds it.
-    //     `aterm pkg repair` rebuilds the view; a mismatch is a warn that withholds
-    //     "healthy".
+    //     something other than the managed toolchain. A view laid as hard links before
+    //     clones is not one. A mismatch is a warn that withholds "healthy", and
+    //     `aterm pkg repair` rebuilds the view.
     // (c) When the active build [`crate::compat::needs_root`] (`rustc` neither `trustc`'s
     //     inode nor its bytes, beside a tippy): an exec root that is a clone of the build
     //     at `Deep` depth, with every trust shim in `bin/` carrying the guard through it,
@@ -972,10 +968,9 @@ pub fn run_with(
             None => {}
         }
     }
-    // A DEV-LINKED trust still has a seam when no shim in `bin/` names a store build
-    // (2026-09-16: the link is a decision to present that compiler, and under a link
-    // every trust shim resolves into the checkout, so `active` has no trust build even
-    // when the store holds one), so its view is checked too — against the checkout, or
+    // A dev-linked trust still has a seam when no shim in `bin/` names a store build: under
+    // a link every trust shim resolves into the checkout, so `active` has no trust build
+    // even when the store holds one. Its view is checked too — against the checkout, or
     // against the store's `current` build under a dev-link the seam refused.
     if !active.contains_key("trust") {
         let current = crate::seam::store_current(layout);
@@ -1160,24 +1155,18 @@ pub fn run_with(
                 }
             }
         }
-        // (6b) RC WIRING — which shells OUTSIDE aterm reach the managed bin/, and for the
-        // ones that do not, WHY. B9 of the 2026-08-31 audit asked doctor to "say plainly"
-        // whether the toolchain is aterm-only on this machine; the report has never
-        // mentioned the rc block at all, so the three states a user can be in — wired,
-        // opted out (they deleted the block and every pass honours that), and skipped at
-        // the consent fence (the rc resolves under a macOS-guarded folder, so no pass
-        // opens it) — were indistinguishable from outside: the rc just sat there, untouched,
-        // with nothing said. One line per rc file that EXISTS (atpkg never creates one).
+        // (6b) rc wiring — which shells outside aterm reach the managed `bin/`, and for the
+        // ones that do not, why. One line per rc file that exists (atpkg never creates one).
+        // Without it the three states a user can be in — wired, opted out, and skipped at
+        // the consent fence — are indistinguishable from outside.
         //
-        // The SourcedElsewhere state is what keeps 7b's rule — doctor must not invent a
-        // fault from evidence it did not measure — honest here: `rc_wiring` reads each
-        // file's CONTENT for a `/.aterm/shell.d/` line, and it also reads the two bash
-        // login profiles install.sh can elect that atpkg has no row for
+        // Doctor must not invent a fault from evidence it did not measure. `rc_wiring` reads
+        // each file's content for a `/.aterm/shell.d/` line, and also the two bash login
+        // profiles install.sh can elect that atpkg has no row for
         // (`hooks::INSTALL_SH_PROFILES`), so a Mac wired by install.sh is not called
-        // unwired. Even so it reads six named files, not every file a shell can start from
-        // ($ZDOTDIR, /etc, fish under $XDG_CONFIG_HOME) — so when none of them sources
-        // shell.d, the note NAMES the six (`hooks::rc_files_read`) instead of calling the
-        // machine aterm-only.
+        // unwired. It still reads six named files, not every file a shell can start from, so
+        // when none of them sources shell.d the note names the six (`hooks::rc_files_read`)
+        // instead of calling the machine aterm-only.
         #[cfg(unix)]
         {
             let wiring = crate::hooks::rc_wiring(home);
@@ -2149,10 +2138,9 @@ fn stray_root_line(p: &str, path: &Path, why: crate::compat::Stray) -> String {
 }
 
 /// Whether the view file `at` presents the store's Trust tool `store`: a clone of it
-/// ([`crate::clone::is_clone_of`] — its length, mode and time, not its inode, so the hard
-/// link a view held before clones does NOT present it) holding its bytes (the attributes
-/// alone cannot tell it from a bundle's separately signed copy under the stock name).
-/// Reads at most the three stock names' bytes; writes nothing.
+/// ([`crate::clone::is_clone_of`] — length, mode and time, not inode, so the hard link a
+/// view held before clones does not present it) holding its bytes, since the attributes
+/// alone cannot tell it from a bundle's separately signed copy. Writes nothing.
 fn presents(store: &Path, at: &Path) -> bool {
     crate::clone::is_clone_of(store, at) && matches!(crate::clone::same_bytes(store, at), Ok(true))
 }
@@ -2181,17 +2169,14 @@ fn index_age_days(updated_at: &str, now: i64) -> Option<i64> {
     Some((now - then) / 86_400)
 }
 
-/// (5f b) For every recorded seam, each stock name the view holds must present the
-/// tool it stands for — the store's while the store's build is what the view presents
-/// (a clone of it holding its bytes, [`presents`]: a hard link a view held before clones
-/// is not one), the dev-linked CHECKOUT's while
-/// trust is dev-linked to a sysroot (2026-09-16: the view is exec stubs there, so the
-/// stub's target is read rather than an inode compared). `store_bin` is the store
-/// build's `bin/` — the active one, or `current`'s when no shim names a build — or
-/// `None` when the store holds none (a store-less dev-link). A mismatch is a tool that
-/// cannot run, with the fix that applies: `repair` rebuilds the view — except under a
-/// dev-link the seam REFUSES (a checkout that is not a sysroot), where nothing rebuilds
-/// it until the link goes.
+/// (5f b) For every recorded seam, each stock name the view holds must present the tool it
+/// stands for: the store's while the store's build is what the view presents (a clone of it
+/// holding its bytes, [`presents`]), the dev-linked checkout's while trust is dev-linked to
+/// a sysroot (the view is exec stubs there, so the stub's target is read rather than an
+/// inode compared). `store_bin` is the store build's `bin/` — the active one, or `current`'s
+/// when no shim names a build — or `None` when the store holds none. A mismatch is a tool
+/// that cannot run: `repair` rebuilds the view, except under a dev-link the seam refuses,
+/// where nothing rebuilds it until the link goes.
 fn view_stock_names_check(
     out: &mut dyn std::io::Write,
     p: &str,
@@ -3565,12 +3550,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Doctor says plainly which rc files reach the managed bin/ (audit B9's ask), in the
-    /// pass's own five states: wired, sourced through a line that is not atpkg's, opted
-    /// out, consent-fenced, or not yet wired. When none reaches, it names every file it
-    /// read rather than calling the machine aterm-only. Before this the report never
-    /// mentioned the rc block, so a user whose rc was skipped at the consent fence, and one
-    /// who had opted out, saw exactly the same thing: nothing.
+    /// Doctor says plainly which rc files reach the managed `bin/`, in the pass's own five
+    /// states: wired, sourced through a line that is not atpkg's, opted out, consent-fenced,
+    /// or not yet wired. When none reaches, it names every file it read rather than calling
+    /// the machine aterm-only.
     #[cfg(unix)]
     #[test]
     fn rc_wiring_is_reported_in_all_five_states() {
@@ -3621,8 +3604,8 @@ mod tests {
             "unwired names the pass that wires it: {unwired}"
         );
 
-        // Wired — by a REAL pass, so the ledger entry the opt-out state needs is the one
-        // the pass writes, not a shape this test invented.
+        // Wired by a real pass, so the ledger entry the opt-out state needs is the one the
+        // pass writes, not a shape this test invented.
         let pass = crate::hooks::pass_at(&l, &home, crate::hooks::RcWiring::HonorOptOut);
         assert_eq!(
             pass.rc(),
@@ -3652,11 +3635,9 @@ mod tests {
             "opted-out is honoured and names the one verb that re-wires: {opted}"
         );
 
-        // Sourced by a line that is NOT atpkg's — tools/install.sh's `wire_shell_path`
-        // marker pair, sourcing the same hook — on top of the opt-out ledger entry above:
-        // the user deleted atpkg's duplicate block and kept install.sh's. The toolchain
-        // reaches this shell, so doctor must say so, and must not call the machine
-        // aterm-only or the rc unwired.
+        // Sourced by a line that is not atpkg's — tools/install.sh's `wire_shell_path`
+        // marker pair, sourcing the same hook — on top of the opt-out ledger entry above.
+        // The toolchain reaches this shell, so doctor must not call the rc unwired.
         std::fs::write(
             &zshrc,
             format!(
@@ -3680,9 +3661,9 @@ mod tests {
             "a shell that reaches the toolchain is neither unreached nor unwired: {foreign}"
         );
 
-        // CONSENT-FENCED: the rc resolves under a folder macOS guards, so no pass opens it
-        // — and neither does this report. The state exists because nothing else could tell
-        // the user why their rc is perpetually untouched.
+        // Consent-fenced: the rc resolves under a folder macOS guards, so no pass opens it,
+        // and neither does this report. Without the state nothing tells the user why their
+        // rc is perpetually untouched.
         let docs = home.join("Documents");
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("zshrc"), "export FOO=1\n").unwrap();
@@ -3709,16 +3690,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// tools/install.sh wires macOS bash through a LOGIN profile: `path_block_rc_target`
-    /// elects ~/.bash_profile, then ~/.bash_login, then ~/.profile, never ~/.bashrc,
-    /// because Terminal.app starts a login bash. atpkg has a row for the FIRST of those
-    /// three and none for the other two, so a Mac whose login bash fell through to
-    /// ~/.bash_login would read as "nothing sources ~/.aterm/shell.d" while it plainly
-    /// did. Pinned in both shapes: install.sh's block in ~/.bash_profile — an atpkg row —
-    /// reads as sourced through a line that is not atpkg's (CONTENT before the ledger),
-    /// and the same block in ~/.bash_login, which atpkg never wires, reads the same way. A
-    /// profile that does not source shell.d is not listed at all (atpkg does not wire it,
-    /// so it has nothing to say about it).
+    /// tools/install.sh wires macOS bash through a login profile: `path_block_rc_target`
+    /// elects ~/.bash_profile, then ~/.bash_login, then ~/.profile, never ~/.bashrc, because
+    /// Terminal.app starts a login bash. atpkg has a row for the first of those three only,
+    /// so a Mac that fell through to ~/.bash_login would read as "nothing sources
+    /// ~/.aterm/shell.d" while it plainly did. Pinned in both shapes — content is read before
+    /// the ledger — and a profile that does not source shell.d is not listed at all.
     #[cfg(unix)]
     #[test]
     fn an_install_sh_block_in_a_login_profile_is_reported_as_sourcing_shell_d() {
@@ -3752,9 +3729,9 @@ mod tests {
             String::from_utf8(out).unwrap()
         };
 
-        // An atpkg ROW carrying install.sh's block, not atpkg's.
+        // An atpkg row carrying install.sh's block, not atpkg's.
         std::fs::write(home.join(".bash_profile"), block("00-atpkg.bash")).unwrap();
-        // A login profile that does NOT source shell.d is not reported.
+        // A login profile that does not source shell.d is not reported.
         std::fs::write(home.join(".profile"), "export BAR=1\n").unwrap();
         let out = report(&home);
         assert!(
@@ -3779,8 +3756,7 @@ mod tests {
             vec![(".bash_profile", crate::hooks::RcState::SourcedElsewhere)]
         );
 
-        // The fall-through profile atpkg has NO row for: the same block, and the same
-        // answer — this is the file whose absence from the roster made the old report lie.
+        // The fall-through profile atpkg has no row for: the same block, the same answer.
         std::fs::remove_file(home.join(".bash_profile")).unwrap();
         std::fs::write(home.join(".bash_login"), block("00-atpkg.bash")).unwrap();
         let out = report(&home);
@@ -5308,13 +5284,11 @@ mod tests {
     }
 
     /// (5f) THE VIEW. With no seam recorded the check has nothing to say. Once a seam
-    /// is attached against a synthetic rustup home, the view's stock names are clones of
-    /// the store's tools and the report is healthy. Two wrong views are named — with the
-    /// repair — and withhold "healthy": a `rustc` that is a HARD LINK to the store's
-    /// `trustc` (the construction before clones, which moved the store's inodes), and one
-    /// with `trustc`'s length, mode and time but other bytes (bundle 8595's separately
-    /// signed copy has exactly that shape). `repair`'s re-assertion rebuilds the view each
-    /// time and the report is healthy again.
+    /// is attached against a synthetic rustup home, the view's stock names are clones of the
+    /// store's tools and the report is healthy. Two wrong views are named with the repair
+    /// and withhold "healthy": a `rustc` hard-linked to the store's `trustc` (the
+    /// construction before clones), and one with `trustc`'s length, mode and time but other
+    /// bytes. `repair`'s re-assertion rebuilds the view and the report is healthy again.
     #[cfg(unix)]
     #[test]
     fn a_rustup_view_whose_stock_names_are_not_the_stores_tools_is_not_healthy() {
@@ -5383,7 +5357,7 @@ mod tests {
         assert!(out.contains(&warn), "the bytes can: {out}");
 
         // What repair does: re-assert, which rebuilds the view — and says so, since the
-        // view's `rustc` changed (2026-09-15).
+        // view's `rustc` changed.
         let lines = crate::seam::reassert(&l, &rustup);
         assert!(
             lines.len() == 1 && lines[0].contains("now presents"),
@@ -5394,12 +5368,11 @@ mod tests {
         assert!(ok && healthy(&out), "{out}{err}");
     }
 
-    /// (5f) THE VIEW FOLLOWS A DEV-LINK (2026-09-16). With trust dev-linked to a sysroot
-    /// checkout, the view presents the checkout, and this check compares it against the
-    /// CHECKOUT's tools — healthy, and no "is not the store's" line over a view that is
-    /// right by construction. A view left presenting the store while the link stands is
-    /// the split this fix exists for, and it is named — against the checkout's tool —
-    /// with the repair. Unlinked, the store's view is right again.
+    /// (5f) The view follows a dev-link. With trust dev-linked to a sysroot checkout the
+    /// view presents the checkout, and this check compares it against the checkout's tools —
+    /// healthy, with no "is not the store's" line over a view right by construction. A view
+    /// left presenting the store while the link stands is named, against the checkout's
+    /// tool, with the repair. Unlinked, the store's view is right again.
     #[cfg(unix)]
     #[test]
     fn a_dev_linked_trusts_view_is_healthy_when_it_presents_the_checkout() {
@@ -5476,9 +5449,9 @@ mod tests {
         assert!(ok && healthy(&out), "{out}{err}");
     }
 
-    /// (5f) A STORE-LESS dev-link has a seam too (2026-09-16), and it is checked — against
-    /// the checkout, the only thing there is: a view that presents it is not warned
-    /// about; a stub replaced by a copy is a tool that cannot run, named with the repair.
+    /// (5f) A store-less dev-link has a seam too, checked against the checkout, the only
+    /// thing there is: a view that presents it is not warned about; a stub replaced by a
+    /// copy is a tool that cannot run, named with the repair.
     #[cfg(unix)]
     #[test]
     fn a_store_less_dev_linked_seam_is_checked_against_the_checkout() {
@@ -5522,8 +5495,8 @@ mod tests {
         );
 
         // The checkout stops being a sysroot: the seam refuses, and with no store build
-        // behind the view doctor says so with the one fix (2026-09-16 review — it said
-        // nothing, and `rustc +trust` ran a compiler with no sysroot).
+        // behind the view doctor says so with the one fix — silence here left
+        // `rustc +trust` running a compiler with no sysroot.
         std::fs::remove_dir_all(checkout.join("lib")).unwrap();
         let lines = crate::seam::reassert(&l, &rustup);
         assert!(
@@ -6283,13 +6256,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// macOS-gated like its sibling above, and for the same reason: it mints the synthetic
-    /// `user.*` attribute through [`crate::provenance::set_xattr_for_test`], which is
+    /// macOS-gated like its sibling above: it mints the synthetic `user.*` attribute through
+    /// [`crate::provenance::set_xattr_for_test`], which is
     /// `#[cfg(all(test, target_os = "macos"))]` because it calls the six-argument Darwin
-    /// `setxattr`. Without the gate this fn was compiled on every target and `cargo test -p
-    /// atpkg` would not BUILD off macOS (E0425, measured on x86_64-unknown-linux-gnu
-    /// 2026-09-16) — the whole unit-test binary lost, not one test.
-    /// `crates/atpkg/tests/platform_cfg_parity.rs` is the standing guard for that class.
+    /// `setxattr`. Without the gate the whole unit-test binary fails to build off macOS
+    /// (E0425); `crates/atpkg/tests/platform_cfg_parity.rs` is the standing guard.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_tracked_install_record_is_reported_as_the_cause() {

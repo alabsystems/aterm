@@ -189,8 +189,36 @@ impl Grid {
     fn blank_wide_wrap_tail(&mut self, ecols: u16, fill: Cell) {
         let row = self.storage.cursor.row;
         let col = self.storage.cursor.col;
+        // `None` only if the row does not exist; then nothing was blanked and
+        // there is no span to give the ring either.
+        let mut bce: Option<core::ops::Range<u16>> = None;
         if let Some(r) = self.storage.row_mut(row) {
-            r.clear_range_with(col, ecols, fill);
+            // A wide half bisected by this blanking takes the BCE blank, not a
+            // default-coloured one. The xterm analogue for a WRITE that bisects
+            // a wide pair is `util.c` `WriteText` -> `DamagedCurCells` ->
+            // `ClearInLine` -> `ClearInLine2` -> `screen.c` `ClearCells`, and
+            // `ClearCells` widens its OWN run over the adjacent `HIDDEN_CHAR`
+            // halves before writing `' '` and
+            // `ld->color[col] = xtermColorPair(xw)` — the CURRENT colour pair,
+            // i.e. the colours of the glyph being written, which is exactly
+            // `fill` here. Same rule as the EL/ED erases (`ClearRight` reaches
+            // the same `ClearCells`); only the rectangle ops differ, and they
+            // reach `Clear1Cell` instead (#7522). See
+            // `Row::clear_range_with_orphan`.
+            bce = Some(r.clear_range_with_orphan(col, ecols, fill, fill));
+        }
+        // A truecolor BCE cell carries only an RGB *marker*; the bytes live in
+        // `RgbColorRing`. This site kept no ring at all, so even the blanked
+        // tail resolved the DEAD glyph's bytes; the orphan column the widened
+        // span adds needs the same entry. `fill_bce_rgb_range` sources the
+        // bytes from the cursor template, which the emulator sets from the same
+        // SGR state these `colors` come from (`handler_sgr`) — the `bg_is_rgb`
+        // guard keeps a caller that desynchronizes the two from seeding the
+        // ring behind an indexed marker.
+        if let Some(bce) = bce
+            && fill.colors().bg_is_rgb()
+        {
+            self.fill_bce_rgb_range(row, bce.start, bce.end);
         }
         self.storage.mark_content_row(row);
     }
@@ -1183,5 +1211,104 @@ impl Grid {
         debug_assert!(written <= ascii.len());
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
         written
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cell, CellFlags, Grid, PackedColors};
+
+    /// The wrap-tail blanking is a BCE erase that can BISECT the wide pair to its
+    /// left, and the orphaned head has to come out of it like any other cell the
+    /// erase rewrote: the BCE blank, resolving the BCE truecolor background.
+    ///
+    /// The shape a real terminal produces (`Terminal::new(3, 10)`):
+    ///
+    /// ```text
+    ///   ESC[48;2;10;20;30m  ESC[1;9H   <wide glyph>   (cols 8-9)
+    ///   ESC[48;2;200;100;50m ESC[1;10H <wide glyph>   (won't fit -> wraps)
+    /// ```
+    ///
+    /// The second glyph cannot fit at the last column, so the tail `[9, 10)` is
+    /// blanked with the NEW background and the glyph wraps to row 1. That
+    /// blanking bisects the first glyph, orphaning its head at col 8.
+    ///
+    /// Two failures lived here. Handing the orphan `Cell::EMPTY` left a
+    /// default-coloured hole beside the blanked tail; handing it the BCE blank
+    /// without extending the truecolor ring made it resolve the DEAD glyph's
+    /// bytes — `[10, 20, 30]` — which is worse than the hole. This site kept no
+    /// ring at all, so col 9, squarely inside the blanked span, had the same
+    /// staleness before any of this.
+    ///
+    /// More than one row on purpose: a single-row grid scrolls the evidence away.
+    #[test]
+    fn wide_wrap_tail_paints_the_bisected_orphan_with_the_bce_blank_and_its_ring() {
+        let (rows, cols) = (3u16, 10u16);
+        let mut grid = Grid::new(rows, cols);
+
+        // --- SGR 48;2;10;20;30 then a wide glyph at cols 8-9.
+        let old_bg = [10u8, 20, 30];
+        let old_colors = PackedColors::new().with_rgb_bg();
+        grid.set_cursor_template(Cell::bce_blank(old_colors), Some(old_bg));
+        grid.move_cursor_to(0, 8);
+        assert!(grid.write_wide_autowrap_fast('\u{4E2D}', old_colors, CellFlags::empty()));
+        // The emulator's write path stores truecolor bytes in the dense ring;
+        // this grid-level fast path leaves that to its caller, so seed it here.
+        grid.extras_mut()
+            .set_rgb_ring_range(0, 8, 10, None, Some(old_bg), rows, cols);
+        assert!(
+            grid.cell(0, 8).unwrap().flags().contains(CellFlags::WIDE),
+            "precondition: col 8 is the wide lead"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 8),
+            Some(old_bg),
+            "precondition: the ring holds the first glyph's bytes"
+        );
+
+        // --- SGR 48;2;200;100;50, cursor to the LAST column, another wide glyph.
+        let new_bg = [200u8, 100, 50];
+        let new_colors = PackedColors::new().with_rgb_bg();
+        grid.set_cursor_template(Cell::bce_blank(new_colors), Some(new_bg));
+        grid.move_cursor_to(0, 9);
+        assert!(grid.write_wide_autowrap_fast('\u{4E2D}', new_colors, CellFlags::empty()));
+
+        assert!(
+            grid.cell(1, 0).unwrap().flags().contains(CellFlags::WIDE),
+            "precondition: the second glyph wrapped to row 1"
+        );
+
+        let fill = Cell::bce_blank(new_colors);
+        let orphan = grid.cell(0, 8).unwrap();
+        assert!(
+            !orphan.flags().contains(CellFlags::WIDE),
+            "the orphaned wide head must be blanked"
+        );
+        assert_eq!(orphan.char(), ' ', "the orphan becomes a space");
+        assert_eq!(
+            orphan.colors(),
+            fill.colors(),
+            "the orphan must carry the BCE blank like the tail it was bisected \
+             by (xterm WriteText -> DamagedCurCells -> ClearCells writes \
+             xtermColorPair over the widened run), not a default-coloured hole"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 8),
+            Some(new_bg),
+            "the orphan must resolve the NEW truecolor background — the cell \
+             carries only the RGB marker, so the ring has to reach it; without \
+             that it resolves the DEAD glyph's bytes, a NEWLY wrong colour"
+        );
+        assert_eq!(
+            grid.cell(0, 9).unwrap().colors(),
+            fill.colors(),
+            "the blanked tail itself carries the BCE blank"
+        );
+        assert_eq!(
+            grid.bg_rgb_at(0, 9),
+            Some(new_bg),
+            "the blanked tail must resolve the new background too — this site \
+             maintained no ring at all, so it resolved the dead glyph's bytes"
+        );
     }
 }

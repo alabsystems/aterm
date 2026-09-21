@@ -207,6 +207,143 @@ fn code_and_path_context_suppressed() {
     }
 }
 
+/// THE SAME LAW, ON THE NO-SPACE ARM. `code_and_path_context_suppressed` above
+/// walks the SPACED arm of the scanner; the scanner has two, and the boundary
+/// test was spelled on one of them. A maximal no-space run is that arm's whole
+/// token — delimited by a script change exactly as a spaced token is delimited
+/// by a non-token character — so the same paths, flags and URLs must be just
+/// as quiet around Han, Hangul and Thai. Measured before the fix: every shape
+/// below decorated, while its Latin twin one test up did not, so a Japanese or
+/// Korean user's file listing sparkled and an English user's did not.
+#[test]
+fn code_and_path_context_suppressed_in_no_space_scripts_too() {
+    let o = opts_allow_cat();
+    for code in [
+        "子猫.txt",
+        "/api/子猫/list",
+        "https://example.com/子猫",
+        "--子猫",
+        "子猫=1",
+        "$子猫",
+        "/etc/고양이/conf",
+        "--고양이",
+        "แมว.log",
+        "$แมว",
+    ] {
+        assert_eq!(
+            classes(code, &o),
+            Vec::<Class>::new(),
+            "false positive in a no-space code context {code:?}"
+        );
+    }
+    // …and the CONTROL, or the assertion above would also pass on a scanner
+    // that had simply stopped reading no-space scripts at all.
+    for prose in ["子猫 が かわいい", "고양이 귀엽다", "แมว น่ารัก"]
+    {
+        assert!(
+            !classes(prose, &o).is_empty(),
+            "the no-space arm must still decorate ordinary prose: {prose:?}"
+        );
+    }
+}
+
+/// A MARKS-REQUIRED FELINE KEY IS NOT THE SHELL COMMAND. `allow_bare_cat`
+/// exists because "`cat` is also the ubiquitous shell command", and the guard
+/// it drives suppressed every feline surface of <= 3 folded chars. Vietnamese
+/// `mèo` folds to `meo` — three — but is marks-required, so no bare-ASCII
+/// typing can ever reach it, and it is the only single-token cat word vi has.
+/// Turning the shell-command decoration OFF therefore turned Vietnamese feline
+/// off entirely. Two-sided: bare `cat` must stay opt-in.
+#[test]
+fn a_marks_required_short_feline_is_not_the_bare_cat_command() {
+    let vi = Lexicon::with_languages(&["vi"]);
+    let o = default_opts();
+    let chars: Vec<char> = "mèo".chars().collect();
+    let got: Vec<Class> = vi.scan("mèo", &o).into_iter().map(|m| m.class).collect();
+    assert_eq!(got, vec![Class::Feline], "vi lost its only cat word");
+    assert_eq!(chars.len(), 3, "fixture: the surface really is three chars");
+    // The bare spelling still matches NOTHING — that is what marks-required
+    // means, and it is why this surface was never in the knob's blast radius.
+    assert!(
+        vi.scan("meo", &o).is_empty() && vi.scan("meo", &opts_allow_cat()).is_empty(),
+        "bare ASCII must never reach a marks-required key"
+    );
+    // …and the knob still does its job for the word it was written for.
+    assert!(
+        classes("cat file.txt", &default_opts()).is_empty(),
+        "bare `cat` must stay opt-in"
+    );
+}
+
+/// MARKS-REQUIRED IS A PROPERTY OF THE KEY, NOT OF THE CLASS. hu `cicák`
+/// (kitties, feline, marked) and id `cicak` (the house gecko, animal, bare)
+/// fold to one key. Feline outranks animal, and the precedence replacement
+/// used to throw the Indonesian claimant's testimony away with its class — so
+/// the bare spelling the data explicitly authored matched NOTHING, and ADDING
+/// a language silently switched off a word that had worked without it.
+#[test]
+fn a_bare_claimant_keeps_its_key_matchable_across_a_precedence_replacement() {
+    let o = opts_allow_cat();
+    let bare = |lx: &Lexicon| -> Vec<Class> {
+        lx.scan("cicak", &o).into_iter().map(|m| m.class).collect()
+    };
+    let id_only = Lexicon::with_languages(&["id"]);
+    assert_eq!(
+        bare(&id_only),
+        vec![Class::Animal],
+        "fixture: id alone works"
+    );
+    // Both orders, and `all`: the merge must not depend on which claimant the
+    // file happens to list first.
+    for langs in [&["hu", "id"][..], &["id", "hu"][..], &["all"][..]] {
+        assert!(
+            !bare(&Lexicon::with_languages(langs)).is_empty(),
+            "{langs:?}: adding a language silenced the bare Indonesian word"
+        );
+    }
+    // The marked Hungarian witness still reaches its own class throughout.
+    for langs in [&["hu"][..], &["all"][..]] {
+        let lx = Lexicon::with_languages(langs);
+        let got: Vec<Class> = lx.scan("cicák", &o).into_iter().map(|m| m.class).collect();
+        assert_eq!(got, vec![Class::Feline], "{langs:?}: hu lost cicák");
+    }
+
+    // BOTH ARMS, which the shipped data cannot reach on its own. `cicak`'s
+    // two claimants arrive in one fixed file order, so exactly ONE of
+    // `insert_class`'s precedence arms — the DROP — decides it, and the
+    // mirror arm (the bare claimant arriving FIRST and being replaced) would
+    // sit unexercised and rot. A synthetic document puts the same two rows in
+    // both orders: the key must be matchable either way, or the rule is an
+    // accident of file order rather than a law.
+    let rows =
+        |first: &str, second: &str| format!("{first}\n{second}\n", first = first, second = second);
+    let feline = "[[entry]]\nclass=\"feline\"\nlang=\"hu\"\nmode=\"forms\"\ncjk=false\nambiguous=false\nforms=[\"zzcicák\"]\n";
+    let animal = "[[entry]]\nclass=\"animal\"\nlang=\"id\"\nmode=\"forms\"\ncjk=false\nambiguous=false\nspecies=\"lizard\"\nforms=[\"zzcicak\"]\n";
+    for (order, src) in [
+        ("bare first", rows(animal, feline)),
+        ("marked first", rows(feline, animal)),
+    ] {
+        let lx = Lexicon::from_sources(&src, "", &["all"]).expect("synthetic lexicon parses");
+        let got: Vec<Class> = lx
+            .scan("zzcicak", &o)
+            .into_iter()
+            .map(|m| m.class)
+            .collect();
+        assert_eq!(
+            got,
+            vec![Class::Feline],
+            "{order}: the bare spelling must stay matchable whichever claimant \
+             the file lists first (it keeps the WINNING class)"
+        );
+        let marked: Vec<Class> = lx
+            .scan("zzcicák", &o)
+            .into_iter()
+            .map(|m| m.class)
+            .collect();
+        assert_eq!(marked, vec![Class::Feline], "{order}: the marked spelling");
+    }
+}
+
 #[test]
 fn cat_command_not_decorated_by_default() {
     // The literal `cat` shell command is a bare 3-letter token → opt-in only.
@@ -924,4 +1061,150 @@ fn form_hash_helpers_match_scan_semantics() {
     let m = lx.scan("これは超考です", &default_opts());
     assert_eq!(m.len(), 1);
     assert_eq!(m[0].form_hash, aterm_lexicon::form_hash("超考"));
+}
+
+// ------------------------------------------------- refusals, never silent ----
+//
+// Three load-time refusals that used to be taken and then discarded. The
+// kitty-command loader's module doc has said for a while that every load law
+// is "recorded on `conflicts`, never silent"; the sparkle loader beside it
+// took three of them silently, and a person who tripped one saw a vocabulary
+// that simply did not arrive.
+
+/// A configured `[sparkle_words] languages` code the DATA names nowhere
+/// un-gates nothing — `"DA"`, `"da-DK"`, `"dk"`, `"ALL"` are all silently
+/// inert, because the gate is an exact-match set probe over the bare
+/// lowercase codes the file uses. That is not a bug to fix by guessing at the
+/// user's intent (a fuzzy match would un-gate the wrong language); it is a
+/// refusal to REPORT.
+#[test]
+fn a_configured_language_the_data_never_names_is_reported_not_swallowed() {
+    for bad in ["DA", "da-DK", "dk", "ALL", "ger", "english"] {
+        let lx = Lexicon::with_languages(&[bad]);
+        assert!(
+            lx.conflicts().iter().any(|c| c.contains(bad)),
+            "{bad:?} un-gated nothing and nothing said so: {:?}",
+            lx.conflicts()
+        );
+    }
+    // Two-sided, or the assertion above would pass on a loader that shouted
+    // about every configuration: the real codes, and the reserved `all`, are
+    // quiet.
+    for good in [&["da"][..], &["en", "de"][..], &["all"][..], &[][..]] {
+        let lx = Lexicon::with_languages(good);
+        assert_eq!(
+            lx.conflicts(),
+            &[] as &[String],
+            "{good:?} is a valid configuration"
+        );
+    }
+}
+
+/// `mode` has exactly two spellings. Any other value falls through to the
+/// explicit-`forms` path and DISCARDS every stem, so the entry compiles to
+/// its `forms` alone — to nothing, for the 12 entries that are all stems.
+#[test]
+fn an_unknown_entry_mode_is_reported_and_its_stems_are_not_lost_in_silence() {
+    let src = "[[entry]]\nclass=\"feline\"\nlang=\"en\"\nmode=\"form\"\ncjk=false\n\
+               ambiguous=false\nstems=[\"zzkitten\"]\nsuffixes=[\"\"]\nforms=[]\n";
+    let lx = Lexicon::from_sources(src, "", &["all"]).expect("parses");
+    assert!(
+        lx.conflicts().iter().any(|c| c.contains("unknown mode")),
+        "a typo'd mode discarded its stems in silence: {:?}",
+        lx.conflicts()
+    );
+    // …and the control: both real spellings are quiet.
+    for mode in ["suffix", "forms"] {
+        let ok = src.replace("mode=\"form\"", &format!("mode=\"{mode}\""));
+        let lx = Lexicon::from_sources(&ok, "", &["all"]).expect("parses");
+        assert_eq!(lx.conflicts(), &[] as &[String], "mode={mode:?}");
+    }
+}
+
+/// A typo'd KEY is a parse error, not a list that silently never loads — the
+/// law `tricks.rs` already states in those words, now spelled on this loader
+/// too. `form = [...]` for `forms` used to yield an entry with zero surfaces
+/// and an empty `conflicts()`.
+#[test]
+fn a_typod_key_in_lexicon_data_is_a_parse_error_not_an_empty_entry() {
+    for (bad, good) in [
+        ("form=[\"zzkitten\"]", "forms=[\"zzkitten\"]"),
+        ("stem=[\"zzkitten\"]", "stems=[\"zzkitten\"]"),
+    ] {
+        let src = |kv: &str| {
+            format!(
+                "[[entry]]\nclass=\"feline\"\nlang=\"en\"\nmode=\"forms\"\ncjk=false\nambiguous=false\n{kv}\n"
+            )
+        };
+        assert!(
+            Lexicon::from_sources(&src(bad), "", &["all"]).is_err(),
+            "{bad:?} parsed instead of failing"
+        );
+        assert!(
+            Lexicon::from_sources(&src(good), "", &["all"]).is_ok(),
+            "fixture: {good:?} must still parse"
+        );
+    }
+    // The exceptions document is held to the same law.
+    assert!(
+        Lexicon::from_sources("", "[[exception]]\nwords=\"zz\"\n", &["all"]).is_err(),
+        "a typo'd exception key parsed instead of failing"
+    );
+    assert!(
+        Lexicon::from_sources("", "[[exception]]\nword=\"zz\"\n", &["all"]).is_ok(),
+        "fixture: the real key must still parse"
+    );
+}
+
+/// AN ENTRY THAT COMPILES TO NOTHING. A surface with a space can never match
+/// whole-word, and 34 such surfaces sit in the shipped file on purpose, as
+/// documentation of a word whose head noun is listed separately ("anak
+/// kucing" beside "kucing"). An entry where EVERY surface goes that way is a
+/// different animal: it contributes no key, so its class is unreachable in
+/// that language and nothing said so. Exactly one of 550 entries was in that
+/// state — Indonesian `canine`, whose only surface was the two-word "anak
+/// anjing", with bare `anjing` permanently profanity-claimed.
+#[test]
+fn an_entry_whose_every_surface_is_unmatchable_is_reported() {
+    let head =
+        "[[entry]]\nclass=\"canine\"\nlang=\"id\"\nmode=\"forms\"\ncjk=false\nambiguous=false\n";
+    let dead = Lexicon::from_sources(&format!("{head}forms=[\"anak anjing\"]\n"), "", &["all"])
+        .expect("parses");
+    assert!(
+        dead.conflicts()
+            .iter()
+            .any(|c| c.contains("NO scannable surface")),
+        "an entry that compiled to nothing said nothing: {:?}",
+        dead.conflicts()
+    );
+    // Two-sided: ONE matchable surface beside the documentation is enough,
+    // or the law would shout about every entry that carries a phrase.
+    let live = Lexicon::from_sources(
+        &format!("{head}forms=[\"guguk\", \"anak anjing\"]\n"),
+        "",
+        &["all"],
+    )
+    .expect("parses");
+    assert_eq!(live.conflicts(), &[] as &[String]);
+}
+
+/// …and the shipped Indonesian dog now actually reaches its class. `anjing`
+/// stays the curse (cross-class precedence, deliberate), so the entry needs a
+/// surface of its own: `guguk`, the child-speak dog built from the bark.
+#[test]
+fn indonesian_canine_reaches_its_class() {
+    let lx = Lexicon::with_languages(&["id"]);
+    let got: Vec<Class> = lx
+        .scan("guguk", &default_opts())
+        .into_iter()
+        .map(|m| m.class)
+        .collect();
+    assert_eq!(got, vec![Class::Canine], "id lost its only matchable dog");
+    // The deliberate precedence call is unchanged: the curse stays the curse.
+    let got: Vec<Class> = lx
+        .scan("anjing", &default_opts())
+        .into_iter()
+        .map(|m| m.class)
+        .collect();
+    assert_eq!(got, vec![Class::Profanity], "anjing must stay the sparkle");
 }

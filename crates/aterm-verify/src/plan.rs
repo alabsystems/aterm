@@ -264,7 +264,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     ));
     v.push(spec(
         StageId::LibcOracle,
-        "libc ABI oracle (4 ABI cells + 2 zero-surface targets; native runtime)",
+        "libc ABI oracle (this host's native cell; the others are decided where they are native)",
         Lane::LibcOracleTarget,
     ));
     v.push(spec(

@@ -229,6 +229,13 @@ enum Action {
     /// transcript archiving up. The caret is a position and rides its band
     /// (`band_pos`), exactly as the host observes it on the next present.
     BandMove(u16, u16, i16),
+    /// A SING-ALONG BAR (§27): `n` stars fanned from the caret, with the
+    /// shockwave ring on every fourth. The party is the one hand-off that
+    /// stages a `Sow` WITHOUT being a cursor event, so it is the one the
+    /// `SOW_SCRATCH` reservation could not be checked against until a
+    /// scenario fired one — and none did, which is how the fan could ship
+    /// dead and then, once wired, breach §18 on a busy frame in silence.
+    Party(u8, bool),
 }
 
 /// A gesture on a tick.
@@ -427,6 +434,50 @@ fn codex_streaming_12cps() -> Scenario {
     }
 }
 
+/// §27: a HELD key at key-repeat cadence — which is what arms the sing-along —
+/// with a bar reported on every bar boundary, the ring on every fourth, and
+/// the fan widening the way `kitty_sing::bar_fan` widens it (5, 7, 9 … capped
+/// at `BAR_FAN_CAP`). This is the busiest frame the party can land on: the
+/// held key has already driven the sky toward its cap, so the bar's `Sow` is
+/// staged beside a full shed. It exists because the party is the ONE hand-off
+/// that stages a sow without being a cursor event, so nothing in this file
+/// could ever have caught it overrunning `SOW_SCRATCH` — and for most of its
+/// life the fan was never minted at all, which is a quieter way for a test
+/// to pass.
+fn sing_along_bars() -> Scenario {
+    let ticks = ticks_in_ms(3_000);
+    // A 30 ms auto-repeat, and a bar every 1.6 s at SING_BPM (4 beats of
+    // 0.4 s) — expressed in ticks so the scenario needs no wall clock.
+    let repeat_ticks = ticks_in_ms(30).max(1);
+    let bar_ticks = ticks_in_ms(1_600).max(1);
+    let mut steps: Vec<Step> = (0..)
+        .map(|k| Step {
+            tick: k * repeat_ticks,
+            action: Action::Typed('a'),
+        })
+        .take_while(|s| s.tick < ticks)
+        .collect();
+    for bar in 0u64.. {
+        let tick = (bar as usize + 1) * bar_ticks;
+        if tick >= ticks {
+            break;
+        }
+        let fan = aterm_effects::kitty_sing::bar_fan(bar);
+        steps.push(Step {
+            tick,
+            action: Action::Party(fan.n, fan.ring),
+        });
+    }
+    steps.sort_by_key(|s| s.tick);
+    Scenario {
+        name: "sing-along bars on a held key, 3 s",
+        start: (ROW, 4),
+        ticks,
+        measure_from: 0,
+        steps,
+    }
+}
+
 fn scenarios() -> Vec<Scenario> {
     let only = std::env::var("RK_FRAME_COST_ONLY").unwrap_or_default();
     let needle = only.split(':').nth(1).unwrap_or("").to_string();
@@ -436,6 +487,7 @@ fn scenarios() -> Vec<Scenario> {
         ctrl_e_ping_pong(),
         held_backspace(),
         codex_streaming_12cps(),
+        sing_along_bars(),
     ]
     .into_iter()
     .filter(|sc| needle.is_empty() || sc.name.contains(&needle))
@@ -638,6 +690,7 @@ impl Driver for V2 {
                 caret.1 = (i32::from(caret.1) + dcol).clamp(0, i32::from(u16::MAX)) as u16;
                 self.eng.on_event(mv(from, *caret, Licence::Nav), now);
             }
+            Action::Party(n, ring) => self.eng.party(now, n, ring),
             Action::Backspace => {
                 caret.1 = caret.1.saturating_sub(1);
                 self.eng.on_event(mv(from, *caret, Licence::Typed), now);
@@ -766,6 +819,8 @@ impl Driver for Host {
                 self.glow.note_band_move(top, bottom, delta);
                 caret.0 = band_pos(caret.0, top, bottom, delta);
             }
+            // v1 has no sing-along; the bar is simply not its gesture.
+            Action::Party(..) => {}
         }
     }
 

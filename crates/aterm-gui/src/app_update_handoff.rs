@@ -5673,10 +5673,8 @@ impl App {
         // mode; this is about idleness, which is a different question.
         let gate_facts = ParkGateFacts {
             mode,
-            quiet: self.automatic_update_activity_quiet(now),
-            hands_off_keys: self.update_apply_hands_off_keys(now),
-            output_quiet: self.automatic_update_output_quiet(now),
-            focused: self.any_os_window_focused(),
+            phase: self.automatic_phase_for(mode, now),
+            activity: self.automatic_activity_facts(mode, now),
             masters_quiet: !handoff_masters_have_activity(&live),
             held_for: now.saturating_duration_since(dialled_at),
         };
@@ -6999,18 +6997,12 @@ struct PrelaunchArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ParkGateFacts {
     pub(crate) mode: crate::native_updater_service::ApplyMode,
-    /// `App::automatic_update_activity_quiet`: one quiet epoch since the last
-    /// input, PTY output or structural event.
-    pub(crate) quiet: bool,
-    /// `App::update_apply_hands_off_keys`: no keystroke landed in an aterm
-    /// window inside the typing gap (and no warm-up gesture holds the lane).
-    pub(crate) hands_off_keys: bool,
-    /// `App::automatic_update_output_quiet`: every live session's PTY output is
-    /// at least one quiet epoch old.
-    pub(crate) output_quiet: bool,
-    /// `App::any_os_window_focused`: an aterm window with an OS surface has
-    /// keyboard focus, so the user is LOOKING at this terminal.
-    pub(crate) focused: bool,
+    /// `App::automatic_apply_phase`: where the automatic lane stands on its
+    /// ladder at this instant. Ignored by the explicit modes.
+    pub(crate) phase: crate::native_update_auto_intent::ApplyPhase,
+    /// `App::automatic_activity_facts`: the terminal's quiet / keys / output /
+    /// focus facts, sampled at this instant.
+    pub(crate) activity: crate::native_update_auto_intent::ActivityFacts,
     /// `!handoff_masters_have_activity`: no master has bytes waiting that a
     /// reader has not consumed.
     pub(crate) masters_quiet: bool,
@@ -7042,30 +7034,28 @@ pub(crate) enum ParkGate {
 /// user nothing: every reader stays live through the successor's swap, second
 /// start and boot check. This gate decides the only thing the user feels.
 ///
-/// So each mode's rule is the one its ENTRY rule was protecting, re-read at the
-/// instant it matters:
+/// So the rule is the one the ENTRY gate applied, re-read at the instant it
+/// matters:
 ///
 /// * `Immediate` / `CleanQuit` — the person asked for this. Park at once; they
 ///   are waiting for it, and a gate here would be aterm deciding it knows better.
-/// * `Automatic` — the quiet-epoch lane. Park only at a quiet moment, which is
-///   what it has always promised; the difference is that it now waits for one
-///   with a successor already booted, so the moment costs milliseconds instead
-///   of a second and a half.
-/// * `AutomaticPastGrace` — the lane that gave up on a machine-wide idle moment
-///   (the daily driver never offers one). It still must not land MID-LINE: the
-///   owner's 2026-09-18 ruling is that stalling a streaming program against a
-///   full PTY buffer for the freeze is an interruption. So it waits for a gap in
-///   the OUTPUT, and only while an aterm window is focused — with the user in
-///   another app the stall is invisible and waiting would be waiting forever.
+/// * the automatic modes — THE LADDER
+///   (`native_update_auto_intent::automatic_park_refusal`), read at its live
+///   phase: a quiet moment while the lane prefers idle, then a gap in output
+///   while an aterm window is focused, then a gap in typing, then nothing. A
+///   successor launched under `Automatic` and held into a later phase parks by
+///   that later phase's rule; the mode only says which entry admitted it.
 ///
-/// And the typing gap applies to BOTH automatic modes, exactly as it does at the
-/// entry: a keystroke inside the gap means fingers are on the keys, and the one
-/// thing this must never do is swallow a keypress.
+/// Plus one fact the ladder never relaxes: bytes waiting on a master that its
+/// reader has not taken. Parking on top of them commits a screen digest the
+/// successor cannot reproduce, so that is a correctness gate, not a comfort,
+/// and it holds in every phase (the reader takes bytes within microseconds, so
+/// the 20 ms re-run finds a clean instant).
 ///
-/// MONOTONE IN `held_for`: past the cap every mode with a cap stands down, and
+/// MONOTONE IN `held_for`: past the cap every automatic mode stands down, and
 /// nothing can make a stood-down gate admit again. That is what bounds the hold
 /// — a booted successor is not left waiting behind a terminal that never goes
-/// quiet.
+/// quiet; the ladder's next phase admits the next attempt sooner.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn prelaunch_park_admitted(
@@ -7081,24 +7071,15 @@ pub(crate) fn prelaunch_park_admitted(
             "the terminal never offered a moment to pause in within the hold cap",
         );
     }
-    if !facts.hands_off_keys {
-        return ParkGate::Wait("a keystroke landed in an aterm window inside the typing gap");
+    if let Some(reason) =
+        crate::native_update_auto_intent::automatic_park_refusal(facts.phase, facts.activity)
+    {
+        return ParkGate::Wait(reason);
     }
     if !facts.masters_quiet {
         return ParkGate::Wait("a session has output waiting that its reader has not taken");
     }
-    match facts.mode {
-        ApplyMode::Automatic if !facts.quiet => {
-            ParkGate::Wait("terminal input/output is still inside the quiet epoch")
-        }
-        ApplyMode::AutomaticPastGrace if facts.focused && !facts.output_quiet => {
-            ParkGate::Wait("terminal output is still streaming")
-        }
-        ApplyMode::Automatic | ApplyMode::AutomaticPastGrace => ParkGate::Park,
-        // Answered above; written rather than argued so a mode added later
-        // cannot pick up a silent default here.
-        ApplyMode::Immediate | ApplyMode::CleanQuit => ParkGate::Park,
-    }
+    ParkGate::Park
 }
 
 /// The hold cap for `mode`: the automatic lanes are bounded, the explicit ones
@@ -8000,14 +7981,16 @@ mod late_park_record_tests {
     }
 }
 
-/// THE PARK GATE, enumerated (2026-09-19). The late park made "start the update"
-/// and "freeze the terminal" two decisions; this is the second one, and every
-/// rule in it is a rule the ENTRY gate used to carry.
+/// THE PARK GATE, enumerated. The late park (2026-09-19) made "start the
+/// update" and "freeze the terminal" two decisions; this is the second one, and
+/// every rule in it is the ladder's rule for the live phase plus the one
+/// correctness fact (unconsumed master bytes) the ladder never relaxes.
 #[cfg(all(test, unix))]
 mod park_gate_tests {
     use super::{
         PRELAUNCH_HOLD_MAX, ParkGate, ParkGateFacts, prelaunch_hold_cap, prelaunch_park_admitted,
     };
+    use crate::native_update_auto_intent::{ActivityFacts, ApplyPhase, automatic_park_refusal};
     use crate::native_updater_service::ApplyMode;
 
     const MODES: [ApplyMode; 4] = [
@@ -8016,16 +7999,40 @@ mod park_gate_tests {
         ApplyMode::Immediate,
         ApplyMode::CleanQuit,
     ];
+    const PHASES: [ApplyPhase; 4] = [
+        ApplyPhase::PreferIdle,
+        ApplyPhase::PreferOutputGap,
+        ApplyPhase::KeysOnly,
+        ApplyPhase::Land,
+    ];
 
     /// A machine that is idle in every sense: every mode parks on these.
-    fn calm(mode: ApplyMode) -> ParkGateFacts {
+    fn calm(mode: ApplyMode, phase: ApplyPhase) -> ParkGateFacts {
         ParkGateFacts {
             mode,
-            quiet: true,
-            hands_off_keys: true,
-            output_quiet: true,
-            focused: true,
+            phase,
+            activity: ActivityFacts {
+                quiet: true,
+                hands_off_keys: true,
+                output_quiet: true,
+                focused: true,
+            },
             masters_quiet: true,
+            held_for: std::time::Duration::ZERO,
+        }
+    }
+
+    fn facts_from_bits(mode: ApplyMode, phase: ApplyPhase, bits: u32) -> ParkGateFacts {
+        ParkGateFacts {
+            mode,
+            phase,
+            activity: ActivityFacts {
+                quiet: bits & 1 != 0,
+                hands_off_keys: bits & 2 != 0,
+                output_quiet: bits & 4 != 0,
+                focused: bits & 8 != 0,
+            },
+            masters_quiet: bits & 16 != 0,
             held_for: std::time::Duration::ZERO,
         }
     }
@@ -8034,61 +8041,94 @@ mod park_gate_tests {
         prelaunch_park_admitted(facts, prelaunch_hold_cap(facts.mode))
     }
 
-    /// EVERY COMBINATION of the five boolean facts, for every mode, against the
-    /// rule written out independently here. A truth table rather than a handful
-    /// of cases, because the failure this guards is one arm quietly admitting a
-    /// park the entry gate would have refused.
+    /// EVERY COMBINATION of the five boolean facts, for every mode and every
+    /// phase, against the rule written out independently here. A truth table
+    /// rather than a handful of cases, because the failure this guards is one
+    /// arm quietly admitting a park the ladder would have refused — or refusing
+    /// one it owes.
     #[test]
-    fn the_gate_admits_exactly_what_each_mode_owes() {
+    fn the_gate_admits_exactly_what_the_ladder_owes() {
         for mode in MODES {
-            for bits in 0..32u32 {
-                let facts = ParkGateFacts {
-                    mode,
-                    quiet: bits & 1 != 0,
-                    hands_off_keys: bits & 2 != 0,
-                    output_quiet: bits & 4 != 0,
-                    focused: bits & 8 != 0,
-                    masters_quiet: bits & 16 != 0,
-                    held_for: std::time::Duration::ZERO,
-                };
-                let expected = if !mode.is_automatic() {
-                    // The person asked and is waiting for it.
-                    true
-                } else {
-                    facts.hands_off_keys
-                        && facts.masters_quiet
-                        && match mode {
-                            ApplyMode::Automatic => facts.quiet,
-                            // Past grace: not mid-line, and only while the user
-                            // is looking.
-                            _ => !(facts.focused && !facts.output_quiet),
+            for phase in PHASES {
+                for bits in 0..32u32 {
+                    let facts = facts_from_bits(mode, phase, bits);
+                    let a = facts.activity;
+                    let expected = if !mode.is_automatic() {
+                        // The person asked and is waiting for it.
+                        true
+                    } else {
+                        facts.masters_quiet
+                            && match phase {
+                                ApplyPhase::PreferIdle => a.hands_off_keys && a.quiet,
+                                ApplyPhase::PreferOutputGap => {
+                                    a.hands_off_keys && !(a.focused && !a.output_quiet)
+                                }
+                                ApplyPhase::KeysOnly => a.hands_off_keys,
+                                ApplyPhase::Land => true,
+                            }
+                    };
+                    assert_eq!(
+                        gate(facts) == ParkGate::Park,
+                        expected,
+                        "{mode:?} {phase:?} with {facts:?} disagreed with the rule"
+                    );
+                    // And the park's refusal is the ENTRY's refusal, word for
+                    // word: one predicate, two instants.
+                    if mode.is_automatic() && facts.masters_quiet {
+                        let entry = automatic_park_refusal(phase, a);
+                        match gate(facts) {
+                            ParkGate::Park => assert_eq!(entry, None),
+                            ParkGate::Wait(reason) => assert_eq!(entry, Some(reason)),
+                            ParkGate::StandDown(_) => unreachable!("held_for is zero"),
                         }
-                };
-                assert_eq!(
-                    gate(facts) == ParkGate::Park,
-                    expected,
-                    "{mode:?} with {facts:?} disagreed with the rule"
-                );
+                    }
+                }
             }
         }
     }
 
-    /// The typing gap is the one rule no automatic mode may skip: a keystroke
-    /// inside it means fingers are on the keys, and the park would swallow the
-    /// echo.
+    /// The typing gap holds every automatic phase but the last: a keystroke
+    /// inside it means fingers are on the keys. `Land` is the bound that keeps
+    /// the ladder from being a refusal that can repeat forever; the deferred
+    /// input queue is what makes overriding the gap there safe.
     #[test]
-    fn a_keystroke_inside_the_typing_gap_holds_every_automatic_lane() {
+    fn a_keystroke_inside_the_typing_gap_holds_every_automatic_phase_but_land() {
         for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
-            let facts = ParkGateFacts {
-                hands_off_keys: false,
-                ..calm(mode)
+            for phase in [
+                ApplyPhase::PreferIdle,
+                ApplyPhase::PreferOutputGap,
+                ApplyPhase::KeysOnly,
+            ] {
+                let facts = ParkGateFacts {
+                    activity: ActivityFacts {
+                        hands_off_keys: false,
+                        ..calm(mode, phase).activity
+                    },
+                    ..calm(mode, phase)
+                };
+                assert!(
+                    matches!(gate(facts), ParkGate::Wait(_)),
+                    "{mode:?} {phase:?}"
+                );
+            }
+            let landing = ParkGateFacts {
+                activity: ActivityFacts {
+                    hands_off_keys: false,
+                    quiet: false,
+                    output_quiet: false,
+                    focused: true,
+                },
+                ..calm(mode, ApplyPhase::Land)
             };
-            assert!(matches!(gate(facts), ParkGate::Wait(_)), "{mode:?}");
+            assert_eq!(gate(landing), ParkGate::Park, "{mode:?} lands at the bound");
         }
         for mode in [ApplyMode::Immediate, ApplyMode::CleanQuit] {
             let facts = ParkGateFacts {
-                hands_off_keys: false,
-                ..calm(mode)
+                activity: ActivityFacts {
+                    hands_off_keys: false,
+                    ..calm(mode, ApplyPhase::PreferIdle).activity
+                },
+                ..calm(mode, ApplyPhase::PreferIdle)
             };
             assert_eq!(
                 gate(facts),
@@ -8098,38 +8138,44 @@ mod park_gate_tests {
         }
     }
 
-    /// The owner's 2026-09-18 ruling, at the instant it now matters: the
-    /// past-grace lane must not land while a program the user is watching is
-    /// streaming. With no aterm window focused it lands — the stall is invisible
-    /// and waiting would be waiting forever.
+    /// THE MACHINE THIS LADDER EXISTS FOR: an agent streaming into a focused
+    /// pane, never quiet, never pausing its output. It waits through the first
+    /// two phases (the owner's 2026-09-18 ruling, kept as a bounded preference)
+    /// and lands in the third, with the user's hands off the keys.
     #[test]
-    fn the_past_grace_lane_waits_for_a_gap_in_a_watched_stream_and_lands_unwatched() {
-        let streaming = ParkGateFacts {
-            output_quiet: false,
-            focused: true,
-            ..calm(ApplyMode::AutomaticPastGrace)
+    fn a_focused_never_quiet_stream_lands_in_the_keys_only_phase() {
+        let streaming = |phase| ParkGateFacts {
+            activity: ActivityFacts {
+                quiet: false,
+                hands_off_keys: true,
+                output_quiet: false,
+                focused: true,
+            },
+            ..calm(ApplyMode::AutomaticPastGrace, phase)
         };
+        assert!(matches!(
+            gate(streaming(ApplyPhase::PreferIdle)),
+            ParkGate::Wait(_)
+        ));
         assert_eq!(
-            gate(streaming),
+            gate(streaming(ApplyPhase::PreferOutputGap)),
             ParkGate::Wait("terminal output is still streaming")
         );
+        assert_eq!(gate(streaming(ApplyPhase::KeysOnly)), ParkGate::Park);
+        assert_eq!(gate(streaming(ApplyPhase::Land)), ParkGate::Park);
+        // With no aterm window focused the stall is invisible: the output-gap
+        // phase lands too.
         assert_eq!(
             gate(ParkGateFacts {
-                focused: false,
-                ..streaming
+                activity: ActivityFacts {
+                    focused: false,
+                    ..streaming(ApplyPhase::PreferOutputGap).activity
+                },
+                ..streaming(ApplyPhase::PreferOutputGap)
             }),
             ParkGate::Park,
             "with the user in another app the stall is invisible"
         );
-        // And the same streaming machine on the QUIET automatic lane waits for
-        // its own epoch, not for this rule.
-        assert!(matches!(
-            gate(ParkGateFacts {
-                quiet: false,
-                ..calm(ApplyMode::Automatic)
-            }),
-            ParkGate::Wait(_)
-        ));
     }
 
     /// MONOTONE IN `held_for`, which is what bounds the hold: past the cap every
@@ -8139,37 +8185,34 @@ mod park_gate_tests {
     fn the_hold_cap_stands_down_and_never_admits_again() {
         for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
             assert_eq!(prelaunch_hold_cap(mode), Some(PRELAUNCH_HOLD_MAX));
-            for bits in 0..32u32 {
-                let facts = ParkGateFacts {
-                    mode,
-                    quiet: bits & 1 != 0,
-                    hands_off_keys: bits & 2 != 0,
-                    output_quiet: bits & 4 != 0,
-                    focused: bits & 8 != 0,
-                    masters_quiet: bits & 16 != 0,
-                    held_for: PRELAUNCH_HOLD_MAX,
-                };
-                assert!(
-                    matches!(gate(facts), ParkGate::StandDown(_)),
-                    "{mode:?} past the cap must stand down: {facts:?}"
-                );
-                assert!(
-                    matches!(
-                        gate(ParkGateFacts {
-                            held_for: PRELAUNCH_HOLD_MAX * 2,
-                            ..facts
-                        }),
-                        ParkGate::StandDown(_)
-                    ),
-                    "and stays stood down"
-                );
+            for phase in PHASES {
+                for bits in 0..32u32 {
+                    let facts = ParkGateFacts {
+                        held_for: PRELAUNCH_HOLD_MAX,
+                        ..facts_from_bits(mode, phase, bits)
+                    };
+                    assert!(
+                        matches!(gate(facts), ParkGate::StandDown(_)),
+                        "{mode:?} past the cap must stand down: {facts:?}"
+                    );
+                    assert!(
+                        matches!(
+                            gate(ParkGateFacts {
+                                held_for: PRELAUNCH_HOLD_MAX * 2,
+                                ..facts
+                            }),
+                            ParkGate::StandDown(_)
+                        ),
+                        "and stays stood down"
+                    );
+                }
             }
             // Just inside the cap a calm machine still parks: the cap bounds the
             // wait, it does not shorten it.
             assert_eq!(
                 gate(ParkGateFacts {
                     held_for: PRELAUNCH_HOLD_MAX - std::time::Duration::from_millis(1),
-                    ..calm(mode)
+                    ..calm(mode, ApplyPhase::PreferIdle)
                 }),
                 ParkGate::Park
             );
@@ -8179,7 +8222,7 @@ mod park_gate_tests {
             assert_eq!(
                 gate(ParkGateFacts {
                     held_for: PRELAUNCH_HOLD_MAX * 10,
-                    ..calm(mode)
+                    ..calm(mode, ApplyPhase::PreferIdle)
                 }),
                 ParkGate::Park
             );
@@ -8214,18 +8257,25 @@ mod park_gate_tests {
     }
 
     /// Bytes waiting on a master that its reader has not taken hold every
-    /// automatic lane: parking on top of them is how an attempt commits a
-    /// screen digest the successor cannot reproduce.
+    /// automatic lane IN EVERY PHASE, `Land` included: parking on top of them
+    /// is how an attempt commits a screen digest the successor cannot
+    /// reproduce. A correctness gate, not a comfort, so the ladder never
+    /// relaxes it.
     #[test]
-    fn unconsumed_master_output_holds_every_automatic_lane() {
+    fn unconsumed_master_output_holds_every_automatic_phase() {
         for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
-            assert!(matches!(
-                gate(ParkGateFacts {
-                    masters_quiet: false,
-                    ..calm(mode)
-                }),
-                ParkGate::Wait(_)
-            ));
+            for phase in PHASES {
+                assert!(
+                    matches!(
+                        gate(ParkGateFacts {
+                            masters_quiet: false,
+                            ..calm(mode, phase)
+                        }),
+                        ParkGate::Wait(_)
+                    ),
+                    "{mode:?} {phase:?}"
+                );
+            }
         }
     }
 }

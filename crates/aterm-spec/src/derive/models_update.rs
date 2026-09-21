@@ -888,6 +888,113 @@ pub fn native_update_auto_intent_model() -> Model {
     }
 }
 
+/// THE APPLY LADDER (docs/DESIGN-auto-apply-ladder-2026-09-21.md): a verified
+/// staged build lands within a bound on a machine that is never quiet, and
+/// activity delays the landing without ever latching the lane manual-only.
+///
+/// `phase` is the ladder (0 PreferIdle, 1 PreferOutputGap, 2 KeysOnly, 3 Land)
+/// and `Advance` is the wall clock. `Busy`/`Quiet`, `KeysDown`/`KeysUp` and
+/// `Blur`/`Focus` are the terminal doing whatever it does. `Park` is the one
+/// decision, guarded by the ladder's rule for the live phase — the shipping
+/// `automatic_park_refusal`, which Tier-1 (`aterm-gui`'s
+/// `native_updater_conformance`) binds to this guard fact by fact.
+///
+/// The mutant is the 2026-09-20 incident: past `Hold` ticks of a busy terminal
+/// it stands the lane down to manual-only, after which nothing is enabled — the
+/// run WEDGES before landing, which is the terminal that never updated. It also
+/// parks without the rule. `ActivityNeverLatchesManualOnly` catches the first;
+/// `ParkedOnlyWhenTheLadderAdmits` catches the second.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_apply_ladder_model() -> Model {
+    crate::ty_model! {
+        NativeUpdateApplyLadder {
+            const Buggy = 0;
+            const Land = 3;
+            const Hold = 2;
+            var phase = 0;
+            var quiet = 0;
+            var keys = 1;
+            var output = 0;
+            var focused = 1;
+            var manual_only = 0;
+            var landed = 0;
+            var parked_phase = 0;
+            var parked_quiet = 0;
+            var parked_keys = 0;
+            var parked_output = 0;
+            var parked_focused = 0;
+            action Advance when (landed == 0 && manual_only == 0 && phase <= Land - 1) {
+                phase = phase + 1;
+            }
+            action Busy when (landed == 0 && manual_only == 0) {
+                quiet = 0;
+                output = 0;
+            }
+            action Quiet when (landed == 0 && manual_only == 0) {
+                quiet = 1;
+                output = 1;
+            }
+            action KeysDown when (landed == 0 && manual_only == 0) {
+                keys = 0;
+                quiet = 0;
+            }
+            action KeysUp when (landed == 0 && manual_only == 0) {
+                keys = 1;
+            }
+            action Blur when (landed == 0 && manual_only == 0) {
+                focused = 0;
+            }
+            action Focus when (landed == 0 && manual_only == 0) {
+                focused = 1;
+            }
+            // The incident's typing hold: a busy terminal past `Hold` ticks
+            // stands the lane down. Nothing is enabled afterwards.
+            action StandDown when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && quiet == 0 &&
+                phase > Hold - 1
+            ) {
+                manual_only = 1;
+            }
+            action Park when (
+                landed == 0 && manual_only == 0 &&
+                (phase == Land ||
+                    (keys == 1 && (phase == 2 ||
+                        (phase == 1 && (focused == 0 || output == 1)) ||
+                        (phase == 0 && quiet == 1))))
+            ) {
+                landed = 1;
+                parked_phase = phase;
+                parked_quiet = quiet;
+                parked_keys = keys;
+                parked_output = output;
+                parked_focused = focused;
+            }
+            // The other mutant: a park that ignores the ladder's rule — its own
+            // dead action, so the closure can credit it as an independently
+            // caught negative control.
+            action ParkWithoutTheRule when (Buggy == 1 && landed == 0 && manual_only == 0) {
+                landed = 1;
+                parked_phase = phase;
+                parked_quiet = quiet;
+                parked_keys = keys;
+                parked_output = output;
+                parked_focused = focused;
+            }
+            invariant ActivityNeverLatchesManualOnly: manual_only == 0;
+            invariant ParkedOnlyWhenTheLadderAdmits:
+                if landed == 1 {
+                    parked_phase == Land ||
+                        (parked_keys == 1 && (parked_phase == 2 ||
+                            (parked_phase == 1 && (parked_focused == 0 || parked_output == 1)) ||
+                            (parked_phase == 0 && parked_quiet == 1)))
+                } else {
+                    landed <= 1
+                };
+        }
+    }
+}
+
 /// Liveness contract for automatic-update quiet admission after hidden PTY output.
 ///
 /// A background tab can consume output and handle its wake without ever presenting;

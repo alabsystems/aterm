@@ -12,27 +12,15 @@
 //! leaves Ctrl-C to the child), and `SetConsoleCtrlHandler` for the landing wait's
 //! Ctrl-C ([`add_ctrl_handler`], the `signal(SIGINT, …)` twin; 2026-09-17).
 //!
-//! **This backend has NOT been exercised on a real Windows host.** It is written to be
-//! correct-by-construction; the pure `.cmd` formatting/parsing is unit-tested (on Unix) in
-//! [`crate::platform`], and running it is still nobody's evidence.
+//! This backend has not been exercised on a real Windows host. `mod windows` is
+//! `#[cfg(windows)]`, so every line below is type-checked on all three Windows cells
+//! `crates/aterm-libc` admits, and the pure `.cmd` formatting/parsing is unit-tested on Unix in
+//! [`crate::platform`] — but no shim, junction or `GetDiskFreeSpaceExW` call here has ever run.
 //!
-//! IT IS TYPE-CHECKED, ON EVERY WINDOWS LANE THIS REPOSITORY HAS, and this header has twice
-//! said otherwise. `mod windows` is `#[cfg(windows)]`, so a compiler reads every line below
-//! on all three Windows cells `crates/aterm-libc` now admits — `x86_64-pc-windows-msvc`,
-//! `aarch64-pc-windows-msvc` and `x86_64-pc-windows-gnu`. Type-checked is not run: no `.cmd`
-//! shim, no junction and no `GetDiskFreeSpaceExW` call below has ever executed on a real
-//! Windows host, and that remains the honest limit of the evidence for this file.
-//!
-//! WHICH WINDOWS TRIPLES REACH THIS FILE AT ALL is decided two crates down: `atpkg` depends
-//! on `libc` unconditionally, `[patch.crates-io]` resolves it to `crates/aterm-libc`, and a
-//! triple absent from that crate's cell list does not fall back to an empty cell — it stops
-//! the build at `compile_error!("aterm-libc has no generated ABI cell for this target")`.
-//! Both gaps that cost this repo a lane are closed: `aarch64-pc-windows-msvc`, a triple
-//! `atpkg::TARGETS` publishes rows for, and `x86_64-pc-windows-gnu`, the cfg-validation lane
-//! `.cargo/config.toml` and `rust-toolchain.toml` both configure. Two standing guards keep
-//! the claim true rather than restating it: `crates/atpkg/tests/shipped_triples_have_an_abi_cell.rs`
-//! fails when a SHIPPED triple is one `aterm-libc` refuses, and
-//! `crates/aterm-libc/tests/target_gate.rs` fails when a CONFIGURED build lane is.
+//! A Windows triple absent from `aterm-libc`'s cell list stops the build rather than falling
+//! back to an empty cell. Guards: `crates/atpkg/tests/shipped_triples_have_an_abi_cell.rs`
+//! (a shipped triple `aterm-libc` refuses) and `crates/aterm-libc/tests/target_gate.rs`
+//! (a configured build lane it refuses).
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};

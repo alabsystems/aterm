@@ -1147,9 +1147,6 @@ fn the_dictionary_gate_catches_an_ungated_foreign_english_word_and_clears_a_gate
 
 // ------------------------------------------------------- data: coverage ----
 
-/// The four tricks every language must reach.
-const CORE_TRICKS: [Trick; 4] = [Trick::Sit, Trick::Sleep, Trick::Jump, Trick::Play];
-
 /// The roster the multilingual data is expected to grow into. NOT asserted
 /// present — this test runs over the languages the file actually holds — only
 /// reported, so the run says honestly how far the data has come.
@@ -1158,9 +1155,9 @@ const ROSTER: &[&str] = &[
     "bn", "id", "vi", "th", "zh", "ja", "ko",
 ];
 
-/// `(lang, trick code, why)` — a core trick a language honestly cannot reach
-/// with one natural typed token. Two-sided: a listed gap that IS reachable
-/// fails, so the table can only describe reality.
+/// `(lang, trick code, why)` — a trick a language honestly cannot reach with
+/// one natural typed token. Two-sided: a listed gap that IS reachable fails,
+/// so the table can only describe reality.
 const CORE_GAPS: &[(&str, &str, &str)] = &[];
 
 /// Whether `lang` reaches `trick` when the user has listed that language:
@@ -1172,21 +1169,30 @@ fn reaches(rows: &[TrickRow], lex: &TrickLexicon, lang: &str, trick: Trick) -> b
         .any(|s| matches!(classify(lex, s), Some(TrickRole::Trick { trick: t, .. }) if t == trick))
 }
 
+/// EVERY trick, in EVERY language the file holds — not a core four. A trick
+/// added to the enum and authored in English only is NOT a multilingual
+/// vocabulary with one gap in it: the word a French or Korean speaker types
+/// for that trick is almost always still sitting in some OTHER trick's row,
+/// so their request classifies, fires, and is answered with the wrong
+/// performance while every test stays green. `sing` shipped exactly that way
+/// — it was a `speak` surface in 44 languages, and `speak` deals ONE note —
+/// and a four-trick pin could not see it. Widening this is the durable half
+/// of that fix: the data half alone would decay at the next new trick.
 #[test]
-fn every_language_in_the_file_reaches_the_core_tricks() {
+fn every_language_in_the_file_reaches_every_trick() {
     let rows = TrickLexicon::all_rows();
     let langs = languages_in_the_file();
     assert!(langs.iter().any(|l| l == "en"), "the file lost English");
     for lang in &langs {
         let lex = TrickLexicon::with_languages(&[lang.as_str()]);
-        for trick in CORE_TRICKS {
+        for trick in Trick::ALL {
             let excused = CORE_GAPS
                 .iter()
                 .any(|(l, code, _)| l == lang && *code == trick.code());
             let reached = reaches(&rows, &lex, lang, trick);
             assert!(
                 reached || excused,
-                "language {lang:?} does not reach the core trick {:?}: add a \
+                "language {lang:?} does not reach the trick {:?}: add a \
                  surface, or record the gap in CORE_GAPS with the reason no \
                  natural single token exists",
                 trick.code()
@@ -1216,7 +1222,7 @@ fn every_language_in_the_file_reaches_the_core_tricks() {
 }
 
 #[test]
-fn english_reaches_all_sixteen_tricks() {
+fn english_reaches_all_seventeen_tricks() {
     let rows = TrickLexicon::all_rows();
     // Under the DEFAULT configuration and under one that does not even list
     // English: English is never gated.
@@ -1229,7 +1235,7 @@ fn english_reaches_all_sixteen_tricks() {
             );
         }
     }
-    assert_eq!(Trick::ALL.len(), 16);
+    assert_eq!(Trick::ALL.len(), 17);
 }
 
 // -------------------------------------------------- the enum and listing ----
@@ -1248,7 +1254,7 @@ fn trick_codes_round_trip_and_all_is_in_declaration_order() {
         );
     }
     assert_eq!(Trick::ALL[0].code(), "sit");
-    assert_eq!(Trick::ALL[15].code(), "treat");
+    assert_eq!(Trick::ALL[16].code(), "treat");
     // Ids are data keys, not typed words: nothing is folded or trimmed.
     for not_a_code in ["", "Sit", "SIT", " sit", "sit ", "sitting", "meow", "kitty"] {
         assert_eq!(Trick::from_code(not_a_code), None, "{not_a_code:?}");

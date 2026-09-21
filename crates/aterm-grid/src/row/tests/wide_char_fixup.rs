@@ -388,6 +388,119 @@ fn selective_erase_chars_clears_left_boundary_continuation() {
     );
 }
 
+/// xterm `util.c` `ClearRight`: the wide half orphaned by an EL/ED/ECH erase goes
+/// through the same `ClearInLine2` -> `ClearCells` as the erased span, so it gets
+/// `' '` with `xtermColorPair(xw)` — the BCE background. aterm handed it
+/// `Cell::EMPTY` (default colours) and left a default-coloured hole one column
+/// LEFT of the erase. `clear_range_with_orphan` is the seam: the erases pass
+/// `orphan = fill`, the rect ops keep `Cell::EMPTY` (#7522).
+#[test]
+fn clear_range_with_orphan_paints_left_wide_orphan_with_the_bce_blank() {
+    use crate::{Cell, CellFlags, PackedColor, PackedColors};
+
+    let (_pages, mut row) = make_row(10);
+    let fg = PackedColor::DEFAULT_FG;
+    let bg = PackedColor::DEFAULT_BG;
+
+    // Wide char at cols 0-1 (col 0 WIDE, col 1 its continuation).
+    row.write_wide_char(0, '\u{4E2D}', fg, bg, CellFlags::empty());
+    assert!(row.get(0).unwrap().is_wide());
+
+    // BCE blank on indexed background 4 (blue) — the erase's fill cell.
+    let fill = Cell::bce_blank(PackedColors::with_indexed_bg(4));
+    assert!(!fill.is_empty(), "precondition: the BCE blank is visible");
+
+    // EL-style erase of [1, 5): the continuation at col 1 goes, orphaning the
+    // WIDE head at col 0.
+    row.clear_range_with_orphan(1, 5, fill, fill);
+
+    let orphan = row.get(0).unwrap();
+    assert!(!orphan.is_wide(), "the orphaned WIDE head must be blanked");
+    assert_eq!(orphan.char(), ' ', "the orphan becomes a space");
+    assert_eq!(
+        orphan.colors(),
+        fill.colors(),
+        "the orphan must carry the BCE background, not default colours \
+         (xterm ClearRight -> ClearCells writes xtermColorPair for it)"
+    );
+    assert!(
+        !orphan.is_empty(),
+        "a default-coloured orphan is the bug: it renders as a hole in the BCE run"
+    );
+}
+
+/// Right-boundary twin of the test above, plus the `len` consequence: the orphan
+/// at index `end` now carries a VISIBLE blank, so it is content and `len` must
+/// stretch to cover it instead of shrinking past it.
+#[test]
+fn clear_range_with_orphan_paints_right_wide_orphan_with_the_bce_blank() {
+    use crate::{Cell, CellFlags, PackedColor, PackedColors};
+
+    let (_pages, mut row) = make_row(10);
+    let fg = PackedColor::DEFAULT_FG;
+    let bg = PackedColor::DEFAULT_BG;
+
+    // Wide char at cols 6-7 — the row's last content, so old_len == 8 == end + 1.
+    row.write_wide_char(6, '\u{4E2D}', fg, bg, CellFlags::empty());
+    assert!(row.get(7).unwrap().is_wide_continuation());
+    assert_eq!(row.len(), 8, "precondition: the wide pair is the tail");
+
+    let fill = Cell::bce_blank(PackedColors::with_indexed_bg(4));
+    let written = row.clear_range_with_orphan(2, 7, fill, fill);
+
+    let orphan = row.get(7).unwrap();
+    assert!(
+        !orphan.is_wide_continuation(),
+        "the orphaned continuation must be blanked"
+    );
+    assert_eq!(
+        orphan.colors(),
+        fill.colors(),
+        "the right orphan must carry the BCE background too"
+    );
+    assert_eq!(
+        row.len(),
+        8,
+        "the BCE-blanked orphan at col 7 is visible content — len must cover it \
+         (the #7522 shrink applies only to an EMPTY orphan)"
+    );
+    assert_eq!(
+        written,
+        2..8,
+        "the written span must report the orphan column so the caller can \
+         extend the truecolor side table to it"
+    );
+}
+
+/// The #7522 direction, asserted on the delegating helper itself: a rect op
+/// (`clear_range_with`) still blanks BOTH orphans to `Cell::EMPTY` even when the
+/// fill carries a visible background, and still reports the widened span.
+#[test]
+fn clear_range_with_keeps_rect_orphans_empty_under_a_visible_fill() {
+    use crate::{Cell, CellFlags, PackedColor, PackedColors};
+
+    let (_pages, mut row) = make_row(12);
+    let fg = PackedColor::DEFAULT_FG;
+    let bg = PackedColor::DEFAULT_BG;
+
+    // Wide pairs straddling both rect edges: 2-3 and 6-7, rect = [3, 7).
+    row.write_wide_char(2, '\u{4E2D}', fg, bg, CellFlags::empty());
+    row.write_wide_char(6, '\u{4E2D}', fg, bg, CellFlags::empty());
+
+    let fill = Cell::bce_blank(PackedColors::with_indexed_bg(4));
+    let written = row.clear_range_with_orphan(3, 7, fill, Cell::EMPTY);
+
+    assert!(
+        row.get(2).unwrap().is_empty(),
+        "#7522: the left orphan of a rect op stays Cell::EMPTY"
+    );
+    assert!(
+        row.get(7).unwrap().is_empty(),
+        "#7522: the right orphan of a rect op stays Cell::EMPTY"
+    );
+    assert_eq!(written, 2..8, "the widened span is reported either way");
+}
+
 /// Regression (round 13): clear_range_with with an EMPTY fill (EL/DECERA with
 /// default SGR) that erases a trailing wide char must shrink len — the right
 /// wide-orphan is cleared at index `end` (one past the range), and when it was

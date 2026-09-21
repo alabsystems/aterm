@@ -352,14 +352,20 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
 
 /// **ZERO PTY BYTES from any inbox record, and a stale `epoch=` refused.**
 ///
-/// The rung's sharpest claim. An `answer` and a `task` from every principal
-/// class, each carrying a `re=` and a `gen=` — the two fields a body could use to
-/// look like a drive record — must move not one byte of the terminal. Then a real
-/// `term/in` record with a STALE epoch is refused and recorded, which is the
-/// proof that the epoch check is what stands between the bus and the PTY rather
-/// than the absence of a code path.
+/// The rung's sharpest claim, and after round 21 the whole of it: an `answer`,
+/// a `task`, a `control`, a `note` and an `ack` from every principal class,
+/// each carrying a `re=` and a `gen=` — the fields a body could use to look
+/// like a drive record — must move not one byte of the terminal.
+///
+/// IT USED TO HAVE A SECOND HALF, and losing it is the point rather than a
+/// gap. That half published a real `term/in` record under a stale epoch and
+/// asserted the refusal, which proved the epoch check was what stood between
+/// the bus and the PTY "rather than the absence of a code path". The drive
+/// face is now absent, so the absence of a code path is exactly what stands
+/// there, and a test that published to `term/in` would be asserting about a
+/// subject this node no longer subscribes to.
 #[test]
-fn no_inbox_record_ever_reaches_the_pty_and_a_stale_epoch_is_refused() {
+fn no_bus_record_ever_reaches_a_pty() {
     let w = World::boot("pty", &["h-andrew", "s-1"]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
@@ -392,48 +398,6 @@ fn no_inbox_record_ever_reaches_the_pty_and_a_stale_epoch_is_refused() {
         "an inbox record moved the terminal — no `in` kind may ever reach a PTY"
     );
     assert!(!after.contains("PWNED"), "{after}");
-
-    // NOW THE DRIVE FACE, with a stale epoch. The human claims control first
-    // (§6.6: a claim by an `h-*` principal is granted unconditionally), so the
-    // refusal that follows is about the EPOCH and not about the holder.
-    let epoch = until("A's launch nonce", || {
-        w.sessions()
-            .into_iter()
-            .find(|(_, sid, _)| *sid == a)
-            .map(|(_, _, nonce)| nonce)
-    });
-    let claim = format!("/f/{FLEET}/in/{}/{a}/h-andrew/control", w.node);
-    god.publish(
-        6_300,
-        1,
-        &claim,
-        format!("v=1 t=1 epoch={epoch} text=claim").as_bytes(),
-    )
-    .expect("publish the claim");
-    until("the claim to be recorded", || {
-        let subject = format!("/f/{FLEET}/pub/{}/{a}/control", w.node);
-        let (rows, _) = w.god().last(&subject, "", 8).ok()?;
-        rows.into_iter()
-            .find(|(_, s, _)| *s == subject)
-            .filter(|(_, _, b)| String::from_utf8_lossy(b).contains("holder=h-andrew"))
-            .map(|_| ())
-    });
-
-    let drive = format!("/f/{FLEET}/term/{}/{a}/in/h-andrew", w.node);
-    let stale = "v=1 t=1 epoch=ffffffffffffffffffffffffffffffff len=11\necho PWNED";
-    god.publish(6_400, 1, &drive, stale.as_bytes())
-        .expect("publish the stale drive record");
-    until("the stale epoch to be refused and recorded", || {
-        w.ev()
-            .into_iter()
-            .any(|e| e.contains(&format!("refused sid={a} face=term reason=epoch")))
-            .then_some(())
-    });
-    let after = w.verb(&format!("@{a} text")).rows().join("\n");
-    assert!(
-        !after.contains("PWNED"),
-        "a stale epoch still typed: {after}"
-    );
 }
 
 /// **`SIGKILL` between `deliver` and `Commit`: the row is there ONCE.**

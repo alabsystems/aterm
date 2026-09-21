@@ -108,7 +108,7 @@ use crate::enable::{
     self, argv_safe, launchctl, launchd_loaded, node_grants, read_node, systemctl, uid,
     write_atomic, Out, Paths, Service, Verb, Wire,
 };
-use crate::tui::safe;
+use crate::render::safe;
 
 /// `aterm fabric mint-for`'s flags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1024,7 +1024,6 @@ fn probe_remote(c: &Checked, out: &mut Out) -> Result<Option<NodePresence>, ()> 
         cap_files: vec![c.cap_src.to_string_lossy().into_owned()],
         state_dir: String::new(),
         accept_from: Vec::new(),
-        screen: Vec::new(),
         sock: None,
         token: None,
         presence: crate::presence::Mode::Meta,

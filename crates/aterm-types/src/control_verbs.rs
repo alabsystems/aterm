@@ -379,7 +379,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         AnyScopeMeta,
         "self-updater [status|check|apply]: staged build state; apply requests an in-session handoff",
-        "Apply requests the seamless handoff, preserving live shells after validation and preflight. Check synchronously uses the current GUI release source and notifies its reducer after completion. The historical `relaunch_ready=true` means a newer stage exists; `apply_posture` reports live policy and scheduling: automatic, automatic-idle, manual-config, disabled-env, retry-wait, manual-only, handoff-unavailable, applying, unreconciled, none, disabled, or unknown. `apply_policy_reason` names a current policy block when known. It is not a preflight guarantee.",
+        "Apply requests the seamless handoff, preserving live shells after validation and preflight. Check synchronously uses the current GUI release source and notifies its reducer after completion. The historical `relaunch_ready=true` means a newer stage exists; `apply_posture` reports live policy and scheduling: automatic, automatic-idle, manual-config, disabled-env, retry-wait, manual-only, handoff-unavailable, applying, unreconciled, none, disabled, or unknown. While the posture is automatic, `apply_phase` names where the lane is on its ladder — prefer-idle, prefer-output-gap, keys-only, land — which ends with the build applied no later than 15 minutes after it was armed, whatever the terminal is doing. `apply_policy_reason` names a current policy block when known. It is not a preflight guarantee.",
     ),
     va(
         "help",
@@ -914,13 +914,26 @@ pub const VERBS: &[VerbSpec] = &[
          (the dial failed — no socket, connection refused — the broker closed the connection, or \
          an ack did not arrive within the bridge's 5 s ack deadline; the bridge redials with \
          back-off from 100 ms to 5 s, mail queues and none arrives meanwhile, and `post --wait` \
-         answers `ERR fabric stalled id=<n> queued=1` at once); `disconnected` = the bridge this \
-         instance had is gone, which is itself a held state. NO HEARTBEAT keeps these honest: \
-         the bridge reports its link over its own control lane (`link`) on every change and \
-         after an ack that moved the round trip by more than 2x, so `fabric_rtt_ms=` is the \
+         answers `ERR fabric stalled id=<n> queued=1` at once); `stale` = a bridge is attached, \
+         has NOT said its link is down, and has answered nothing for work this instance handed \
+         it (round 21: no ack, no landing and no `link` record for three link refreshes after a \
+         post was queued) — the wedged-HELPER case, which `stalled` cannot see because a hung \
+         helper holds both its lanes open and reports nothing, and which read `connected` for \
+         as long as it hung before round 21; its posts queue and `post --wait` answers \
+         `ERR fabric stale id=<n> queued=1`, and the fix is to kill the bridge pid and let the \
+         instance relaunch it; `disconnected` = the bridge this \
+         instance had is gone, which is itself a held state. NO HEARTBEAT ON A QUIET FLEET keeps \
+         these honest: the bridge reports its link over its own control lane (`link`) on every \
+         change and after an ack that moved the round trip by more than 2x — not on a clock, \
+         with one bounded exception (a bridge that has found a presence row nothing hosts \
+         re-reads the roster about once a minute until it retires it, and any answered broker \
+         read is an ack, so it reports for as long as that takes and then stops). So \
+         `fabric_rtt_ms=` is the \
          last acknowledged round trip to the broker in ms (`-` before the first) and \
          `fabric_link_age_ms=` is how long ago that ack was — a large age on `connected` means \
-         a quiet link, not a dead one, and only the next exchange can tell. \
+         a quiet link, not a dead one, and only the next exchange can tell. That is why `stale` \
+         is NOT read off this number: it is read off an exchange that was asked for and never \
+         came. \
          `identity=<name|->` is the agent identity the session was spawned under (`spawn \
          identity=<name>`), `-` for the human's own agent config - the same word the \
          `sessions` roster carries, so a driver polling one session need not re-read the \
@@ -1824,7 +1837,8 @@ pub const VERBS: &[VerbSpec] = &[
          A VERDICT IS A RECEIPT (R8): with `handled|refused|deferred` the event also carries \
          `verdict=<v> kind=<k> from=<p>` for THE ROW THE ID NAMES (not every row the watermark \
          passes — a bare `inbox seen <id>` names no verdict for any of them), and a bridge \
-         running `--receipts` (`[fabric] receipts = true`, which `aterm fabric on` writes) then \
+         running with receipts on (the DEFAULT since round 21, whichever way the bridge was \
+         set up; `--no-receipts` or `[fabric] receipts = false` turns it off) then \
          publishes `kind=ack re=<off> verdict=<v>` onto the SENDER's inbox lane for an `ask` or \
          `task` row — never for a `note`, a demoted task included — so the sender's `post \
          --wait-ack` returns, their `await inbox re=<off>` latches and their `inbox` lists `ack … \
@@ -1855,12 +1869,13 @@ pub const VERBS: &[VerbSpec] = &[
          answer carries back as `re=`. `--wait-ack[=<ms>]` (`ask`/`task` only; implies the \
          landing wait) then ALSO waits for the RECIPIENT's word: their bridge's receipt, `kind=ack \
          re=<off> verdict=<v>`, published when they run `inbox seen <id> handled|refused|deferred` \
-         under `--receipts`, answers `OK <id> off=<n> ack=<verdict> msg=<inbox id>`; the asker's \
+         with receipts on, answers `OK <id> off=<n> ack=<verdict> msg=<inbox id>`; the asker's \
          own bridge recording the deadline passed answers `ERR expired id=<n> off=<n>`; and the \
          bound is `<ms>` when given, else `dl=` plus 5 s for that verdict to come back, else 30 s \
          — a timeout is `ERR timeout id=<n> \
          off=<n>`, naming the offset because the post DID land (`await inbox re=<off>` picks it \
-         up later; a recipient whose bridge runs without receipts never acks, so bound it). \
+         up later; a recipient who has TURNED receipts off never acks, so bound it — that is \
+         no longer the out-of-the-box case). \
          `key=<token>` (1–64 of `[A-Za-z0-9._:-]`) is the \
          IDEMPOTENCY KEY, per session: the bridge reserves a producer sequence for the key \
          durably BEFORE publishing and reuses it on any later post under the same key, so the \

@@ -2,19 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The rustup VIEW through the untracked lane (`atpkg::seam`), against the REAL
-//! `atpkg` binary this build produced: the view's `bin/` is one copy-on-write CLONE per
-//! tool of the live trust build. Every file a TRACKED process creates carries
-//! com.apple.provenance (`crate::provenance`, measured 2026-09-12), and a toolchain run
-//! from tagged files tags what it writes. The view used to be hard links, and the 0.86.0
-//! app built it in-process on every pass, re-tagging the clean `trust` bundle ITSELF (all
-//! 21 executables, 2026-09-15). A clone never writes the store — but the clone's own files
-//! would be tagged if this process laid them. So the view is built by a launchd job, like
-//! the bundle is staged and the shims are laid, and this test proves both properties:
-//! the store's files stay CLEAN whoever lays the view, and the VIEW's files stay clean
-//! when the lane lays them, while an in-process refresh from this same process tags the
-//! view (never the store) whenever this process is tracked. Under an untracked shell every
-//! half is clean and the test says which case it exercised — the tag cannot be minted by
-//! hand.
+//! `atpkg` binary this build produced: the view's `bin/` is one copy-on-write clone per
+//! tool of the live trust build. Anything a provenance-tracked process writes carries
+//! com.apple.provenance, and a toolchain run from tagged files tags its own output — so
+//! the view must be laid by a launchd job, or an in-process refresh re-tags the clean
+//! `trust` bundle itself. Pinned: the store stays clean whoever lays the view, the lane's
+//! view files stay clean, and an in-process control tags the view (never the store)
+//! exactly when this process is tracked.
 //!
 //! macOS only: the tag and launchd exist nowhere else.
 
@@ -122,15 +116,13 @@ fn identity(path: &Path) -> (u64, u64) {
     (m.dev(), m.ino())
 }
 
-/// The bytes of `path`.
 fn bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
 /// The lane builds the same view the in-process body builds — clones of the store's
-/// files, the stock names beside them — and neither the store nor the view is tagged; the
-/// in-process control from this process tags the VIEW whenever this process is tracked,
-/// and never the store.
+/// files, the stock names beside them — and tags neither. The in-process control tags
+/// the view, never the store, whenever this process is tracked.
 #[test]
 fn the_view_lane_clones_the_store_without_tagging_either() {
     let d = scratch("lane");

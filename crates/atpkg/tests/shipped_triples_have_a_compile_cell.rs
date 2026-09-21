@@ -1,63 +1,29 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! SHIPPED TRIPLE => COMPILED TRIPLE: every target this client publishes rows for must be a
+//! Shipped triple => compiled triple: every target this client publishes rows for must be a
 //! cell some compiler is made to read.
 //!
-//! THE CLASS THIS GUARDS. [`atpkg::TARGETS`] is the schema's roster of served triples, and
+//! [`atpkg::TARGETS`] is the roster of served triples;
 //! `aterm_forge::resolve::default_cells()` is the matrix `xtask gate cells` and
-//! `xtask gate cells-foreign` type-check — the only lanes in this repository that compile
-//! aterm for a triple the box in front of you is not. Nothing made the two lists agree, and on
-//! 2026-09-18 they did not:
+//! `cells-foreign` type-check, the only lanes here that compile aterm for a triple the box in
+//! front of you is not. Nothing makes the two lists agree, so a shipped triple in no cell is
+//! compiled by no gate anywhere and a break visible only there reads green.
 //!
-//!   * `aarch64-unknown-linux-gnu`, `aarch64-pc-windows-msvc` and `x86_64-apple-darwin` were
-//!     THREE OF THE SIX shipped triples, each with a `[[artifact]]` row the index can name and
-//!     a `cli::current_triple` arm that reports it, and NONE of them was a cell. So a break
-//!     visible only on one of those three reached no gate on any box: `gate cells` was green
-//!     over a matrix that never mentioned them, and `gate all` — which runs
-//!     `cells-foreign` — was green with them. That is the same shape as the four Windows
-//!     breaks of 2026-09-16 (see `shipped_triples_have_an_abi_cell.rs`), one level up: there
-//!     the triple could not compile at all, here nothing ever tried.
-//!
-//! WHY HERE, beside the ABI-cell law. That file guards "a shipped triple the first-party graph
-//! REFUSES"; this one guards "a shipped triple no compiler ever READS". They are the two ends
-//! of the same seam — `atpkg::TARGETS` on one side, the build matrix on the other — and the
-//! second is worthless without the first: a triple admitted by `aterm-libc` and compiled by
-//! nobody is exactly the state three of the six were in.
-//!
-//! WHY NOT IN `gate cells` ITSELF. The gate's own matrix audit (`cell_matrix_audit` in
-//! crates/xtask/src/gate.rs) already refuses a cell with no coverage floor and a floor with no
-//! cell — but it cannot ask this question, because `xtask` does not depend on `atpkg` and the
-//! roster of SHIPPED triples is atpkg's to own. Asking it from here costs nothing: pure `std`,
-//! no subprocess, no network, no new dependency, reading one committed source file under the
-//! workspace root, on whatever box the change is being written on.
-//!
-//! THE LAW. For every triple in [`atpkg::TARGETS`], `aterm_forge::resolve::default_cells()`
-//! must carry a cell whose `triple` is that spelling. ONE-DIRECTIONAL, like its neighbour: a
-//! cell for a triple nothing ships (`wasm32-unknown-unknown`, the two browser modules) is not
-//! a violation — aterm ships those as `.wasm` inside the app, not as an atpkg artifact row.
-//! The direction with teeth is the one that was violated.
-//!
-//! SCOPE AND LIMITS, said out loud so a green run is not read as more than it is:
-//!
-//!   * This is a STRING law over committed text, not a compile. It proves a cell EXISTS for
-//!     every shipped triple; `xtask gate cells` is the authority on whether that cell's graph
-//!     type-checks, and stays it. What this file makes impossible is the failure that was
-//!     live — a shipped triple with no cell to type-check at all.
-//!   * A `default_cells()` body this file cannot parse is an ERROR, never a silent pass: the
-//!     question asked here is "is this matrix complete", so a matrix it cannot read is one it
-//!     must not vouch for.
-//!   * Only the cell LIST is read. Which package each cell is rooted at, and what its floor
-//!     is, are `tools/cross-cell-gate.tsv`'s business and the gate's.
+//! One-directional, like its neighbour `shipped_triples_have_an_abi_cell.rs`: a cell for a
+//! triple nothing ships (`wasm32-unknown-unknown`, the browser modules) is no violation. It
+//! lives here because `xtask` does not depend on `atpkg` and the shipped roster is atpkg's to
+//! own. A string law over committed text, not a compile — `xtask gate cells` stays the
+//! authority on whether a cell's graph type-checks; a `default_cells()` body this file cannot
+//! parse is an error, never a silent pass.
+//! `tools/cross-cell-gate.tsv`'s business and the gate's.
 
 use std::path::{Path, PathBuf};
 
-// ---------------------------------------------------------------------------
-// THE SOURCE UNDER TEST
-// ---------------------------------------------------------------------------
+// The source under test
 
-/// The function whose body IS the matrix. Quoted once, so a rename is a loud failure here
-/// rather than a guard that quietly stops finding its subject.
+/// The function whose body is the matrix. Quoted once, so a rename fails loudly here rather
+/// than leaving a guard that quietly stops finding its subject.
 const MATRIX_FN: &str = "pub fn default_cells() -> Vec<Cell> {";
 
 fn repo_root() -> PathBuf {
@@ -75,9 +41,7 @@ fn resolve_source() -> String {
         .unwrap_or_else(|e| panic!("cannot read {} ({e})", path.display()))
 }
 
-// ---------------------------------------------------------------------------
-// READING THE MATRIX
-// ---------------------------------------------------------------------------
+// Reading the matrix
 
 /// One cell as the committed source spells it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,10 +82,10 @@ fn field_after(body: &str, from: usize, key: &str) -> Option<(String, usize)> {
 
 /// Every `Cell { name: "…", triple: "…", … }` literal in the matrix, in source order.
 ///
-/// Deliberately shallow: the matrix is a `vec![]` of struct literals written out by hand,
-/// which is the shape this reads. A cell built any other way would not be found — so the
-/// count is pinned against the committed file by `the_scan_still_sees_the_matrix`, and a
-/// literal that names no `triple` is an error rather than a skip.
+/// Deliberately shallow: the matrix is a hand-written `vec![]` of struct literals, which is
+/// the shape this reads. A cell built any other way would not be found, so the count is
+/// pinned against the committed file by `the_scan_still_sees_the_matrix`, and a literal that
+/// names no `triple` is an error rather than a skip.
 fn cells(src: &str) -> Result<Vec<Cell>, String> {
     let body = matrix_body(src)?;
     let mut out = Vec::new();
@@ -138,12 +102,9 @@ fn cells(src: &str) -> Result<Vec<Cell>, String> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// THE LAW
-// ---------------------------------------------------------------------------
+// The law
 
-/// THE DEFECT THIS WAS WRITTEN FOR: three of the six shipped triples were in no cell, so no
-/// gate on any box ever compiled aterm for them.
+/// The defect this was written for: a shipped triple in no cell is compiled by no gate.
 #[test]
 fn every_shipped_triple_is_a_cell_some_compiler_reads() {
     let src = resolve_source();
@@ -166,9 +127,7 @@ fn every_shipped_triple_is_a_cell_some_compiler_reads() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// NON-VACUITY
-// ---------------------------------------------------------------------------
+// Non-vacuity
 
 /// The scanner's own obligation, pinned against the committed file rather than a fixture: a
 /// reader that quietly matched nothing would pass the law above forever.
@@ -199,9 +158,9 @@ fn the_scan_still_sees_the_matrix() {
     }
 }
 
-/// THE RED PROOF, against the real shape rather than a mutated constant: the matrix exactly as
-/// it stood before 2026-09-18 — five cells, three shipped triples unmentioned — and the law
-/// must name those three and no others.
+/// The red proof, against the real shape rather than a mutated constant: the matrix as it
+/// stood before the fix — five cells, three shipped triples unmentioned — and the law must
+/// name those three and no others.
 #[test]
 fn the_law_names_the_three_triples_the_matrix_forgot() {
     let before = "\
@@ -258,7 +217,7 @@ pub fn default_cells() -> Vec<Cell> {
     );
 }
 
-/// A body this file cannot read is an ERROR, not a pass. A completeness law that shrugs at a
+/// A body this file cannot read is an error, not a pass. A completeness law that shrugs at a
 /// matrix it never parsed reports green on nothing at all.
 #[test]
 fn an_unreadable_matrix_stops_the_test() {

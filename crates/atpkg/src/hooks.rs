@@ -155,8 +155,8 @@ pub fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static str)> {
 pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     let bin = sh_quote(bin_dir);
     let agents = sh_quote(agents_dir);
-    // fish is NOT a POSIX shell and its double quotes are not sh's, so the fish body below
-    // is rendered through its OWN quoter ([`fish_quote`]) — never this one.
+    // fish is not a POSIX shell and its double quotes are not sh's, so the fish body below
+    // is rendered through its own quoter ([`fish_quote`]), never this one.
     let fish_bin = fish_quote(bin_dir);
     let fish_agents = fish_quote(agents_dir);
     // POSIX (zsh + bash, down to macOS's bash 3.2): the agents dir is MOVED TO THE FRONT,
@@ -235,10 +235,9 @@ enum Prev {
     Absent,
     /// The previous pass's hook — a regular file — moved aside to this path.
     Saved(std::path::PathBuf),
-    /// Something that is NOT a regular file (a directory, a link, a device). It is left
-    /// exactly where it is: the rename that follows then fails on a directory just as it
-    /// always has, and this pass's bookkeeping displaces nothing of the user's. An unwind
-    /// leaves whatever stands there alone, having nothing it could put back.
+    /// Something that is not a regular file (a directory, a link, a device), left exactly
+    /// where it is: the rename that follows fails on it as it always has, and an unwind has
+    /// nothing it could put back.
     Foreign,
 }
 
@@ -282,25 +281,11 @@ fn restore_prev(dest: &Path, prev: Prev) {
 /// Write the three dialect hooks into `shell_d` (each `0600` via temp + rename) and delete a
 /// stray POSIX `00-atpkg.sh` (fish-safety). Returns the written file names.
 pub fn write_hooks(shell_d: &Path, bin_dir: &Path, agents_dir: &Path) -> io::Result<Vec<String>> {
-    // EVERY TEMP FIRST, THEN EVERY RENAME (audit 2026-09-17). Written one whole file at
-    // a time, a failure on the THIRD dialect left the first two carrying the new PATH
-    // policy and the last two the old one — four files that are only ever correct as a
-    // set, since one shell reads each and the aterm integration sources whichever it
-    // finds. Staging all four before any of them is published keeps the visible set in
-    // step: the ordinary failure (a full disk, a name that cannot be created) now
-    // happens while nothing has been replaced, and the hooks on disk stay exactly as
-    // they were for the next pass to retry.
-    //
-    // AND THE RENAME PHASE MOVES AS A SET TOO (review, 2026-09-19). Staging every temp
-    // first made only the TEMP phase all-or-nothing: a rename that failed partway still
-    // left the earlier dialects publishing the new PATH policy and the rest the old one,
-    // and reported failure — on which `refresh_at`'s gate then suppressed the rc wiring
-    // for ALL FOUR shells, including the ones whose own hook was on disk and correct. A
-    // failure of that shape is persistent (a directory standing at a hook name), so every
-    // later pass failed the same way and the rc block was never laid at all. Each
-    // destination's previous file is now moved aside before it is replaced and put back
-    // if a later rename fails, so a failed publish leaves `shell.d` exactly as it found
-    // it and the next pass retries the hooks and the rc wiring together.
+    // Stage every temp, then rename every destination; both phases are all-or-nothing.
+    // The dialects are only correct as a set — one shell reads each — so a partial publish
+    // leaves some carrying the new PATH policy and some the old. Each destination's previous
+    // file is moved aside and put back if a later rename fails, so a failed publish leaves
+    // `shell.d` as it found it and the next pass retries hooks and rc wiring together.
     let files = hook_files(bin_dir, agents_dir);
     let mut staged = Vec::with_capacity(files.len());
     for (name, content) in &files {
@@ -353,24 +338,21 @@ pub fn write_hooks(shell_d: &Path, bin_dir: &Path, agents_dir: &Path) -> io::Res
     Ok(written)
 }
 
-/// What one hooks pass did, so a caller that PRINTS its result states what happened
-/// rather than what it attempted. No variant is an error to a caller — a hooks pass never
-/// fails an install — but "rewritten" is claimed only where it is true: `atpkg repair`
-/// printed "shell integration rewritten (~/.aterm/shell.d + rc wiring)" unconditionally,
-/// including on the paths where nothing had been touched at all.
+/// What one hooks pass did, so a caller that prints its result states what happened rather
+/// than what it attempted. No variant is an error to a caller — a hooks pass never fails an
+/// install — but "rewritten" is claimed only where it is true.
 ///
-/// Only [`HookPass::Rewritten`] carries rc outcomes, because the rc step runs only once
-/// the hooks are on disk (THE BLOCK NEVER LEADS THE HOOKS, [`refresh_at`]) — and the list
-/// is empty off unix, where no rc is wired, and on a home where none of the `RC_FILES`
-/// roster exists.
+/// Only [`HookPass::Rewritten`] carries rc outcomes, because the rc step runs only once the
+/// hooks are on disk (the block never leads the hooks, [`refresh_at`]); the list is empty
+/// off unix, where no rc is wired, and on a home where no `RC_FILES` row exists.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HookPass {
     /// `~/.aterm` and `~/.aterm/shell.d` were hardened and the hook files were written.
-    /// One [`RcOutcome`] per rc file that EXISTS, in `RC_FILES` order.
+    /// One [`RcOutcome`] per rc file that exists, in `RC_FILES` order.
     Rewritten(Vec<(&'static str, RcOutcome)>),
-    /// The directories were hardened, a hook file could not be written, and the rc step
-    /// was therefore SKIPPED — a block that names a hook which is not there sources
-    /// nothing, and being marker-bounded no later pass would rewrite it.
+    /// The directories were hardened, a hook file could not be written, and the rc step was
+    /// therefore skipped — a block naming a hook that is not there sources nothing, and
+    /// being marker-bounded no later pass would rewrite it.
     HooksNotWritten,
     /// `$HOME` is unknown, or `~/.aterm` / `~/.aterm/shell.d` could not be made the
     /// user's own `0700` directory ([`ensure_private_dir`] refuses a symlink, a foreign
@@ -390,14 +372,11 @@ impl HookPass {
     }
 }
 
-/// What one pass did to one rc file that EXISTS. An absent rc has no outcome: atpkg never
+/// What one pass did to one rc file that exists. An absent rc has no outcome: atpkg never
 /// creates one. Carried in [`HookPass`] so `atpkg repair` prints one line per rc — what it
 /// wrote, what it left alone, and what it skipped and why — instead of one sentence that
-/// claimed "rc wiring" whether it had just re-laid a block the user deleted, failed to
-/// write the rc (a `~/.zshrc` linked into a read-only store), skipped it at the consent
-/// fence, or found no rc at all. Users AND agents are sent to `repair` for other reasons —
-/// a stale rustup link, a missing reroute stub (`doctor`, the manual, aterm-primer) — so
-/// re-laying an opt-out must be announced, never implied.
+/// claimed "rc wiring" either way. Users and agents are sent to `repair` for unrelated
+/// reasons too, so re-laying an opt-out must be announced, never implied.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RcOutcome {
     /// The rc already carried atpkg's block; nothing was written to it.
@@ -410,7 +389,7 @@ pub enum RcOutcome {
     /// The user had deleted atpkg's block and this pass left the rc exactly as it was.
     OptOutKept,
     /// The rc resolves under a folder macOS guards with a consent dialog, so it was not
-    /// even OPENED (the consent fence in `ensure_rc_sources_hooks`).
+    /// even opened (the consent fence in `ensure_rc_sources_hooks`).
     ConsentFenced,
     /// The rc exists but is not something atpkg edits: a dangling link, not a regular
     /// file, or not UTF-8. Left untouched.
@@ -430,8 +409,8 @@ pub enum RcOutcome {
 /// carries the block is left exactly as the user left it ([`RC_LEDGER`]).
 /// [`refresh_rewiring_rc`] is the deliberate pass that writes it back.
 ///
-/// The returned [`HookPass`] says what the pass DID. Every unattended caller discards it,
-/// as it discarded the unit before; `atpkg repair` is the one caller that reports it.
+/// The returned [`HookPass`] says what the pass did. Every unattended caller discards it;
+/// `atpkg repair` is the one caller that reports it.
 pub fn refresh(layout: &Layout) -> HookPass {
     refresh_with(layout, RcWiring::HonorOptOut)
 }
@@ -474,15 +453,11 @@ pub(crate) fn pass_at(layout: &Layout, home: &Path, wiring: RcWiring) -> HookPas
 /// [`refresh_with`] over an explicit `home` and the two managed directories, so a test
 /// can drive a whole pass under a throwaway home.
 ///
-/// THE BLOCK NEVER LEADS THE HOOKS (audit 2026-09-17). The rc block is the only thing
-/// that makes a hook reachable from an ORDINARY shell, and it is written into a file
-/// atpkg does not own — so it may only go in once the hook it names is actually on
-/// disk. [`write_hooks`]'s result was discarded here, so a pass whose hook write failed
-/// (a full disk, a `shell.d` entry that could not be replaced) still appended a block
-/// naming a file that was never written. The block is marker-bounded, so no later pass
-/// rewrites it: it would have sourced nothing for as long as it stood, and — before the
-/// status-neutral line below — left `$?` = 1 in every shell that read it. The wiring
-/// now runs only when the hooks are there, and the next pass retries the two together.
+/// The block never leads the hooks. The rc block is the only thing that makes a hook
+/// reachable from an ordinary shell, and it goes into a file atpkg does not own, so it may
+/// only be written once the hook it names is on disk: a marker-bounded block naming a file
+/// that was never written sources nothing, and no later pass rewrites it. The wiring runs
+/// only when the hooks are there, and the next pass retries the two together.
 fn refresh_at(home: &Path, bin_dir: &Path, agents_dir: &Path, wiring: RcWiring) -> HookPass {
     let aterm = home.join(".aterm");
     let shell_d = aterm.join("shell.d");
@@ -518,22 +493,21 @@ pub(crate) const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
 pub(crate) const RC_END: &str = "# <<< atpkg shell integration <<<";
 
 /// The rc files atpkg wires: each row is a path relative to `$HOME` and the `shell.d` hook
-/// it sources — the ONE roster, so the pass that writes the block and the report that names
+/// it sources — the one roster, so the pass that writes the block and the report that names
 /// its state ([`rc_wiring`]) can never disagree about which files are atpkg's. Each is the
 /// startup file of a shell whose hook dialect exists in [`hook_files`], and atpkg edits one
-/// only when it ALREADY EXISTS.
+/// only when it already exists.
 ///
-/// A shell that reads none of these four is not wired by atpkg: fish with
-/// `$XDG_CONFIG_HOME` set reads a different `config.fish`, and a login bash on a home with
-/// no `~/.bash_profile` falls through to `~/.bash_login` and then `~/.profile`, neither of
-/// which is a row (`ensure_rc_sources_hooks`'s doc says why). `aterm pkg doctor`'s PATH
-/// line is the way in for those.
+/// A shell that reads none of these four is not wired by atpkg: fish with `$XDG_CONFIG_HOME`
+/// set reads a different `config.fish`, and a login bash with no `~/.bash_profile` falls
+/// through to `~/.bash_login` and then `~/.profile`, neither of which is a row.
+/// `aterm pkg doctor`'s PATH line is the way in for those.
 #[cfg(unix)]
 pub(crate) const RC_FILES: [(&str, &str); 4] = [
     (".zshrc", "00-atpkg.zsh"),
     (".bashrc", "00-atpkg.bash"),
-    // The LOGIN bash rc ([`ensure_rc_sources_hooks`]): the same hook, reached by the
-    // shell Terminal.app actually opens.
+    // The login bash rc ([`ensure_rc_sources_hooks`]): the same hook, reached by the shell
+    // Terminal.app actually opens.
     (".bash_profile", "00-atpkg.bash"),
     (".config/fish/config.fish", "00-atpkg.fish"),
 ];
@@ -649,10 +623,9 @@ fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTre
 /// bash/zsh hook body (`${x//p/r}`) is not written for; `aterm pkg doctor`'s PATH line
 /// is the way in for those.
 ///
-/// Returns one [`RcOutcome`] per row that EXISTS, in [`RC_FILES`] order, so `atpkg repair`
+/// Returns one [`RcOutcome`] per row that exists, in [`RC_FILES`] order, so `atpkg repair`
 /// can print what happened to each rc instead of one sentence about all of them. An absent
-/// row is not in the list at all: atpkg never creates an rc, so there is nothing to report
-/// but "not there", which the caller says once by naming the roster.
+/// row is not in the list at all: atpkg never creates an rc.
 #[cfg(unix)]
 fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, RcOutcome)> {
     // Both sides of the protected-root comparison canonical: `$TMPDIR` and a home
@@ -675,9 +648,9 @@ fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, 
         // Write to the FILE the rc names, never over a link: a symlinked rc (stow,
         // yadm/chezmoi, home-manager, a dotfiles repo) renamed over became a detached
         // 0644 copy the dotfile never saw (2026-09-12, audit K12). Resolved for a
-        // REGULAR rc too: `~/.config` is itself a link in the same setups, and the file
-        // it leads to is the one every call below would open. A dangling link, or
-        // anything that is not a regular file, is left alone.
+        // Regular rc too: `~/.config` is itself a link in the same setups, and the file it
+        // leads to is the one every call below would open. A dangling link, or anything that
+        // is not a regular file, is left alone.
         let Ok(real) = fs::canonicalize(&rc_path) else {
             outcomes.push((rc, RcOutcome::Unreadable));
             continue;
@@ -718,7 +691,7 @@ fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, 
         // user deleted it exactly as the block told them to. An unattended pass — an
         // install, a seed, the six-hourly `update` — must not undo a user's edit to their
         // own dotfile; `atpkg repair` ([`refresh_rewiring_rc`]) is the pass that asks for
-        // it back — and it SAYS which rc it re-laid, so the deletion is never undone
+        // it back — and it says which rc it re-laid, so the deletion is never undone
         // silently ([`RcOutcome::RelaidOverOptOut`]).
         let opted_out = ledger.contains(real.to_string_lossy().as_ref());
         if wiring == RcWiring::HonorOptOut && opted_out {
@@ -735,17 +708,12 @@ fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, 
         // line is never rewritten by a later pass — it has to be born right (2026-09-16
         // audit; the real-shell test below replays it in bash and zsh).
         //
-        // STATUS-NEUTRAL, both dialects (audit 2026-09-17). This line is the LAST thing
-        // many rc files run, so the status it leaves is the `$?` the user's first prompt
-        // reads. `[ -f "<hook>" ] && . "<hook>"` is an `&&` list: with the hook ABSENT —
-        // an install whose hook write failed, a cleared `~/.aterm`, a home restored
-        // without it — the test fails, nothing is sourced, and the list exits 1.
-        // Measured in both shells on 2026-09-17: the `&&` line over a missing hook left
-        // `rc=1` in bash and zsh, the `if` form `rc=0`. Every prompt that renders the
-        // last status (a `git`-aware theme, a `PS1` carrying `$?`, starship) then opened
-        // showing a failure with nothing to blame. `if …; then …; fi` reports the
-        // SOURCED hook's own status and 0 when there is nothing to source, which is the
-        // truth in both cases.
+        // Status-neutral in both dialects: this line is the last thing many rc files run,
+        // so the status it leaves is the `$?` the user's first prompt reads.
+        // `[ -f "<hook>" ] && . "<hook>"` is an `&&` list, so with the hook absent the test
+        // fails, nothing is sourced, and the list exits 1 — every prompt that renders the
+        // last status then opens showing a failure with nothing to blame. `if …; then …; fi`
+        // reports the sourced hook's own status, and 0 when there is nothing to source.
         let line = if hook.ends_with(".fish") {
             format!(
                 "if test -f \"{p}\"; source \"{p}\"; end",
@@ -770,7 +738,7 @@ fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) -> Vec<(&'static str, 
         ));
         // Same temp+rename discipline the hook files use: a reader never sees a
         // half-written rc, and a failure leaves the original untouched. The temp sits
-        // beside the REAL file (same filesystem, so the rename replaces it and not the
+        // beside the real file (same filesystem, so the rename replaces it and not the
         // link) and carries its mode, so a 0600 rc stays 0600. A directory we cannot
         // write (a link into the read-only /nix/store) fails here and changes nothing.
         let Some(name) = real.file_name() else {
@@ -820,14 +788,13 @@ fn create_rc_temp(tmp: &Path) -> io::Result<fs::File> {
 }
 
 /// The login profiles `tools/install.sh`'s `path_block_rc_target` can elect for bash on
-/// macOS that atpkg has NO row for, relative to `$HOME`. Login bash reads the first of
-/// `~/.bash_profile`, `~/.bash_login`, `~/.profile` that exists; the first IS one of
-/// [`RC_FILES`], and these two are the fall-through atpkg never wires (the never-create
-/// rule, and `.profile` is read by `sh`/dash logins the bash hook body is not written for).
+/// macOS that atpkg has no row for, relative to `$HOME`. Login bash reads the first of
+/// `~/.bash_profile`, `~/.bash_login`, `~/.profile` that exists; the first is one of
+/// [`RC_FILES`], and these two are the fall-through atpkg never wires.
 ///
-/// atpkg never EDITS them. [`rc_wiring`] READS them, so `doctor` can see install.sh's own
-/// `# >>> aterm ALab toolset` block there: a Mac whose bash was wired by install.sh into
-/// `~/.bash_login` would otherwise read as "nothing sources shell.d".
+/// atpkg never edits them; [`rc_wiring`] reads them, so `doctor` can see install.sh's own
+/// block there — a Mac whose bash was wired into `~/.bash_login` would otherwise read as
+/// "nothing sources shell.d".
 #[cfg(unix)]
 pub(crate) const INSTALL_SH_PROFILES: [&str; 2] = [".bash_login", ".profile"];
 
@@ -851,10 +818,9 @@ pub(crate) enum RcState {
     /// sources `shell.d` from it either — so no pass has run since it appeared.
     Unwired,
     /// The rc resolves under a folder macOS guards with a consent dialog, so no pass will
-    /// open it ([`ensure_rc_sources_hooks`]'s consent fence) — and neither does this
-    /// report, which is why the state is about the path, not the contents. THE ONE STATE
-    /// THE USER CANNOT DIAGNOSE THEMSELVES: the rc looks ordinary, every pass leaves it
-    /// untouched, and nothing said why.
+    /// open it ([`ensure_rc_sources_hooks`]'s consent fence) — and neither does this report,
+    /// which is why the state is about the path, not the contents. The one state a user
+    /// cannot diagnose alone: the rc looks ordinary and every pass leaves it untouched.
     ConsentFenced,
 }
 
@@ -866,7 +832,7 @@ pub(crate) enum RcState {
 enum RcRead {
     /// The resolved target and its contents.
     Body(std::path::PathBuf, String),
-    /// The rc resolves under a macOS-guarded root and was NOT opened.
+    /// The rc resolves under a macOS-guarded root and was not opened.
     Fenced,
 }
 
@@ -887,12 +853,12 @@ fn read_rc_for_report(canonical_home: &Path, rc_path: &Path) -> Option<RcRead> {
     Some(RcRead::Body(real, body))
 }
 
-/// The rc-wiring state of each [`RC_FILES`] row that EXISTS under `home`, in roster order,
+/// The rc-wiring state of each [`RC_FILES`] row that exists under `home`, in roster order,
 /// then each [`INSTALL_SH_PROFILES`] entry that sources `shell.d`.
 ///
 /// An absent rc is not listed: atpkg never creates one, so there is nothing to say about it
 /// beyond "not there" — and an rc no pass would edit (not a regular file, not UTF-8) is not
-/// listed either. Content is read BEFORE the ledger: an rc that sources `shell.d` through a
+/// listed either. Content is read before the ledger: an rc that sources `shell.d` through a
 /// foreign line ([`RcState::SourcedElsewhere`]) reaches the toolchain whether or not
 /// atpkg's own block was deleted from it. The install.sh profiles are read-only probes —
 /// atpkg never wires them, so the only state they can report is `SourcedElsewhere`, and one
@@ -964,8 +930,8 @@ fn sources_shell_d(rc: &str) -> bool {
 /// Put `aterm` and `atpkg` in `~/.local/bin` when we are running from an app bundle.
 ///
 /// The rc wiring is [`ensure_rc_sources_hooks`]'s (the marker-bounded block in an
-/// EXISTING `~/.zshrc` / `~/.bashrc` / `~/.bash_profile` / fish config that sources
-/// `shell.d`); this is the OTHER half of reaching the toolchain from outside aterm: the
+/// existing `~/.zshrc` / `~/.bashrc` / `~/.bash_profile` / fish config that sources
+/// `shell.d`); this is the other half of reaching the toolchain from outside aterm: the
 /// `aterm <tool>` / `atpkg run` route. On the DMG install route those two commands did
 /// not exist on any PATH — the binaries live only inside
 /// `/Applications/aterm.app/Contents/MacOS`, and only `tools/install.sh` ever linked
@@ -977,9 +943,9 @@ fn sources_shell_d(rc: &str) -> bool {
 /// said the same and was corrected with it.)
 ///
 /// Deliberately narrow: symlinks only, into the same `~/.local/bin` that
-/// `tools/install.sh` uses, and NEVER over anything that is not already ours — a
-/// real file there is someone's own build. No dotfile is touched HERE; `atpkg doctor`
-/// still prints the rc line for putting the managed `bin/` itself on PATH.
+/// `tools/install.sh` uses, and never over anything that is not already ours — a real file
+/// there is someone's own build. No dotfile is touched here; `atpkg doctor` still prints
+/// the rc line for putting the managed `bin/` itself on PATH.
 ///
 /// Unix-only: the whole body is bundle-shaped (`Contents/MacOS`, `~/.local/bin`,
 /// POSIX symlinks), so on Windows it could only ever return early — and
@@ -1079,8 +1045,8 @@ fn command_links_dir(home: &Path) -> Option<std::path::PathBuf> {
 /// metacharacters a double-quoted context still interprets. A HOME-derived path won't
 /// contain them, but never interpolate raw.
 ///
-/// POSIX ONLY — zsh, bash, and the `if [ -f "…" ]` rc line. fish has [`fish_quote`]; this
-/// quoter's backtick is WRONG there.
+/// POSIX only — zsh, bash, and the `if [ -f "…" ]` rc line. fish has [`fish_quote`]; this
+/// quoter's backtick is wrong there.
 fn sh_quote(bin_dir: &Path) -> String {
     let mut out = String::new();
     for ch in bin_dir.to_string_lossy().chars() {
@@ -1094,16 +1060,13 @@ fn sh_quote(bin_dir: &Path) -> String {
 
 /// Render `p` for a double-quoted **fish** string — the fish hook body and the fish rc line.
 ///
-/// NOT [`sh_quote`] (review, 2026-09-19). fish is not a POSIX shell and its double quotes
-/// are not sh's: between them fish recognises only `\\`, `\"` and `\$` (and a
-/// backslash-newline continuation), and a backslash before ANY other character is kept
-/// LITERALLY. fish also has no backtick command substitution at all — `(cmd)` is its
-/// spelling, and inside double quotes only `$(cmd)`, which escaping `$` already covers. So
-/// sh's quoter, which also escapes a backtick, turned a prefix or a `$HOME` holding one into
-/// a path of a DIFFERENT name: `/opt/a`b` was emitted as `/opt/a\`b`, which fish reads with
-/// the backslash in it. The hook then put a directory that does not exist on PATH and
-/// `ATPKG_BIN`/`ATPKG_AGENTS` named it, and the rc line's `test -f` never found the hook, so
-/// the block sourced nothing — and, being marker-bounded, no later pass would rewrite it.
+/// Not [`sh_quote`]: fish is not a POSIX shell. Between double quotes it recognises only
+/// `\\`, `\"` and `\$` (and a backslash-newline continuation), keeps a backslash before any
+/// other character literally, and has no backtick command substitution at all. sh's quoter
+/// also escapes a backtick, so a prefix or a `$HOME` holding one became a path of a
+/// different name (`/opt/a`b` emitted as `/opt/a\`b`): the hook put a directory that does
+/// not exist on PATH, the rc line's `test -f` never found the hook, and the marker-bounded
+/// block sourced nothing for ever.
 fn fish_quote(p: &Path) -> String {
     let mut out = String::new();
     for ch in p.to_string_lossy().chars() {
@@ -1132,16 +1095,13 @@ fn atomic_write(dest: &Path, content: &str) -> io::Result<()> {
 }
 
 /// Write `content` to `dest`'s temp sibling, born `0600` and hardened, and hand back the
-/// temp path for the caller to rename into place. The temp is removed on EVERY error arm.
+/// temp path for the caller to rename into place. The temp is removed on every error arm.
 ///
-/// TWO FIXES OVER THE OLD `fs::write` (audit 2026-09-17). It left the temp behind
-/// whenever `harden_file` or the rename failed — `~/.aterm/shell.d` is swept by nobody,
-/// so each failed pass added one more `.00-atpkg.zsh.tmp-<pid>` that the fish and zsh
-/// glob loops in aterm's own integration then had to skip forever. And `fs::write`
-/// creates at the umask default, usually `0644`, so the hook was world-readable between
-/// the write and the chmod; `create_new` + `mode(0o600)` gives it the mode at birth,
-/// which is what [`create_rc_temp`] already does for the rc rewrite, and refuses to
-/// write through a name something else already holds.
+/// Not `fs::write`: it left the temp behind whenever `harden_file` or the rename failed, and
+/// `~/.aterm/shell.d` is swept by nobody, so each failed pass added another
+/// `.00-atpkg.zsh.tmp-<pid>` for aterm's own glob loops to skip. It also creates at the umask
+/// default, leaving the hook world-readable until the chmod; `create_new` + `mode(0o600)`
+/// gives it the mode at birth and refuses a name something else already holds.
 fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {
     let name = dest
         .file_name()
@@ -1151,7 +1111,7 @@ fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hook path has no parent"))?;
     let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
-    // A temp of OUR name left by a dead process with this pid is ours to clear; anything
+    // A temp of our own name left by a dead process with this pid is ours to clear; anything
     // that is not a plain file we can remove stays, and `create_new` then refuses.
     let _ = fs::remove_file(&tmp);
     let staged = create_hook_temp(&tmp)
@@ -1166,7 +1126,7 @@ fn stage_hook(dest: &Path, content: &str) -> io::Result<std::path::PathBuf> {
     }
 }
 
-/// Create a hook temp EXCLUSIVELY and, on Unix, born `0600` — [`create_rc_temp`]'s twin
+/// Create a hook temp exclusively and, on Unix, born `0600` — [`create_rc_temp`]'s twin
 /// for the files under `shell.d`. Windows has no mode to ask for at creation;
 /// [`crate::platform::harden_file`] is the no-op there and the directory is already
 /// private ([`ensure_private_dir`]).
@@ -1195,9 +1155,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    /// THE CHECKED REMEDY (review, 2026-09-16): `rc_hook_wired` reads the rc itself —
-    /// the marker block, or a hand-written line naming the hook — never a ledger, and
-    /// knows the three shell families and nothing else.
+    /// The checked remedy: `rc_hook_wired` reads the rc itself — the marker block, or a
+    /// hand-written line naming the hook — never a ledger, and knows the three shell
+    /// families and nothing else.
     #[test]
     fn rc_hook_wired_reads_the_rc_for_the_shell_family() {
         let home = std::env::temp_dir().join(format!("atpkg-rcwired-{}", std::process::id()));
@@ -1530,21 +1490,18 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// THE BLOCK MUST NOT LEAVE `$?` = 1 IN EVERY NEW SHELL (audit 2026-09-17).
+    /// The block must not leave `$?` = 1 in every new shell.
     ///
-    /// The block is the last thing many rc files run, so the status its line leaves is
-    /// the `$?` the user's first prompt reads. `[ -f "<hook>" ] && . "<hook>"` is an
-    /// `&&` list: with the hook ABSENT — an install whose hook write failed, a cleared
-    /// `~/.aterm`, a home restored without it — the test fails, nothing is sourced, and
-    /// the list exits 1. Every prompt that renders the last status (a `git`-aware
-    /// theme, a `PS1` carrying `$?`, starship) then opened showing a failure with
-    /// nothing to blame. Replayed in the real shells, running the generated line
-    /// exactly as the user's rc runs it, over a `shell.d` that holds no hook at all.
+    /// The block is the last thing many rc files run, so the status its line leaves is the
+    /// `$?` the user's first prompt reads. `[ -f "<hook>" ] && . "<hook>"` is an `&&` list:
+    /// with the hook absent the test fails, nothing is sourced, and the list exits 1, so
+    /// every prompt that renders the last status opens showing a failure with nothing to
+    /// blame. Replayed in the real shells over a `shell.d` that holds no hook at all.
     #[cfg(unix)]
     #[test]
     fn the_rc_line_is_status_neutral_when_the_hook_is_missing() {
         let home = tmp("rcstatus");
-        // The rc files exist; the hooks deliberately DO NOT.
+        // The rc files exist; the hooks deliberately do not.
         for rc in [".zshrc", ".bashrc", ".config/fish/config.fish"] {
             let rc_path = home.join(rc);
             fs::create_dir_all(rc_path.parent().unwrap()).unwrap();
@@ -1605,13 +1562,12 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// A PASS WHOSE HOOK WRITE FAILED WIRES NO RC (audit 2026-09-17).
+    /// A pass whose hook write failed wires no rc.
     ///
-    /// The block names ONE file. Writing it when that file is not there leaves an rc
-    /// sourcing nothing — and, because the block is marker-bounded, no later pass ever
-    /// rewrites the line, so it stays wrong for as long as it stands. The hook write is
-    /// made to fail the way a real one does (the temp path it must create is occupied),
-    /// and the rc must come out exactly as the user left it.
+    /// The block names one file. Writing it when that file is not there leaves an rc
+    /// sourcing nothing, and the marker-bounded block is never rewritten, so it stays wrong
+    /// for as long as it stands. The hook write is made to fail the way a real one does (the
+    /// temp path it must create is occupied), and the rc must come out as the user left it.
     #[cfg(unix)]
     #[test]
     fn a_failed_hook_write_wires_no_rc_block() {
@@ -1621,8 +1577,8 @@ mod tests {
         fs::write(&zshrc, user).unwrap();
         let shell_d = home.join(".aterm").join("shell.d");
         fs::create_dir_all(&shell_d).unwrap();
-        // A DIRECTORY stands where the hook writer must create its temp file, so the
-        // very first dialect's write fails and `write_hooks` returns Err.
+        // A directory stands where the hook writer must create its temp file, so the very
+        // first dialect's write fails and `write_hooks` returns Err.
         let blocked = shell_d.join(format!(".{HOOK_BASENAME}.zsh.tmp-{}", std::process::id()));
         fs::create_dir_all(&blocked).unwrap();
 
@@ -1648,7 +1604,7 @@ mod tests {
 
     /// A symlinked rc (GNU stow, yadm/chezmoi symlink mode, home-manager, any dotfiles
     /// repo) gets the block written THROUGH the link, and stays a link. Until 2026-09-12
-    /// the temp file was renamed over the rc path, which replaces the LINK: `~/.zshrc`
+    /// the temp file was renamed over the rc path, which replaces the link: `~/.zshrc`
     /// became a detached regular 0644 copy, the dotfile never got the block, and later
     /// edits to the dotfiles repo silently stopped reaching the shell (audit K12).
     #[cfg(unix)]
@@ -2165,20 +2121,19 @@ mod tests {
         assert!(!fish.contains("export "), "no POSIX export in fish");
     }
 
-    /// THE FOUR HOOKS MOVE AS A SET, OR NOT AT ALL (audit 2026-09-17).
+    /// The four hooks move as a set, or not at all.
     ///
-    /// One shell reads each dialect and aterm's own integration sources whichever it
-    /// finds, so the four files are only ever correct together. Written one whole file
-    /// at a time, a failure on the third left `00-atpkg.zsh` and `00-atpkg.bash`
-    /// carrying the new PATH policy and `00-atpkg.fish`/`.ps1` the old one, with nothing
-    /// to put them back. Staging every temp before publishing any of them means the
+    /// One shell reads each dialect and aterm's own integration sources whichever it finds,
+    /// so the four files are only ever correct together. Written one at a time, a failure on
+    /// the third left two dialects carrying the new PATH policy and two the old, with
+    /// nothing to put them back. Staging every temp before publishing any of them means the
     /// ordinary failure happens while nothing has been replaced.
     #[cfg(unix)]
     #[test]
     fn a_failed_hook_write_replaces_none_of_the_dialects() {
         let d = tmp("writeset");
-        // A DIRECTORY stands where the THIRD dialect's temp must be created, so its
-        // staging fails after the first two have been staged.
+        // A directory stands where the third dialect's temp must be created, so its staging
+        // fails after the first two have been staged.
         let blocked = d.join(format!(".{HOOK_BASENAME}.fish.tmp-{}", std::process::id()));
         fs::create_dir_all(&blocked).unwrap();
 
@@ -2202,7 +2157,7 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// NO TEMP IS LEFT BEHIND, ON ANY ERROR ARM (audit 2026-09-17).
+    /// No temp is left behind, on any error arm.
     ///
     /// `~/.aterm/shell.d` is swept by nobody, and the fish and zsh integration scripts
     /// glob the directory — so every failed pass used to add one more
@@ -2234,7 +2189,7 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// AND THE PUBLISH PHASE MOVES AS A SET TOO (review, 2026-09-19).
+    /// And the publish phase moves as a set too.
     ///
     /// Staging every temp first made only the TEMP phase all-or-nothing. A rename that
     /// failed partway still left the earlier dialects carrying the NEW policy and the rest
@@ -2248,12 +2203,12 @@ mod tests {
     #[test]
     fn a_failed_publish_puts_back_every_dialect_it_had_already_replaced() {
         let d = tmp("publishset");
-        // A PREVIOUS PASS'S HOOKS stand for the three dialects that publish first.
+        // A previous pass's hooks stand for the three dialects that publish first.
         let old = "# the previous pass's hook\n";
         for name in ["00-atpkg.zsh", "00-atpkg.bash", "00-atpkg.fish"] {
             fs::write(d.join(name), old).unwrap();
         }
-        // The LAST dialect's destination is a NON-EMPTY DIRECTORY, so its rename fails with
+        // The last dialect's destination is a non-empty directory, so its rename fails with
         // the first three already renamed into place.
         fs::create_dir_all(d.join("00-atpkg.ps1").join("occupied")).unwrap();
 
@@ -2284,16 +2239,15 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// FISH IS NOT A POSIX SHELL, AND ITS DOUBLE QUOTES ARE NOT SH'S (review, 2026-09-19).
+    /// fish is not a POSIX shell, and its double quotes are not sh's.
     ///
-    /// The fish hook body and the fish rc line were both rendered through `sh_quote`, which
-    /// escapes a BACKTICK. Between double quotes fish recognises only `\\`, `\"` and `\$`
-    /// (and a backslash-newline); a backslash before anything else is kept LITERALLY, and
-    /// fish has no backtick command substitution at all. So a prefix or a `$HOME` holding a
-    /// backtick was emitted with a backslash in front of it, which fish reads as a directory
-    /// of a DIFFERENT name: the hook put a path that does not exist on PATH.
+    /// The fish hook body and rc line were both rendered through `sh_quote`, which escapes a
+    /// backtick. Between double quotes fish recognises only `\\`, `\"` and `\$`, keeps a
+    /// backslash before anything else literally, and has no backtick command substitution at
+    /// all — so a prefix or a `$HOME` holding a backtick was emitted with a backslash in
+    /// front of it, naming a directory that does not exist.
     ///
-    /// fish is not installed on this host, so the quoter is measured directly against those
+    /// fish is not installed on this host, so the quoter is measured against those
     /// documented rules rather than by running it.
     #[test]
     fn fish_quoting_escapes_fishs_metacharacters_and_leaves_a_backtick_alone() {

@@ -1981,17 +1981,16 @@ fn any_member_tombstoned_in_place(layout: &Layout, group: &Group) -> bool {
 /// `None` ⇒ the group has no installed member and was skipped (that would be a fresh
 /// `install`, not an update). Otherwise `Some(outcome)`.
 ///
-/// [`crate::gate::decide`] is the security AUTHORITY, evaluated FIRST. The consumer gates run
-/// strictly AFTER it and can only SUPPRESS/ABORT, never move a build:
+/// [`crate::gate::decide`] is the security authority, evaluated first. The consumer gates
+/// run strictly after it and can only suppress or abort, never move a build:
 /// * **local pin** — if any member is pinned AND the group is not tombstoning AND it wants an
 ///   upgrade, the whole tuple is held on its current builds ([`TxnOutcome::Pinned`]); a
 ///   Tombstone anywhere makes the pin IGNORED so a revoked build never keeps running;
-/// * **missing-triple hold** — if a member the group would MOVE has a new pin PROVEN (from
+/// * **missing-triple hold** — if a member the group would move has a new pin proven (from
 ///   its verified manifest, bound to that pin) to publish no artifact for this triple, the
-///   whole tuple is held on its current builds ([`TxnOutcome::Unpublished`]) — a correct
-///   state, not a failure — unless a current build is revoked, which aborts with that
-///   build's commands disabled; a fetch/verify failure proves nothing and defers to the
-///   real stage;
+///   whole tuple is held on its current builds ([`TxnOutcome::Unpublished`]), unless a
+///   current build is revoked, which aborts with that build's commands disabled; a
+///   fetch/verify failure proves nothing and defers to the real stage;
 /// * **disk preflight** — a group-aggregated shortfall aborts the group before staging so it
 ///   stays coherent on its current builds; fails OPEN on any query/fetch failure.
 #[allow(
@@ -2344,14 +2343,12 @@ fn apply_group_txn(
         }
     }
 
-    // ONE WALK over the manifests of the members decide() marked Install — exactly the
+    // One walk over the manifests of the members decide() marked Install — exactly the
     // members `transact` would stage — feeds both gates below: the missing-triple hold and
     // the group-aggregated disk preflight. It makes the requests the disk preflight always
-    // made, in the same order, and stops where it always stopped, so the hold costs no
-    // fetch the old path did not make. Only-when-nonempty, so an UpToDate group (0
-    // installs) walks nothing and is never spuriously aborted on a low-but-nonzero disk.
-    // Fetches only the tiny manifests here; the big asset download stays in stage_member,
-    // once.
+    // made, in the same order, so the hold costs no extra fetch. Only when nonempty, so an
+    // UpToDate group walks nothing and is never aborted on a low-but-nonzero disk. Manifests
+    // only; the asset download stays in `stage_member`.
     let install_members: Vec<&String> = decisions
         .iter()
         .filter(|(_, d)| *d == ApplyDecision::Install)
@@ -2363,27 +2360,21 @@ fn apply_group_txn(
         group_install_need(fetcher, index, ch, &install_members, triple)
     };
 
-    // THE MISSING-TRIPLE HOLD — the bootstrap's clean-skip doctrine
-    // ([`group_missing_triple`]: a tuple that cannot fully exist on this host is a correct
-    // state the 6h loop must not scream about, not a failure) lifted to an INSTALLED
-    // tuple. Without it, a channel that moved a group to a pin the publisher has not built
-    // for this triple sent the update lane straight into `stage_member`, whose
-    // `artifact_for(triple)` miss aborted the group — on every pass, one failure per tick,
-    // on a machine whose tuple kept running its previous builds (measured on an Intel Mac
-    // 2026-09-11/12: `rustc update ABORTED at trust during stage` on every six-hourly pass,
-    // joined by `clean update ABORTED at clean during stage`). Strictly after decide(),
-    // suppression-only, and proof-only: the walk must SHOW the missing row in the verified
-    // manifest of a member this pass would stage, bound to that member's pinned program and
-    // build. An UpToDate member is never read — it stages nothing, so its manifest proves
-    // nothing about this pass — and a fetch/verify failure or an unbound manifest proves
-    // nothing either, so the real stage still runs and fails loudly. Only a group with
-    // something installed has builds to stay on — a wholly-absent group is the
-    // bootstrap's, which prescans it itself — so the fresh install is untouched. Never over
-    // a Tombstone (transact tombstones the group), and never a QUIET hold over a
-    // force-upgrade off a revoked current build: that would keep the revoked build running
-    // on exactly the host with no replacement, so — as the disk preflight below does when
-    // the upgrade cannot be afforded — the revoked build's commands are disabled and the
-    // group aborts loudly.
+    // The missing-triple hold: the bootstrap's clean-skip doctrine ([`group_missing_triple`]
+    // — a tuple that cannot fully exist on this host is a correct state, not a failure)
+    // lifted to an installed tuple. Without it, a channel that moved a group to a pin the
+    // publisher has not built for this triple sent the update lane into `stage_member`, whose
+    // `artifact_for(triple)` miss aborted the group on every six-hourly pass while the tuple
+    // kept running its previous builds.
+    //
+    // Strictly after decide(), suppression-only, and proof-only: the walk must show the
+    // missing row in the verified manifest of a member this pass would stage, bound to that
+    // member's pinned program and build. An UpToDate member is never read, and a
+    // fetch/verify failure or an unbound manifest proves nothing, so the real stage still
+    // runs and fails loudly. Only a group with something installed has builds to stay on, so
+    // the fresh install is untouched. Never over a Tombstone, and never a quiet hold over a
+    // force-upgrade off a revoked current build — that would keep the revoked build running
+    // with no replacement, so its commands are disabled and the group aborts loudly.
     if !any_tombstone
         && group.members.iter().any(|m| installed.contains_key(m))
         && let InstallNeed::Unpublished { member, build } = &need
@@ -2405,15 +2396,13 @@ fn apply_group_txn(
                 recalled_unpublished_notice(program, member, *build, triple)
             );
         }
-        // THE ABORT NAMES THE PROGRAM IT DISABLED, not the unpublished member, because
-        // that row has to outlive this pass. The tombstone shims drop the disabled program
-        // from `active_builds`, so the next pass sees it as not installed: decide() asks
-        // for a fresh install, an absent current build is trivially valid, and the tuple
-        // takes the quiet hold above, which rewrites only INSTALLED members' rows. Named
-        // on the unpublished member, the `aborted: stage` row became `held: …` on that
-        // pass while the disabled program's row went on reading `managed` — the silent
-        // tombstone doctor exists to catch. On the disabled program, the counted row
-        // stands until an apply replaces the tombstone and rewrites it.
+        // The abort names the program it disabled, not the unpublished member, because that
+        // row has to outlive this pass. The tombstone shims drop the disabled program from
+        // `active_builds`, so the next pass sees it as not installed and the tuple takes the
+        // quiet hold above, which rewrites only installed members' rows — leaving the
+        // disabled program's row reading `managed`, the silent tombstone doctor exists to
+        // catch. On the disabled program, the row stands until an apply replaces the
+        // tombstone.
         return (
             TxnOutcome::Aborted {
                 failed: disabled.first().unwrap_or(member).clone(),
@@ -2428,8 +2417,8 @@ fn apply_group_txn(
         );
     }
 
-    // GROUP-AGGREGATED DISK PREFLIGHT (§9): one all-or-nothing check for the whole tuple,
-    // over the walk's aggregate. A walk that proved no aggregate fails OPEN.
+    // Group-aggregated disk preflight (§9): one all-or-nothing check for the whole tuple,
+    // over the walk's aggregate. A walk that proved no aggregate fails open.
     if let InstallNeed::Bytes(required) = need
         && disk_gate(required, crate::freespace::available_bytes(&layout.prefix)).is_err()
     {
@@ -2651,12 +2640,11 @@ fn carried_archive(dl: &Path, artifact: &crate::manifest::Artifact) -> bool {
     crate::tree::file_sha256(dl).is_ok_and(|got| got.eq_ignore_ascii_case(&artifact.sha256))
 }
 
-/// Disable the live commands of every member `decide` asked to force OFF its current build
-/// — an Install whose CURRENT build is yanked or below the floor — by laying failing
-/// tombstone shims over them, and return their names. The half of a force-upgrade that must
-/// still happen when the upgrade itself cannot (a disk shortfall, a replacement not
-/// published for this triple): an abort that leaves the tuple on its current builds must
-/// not leave a revoked one runnable.
+/// Disable the live commands of every member `decide` asked to force off its current build
+/// — an Install whose current build is yanked or below the floor — by laying failing
+/// tombstone shims over them, and return their names. An abort that leaves the tuple on its
+/// current builds (a disk shortfall, a replacement not published for this triple) must not
+/// leave a revoked build runnable.
 fn disable_revoked_currents(
     layout: &Layout,
     ch: &Channel,
@@ -2679,8 +2667,8 @@ fn disable_revoked_currents(
 
 /// The line the missing-triple hold prints for each `program` it disables: the build this
 /// `triple` lacks — `member`'s pinned `build`, the tuple's new pin — and that the program's
-/// commands stay disabled until it publishes. The two names differ whenever a SIBLING's
-/// new pin is the missing one: the recalled program's own replacement may be published.
+/// commands stay disabled until it publishes. The two names differ whenever a sibling's new
+/// pin is the missing one: the recalled program's own replacement may be published.
 pub(crate) fn recalled_unpublished_notice(
     program: &str,
     member: &str,
@@ -2874,30 +2862,28 @@ fn disk_gate(required: u64, available: Option<u64>) -> Result<(), FlowError> {
     }
 }
 
-/// What one walk over a group's Install members' pinned, release-verified manifests
-/// proved — the ONE walk both the missing-triple hold and the disk preflight read.
+/// What one walk over a group's Install members' pinned, release-verified manifests proved
+/// — the one walk both the missing-triple hold and the disk preflight read.
 enum InstallNeed {
     /// Every Install member's manifest carries an artifact for the triple: the aggregate
     /// installed-bytes the disk preflight gates on.
     Bytes(u64),
-    /// `member`'s manifest — bound to its pinned program and `build` — carries NO artifact
+    /// `member`'s manifest — bound to its pinned program and `build` — carries no artifact
     /// for the triple: that pin cannot exist on this host.
     Unpublished { member: String, build: u64 },
     /// Nothing proven: a fetch/verify/parse failure, or a manifest with no row for the
-    /// triple that does not bind to its pin. Both gates fail OPEN, letting the real stage
+    /// triple that does not bind to its pin. Both gates fail open, letting the real stage
     /// surface the failure.
     Unknown,
 }
 
 /// The aggregate installed-bytes a group's Install members need — the sum of each member's
 /// signed `size` (compressed asset) + `disk_installed` (extracted tree) — walked in order.
-/// Preserves VERIFY-BEFORE-PARSE via the shared [`verified_pkg`] sequence (never parsing
-/// unverified TOML). Stops at the first member whose manifest fails to fetch, verify or
-/// parse ([`InstallNeed::Unknown`]) or has no artifact for `triple`: that is
-/// [`InstallNeed::Unpublished`] only when the manifest binds to the member's pinned program
-/// and build — the stage's own admission, so the proof is as strong as the refusal it
-/// replaces — and [`InstallNeed::Unknown`] when it does not, because another program's or
-/// build's manifest says nothing about THIS pin.
+/// Verify before parse, through the shared [`verified_pkg`] sequence. Stops at the first
+/// member whose manifest fails to fetch, verify or parse ([`InstallNeed::Unknown`]) or has
+/// no artifact for `triple`: that is [`InstallNeed::Unpublished`] only when the manifest
+/// binds to the member's pinned program and build, and [`InstallNeed::Unknown`] when it does
+/// not, because another program's or build's manifest says nothing about this pin.
 fn group_install_need(
     fetcher: &dyn Fetcher,
     index: &TrustedIndex,
@@ -7435,7 +7421,7 @@ mod tests {
         group_fixture_with(dir, &[])
     }
 
-    /// [`group_fixture`] with each program in `unserved` published only for a FOREIGN
+    /// [`group_fixture`] with each program in `unserved` published only for a foreign
     /// triple — how the release looks from a host the publisher does not build it for.
     fn group_fixture_with(dir: &Path, unserved: &[&str]) -> Fake {
         let mut pkg = HashMap::new();
@@ -7956,8 +7942,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // THE MISSING-TRIPLE HOLD, at the flow layer: an INSTALLED tuple (ay@17 + trust@4820)
-    // whose new pin trust@4821 publishes no artifact for this triple is held WHOLE on its
+    // The missing-triple hold at the flow layer: an installed tuple (ay@17 + trust@4820)
+    // whose new pin trust@4821 publishes no artifact for this triple is held whole on its
     // current builds — never staged, never aborted, nothing resolved for download.
     #[test]
     fn an_installed_group_whose_new_pin_lacks_this_triple_is_held_whole() {
@@ -8037,11 +8023,9 @@ mod tests {
         }
     }
 
-    // THE HOLD READS ONLY THE MEMBERS THE PASS WOULD MOVE. ay is up to date on build 18,
-    // whose signed manifest has no row for this triple; trust moves 4820 → 4821, which IS
-    // published here. Nothing of ay's is staged, so its manifest proves nothing about this
-    // pass and is never even fetched: the tuple applies exactly as it did before the hold
-    // existed.
+    // The hold reads only the members the pass would move. ay is up to date on build 18,
+    // whose signed manifest has no row for this triple; trust moves 4820 → 4821, which is
+    // published here. Nothing of ay's is staged, so its manifest is never even fetched.
     #[test]
     fn an_up_to_date_member_whose_pin_lacks_this_triple_never_holds_its_sibling() {
         let dir = scratch("group-uptodate-unserved");
@@ -8095,7 +8079,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A recalled member whose OWN new pin is the unpublished one is told that its
+    // A recalled member whose own new pin is the unpublished one is told that its
     // replacement is missing, and which build that is. (A recalled member whose sibling's
     // pin is missing is named with that sibling's build — the cli revoked-build test.)
     #[test]

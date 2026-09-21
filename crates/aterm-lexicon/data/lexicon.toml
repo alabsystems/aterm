@@ -1572,10 +1572,10 @@ notes    = "FOLD COLLISION with ordinary English: köpek -> kopek (the Russian c
 class    = "canine"
 lang     = "id"
 mode     = "forms"
-forms    = ["anak anjing"]
+forms    = ["guguk", "anak anjing"]
 cjk      = false
 ambiguous= false
-notes    = "anak anjing = puppy ('child dog', multiword -> forms mode). Bare 'anjing' is profanity-claimed (id/ms curse usage) and cross-class precedence keeps it there — the sparkle, not the dog."
+notes    = "guguk is the everyday child-speak dog (KBBI; the noun built from the bark guk-guk), and it is the only surface here a scanner can actually match: anak anjing = puppy is TWO WORDS, and a multi-word surface never matches whole-word — so this entry compiled to no key at all and id/canine was unreachable in every configuration, silently. Bare 'anjing' is profanity-claimed (id/ms curse usage) and cross-class precedence keeps it there — the sparkle, not the dog; 'kirik' is left out for the reason 'asu' is, it carries the insult sense too. The two-word form stays as documentation of the word."
 
 [[entry]]
 class    = "canine"
