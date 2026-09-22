@@ -42,6 +42,7 @@ fn config(style: GlowStyle, theme: Theme) -> GlowConfig {
         duration: Duration::from_millis(560),
         length: 48,
         intensity: 0.92,
+        audible: true,
         radius: 0.34,
         ring: false,
         dark_theme: true,

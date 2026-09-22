@@ -228,19 +228,53 @@ WHAT IT IS
   `~/.config/opencode/command/aterm-fabric.md`. The content is compiled into the
   binary, so it updates with aterm and there is no second copy to drift.
 
+  And for Claude Code — the one agent with a hook contract aterm can write — it
+  installs the HOOKS: five marked entries in `~/.claude/settings.json` (SessionStart,
+  UserPromptSubmit, PermissionRequest, Notification, Stop), each running `aterm link
+  hook run <event>`, every other key and every foreign hook kept (PreToolUse, the tool
+  gate, stays opt-in: `aterm help fabric`). They are what makes a Claude tab part of
+  the harness rather than a stranger in it: the inbox metadata in front of the model at
+  each prompt, the end-of-turn report — and, since 2026-09-21, the approval box.
+  `permission-request` answers the one class a bypass-permissions session still stops
+  on (the vendor's critical-path
+  removal circuit breaker on a shell-variable target, which no permission rule can
+  allow) by GUARDING the variables (`rm -rf $S/$1` runs as `rm -rf ${S:?}/${1:?}`, the
+  amendment the box itself asks for) and allowing — only when every value those
+  variables can take on the line (its assignments, `for` lists, `set --`, a `mktemp`
+  directory, the environment) renders to a path outside the critical classes. Every
+  other box, and every box in a mode that asks by design, is left to the human and
+  ESCALATED by the `notification` hook once the vendor says it is waiting (about six
+  seconds, never for a box another hook answered) — the session's `attention` meta
+  (`claude needs approval: …`: the menu bar badges it, `ls` shows meta=1, `status`
+  reads level=attention, `aterm drive phase` prints the box with its `note` rows) and,
+  for a worker installed with `--report-to`, a kind=ask to its manager — and the box
+  is left for the human. `aterm help fabric` has the whole contract. The commands are
+  self-tested against THIS aterm before a byte is written (a hook that does not run
+  would block the agent the moment the vendor loaded it), and an operator's own Stop
+  flags (`--accept-from`, `--report-to`, the budget) and state dir survive the update
+  that adds an event. The window's own pass installs from an installed aterm only (an
+  app bundle or the package store; never a `target/…` build), on macOS and Linux, and
+  leaves a complete block another installed aterm wrote alone (`hooks … installed (by
+  <path>)`), so the release and the dev app never trade the file; `aterm agents
+  install` is the operator asking THIS binary, and takes it over.
+
 KEY USAGE
-  aterm agents               status: each agent, its context file + skills,
-                             installed/stale/absent/foreign
-  aterm agents install       install/update the block AND the bundled skills for every
-                             DETECTED agent (its config dir exists); others are skipped
+  aterm agents               status: each agent, its context file + skills, and for
+                             Claude the hooks row — installed/stale/absent/foreign
+  aterm agents install       install/update the block, the bundled skills AND (Claude)
+                             the hooks for every DETECTED agent (its config dir
+                             exists); others are skipped
   aterm agents install codex force one agent by name (creates the file if needed)
-  aterm agents remove        remove exactly the managed block, and aterm-owned skills
+  aterm agents remove        remove exactly the managed block, aterm-owned skills, and
+                             aterm's hook entries (everything else in settings.json
+                             stays)
   aterm agents primer        print the block — paste into any project AGENTS.md/CLAUDE.md
 
 WHEN TO REACH FOR IT
   Usually never — in a WINDOW. aterm runs this installer itself, in the background, at
   most once a minute, each time the window (or a --headless instance) opens
-  a session — every DETECTED agent gets the current primer and skills, and nothing is
+  a session — every DETECTED agent gets the current primer and skills, Claude its
+  hooks (self-tested against the running instance first), and nothing is
   written for an agent whose config dir does not exist (`agents_auto_prime = false` in
   aterm.toml turns the pass off; `aterm agents status` names the knob, and so does the
   one line a pass that wrote anything leaves in aterm's log, ahead of the files it
@@ -272,6 +306,86 @@ GOTCHAS
     `/aterm-fabric`, which is why the fabric FACT rides in the primer block and only
     its depth lives in the doc. aterm invents no convention of its own: a doc goes
     only where the vendor already defines a place for it."#,
+        ),
+    },
+    Topic {
+        name: "harness",
+        tagline: "the Claude Code harness — the hook bridge, the read verbs, and the two that act",
+        body: Some(
+            r#"harness — the Claude Code harness (`aterm harness`): answer the vendor's hooks,
+record its statusLine, and read back what the harness saw.
+
+WHAT IT IS
+  Claude Code can be asked to run a command at defined moments (a HOOK) and to render
+  a line in its footer (the statusLine). `aterm harness` is the program on the other
+  end of both: it decides, it journals, and it prints exactly what the vendor reads —
+  one JSON object for a decision, one line for the footer, nothing else, exit 0 always.
+
+  THE LAW IT IS BUILT ON: aterm's OWN view of a session is the spine, and vendor hooks
+  are ENRICHMENT. `claude --bare` removes hooks, plugins and the statusLine in one
+  flag, and a session aterm ADOPTED (rather than spawned) owns no shell-integration
+  block — so a capability that only works when a hook fires is the wrong shape. Every
+  read verb below therefore answers with ZERO hooks installed, and says so: each one
+  carries a `source` field, one word from a closed set — `statusline`, `hook` or
+  `grid` for the three ladders a read can come down. (It read `spine` here until
+  2026-09-22; that word was retired from the code and the parser refuses it, so a
+  reply can never carry it.) Exactly one capability is honestly hook-only —
+  approving a permission prompt — because that is the vendor's own decision channel
+  and aterm never types `y` at an approval.
+
+KEY USAGE — the read verbs
+  aterm harness install         write the plugin tree and merge into ~/.claude/settings.json
+  aterm harness uninstall       undo it; your own statusLine command is put back
+  aterm harness status [--json] what the harness is, what it can see, hooks present or not
+  aterm harness usage [--json]  the usage view: windows per account, spend per model
+  aterm harness limits [--json] the failure classifier's verdict (a 5h/7d limit, a storm, auth)
+  aterm harness liveness [--json]  the stall verdict and which ladder rung is due
+  aterm harness accounts [--json]  the account roster and what may be rotated into
+  aterm harness align|caps [--json]  probe the installed program; the per-capability verdict
+  aterm harness disk [<build-dir> ...] [--json]   free space and the stale targets
+  aterm harness mark|enable|disable                the four-state mark and the off switches
+  aterm harness config get|set <key> [<value>]     the harness's own config.toml
+  aterm harness ledger <rm|event|statusline|disk|recovery|actuation> [<n>] [--since <id>] [--json]
+  aterm harness hook <EVENT> [<cap>]   run BY the vendor; its JSON arrives on stdin
+  aterm harness statusline             run BY the vendor; its JSON arrives on stdin
+
+KEY USAGE — the verbs that ACT
+  aterm harness switch <model|account> <target>    ONE guarded switch, by hand
+  aterm harness watch [--passes <n>]               RUN THE LOOP against this instance
+  aterm harness recover <class|action> [--commands]   what the recovery table would do
+  aterm harness nudge [<sid>] [--level <l>]           one ladder rung, by hand
+  aterm harness disk --apply <class>                  the one removal path
+
+  `switch` and `watch` open the control socket and act; `recover` and `nudge` decide
+  and PRINT, and withhold the sendable lines of a typing act unless you assert the
+  spine with `--assume-spine`. Every act obeys the same order — journal a row, take
+  the lease, respect a `hold`, write the verdict — and none of them ever types `y` at
+  an approval box or presses Enter bare.
+
+  `ledger recovery` and `ledger actuation` are where `watch` writes every journal
+  row and every verdict, including the refusals; they are the first place to look
+  when the loop did nothing.
+
+WHEN TO REACH FOR IT
+  `install` once, then `status` to see whether hooks are actually live (a `--bare`
+  launch or a settings override silently removes them, and this is how you find out).
+  `ledger rm` is the record of every `rm` the policy judged — allowed or abstained,
+  with the rule that decided and the targets it resolved. `limits` is what a watcher
+  asks before deciding to wait, retry or switch.
+
+GOTCHAS
+  * The hook verbs ALWAYS exit 0 and print nothing but their one answer. This is not
+    politeness: Claude Code reads a failing hook command as a block on the agent's
+    turn, and the day one was saved it stopped a real worker's prompts and tool calls.
+  * `install` preserves every key and every foreign hook in your settings file, but
+    it does NOT preserve key order or whitespace — the writer sorts keys. So it keeps
+    a copy of the original bytes beside the file, and `uninstall` puts those bytes
+    back when nothing else changed meanwhile. Edit the file after installing and
+    your edit wins; the pruned render is written instead and the copy is kept.
+  * The rm policy answers `allow` or nothing. There is no deny: an abstention means
+    the vendor's own prompt shows, which is the safe answer for every tie.
+  * `ATERM_NO_HARNESS=1` makes every installed hook an immediate no-op without
+    touching a file."#,
         ),
     },
     Topic {
@@ -1219,6 +1333,9 @@ fn overview_page() -> String {
             crate::Verb::Agents => {
                 "make coding agents aterm-aware (the primer; aterm also installs it itself)"
             }
+            crate::Verb::Harness => {
+                "the Claude Code harness: the hook bridge and its read verbs (hooks are enrichment)"
+            }
             crate::Verb::NewTab => "open a terminal tab (where it opens is `windowing_behavior`)",
             crate::Verb::NewWindow => "open a NEW window, always",
             crate::Verb::SplitPane => "split the current pane",
@@ -1578,9 +1695,13 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      --no-nudge, one read of the worker's screen and — only
                      when it is idle — the one-line nudge `Inbox: task @<off>`
                      typed as a turn (not waited on; a busy worker gets the
-                     mail alone; a worker whose round 12 wake hooks accept you
-                     — your sid in their --accept-from — wants --no-nudge, its
-                     Stop hook wakes it). Prints `task @<off>
+                     mail alone; a worker whose hooks were installed
+                     --keep-alive AND accept you — your sid in their
+                     --accept-from — can take --no-nudge, because its Stop hook
+                     parks on the mail and wakes. Round 22 made --keep-alive
+                     OPT-IN, so a DEFAULT install does not wake: --no-nudge
+                     against one posts the task and nothing reads it. When in
+                     doubt, nudge — it costs one line on an idle screen). Prints `task @<off>
                      nudged=0|1` once the post landed; one that did not is
                      the error in the server's words (`queued=1`: in the
                      outbox, it WILL land, do not re-post; `no-bridge=1`: no
@@ -2014,6 +2135,7 @@ fn rust_page() -> String {
          \n\
          THE DEFAULT HERE IS THE TRUST TOOLCHAIN. `targo` is cargo, `trustc` is rustc, `tippy` is\n\
          clippy, `trustfmt` is rustfmt, `trustdoc` is rustdoc; `ty`, `ay`, `clean` are the verifiers.\n\
+         Those are the tools' names — use them in replies too (tippy, not clippy).\n\
          Stock `cargo`/`rustc` is never blocked — but it is the exception, and inside a session a bare\n\
          `cargo …` prints the `targo` spelling of your command before running (`aterm help reroute`).\n\
          Name the lane; `targo` will not pick one for you:\n\
@@ -3306,6 +3428,31 @@ THE FIVE VERBS YOU NEED
   aterm ctl @self post to=@<sid> kind=task '<text>'    send one
   aterm ctl @self await inbox since=<id>    block until new mail, instead of polling
 
+BROADCAST — ONE RECORD, HOWEVER MANY READERS
+  aterm ctl @self post to=say:<topic> kind=note '<text>'   shout on a topic
+  aterm ctl @<sid> topic add <topic> [since=head|@<off>]   opt IN (Owner-only)
+  aterm ctl @<sid> topic ls | topic drop <topic>           what is on, and off
+
+  `to=say:<topic>` puts ONE record on the bus whatever the audience — it does not copy
+  the body into anybody's inbox. A session receives it only because it asked, with
+  `topic add`, and the set is EMPTY by default, so a session that asked for nothing
+  receives nothing — INCLUDING the sender, which hears its own shout only if it
+  subscribed too. `since=head` (the default) takes only what is published from then on;
+  `since=@<off>` replays the topic from that bus offset for a session joining late.
+  Topic is `[a-z0-9][a-z0-9._-]{0,31}`; anything else is `ERR usage` at the post.
+
+  A delivered broadcast is an ORDINARY inbox row — same ring, same per-sender quota, and
+  a `task` from a principal this node does not accept still arrives `kind=note
+  demoted=task` — carrying `topic=<t>`. `subscribe @<sel> mail:topic=<t>` watches one.
+  What the SENDER never learns: who received it, and that a recipient whose ring was
+  full dropped it (that shows on the RECIPIENT's `inbox` header as `dropped=`).
+
+  A topic added takes effect within one bridge roster round (2 s), because the set lives
+  in this endpoint and the bridge samples it; `since=@<off>` is the exact answer for a
+  caller who cannot accept that. `aterm fabric tail --filter /f/<F>/pub/*/*/say/>`
+  watches every broadcast in the fleet, and `aterm fabric status`'s TOPICS column says
+  which sessions are listening at all.
+
   Kinds: ask answer task report note ack control. `ask` and `task` wait for the broker to
   confirm the record landed and answer `OK <id> off=<n>`; that offset is the correlation
   id an answer carries back as `re=<n>`.
@@ -3580,12 +3727,28 @@ A SECOND HOST (round 16) — over the sealed TCP wire
   recipe, and what it does not protect: docs/FABRIC-SECOND-HOST.md in the source tree.
 
 BEING WOKEN — WHAT EXISTS, PER AGENT, HONESTLY
-  Claude Code   `aterm link hook install claude --merge --settings <file>` merges four
+  Claude Code   `aterm link hook install claude --merge --settings <file>` merges FIVE
                 hooks into that settings file (a backup at <file>.bak-<unix> first; bare,
-                it writes a new file and refuses to touch one that exists). SessionStart
+                it writes a new file and refuses to touch one that exists) — and aterm
+                itself installs them into ~/.claude/settings.json, batteries included,
+                on the same once-a-minute pass that installs the primer, from an
+                installed aterm (`aterm agents` shows the `hooks` row; `aterm help
+                agents`). SessionStart
                 and UserPromptSubmit put the inbox METADATA (never a body) in front of
-                the model; PreToolUse blocks tool calls while held; Stop keeps the turn
-                alive when unread mail arrives. Claude Code loads a hook edit into the
+                the model; Stop reports; PermissionRequest answers the approval box
+                when aterm can make the request safe (a bypass-permissions session's
+                shell-variable removal whose every value on the line resolves outside
+                the critical paths, guarded as `${S:?}` and allowed) and leaves every
+                other box alone; Notification is the ESCALATION — when the vendor says
+                it is waiting on a human (about six seconds after a box with no
+                keystroke, and never for one a hook answered) it sets the session's
+                `attention` meta and posts a kind=ask to `--report-to`. Two more are
+                OPT-IN: `--gate-tools` adds PreToolUse (which refuses tool calls while
+                the session is held) and `--keep-alive` makes Stop wait on `await
+                inbox` and wake for unread mail — both off by default, because a hook
+                that fails blocks the agent and a hook that holds a turn open hides its
+                end from the human watching. An upgrade also turns an older install's
+                tool gate off. Claude Code loads a hook edit into the
                 RUNNING session and reads a failing hook as a block, so a hook that does
                 not run stops the agent the moment it is saved: the installer therefore
                 EXECUTES every command it generates with --check and refuses (exit 2,
@@ -3595,21 +3758,27 @@ BEING WOKEN — WHAT EXISTS, PER AGENT, HONESTLY
                 (the rendezvous dir, through $ATERM_PARENT_SESSION_ID), or the reason.
                 A hook that cannot reach aterm exits 0 and says why on stderr; only a
                 hold and a wake ever block.
-                `--report-to @<sid>` makes the END-OF-TURN REPORT structural: before the
-                Stop hook waits for mail it posts the agent's LAST message — the last
-                assistant text in the transcript Claude Code hands the hook
-                (transcript_path, a regular file) — to <sid> as kind=report, re= the
-                newest task in the agent's own inbox that is unhandled or newer than its
-                last report, trimmed to 4 KiB with a marker, once per message (a re-fired
-                Stop posts nothing twice); the recipient is asked status first and the
+                `--report-to @<sid>` makes the END-OF-TURN REPORT structural: the Stop
+                hook posts what the agent's SCREEN says — `status` names the settled
+                screen's seq=/hash=, `text` hands over its rows, the hook hashes the
+                rows itself and checks them against that stamp, and the body is that
+                stamp line then the rows from the last ⏺ row down to where the live zone
+                begins (or the last six non-blank rows) — to <sid> as kind=report, re=
+                the newest task in the agent's own inbox that is unhandled or newer than
+                its last report, trimmed to 4 KiB with a marker, once per SCREEN (a
+                re-fired Stop reads the same screen and posts nothing twice). ` busy=1`
+                on the stamp line means the screen was still mid-turn on every read, so
+                that stamp will NOT match `history`. The recipient is asked status first
+                and the
                 post waited on for its landing, then charged to the wake budget (queued
                 behind a bridge whose link is down: charged and said; in the outbox of an
                 instance with no bridge: said, not charged); the agent is never told to
                 post it, and a manager parked on `aterm drive watch --mail` reads it as
-                the turn's report. Fail-open like the rest: no transcript, a transcript
-                that is not Claude Code's or not a regular file, a spent budget, a
-                recipient not hosted, a refused post — the reason on stderr, nothing
-                posted, the wait as without the flag. `hook run stop --check` ends
+                the turn's report. Fail-open like the rest: an instance whose status
+                carries no stamp, a screen that moves under the two reads every try, a
+                spent budget, a recipient not hosted, a refused post — the reason on
+                stderr, nothing posted, the wait (when --keep-alive asks for one) as
+                without the flag. `hook run stop --check` ends
                 `report-to=<sid>` once the recipient answers status and `fabric status`
                 is not `state=absent supervised=0`, so the installer refuses a recipient
                 the instance does not host and an instance with no bridge and none coming.
@@ -3677,7 +3846,12 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         // `link` is the VERB that runs the bridge; the fabric page is what a
         // reader of it needs, and `every_front_door_verb_resolves` requires
         // every front-door verb to land on a page rather than exit 2.
-        "inbox" | "post" | "mail" | "link" => "fabric",
+        // …and the three a reader of a BROADCAST types. `topic` is the verb
+        // that opts a session in; `say` and `broadcast` are what someone who
+        // has seen `to=say:<topic>` guesses. All land on the fabric page,
+        // which is where the mailbox and the fan-out are explained together —
+        // a separate page would split one subject in two.
+        "inbox" | "post" | "mail" | "link" | "topic" | "say" | "broadcast" => "fabric",
         // What someone guesses when they want the cursor cat's words.
         "pet" | "cat" | "tricks" | "kitty-commands" | "list-kitty-commands" => "kitty",
         other => other,
@@ -5406,7 +5580,15 @@ mod tests {
     /// operator looking for a hook that does not exist.
     #[test]
     fn fabric_topic_is_reachable_and_honest_about_wake_paths() {
-        for name in ["fabric", "inbox", "post", "mail"] {
+        for name in [
+            "fabric",
+            "inbox",
+            "post",
+            "mail",
+            "topic",
+            "say",
+            "broadcast",
+        ] {
             let (page, code) = render(Some(name), None);
             assert_eq!(code, 0, "`aterm help {name}` should resolve");
             assert!(

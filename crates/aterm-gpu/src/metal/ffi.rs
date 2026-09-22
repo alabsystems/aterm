@@ -467,11 +467,12 @@ impl PixelFormat {
     }
 }
 
-/// `MTLVertexFormat`, for the four instance layouts in `cell.metal`.
+/// `MTLVertexFormat`, for the five instance layouts in `cell.metal` /
+/// `hdr_glow.metal`.
 #[derive(Clone, Copy, Debug)]
 #[repr(usize)]
 pub(crate) enum VertexFormat {
-    /// `Uint8x4` — the fire `tsl` bytes.
+    /// `Uint8x4` — the fire `tsl` bytes and the glow colour pair.
     UChar4 = 3,
     /// `Unorm8x4` — every packed RGBA colour.
     UChar4Normalized = 9,

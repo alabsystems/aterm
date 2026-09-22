@@ -90,32 +90,44 @@ pub(crate) fn send_bytes(rest: &str) -> Vec<u8> {
 /// returning the modifier mask and the rest of the line with the token removed.
 /// Additive: a verb line WITHOUT `mods=` parses to `Modifiers::empty()` and the
 /// untouched line, so every existing caller stays byte-compatible.
-pub(crate) fn take_mods(rest: &str) -> (aterm_types::keyboard::Modifiers, String) {
+/// A NAME THIS TABLE DOES NOT KNOW IS A REFUSAL (`None`), never a silent drop —
+/// `hwkey::take_tokens`' own rule, "any unparsable token value is an error
+/// rather than a silent default". Dropping it made `key a mods=CTRL` answer
+/// `OK` and deliver a BARE `a`, while the inline spelling of the same intent
+/// (`key CTRL+a`) answered the usage line and the `type=` / `base=` tokens
+/// beside it refused their own bad values. The verb that carries the
+/// controller half of the modifier convergence cannot report success for a
+/// chord it did not send.
+pub(crate) fn take_mods(rest: &str) -> Option<(aterm_types::keyboard::Modifiers, String)> {
     use aterm_types::keyboard::Modifiers;
     let mut m = Modifiers::empty();
     let mut kept: Vec<&str> = Vec::new();
     for tok in rest.split_whitespace() {
         if let Some(list) = tok.strip_prefix("mods=") {
             for name in list.split(['+', ',']) {
-                match name {
-                    "shift" => m |= Modifiers::SHIFT,
-                    "ctrl" | "control" => m |= Modifiers::CTRL,
-                    "alt" | "option" => m |= Modifiers::ALT,
+                m |= match name {
+                    "shift" => Modifiers::SHIFT,
+                    "ctrl" | "control" => Modifiers::CTRL,
+                    "alt" | "option" => Modifiers::ALT,
                     // `meta` is its OWN modifier (Kitty CSI-u bit 8), distinct from
                     // ALT — a controller can now drive a real Meta chord. Legacy /
                     // xterm encoders ignore META/HYPER so their bytes are unchanged;
                     // only the Kitty keyboard protocol gains the extra bit.
-                    "meta" => m |= Modifiers::META,
-                    "hyper" => m |= Modifiers::HYPER,
-                    "super" | "cmd" | "command" => m |= Modifiers::SUPER,
-                    _ => {}
-                }
+                    "meta" => Modifiers::META,
+                    "hyper" => Modifiers::HYPER,
+                    "super" | "cmd" | "command" => Modifiers::SUPER,
+                    // A bare `mods=` (or a trailing separator) names no
+                    // modifier and asks for none — the empty element the
+                    // hardware-key parser accepts too.
+                    "" => Modifiers::empty(),
+                    _ => return None,
+                };
             }
         } else {
             kept.push(tok);
         }
     }
-    (m, kept.join(" "))
+    Some((m, kept.join(" ")))
 }
 
 /// Parse the optional trailing `type=<press|repeat|release>` token, returning the
@@ -300,10 +312,11 @@ fn named_key_from_token(body: &str) -> Option<aterm_types::keyboard::NamedKey> {
 /// human's named-key press builds, so the seam (the plain verb's encoder caller) yields
 /// byte-identical output incl. Kitty REPORT_ALTERNATE_KEYS. All trailing tokens
 /// are ADDITIVE — a bare `key up` still parses to empty mods / Press / no base.
-/// Returns `None` for an unknown key name or a malformed `type=`/`base=` value.
+/// Returns `None` for an unknown key name or a malformed `mods=`/`type=`/`base=`
+/// value.
 pub(crate) fn parse_key(rest: &str) -> Option<InputEvent> {
     use aterm_types::keyboard::Key;
-    let (mut mods, body) = take_mods(rest);
+    let (mut mods, body) = take_mods(rest)?;
     let (event_type, body) = take_event_type(&body)?;
     let (base_explicit, body) = take_base_layout(&body)?;
     // Inline modifier prefixes: `ctrl+u`, `alt+x`, `ctrl+shift+a`, ... The
@@ -911,12 +924,26 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
     for tok in rest.split_whitespace() {
         if let Some(list) = tok.strip_prefix("mods=") {
             for name in list.split(['+', ',']) {
-                match name {
-                    "shift" => mods |= SHIFT_MASK,
-                    "alt" | "option" | "meta" => mods |= ALT_MASK,
-                    "ctrl" | "control" => mods |= CTRL_MASK,
-                    _ => {}
-                }
+                // A NAME THIS TABLE DOES NOT KNOW IS A REFUSAL, never a
+                // silent drop — the same rule as `take_mods` above. The
+                // legacy/SGR mouse report has bits for SHIFT/META/CTRL and
+                // for nothing else, so `super` / `cmd` / `hyper` — spellings
+                // `key`'s `take_mods` DOES accept — cannot be encoded here.
+                // Say so, instead of reporting a press the program will read
+                // as unmodified: one advertised `mods=` grammar must not be
+                // honoured two ways across two input verbs.
+                mods |= match name {
+                    "shift" => SHIFT_MASK,
+                    "alt" | "option" | "meta" => ALT_MASK,
+                    "ctrl" | "control" => CTRL_MASK,
+                    "" => 0,
+                    other => {
+                        return Err(format!(
+                            "ERR bad modifier `{other}` (a mouse report carries \
+                             shift|alt|meta|ctrl only)\n"
+                        ));
+                    }
+                };
             }
         } else if let Some(c) = tok.strip_prefix("count=") {
             click_count = c.parse::<u8>().unwrap_or(1).clamp(1, 3);

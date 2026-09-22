@@ -84,6 +84,7 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         duration: Duration::from_millis(240),
         length: 18,
         intensity: 0.7,
+        audible: true,
         radius: 0.6,
         ring: true,
         beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
@@ -724,8 +725,38 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // entry is byte-identical. (The classic grade's own commit re-minted
         // no golden here; its suite run was filtered to ring/impact/momentum,
         // so these numbers were first read on the merge.)
-        11_108_773_950_677_089_257,
-        13_440_444_393_441_563_092,
+        // **RE-BASELINED, ALL NINE, 2026-09-21 — MECHANICALLY, the same way
+        // as the `alpha` field on 2026-08-28 (above): ribbon quads carry a
+        // per-column gradient.** `GlowQuad` gained `color2`/`alpha2` (the
+        // quad's RIGHT edge; `ribbon_beam` samples the colour at each slab's
+        // two edges so a whole-cell slab ramps instead of stepping), and the
+        // fold hashes each quad's Debug string, so every string changed for
+        // every style whether or not a photon moved. CHECKED, not
+        // re-recorded blind: (1) exactly ONE emitter writes `color2 !=
+        // color` — `aterm_render::ribbon_beam`, the rainbow kitty's ribbon;
+        // every other producer writes its one colour to both ends
+        // (`GlowQuad::flat`), and `glow_lerp_is_the_identity_on_a_flat_pair_
+        // and_a_monotone_ramp_otherwise` (aterm-render) proves the per-column
+        // law is the bit-exact identity on a flat pair; (2) the damage-word
+        // goldens over the same styles (`cursor_glow::DELETION_GOLDENS`,
+        // which fold a flat quad to the pre-gradient pair bit for bit) held
+        // the eight non-kitty rows UNCHANGED on this tree's run —
+        // `the_other_nine_styles_are_byte_identical_with_v2_unconditional`
+        // green — while the four kitty rows moved; (3)
+        // `gradient_glow_under_is_byte_exact_cpu_vs_gpu` (aterm-gpu) renders
+        // ramps on real Metal and finds CPU == GPU byte-exact, the flat twin
+        // too. So the eight styles' light is unchanged and the fold's INPUT
+        // REPRESENTATION grew two fields; entry 2 alone also carries a real
+        // change of light. If all nine move again without a `GlowQuad` field
+        // change behind them, that is the regression this array exists to
+        // catch. Captured with `ATERM_CAPTURE_TYPED_PARITY=1`: was
+        // `[11_108_773_950_677_089_257, 13_440_444_393_441_563_092,
+        // 750_028_201_522_132_832, 12_359_376_227_302_100_357,
+        // 17_288_162_128_308_037_669, 13_741_658_660_564_044_123,
+        // 8_682_652_025_797_884_188, 1_945_409_555_229_807_496,
+        // 13_099_582_226_493_843_556]`.
+        2_012_044_335_639_200_132,
+        9_056_904_005_182_467_320,
         // RE-BASELINED 2026-09-06 — v1 DELETED (RAINBOW-KITTY-V2.md §17.3
         // phase 7): `rainbow kitty` is its v2 engine unconditionally, so this
         // entry is v2's fold of the same script (and the fold's light channel
@@ -905,13 +936,57 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // and the other eight came back byte-identical from this tree's own
         // capture (`ATERM_CAPTURE_TYPED_PARITY=1`) — which is the whole reason
         // the eight are kept here.
-        750_028_201_522_132_832,
-        12_359_376_227_302_100_357,
-        17_288_162_128_308_037_669,
-        13_741_658_660_564_044_123,
-        8_682_652_025_797_884_188,
-        1_945_409_555_229_807_496,
-        13_099_582_226_493_843_556,
+        //
+        // **RE-BASELINED 2026-09-21, THE FOLD FLOW, AND AGAIN ONLY ENTRY
+        // `2`** (was `750_028_201_522_132_832`). The script's wrap — the
+        // licensed typed fold `(2, 36) → (3, 0)` — now sets the row it left
+        // FLOWING (`Cohort::flow`, `Ribbon::flow_row`; the owner: *"the
+        // previous row's rainbow flows in the direction of typing while the
+        // rainbow continues on the next line"*): row 2 slides into its fold
+        // point from its last key over `FLOW_SLIDE_S` instead of holding
+        // still through its grace. Decomposed: with `Ribbon::flow_cohort`
+        // forced to a no-op and every other law of the round in place (the
+        // relay's walk, the follow pass, the flush clock, the witness's
+        // standing-space law), entry 2 reads `750_028_201_522_132_832`
+        // again, to the bit — the flow is the whole of the move — and the
+        // other eight came back byte-identical.
+        //
+        // **MERGED 2026-09-22 (the rainbow-ribbon integration).** The fold
+        // flow above and the gradient quad (`GlowQuad::color2`, the cause at
+        // the top of this array) both move entry 2; entries 0, 1 and 3..=8
+        // are the gradient branch's re-bake unchanged (the flow reaches no
+        // other style). Entry 2 was re-captured on the merged tree with
+        // `ATERM_CAPTURE_TYPED_PARITY=1`, and the other eight came back
+        // byte-identical to the gradient branch's values — the control.
+        // Entry 2: flow alone `7_947_582_046_364_369_296`, gradient alone
+        // `7_972_335_274_463_860_508`, both `2_404_759_666_353_363_322`.
+        // (…and all seven below re-baselined 2026-09-21 with entries 0 and
+        // 1 — the mechanical gradient-field cause recorded at the top.)
+        // **RE-BASELINED 2026-09-22, THE SPARK-FLOOR ROUND, AND AGAIN ONLY
+        // ENTRY `2`.** A meteor landing's SPARK SHOWER now keeps the
+        // ribbon's own floor law (`rainbow_kitty::meteor`'s `spark_room`,
+        // `rainbow_kitty::ribbon::Ribbon::hand_floor`): a spark whose throw
+        // would carry it left of the leftmost column the hand has held on
+        // that row is thrown the other way instead, at its own speed, for
+        // its own life. The shower is a rainbow-kitty landing mark, so
+        // `GlowStyle::RainbowKitty` is the one entry that may move — and the
+        // other eight came back byte-identical from this tree's own capture
+        // (`ATERM_CAPTURE_TYPED_PARITY=1`), which is the whole reason the
+        // eight are kept here. Nothing is culled, shortened or damped; only
+        // the direction of a throw that would have left the hand's ink.
+        // **MERGED 2026-09-22, ROUND TWO** (main's spark-floor and hand-floor
+        // rounds, this branch's fold flow and gradient quad): entry 2 is the
+        // only one the two rounds both move, and it is re-captured on the
+        // merged tree (`ATERM_CAPTURE_TYPED_PARITY=1`) — main's value
+        // `18_370_343_873_451_645_674` is what the merged tree reads, entries
+        // 0, 1 and 3..=8 came back byte-identical to main's, the control.
+        18_370_343_873_451_645_674,
+        6_434_568_479_864_447_486,
+        1_103_233_083_236_013_119,
+        10_518_610_175_969_919_396,
+        9_195_345_295_744_972_650,
+        16_308_416_874_437_072_549,
+        9_650_234_412_234_410_662,
     ];
     let styles = ALL_STYLES;
     let mut actual = [0u64; 9];
@@ -991,7 +1066,34 @@ fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
     // entry 2 above) moves the flat fold with the comet one. Read off this
     // tree's own run as `15_974_855_624_796_755_313`; the `assert_ne!` control
     // below still holds.
-    const PRE_COMET: u64 = 3_217_110_197_472_841_106;
+    // RE-CAPTURED 2026-09-21, THE FOLD FLOW (was
+    // `3_217_110_197_472_841_106`): the flow is not a comet branch — the
+    // flag gates the comet profile, the vivid rail and the from-the-hand
+    // wipe, not whether a row the hand typed off slides into its fold — so
+    // it moves the flat fold with the comet one. With `Ribbon::flow_cohort`
+    // forced to a no-op this reads `3_217_110_197_472_841_106` again, to the
+    // bit; the `assert_ne!` control below still holds.
+    // RE-CAPTURED 2026-09-21: ribbon quads carry a per-column gradient
+    // (`GlowQuad::color2`; the mechanical cause on `GOLDEN` above). The flat
+    // spelling collapses the comet BODY, not the colour walk, so its slabs
+    // ramp too and its Debug fold moves with the rest: was
+    // `3_217_110_197_472_841_106`; the `assert_ne!` control below still holds.
+    // MERGED 2026-09-22: both causes at once, re-captured on the merged tree
+    // (`ATERM_CAPTURE_TYPED_PARITY=1`): flow alone `13_244_379_200_867_644_932`,
+    // gradient alone `3_090_160_706_360_356_223`.
+    // RE-CAPTURED 2026-09-22, THE SPARK-FLOOR ROUND: a landing's spark
+    // shower is not a comet branch either — the flag gates the comet
+    // profile, the vivid rail and the from-the-hand wipe, not where a
+    // landing may throw its sparks — so bounding the shower at the hand's
+    // floor (see `GOLDEN`'s entry 2 above) moves the flat fold with the
+    // comet one. Read off this tree's own run as
+    // `2_196_076_727_577_883_205`; the `assert_ne!` control below still
+    // holds, which is what keeps this a pin on the COLLAPSE.
+    // MERGED 2026-09-22, ROUND TWO: both rounds' causes at once, re-captured
+    // on the merged tree (`ATERM_CAPTURE_TYPED_PARITY=1`); the `assert_ne!`
+    // control below still holds, which is what keeps this a pin on the
+    // COLLAPSE rather than on a number.
+    const PRE_COMET: u64 = 14_052_065_336_766_733_923;
     let mut flat = cfg(GlowStyle::RainbowKitty);
     flat.ribbon_flat = true;
     let a = typed_script_with(&flat, true);

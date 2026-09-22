@@ -12,7 +12,7 @@
 //   - blink phase off (Blinking* styles only) and DECTCEM-hidden: no cursor.
 
 use aterm_core::terminal::{CursorStyle, Terminal};
-use aterm_render::{Frame, Renderer, Theme, cursor_rects};
+use aterm_render::{Frame, Renderer, Theme, cursor_rects, for_each_cursor_rect};
 
 const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
 const FG: u32 = 0x00D0_D0D0; // Theme::default().fg
@@ -39,6 +39,63 @@ fn term_with(bytes: &[u8]) -> Terminal {
     let mut t = Terminal::new(2, 4);
     t.process(bytes);
     t
+}
+
+#[test]
+fn cursor_rect_visitor_preserves_order_and_degenerate_geometry() {
+    // Literal geometry pins the visitor independently of the collecting API.
+    // In particular, retain zero-area strips and overlapping tiny hollow edges:
+    // the painters, not this shared generator, own their clipping/blending.
+    let check = |style, w, h, expected: &[[usize; 4]]| {
+        let mut actual = [[0; 4]; 128];
+        let mut len = 0;
+        for_each_cursor_rect(style, 7, 11, w, h, |rect| {
+            actual[len] = rect;
+            len += 1;
+        });
+        assert_eq!(&actual[..len], expected, "{style:?}, {w}x{h}");
+        assert_eq!(cursor_rects(style, 7, 11, w, h), expected);
+    };
+    for style in [CursorStyle::BlinkingBlock, CursorStyle::SteadyBlock] {
+        check(style, 13, 32, &[[7, 11, 13, 32]]);
+        check(style, 0, 0, &[[7, 11, 0, 0]]);
+    }
+    for style in [CursorStyle::BlinkingUnderline, CursorStyle::SteadyUnderline] {
+        check(style, 13, 32, &[[7, 39, 13, 4]]);
+        check(style, 1, 1, &[[7, 11, 1, 1]]);
+        check(style, 13, 0, &[[7, 11, 13, 0]]);
+    }
+    for style in [CursorStyle::BlinkingBar, CursorStyle::SteadyBar] {
+        check(style, 13, 32, &[[7, 11, 2, 32]]);
+        check(style, 1, 1, &[[7, 11, 1, 1]]);
+        check(style, 0, 32, &[[7, 11, 0, 32]]);
+    }
+    check(
+        CursorStyle::HollowBlock,
+        13,
+        32,
+        &[
+            [7, 11, 13, 2],
+            [7, 41, 13, 2],
+            [7, 13, 2, 28],
+            [18, 13, 2, 28],
+        ],
+    );
+    check(
+        CursorStyle::HollowBlock,
+        1,
+        1,
+        &[[7, 11, 1, 1], [7, 11, 1, 1], [7, 12, 1, 0], [7, 12, 1, 0]],
+    );
+    check(
+        CursorStyle::Bolt,
+        4,
+        4,
+        &[[8, 11, 3, 1], [8, 12, 2, 1], [8, 13, 2, 1], [7, 14, 2, 1]],
+    );
+    check(CursorStyle::Bolt, 0, 2, &[[7, 11, 1, 1], [7, 12, 1, 1]]);
+    check(CursorStyle::Bolt, 13, 0, &[]);
+    check(CursorStyle::Hidden, 13, 32, &[]);
 }
 
 #[test]

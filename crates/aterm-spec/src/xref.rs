@@ -1030,6 +1030,11 @@ pub fn model_registry() -> Vec<Model> {
         operator_fleet_fault_model(),
         // A7 (WS-G): the PTY-master fd-lifecycle ownership discipline — drift-free
         // twin of FdLifecycle.tla, anchored to aterm-session/src/sink.rs.
+        // The app's TCC identity is EXCLUSIVE: a second bundle claiming it can
+        // destroy the grant for every copy, so a conflict must never be silent
+        // and nothing may be retired unnamed. Tier-1 drives the real
+        // `aterm_containment::consent::classify_claimants`.
+        tcc_identity_claim_exclusivity_model(),
         fd_lifecycle_model(),
         // WS-G: spawn-time locale guarantee — the child always runs under a UTF-8
         // LC_CTYPE. Abstract twin of aterm_pty::resolve_spawn_locale (real-code

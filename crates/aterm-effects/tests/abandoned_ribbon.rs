@@ -44,7 +44,7 @@ use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::rainbow_kitty::ribbon::{
-    PHRASE_REST_MIN_S, RETIRE_MELT_S, RETRACT_DUR_S, RETRACT_FADE_S, SWOOSH_TOTAL_S,
+    FLOW_TOTAL_S, PHRASE_REST_MIN_S, RETRACT_DUR_S, RETRACT_FADE_S, SWOOSH_TOTAL_S,
 };
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
@@ -83,6 +83,7 @@ fn cfg() -> GlowConfig {
         duration: Duration::from_millis(240),
         length: 18,
         intensity: 0.7,
+        audible: true,
         radius: 0.6,
         ring: true,
         beam: false,
@@ -270,6 +271,12 @@ impl Host {
         self.glow.v2_status().map_or(0, |s| s.retired)
     }
 
+    /// `ribbon_followed=`: the cells the follow pass carried to another
+    /// row with their text (2026-09-21).
+    fn followed(&self) -> u64 {
+        self.glow.v2_status().map_or(0, |s| s.followed)
+    }
+
     /// Seconds since the last key — the guards below use it to prove the
     /// band was still inside its own grace (no swoosh could have taken it).
     fn since_key(&self) -> f32 {
@@ -310,6 +317,15 @@ fn hello(row: u16) -> Host {
 /// (0.90 s at the floor, not a 0.75 s literal), so the swoosh is
 /// `SWOOSH_TOTAL_S` = 1.69 s, and both numbers are derived rather than
 /// written down.
+///
+/// THE FOLD FLOW (re-pinned 2026-09-21 — the owner: *"the previous row's
+/// rainbow vanishes suddenly … a beautiful animation where the previous
+/// row's rainbow flows in the direction of typing"*). The row the hand
+/// wrapped off no longer holds still through its grace: `leave_row` marks
+/// it flowing (`Cohort::flow`) and it slides into the fold point from its
+/// own last key over `FLOW_SLIDE_S`, then fades — gone by `FLOW_TOTAL_S` =
+/// 1.34 s, moving throughout. The row scope is untouched: no key on row 6
+/// renews it, and the bound below is the flow's own span.
 #[test]
 fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_the_second() {
     let mut h = Host::at_row(5);
@@ -332,12 +348,13 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
         let since = h.now.saturating_duration_since(left_row_5).as_secs_f32();
         assert!(h.lit(6), "row 6 is lit under the hand at +{since:.2} s");
         if since < (RETRACT_DUR_S + RETRACT_FADE_S) * 0.9 {
-            // The wrap ABANDONS the row the caret left (`leave_row`), so it
-            // leaves on the retract's own span rather than its grace — and
-            // it must keep its light the whole way down: no early cut.
+            // The wrap sets the row the caret left FLOWING (`leave_row`,
+            // 2026-09-21): it slides into the fold from its own last key
+            // and must keep light on the glass the whole way down — no
+            // early cut — for well past the old retract's span.
             assert!(
                 h.lit(5),
-                "row 5 keeps the life it had through its grace (+{since:.2} s)"
+                "row 5 keeps its light through the flow's first half (+{since:.2} s)"
             );
             row_5_lit_at_grace = true;
         }
@@ -345,16 +362,22 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
             row_5_dark_at = Some(since);
         }
     }
-    assert!(row_5_lit_at_grace, "the grace was observed");
+    assert!(row_5_lit_at_grace, "the flow's first half was observed");
     let dark = row_5_dark_at.expect(
         "row 5 must go dark while the hand is still typing on row 6 — a global hold          keeps it at full light for as long as any key is live",
     );
-    // THE BOUND: its own swoosh, and not a frame later than one key's cadence
-    // past it (the read is once per key, 90 ms apart).
+    // THE BOUND (re-pinned 2026-09-21, the fold flow): the row's own flow,
+    // `FLOW_TOTAL_S` = 1.34 s from the wrap key (one key's cadence after
+    // the row's last key), and not a frame later than one key's cadence
+    // past it (the read is once per key, 90 ms apart). Until 2026-09-21
+    // this read `RETRACT_DUR_S + RETRACT_FADE_S ..= SWOOSH_TOTAL_S + 0.1`
+    // (0.64 .. 1.79 s): the folded row held still for its 0.90 s grace and
+    // then left through the swoosh — the owner's "vanishes suddenly".
     assert!(
-        (RETRACT_DUR_S + RETRACT_FADE_S..=SWOOSH_TOTAL_S + 0.1).contains(&dark),
+        (FLOW_TOTAL_S..=FLOW_TOTAL_S + 0.09 + 0.1).contains(&dark),
         "row 5 went out at +{dark:.2} s after the caret left it; the bound is the \
-         abandon's own retract, and never past its swoosh, {SWOOSH_TOTAL_S} s"
+         fold flow's own span, {FLOW_TOTAL_S} s from the wrap key, and never past \
+         one key's cadence after it"
     );
     // THE ABSOLUTE CEILING, AND WHY IT MOVED. This read 1.6 s while the swoosh
     // was a 1.54 s literal. The phrase rest is now the melody's — 0.90 s at 2.8
@@ -397,8 +420,22 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
 /// owner's defect. What the flush owes is the landing, and since the
 /// re-anchor's one-cell sweep it pays it: the next key flushes the park and
 /// the growth key's own glyph lights beside it.
+///
+/// **RE-PINNED 2026-09-21 — THE BAND FOLLOWS ITS TEXT.** The growth key's
+/// rewrite is exactly the shape the follow pass (`rk::witness`,
+/// `Engine::follow_rows`) was built for: every glyph of `hello world` is
+/// gone from row 6 and stands one row up at its own column. So the band is
+/// no longer melted where its text WAS; it is TRANSLATED to row 5 under
+/// its text on the frame the box grew, with every clock intact and nothing
+/// retired, and — the text having left the caret's row, which is the fold
+/// — it FLOWS there: it slides into the fold point over `FLOW_SLIDE_S` and
+/// fades over `RETRACT_FADE_S`, gone by `FLOW_TOTAL_S`, while the hand
+/// types on the caret row. The park's own laws are unchanged: the wrap's
+/// verdict is still held and flushed by the next key, which lays the
+/// landing. The owner's vanish (2026-09-21) was this fixture's old
+/// expectation on his glass.
 #[test]
-fn the_box_growth_wrap_melts_the_old_band_at_once_and_the_flush_pays_its_landing() {
+fn the_box_growth_wrap_carries_the_band_up_with_its_text_and_the_flush_pays_its_landing() {
     let mut h = hello(6);
     // The key that grows the box: line 1 is re-laid a row up, line 2 (this
     // key's glyph) on the caret's row, the caret after it.
@@ -410,28 +447,39 @@ fn the_box_growth_wrap_melts_the_old_band_at_once_and_the_flush_pays_its_landing
         "the caret stayed on its row and re-anchored left"
     );
     let want: Vec<u16> = (0..11).collect();
-    assert_eq!(
-        h.leaving(6),
-        want,
-        "the old band's cells, now blank or overwritten, are retired at once"
-    );
     assert!(
-        h.live(6).is_empty(),
-        "the park holds the wrap's own verdict"
+        h.cells(6).is_empty(),
+        "the band left the caret row with its text, unstamped: {:?}",
+        h.cells(6)
     );
+    assert_eq!(
+        h.live(5),
+        want,
+        "…and stands under its text one row up, every cell and the space between"
+    );
+    assert_eq!(h.retired(), 0, "nothing was retired by content");
+    assert_eq!(h.followed(), 11, "every cell followed its text");
+    assert!(h.lit(5), "the row the text moved to carries the band");
     assert_eq!(
         h.glow.in_flight_tally().park_flushed,
         0,
         "…held, not judged: nothing flushed yet"
     );
+    let flowing = h
+        .glow
+        .v2_ribbon()
+        .expect("rainbow kitty owns the frame")
+        .cohorts()
+        .iter()
+        .filter(|k| k.row == 5)
+        .all(|k| k.flow.is_some());
     assert!(
-        !h.lit(5),
-        "the row the text moved to was never typed on here: dark"
+        flowing,
+        "the run the text carried away from the caret's row flows"
     );
-    assert_eq!(h.retired(), 11);
     // Typing on: the first key FLUSHES the park — the wrap's landing is laid
     // at the key's own clock — and then lays its own cell; each key after it
-    // renews only the live run, and the retired cells keep melting.
+    // renews only the live run, and the followed band keeps flowing.
     h.type_str("yz");
     assert_eq!(
         h.glow.in_flight_tally().park_flushed,
@@ -448,10 +496,18 @@ fn the_box_growth_wrap_melts_the_old_band_at_once_and_the_flush_pays_its_landing
     assert_eq!(
         h.cells(6),
         vec![(0, false), (1, false), (2, false)],
-        "the old band is gone inside 200 ms; the typed cells stand"
+        "the typed cells stand on the caret row"
     );
-    assert!(!h.lit(5));
+    assert!(h.lit(5), "the followed band is still flowing 0.4 s on");
     assert!(h.lit(6));
+    // …and it is gone by the flow's end, the hand still on row 6.
+    h.idle((FLOW_TOTAL_S * 1000.0) as u64);
+    assert!(
+        h.cells(5).is_empty() && !h.lit(5),
+        "the followed band flowed out inside FLOW_TOTAL_S: {:?}",
+        h.cells(5)
+    );
+    assert_eq!(h.retired(), 0, "…and still nothing was retired by content");
 }
 
 /// (i) D2, the control: an ED and the same text back at the same cells in
@@ -486,12 +542,25 @@ fn a_prompt_redraw_that_puts_the_same_text_back_keeps_every_cell() {
 }
 
 /// (ii) The relocation: an ED, the text re-drawn two rows down, the caret
-/// with it, no key. The move is DECLINED (no fresh hint); the witness sees
-/// row 5's glyphs go and retires the band; row 7 — text nobody typed here —
-/// stays dark. RED on main: row 5 stayed lit for its whole life (the band was
-/// stranded) and `ribbon_retired` did not exist.
+/// with it, no key. The move is DECLINED (no fresh hint).
+///
+/// RE-PINNED 2026-09-21 (the band follows its text — `rk::witness`'s follow
+/// pass, `Engine::follow_rows`; RED on main before 2026-09-12 because row 5
+/// stayed lit for its whole life with its text gone, the stranded band).
+/// From 2026-09-12 to 2026-09-21 this pinned the melt: the witness saw row
+/// 5's glyphs go and retired the band in `RETIRE_MELT_S`, and row 7 — "text
+/// nobody typed here" — stayed dark. That was the wrong reading of a box
+/// that moved WITH its text: the hand typed exactly those glyphs, and the
+/// light belongs under them. Now the run's glyphs are found two rows down
+/// at their own columns, gone from their own row, and the band is
+/// TRANSLATED there with every clock intact — nothing stamped, nothing
+/// retired, `ribbon_followed=` counting the cells. The caret went with the
+/// text, so the run is not flowing: it keeps the clock its last key gave
+/// it. A relocation whose text is NOT found still retires as before
+/// (`a_band_overwritten_with_different_text_is_retired`, and the true
+/// re-layout control in `composer_box_growth_wrap.rs`).
 #[test]
-fn a_relocated_input_box_retires_the_band_on_the_abandoned_row_and_lights_nothing_on_the_new_one() {
+fn a_relocated_input_box_carries_the_band_with_its_text_and_stamps_nothing() {
     let mut h = hello(5);
     h.idle(400);
     h.program(b"\x1b[2J\x1b[8;1Hhello world");
@@ -503,33 +572,94 @@ fn a_relocated_input_box_retires_the_band_on_the_abandoned_row_and_lights_nothin
         "the relocation had no key behind it"
     );
     let want: Vec<u16> = (0..11).collect();
-    assert_eq!(
-        h.leaving(5),
-        want,
-        "every cell of the abandoned band is retired on the frame"
+    assert!(
+        h.cells(5).is_empty(),
+        "the band left row 5 with its text: {:?}",
+        h.cells(5)
     );
-    assert_eq!(h.retired(), 11);
-    assert!(!h.lit(7), "row 7 holds text nobody typed: dark");
+    assert_eq!(h.live(7), want, "…and stands under it on row 7, unstamped");
+    assert_eq!(h.retired(), 0, "nothing was retired by content");
+    assert_eq!(h.followed(), 11, "every cell followed its text");
+    assert!(h.lit(7), "row 7 is lit under the text the hand typed");
+    assert!(!h.lit(5), "…and row 5 is dark");
     h.idle(200);
     assert!(
         h.since_key() < GRACE_S,
         "inside the grace: the swoosh could not have taken it"
     );
-    assert!(
-        h.cells(5).is_empty(),
-        "row 5 is out of the pool inside 200 ms"
-    );
-    assert!(!h.lit(5), "…and off the glass");
-    assert!(!h.lit(7), "row 7 stays dark");
-    assert!(
-        (RETIRE_MELT_S * 1000.0) as u64 <= 150,
-        "the melt is inside the 150 ms the ruling allows"
-    );
+    assert_eq!(h.live(7), want, "the band stays under its text");
+    assert!(h.cells(5).is_empty());
+    assert!(h.lit(7));
+    assert!(!h.lit(5));
 }
 
-/// (iii) The next key after the relocation lays on row 7, nothing on row 5:
-/// the mirror followed the DECLINED row change. RED on main: the key laid at
-/// the stale mirror, `(5, 11)`.
+/// **THE NEGATIVE CONTROL OF THE FOLLOW: A KILLED LINE UNDER ITS OWN
+/// TWIN.** Row 4 holds the previous command, `$ cd ..`; the hand types the
+/// same `cd ..` on row 5 and readline's Ctrl-U redraw (`\r$ \x1b[K`, no
+/// key hint — a program's own repaint) blanks it. The run's glyphs are
+/// gone from row 5, and row 4 holds the same glyphs at the same columns
+/// as one block — but they were STANDING THERE before any of this run's
+/// glyphs was laid: nothing moved, nothing arrived, and the follow pass
+/// must not carry the band onto a line no key wrote this time. The band
+/// is released into the swoosh, exactly as with any other line above
+/// (the control: `$ ls -la`). RED on the integration tree before the fix
+/// at `followed == 0` (`followed=5`, row 4 lit for 1.28 s).
+#[test]
+fn a_killed_line_under_an_identical_line_is_released_not_followed_onto_it() {
+    for above in ["cd ..", "ls -la"] {
+        let mut h = Host::at_row(4);
+        h.program(format!("$ {above}\r\n$ ").as_bytes());
+        h.type_str("cd ..");
+        h.idle(64);
+        assert_eq!(h.live(5), vec![2, 3, 4, 5, 6], "the band is under `cd ..`");
+        assert!(!h.lit(4), "row 4 is dark before the kill");
+        h.program(b"\r$ \x1b[K");
+        assert_eq!(h.followed(), 0, "above `{above}`: nothing followed");
+        let mut lit4 = 0;
+        for _ in 0..90 {
+            h.idle(16);
+            lit4 += usize::from(h.lit(4));
+        }
+        assert_eq!(
+            lit4, 0,
+            "above `{above}`: the previous command's row never lights"
+        );
+        assert!(h.cells(4).is_empty(), "above `{above}`: {:?}", h.cells(4));
+    }
+}
+
+/// **…AND WITH THE KILL KEY BEHIND IT.** The same line, killed by the hand:
+/// `note_kill` precedes the erase's bytes (`\b`×5 and `EL`). The kill's own
+/// retract must take the band on its own row — row 5 lit while it drains
+/// — and the identical line above must stay dark. RED on the integration
+/// tree before the fix: the follow pass ran before the kill replayed,
+/// carried the band onto row 4, and row 5 was never lit.
+#[test]
+fn a_ctrl_u_under_an_identical_line_drains_on_its_own_row() {
+    let mut h = Host::at_row(4);
+    h.program(b"$ cd ..\r\n$ ");
+    h.type_str("cd ..");
+    h.idle(300);
+    h.now += Duration::from_millis(90);
+    h.glow.note_kill(h.now, true);
+    h.term.process(b"\x08\x08\x08\x08\x08\x1b[K");
+    h.frame();
+    assert_eq!(h.followed(), 0, "nothing followed onto the line above");
+    let (mut lit4, mut lit5) = (0, 0);
+    for _ in 0..90 {
+        h.idle(16);
+        lit4 += usize::from(h.lit(4));
+        lit5 += usize::from(h.lit(5));
+    }
+    assert_eq!(lit4, 0, "the previous command's row never lights");
+    assert!(lit5 > 0, "the kill's swoosh drains on the killed row");
+}
+
+/// (iii) The next key after the relocation lays on row 7 BESIDE the band
+/// that followed the text there, nothing on row 5: the mirror followed the
+/// DECLINED row change. RED on main before 2026-09-12: the key laid at the
+/// stale mirror, `(5, 11)`. RE-PINNED 2026-09-21: the band is on row 7 too
+/// (see (ii)), so the key's cell joins it — one run, columns 0..=11.
 #[test]
 fn the_next_key_after_a_declined_relocation_lays_at_the_caret_s_true_cell() {
     let mut h = hello(5);
@@ -538,7 +668,12 @@ fn the_next_key_after_a_declined_relocation_lays_at_the_caret_s_true_cell() {
     h.idle(200);
     assert!(h.cells(5).is_empty());
     h.key(b"x", 1);
-    assert_eq!(h.live(7), vec![11], "the key laid its own cell on row 7");
+    let want: Vec<u16> = (0..12).collect();
+    assert_eq!(
+        h.live(7),
+        want,
+        "the key laid its own cell on row 7 beside the band that followed"
+    );
     assert!(
         h.cells(5).is_empty(),
         "…and nothing on the row the caret left"
@@ -692,8 +827,13 @@ fn a_wide_glyph_s_two_cells_are_retired_as_one_unit() {
 /// re-anchor's one-cell sweep: the park had deferred the mirror past the
 /// key's `Typed` replay, the glyph landed on the abandoned band instead and
 /// the landing was dark for good.
+///
+/// RE-PINNED 2026-09-21 (the band follows its text — see the sibling
+/// above): the band is carried up under its text on the growth frame and
+/// flows there, nothing is retired, and the silent flush still lays the
+/// landing on the caret row as before.
 #[test]
-fn the_box_growth_wrap_melts_the_band_at_once_and_a_silent_flush_lays_its_landing() {
+fn the_box_growth_wrap_carries_the_band_up_and_a_silent_flush_lays_its_landing() {
     let mut h = hello(6);
     h.key(b"\x1b[6;1Hhello world\x1b[7;1H\x1b[2Kx", 1);
     let c = h.term.cursor();
@@ -703,26 +843,22 @@ fn the_box_growth_wrap_melts_the_band_at_once_and_a_silent_flush_lays_its_landin
         "the caret stayed on its row and re-anchored left"
     );
     let want: Vec<u16> = (0..11).collect();
-    assert_eq!(
-        h.leaving(6),
-        want,
-        "the old band's cells, now blank or overwritten, are retired at once"
-    );
     assert!(
-        h.live(6).is_empty(),
-        "the park holds the wrap's own verdict"
+        h.cells(6).is_empty(),
+        "the band left the caret row with its text: {:?}",
+        h.cells(6)
     );
-    assert!(
-        !h.lit(5),
-        "the row the text moved to was never typed on here: dark"
-    );
-    assert_eq!(h.retired(), 11);
+    assert_eq!(h.live(5), want, "…and stands under it one row up");
+    assert_eq!(h.retired(), 0);
+    assert_eq!(h.followed(), 11);
+    assert!(h.lit(5), "the row the text moved to carries the band");
     h.idle(200);
     assert!(h.since_key() < GRACE_S);
     assert!(
         h.cells(6).is_empty(),
-        "the old band is gone inside 200 ms — and the park is still held"
+        "nothing on the caret row yet — the park is still held"
     );
+    assert!(h.lit(5), "the followed band is flowing");
     assert_eq!(h.glow.in_flight_tally().park_flushed, 0);
     // Past the park's own window: the flush judges the wrap as the re-anchor
     // it always was and lays the one cell it spent its credit on.
@@ -735,7 +871,13 @@ fn the_box_growth_wrap_melts_the_band_at_once_and_a_silent_flush_lays_its_landin
         "the flush's re-anchor lays the key's own cell at the landing"
     );
     assert!(h.lit(6), "…and it is on the glass");
-    assert!(!h.lit(5));
+    assert!(h.lit(5), "the followed band is still flowing at +0.35 s");
+    h.idle((FLOW_TOTAL_S * 1000.0) as u64);
+    assert!(
+        h.cells(5).is_empty() && !h.lit(5),
+        "…and gone by the flow's end: {:?}",
+        h.cells(5)
+    );
 }
 
 /// **A RE-ANCHOR ONTO THE PANE'S FIRST COLUMN LIGHTS NOTHING IN THE PANE
@@ -931,6 +1073,7 @@ fn trail_status_appends_ribbon_retired_after_the_v2_rows() {
         motion_mode: "auto",
         shed: 1.0,
         intensity: 0.7,
+        sound_seam: true,
         ribbon_look: "tall",
         tally: h.glow.admission_tally(),
         spawns: h.glow.spawns(),
@@ -961,12 +1104,15 @@ fn trail_status_appends_ribbon_retired_after_the_v2_rows() {
         in_flight: aterm_effects::cursor_glow::InFlightTally::default(),
     }
     .line_v2(Some(status));
+    // `ribbon_followed=` (2026-09-21) rides beside it, last: the cells the
+    // follow pass carried WITH their text — none here, the text was
+    // overwritten in place.
     assert!(
-        line.ends_with(" ribbon_retired=11"),
-        "the count is the last field: {line}"
+        line.ends_with(" ribbon_retired=11 ribbon_followed=0"),
+        "the two content counts are the last fields: {line}"
     );
     assert!(
-        line.contains(" v2_meteors=0 v2_bridged=0 ribbon_retired=11"),
+        line.contains(" v2_meteors=0 v2_bridged=0 ribbon_retired=11 ribbon_followed=0"),
         "{line}"
     );
 }

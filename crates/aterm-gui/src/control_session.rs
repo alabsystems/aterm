@@ -2012,11 +2012,9 @@ pub(crate) fn cmd_turn_guarded(
         let t = term_lock(term);
         let rows = t.rows() as usize;
         let seq = t.content_seq();
-        let mut screen = String::new();
-        for r in 0..rows {
-            screen.push_str(&super::visible_row(&t, r));
-            screen.push('\n');
-        }
+        // ONE CONSTRUCTION, shared with `status`'s stamp — see
+        // [`crate::control::screen_text`].
+        let screen = super::screen_text(&t);
         (rows, seq, screen)
     };
     // Record this exchange in the session TURN LEDGER — read back by `turns`,
@@ -2109,10 +2107,15 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
         }
     }
     let ledger = ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
-    let mut recs: Vec<&crate::turn_ledger::TurnRecord> = ledger.since(since).collect();
-    if n > 0 && recs.len() > n {
-        recs.drain(..recs.len() - n);
-    }
+    let recs = ledger.since(since);
+    // The ring range already knows its length; seek to the requested suffix
+    // without collecting (and then discarding) all the older matching rows.
+    let skip = if n == 0 {
+        0
+    } else {
+        recs.len().saturating_sub(n)
+    };
+    let recs = recs.skip(skip);
     let mut out = format!("OK {}\n", recs.len());
     for r in recs {
         out.push_str(&format!(
@@ -2300,10 +2303,13 @@ pub(crate) fn cmd_timeline(ctx: &SessionCtx, rest: &str) -> String {
         }
     }
     let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-    let mut recs: Vec<&crate::session_timeline::TimelineEvent> = tl.since(since).collect();
-    if n > 0 && recs.len() > n {
-        recs.drain(..recs.len() - n);
-    }
+    let recs = tl.since(since);
+    let skip = if n == 0 {
+        0
+    } else {
+        recs.len().saturating_sub(n)
+    };
+    let recs = recs.skip(skip);
     let mut out = format!("OK {}\n", recs.len());
     for e in recs {
         out.push_str(&format!(
@@ -2944,6 +2950,92 @@ mod tests {
     use super::*;
     use aterm_session::{EdgeTable, LaunchNonce};
 
+    #[test]
+    fn history_and_timeline_limits_match_retained_wire_rows() {
+        use crate::session_timeline::TIMELINE_CAP;
+        use crate::turn_ledger::{ArchMark, LEDGER_CAP, TurnRecord};
+
+        let h = crate::session_store::test_handle(73);
+        assert_eq!(cmd_history(&h.ctx, "1 since=0"), "OK 0\n");
+        assert_eq!(cmd_timeline(&h.ctx, "1 since=0"), "OK 0\n");
+
+        // Overflow both rings, and give turns gaps in their process-global ids.
+        // Queries below the retained floor must still return the retained tail.
+        for i in 1..=(LEDGER_CAP.max(TIMELINE_CAP) + 7) as u64 {
+            h.ctx.turns.lock().unwrap().push(TurnRecord {
+                id: i * 2,
+                started_ms: i,
+                dur_ms: 3,
+                submitted: true,
+                status: "settled",
+                text: format!("turn {i} 🦀"),
+                screen_hash: i,
+                seq: i,
+                arch: ArchMark { origin: 7, last: i },
+                carried: i.is_multiple_of(2),
+            });
+            h.ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .record("title-change", format!("title=tab%20{i}"));
+        }
+
+        type HistoryQuery = fn(&SessionCtx, &str) -> String;
+        let verbs: [(HistoryQuery, usize); 2] =
+            [(cmd_history, LEDGER_CAP), (cmd_timeline, TIMELINE_CAP)];
+        for (verb, cap) in verbs {
+            let all = verb(&h.ctx, "");
+            let rows: Vec<(u64, &str)> = all
+                .lines()
+                .skip(1)
+                .map(|line| {
+                    (
+                        line.split_whitespace().nth(1).unwrap().parse().unwrap(),
+                        line,
+                    )
+                })
+                .collect();
+            assert_eq!(rows.len(), cap, "fixture must reach ring eviction");
+            let low = rows[0].0;
+            let high = rows.last().unwrap().0;
+            assert!(low > 1, "fixture must evict a prefix");
+
+            for n in [0, 1, 2, cap - 1, cap, cap + 1, usize::MAX] {
+                for since in [
+                    None,
+                    Some(0),
+                    Some(low - 1),
+                    Some(low),
+                    Some(high - 1),
+                    Some(high),
+                    Some(u64::MAX),
+                ] {
+                    // Independent wire oracle: filter the complete reply, then
+                    // select its tail. No ring iterator/skip is used here.
+                    let mut expected: Vec<&str> = rows
+                        .iter()
+                        .filter(|(id, _)| since.is_none_or(|after| *id > after))
+                        .map(|(_, line)| *line)
+                        .collect();
+                    if n > 0 && expected.len() > n {
+                        expected.drain(..expected.len() - n);
+                    }
+                    let mut want = format!("OK {}\n", expected.len());
+                    for line in expected {
+                        want.push_str(line);
+                        want.push('\n');
+                    }
+                    let args = match since {
+                        Some(id) => format!("{n} since={id}"),
+                        None => n.to_string(),
+                    };
+                    assert_eq!(verb(&h.ctx, &args), want, "arguments: {args}");
+                }
+            }
+        }
+    }
+
     /// Tier-1: every production read decision has exactly the model's guard.
     /// The retired decision re-armed after an expired, unmet reading.
     #[test]
@@ -3131,7 +3223,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
-            fabric: crate::fabric::SessionFabric::default(),
+            fabric: std::sync::Arc::default(),
         });
         SessionHandle {
             sid,
@@ -3400,7 +3492,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
-            fabric: crate::fabric::SessionFabric::default(),
+            fabric: std::sync::Arc::default(),
         }
     }
 

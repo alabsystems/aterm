@@ -159,11 +159,15 @@ fn due(last: Option<Instant>, now: Instant) -> bool {
 /// against a scratch directory: runs the installer, records the outcome, logs
 /// a change at `info` and each failed agent at `warn` — and nothing when the
 /// pass changed nothing, because a line per spawn would be noise.
-fn run_agent_prime(enabled: bool, home: Option<std::path::PathBuf>) -> AgentPrimeOutcome {
+fn run_agent_prime(
+    enabled: bool,
+    home: Option<std::path::PathBuf>,
+    lane: Option<&aterm_primer::HookLane>,
+) -> AgentPrimeOutcome {
     let outcome = if !enabled {
         AgentPrimeOutcome::Disabled
     } else if let Some(home) = home {
-        let pass = aterm_primer::auto_prime(&home);
+        let pass = aterm_primer::auto_prime_with_lane(&home, lane);
         if pass.changed() {
             aterm_log::info!("{}", pass.summary);
         }
@@ -179,6 +183,135 @@ fn run_agent_prime(enabled: bool, home: Option<std::path::PathBuf>) -> AgentPrim
     };
     record_agent_prime_outcome(outcome.clone());
     outcome
+}
+
+/// How long the primer thread waits for this instance's control socket before a
+/// pass. Session 0 is spawned BEFORE the control listener binds, so on the
+/// first pass of every launch [`crate::proxy::self_sock_path`] is still `None`.
+const SELF_SOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often that wait looks again.
+const SELF_SOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// This instance's control socket, waiting up to `wait` for the listener to
+/// bind. `None` once `wait` has passed: a disabled socket never binds, and the
+/// pass must still run (the installer's self-test then finds an instance the
+/// way `aterm ctl` does).
+fn await_self_sock(wait: std::time::Duration) -> Option<String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(sock) = crate::proxy::self_sock_path() {
+            return Some(sock);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(SELF_SOCK_POLL);
+    }
+}
+
+/// Set once the automatic pass has said it skipped the hooks for a build-tree
+/// binary, so the line is logged once per process, not once a minute.
+static HOOK_LANE_BUILD_TREE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// The lane the AUTOMATIC pass may use: `lane` when it names an installed aterm
+/// ([`aterm_primer::installed_exe`]), `None` for a raw build in a cargo target
+/// tree — whose path must not be written into the human's
+/// `~/.claude/settings.json`, where the next rebuild replaces it and `targo
+/// clean` deletes it. The pass still runs without the lane (the primer and the
+/// skills land); the skip is logged once per process (`logged`). `aterm agents
+/// install`, the operator's explicit ask, is not gated.
+fn automatic_hook_lane(
+    lane: Option<aterm_primer::HookLane>,
+    logged: &AtomicBool,
+) -> Option<aterm_primer::HookLane> {
+    let lane = lane?;
+    if aterm_primer::installed_exe(&lane.exe) {
+        return Some(lane);
+    }
+    if !logged.swap(true, Ordering::Relaxed) {
+        aterm_log::info!(
+            "agent primer: Claude Code hooks not installed — {} is a build-tree binary; `aterm \
+             agents install` or `aterm link hook install claude --merge --settings \
+             ~/.claude/settings.json` installs them by hand",
+            lane.exe.display()
+        );
+    }
+    None
+}
+
+/// What the automatic pass does with the Claude Code hook block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookPlan {
+    /// Build the lane and install/update the block (the default).
+    Install,
+    /// `[harness] enabled = false`: no lane, and this executable's own block
+    /// ([`aterm_primer::HookState::Installed`]) is removed.
+    Withdraw,
+    /// `agents_auto_prime = false`: the pass reads and writes nothing, the
+    /// hook file included.
+    Nothing,
+}
+
+/// The hook decision, pure. `agents_auto_prime = false` wins outright — that
+/// switch promises nothing is read or written — so the master switch acts
+/// only on a pass that runs at all.
+fn hook_plan(auto_prime: bool, harness_enabled: bool) -> HookPlan {
+    match (auto_prime, harness_enabled) {
+        (false, _) => HookPlan::Nothing,
+        (true, true) => HookPlan::Install,
+        (true, false) => HookPlan::Withdraw,
+    }
+}
+
+/// The aterm wrapper's durable master switch, `[harness] enabled` in
+/// aterm.toml, read WITHOUT [`crate::app_config::load_config`]'s user-visible
+/// side effects (this runs on the primer thread, once a minute). Default ON:
+/// no config path, a missing or unreadable file, and an unset key all read
+/// `true`, exactly as [`crate::app_config::agents_auto_prime_setting`] resolves
+/// its own knob.
+fn harness_enabled_setting() -> bool {
+    let Some(path) = crate::app_config::config_path() else {
+        return true;
+    };
+    match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
+        Ok(observation) => harness_enabled_from_text(&observation.text),
+        Err(_) => true,
+    }
+}
+
+/// Pure core of [`harness_enabled_setting`]. The harness's OWN reader
+/// (`aterm_agent::harness::cli::toml_bool`, the one `Env::master_switch` and
+/// `aterm harness status` use), so the window and the harness can never
+/// disagree about whether the owner switched it off — only an explicit
+/// `false` turns it off.
+fn harness_enabled_from_text(text: &str) -> bool {
+    aterm_agent::harness::cli::toml_bool(text, "harness", "enabled") != Some(false)
+}
+
+/// `[harness] enabled = false`: take this executable's own hook block out of
+/// `~/.claude/settings.json` ([`aterm_primer::withdraw_hooks_with_lane`]); a
+/// block another aterm wrote is left alone. Logged only when something was
+/// removed or the remover refused — once a block is gone every later pass is
+/// a silent `absent`.
+fn withdraw_own_hooks(home: Option<std::path::PathBuf>) {
+    let Some(home) = home else {
+        return;
+    };
+    // No socket: `status` and `remove` run no self-test.
+    let Some(lane) = aterm_primer::HookLane::from_current_exe(None) else {
+        return;
+    };
+    match aterm_primer::withdraw_hooks_with_lane(&home, &lane) {
+        Ok(Some(line)) => aterm_log::info!(
+            "agent primer: harness.enabled = false — Claude Code hooks removed from \
+             ~/.claude/settings.json ({line})"
+        ),
+        Ok(None) => {}
+        Err(e) => aterm_log::warn!(
+            "agent primer: harness.enabled = false, but the Claude Code hooks could not be \
+             removed: {e}"
+        ),
+    }
 }
 
 /// Prime detected coding agents if the throttle says a pass is due — called at
@@ -206,7 +339,39 @@ pub(crate) fn prime_agents_if_due() {
         .name("aterm-agent-prime".to_string())
         .spawn(|| {
             let enabled = crate::app_config::agents_auto_prime_setting();
-            let _ = run_agent_prime(enabled, aterm_primer::home_dir());
+            // THE HOOK LANE: this binary, and this instance's socket, so the
+            // installer's self-test can prove each hook command runs and
+            // reaches THIS aterm before a byte lands in the vendor's settings
+            // file — from a thread that has no session of its own. Session 0
+            // is spawned before the control listener binds, so on the first
+            // pass of every launch there is no socket YET: without the wait
+            // the self-test would fall through to the `latest` alias (another
+            // instance, or nothing). So wait for it — up to SELF_SOCK_WAIT,
+            // polling every SELF_SOCK_POLL. This thread is detached and off
+            // the event loop, so the wait costs the caret nothing; a disabled
+            // socket never binds, and the pass then runs without one.
+            //
+            // THE MASTER SWITCH: `[harness] enabled = false` in aterm.toml
+            // (wrapper design §4.6.2) reaches this pass too. The hooks are
+            // installed by DEFAULT — the owner's instruction of 2026-09-21,
+            // "claude code harness for aterm must be BATTERIES INCLUDED ON BY
+            // DEFAULT for features", is the consent basis — and the durable
+            // `false` is the recorded way to say no: no lane is built, and
+            // this executable's own block is taken back out.
+            let plan = hook_plan(enabled, harness_enabled_setting());
+            let lane = if plan == HookPlan::Install {
+                let sock = await_self_sock(SELF_SOCK_WAIT);
+                automatic_hook_lane(
+                    aterm_primer::HookLane::from_current_exe(sock),
+                    &HOOK_LANE_BUILD_TREE_LOGGED,
+                )
+            } else {
+                None
+            };
+            if plan == HookPlan::Withdraw {
+                withdraw_own_hooks(aterm_primer::home_dir());
+            }
+            let _ = run_agent_prime(enabled, aterm_primer::home_dir(), lane.as_ref());
         });
     if let Err(e) = spawned {
         aterm_log::warn!("agent primer: could not start the installer thread: {e}");
@@ -815,6 +980,11 @@ pub(crate) struct Adopted {
     /// `Session::identity` and the registry handle, so `sessions` keeps saying
     /// whose the tab is and `identities forget` keeps seeing it live.
     pub identity: Option<String>,
+    /// BROADCAST OPT-INS (round 23): the `topic add` set from the handoff
+    /// record, `"<topic> <since>"` rows, already validated. Re-seeded onto the
+    /// adopted session's `SessionFabric` so a seamless update does not silently
+    /// unsubscribe an agent from the topic it is listening to.
+    pub topics: Vec<String>,
 }
 
 #[allow(
@@ -871,6 +1041,12 @@ pub(crate) fn spawn_session(
     }
     let handoff_local_id = adopt.as_ref().map(|adopted| adopted.local_id);
     let frozen_path = adopt.as_ref().is_some_and(|adopted| adopted.frozen_path);
+    // The carried broadcast opt-ins, taken before the match below consumes the
+    // handle; re-seeded onto `ctx.fabric` once it exists.
+    let adopt_topics: Vec<String> = adopt
+        .as_ref()
+        .map(|adopted| adopted.topics.clone())
+        .unwrap_or_default();
     // The identity LABEL this session wears: the name it is spawned under, or —
     // for an adopted shell, whose env is what it was — the one its record
     // carried across the handoff.
@@ -1137,12 +1313,20 @@ pub(crate) fn spawn_session(
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
-        fabric: crate::fabric::SessionFabric::default(),
+        fabric: std::sync::Arc::default(),
     });
     // ROOT session only: record the edges the OUTER aterm preminted for us (from
     // our injected env), so it holds the read/write/signal authority it granted.
     if id == 0 {
         register_injected_parent_edges(&ctx);
+    }
+    // THE BROADCAST OPT-INS THE HANDOFF CARRIED. Receiver-side consent is the
+    // whole safety story of `post to=say:<topic>`, and consent that evaporates
+    // on a seamless update is indistinguishable, from inside the session, from
+    // a broadcast nobody sent. Empty for every fresh spawn.
+    if !adopt_topics.is_empty() {
+        ctx.fabric
+            .set_topics(crate::fabric::parse_topics(&adopt_topics));
     }
 
     // SEAMLESS SCREEN CARRY: hydrate the adopted engine with the outgoing
@@ -1378,9 +1562,71 @@ impl DeferredReaderGate {
 #[cfg(test)]
 mod agent_prime_tests {
     use super::{
-        AGENT_PRIME_INTERVAL, AgentPrimeOutcome, agent_prime_outcome, due, run_agent_prime,
+        AGENT_PRIME_INTERVAL, AgentPrimeOutcome, HookPlan, agent_prime_outcome,
+        automatic_hook_lane, due, harness_enabled_from_text, hook_plan, run_agent_prime,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    /// The automatic pass never writes a build-tree binary into the human's
+    /// settings: a lane naming `target*/…/release|debug` is dropped (said
+    /// once, however many passes), an installed aterm's lane is kept, and no
+    /// lane stays no lane without a word.
+    #[test]
+    fn the_automatic_pass_drops_a_build_tree_lane_and_says_so_once() {
+        let lane = |exe: &str| {
+            Some(aterm_primer::HookLane {
+                exe: exe.into(),
+                sock: None,
+            })
+        };
+        let logged = AtomicBool::new(false);
+        assert_eq!(automatic_hook_lane(None, &logged), None);
+        assert!(!logged.load(Ordering::Relaxed), "no lane, nothing to say");
+
+        let raw = "/Users//x/aterm/target.noindex/release/aterm";
+        assert_eq!(automatic_hook_lane(lane(raw), &logged), None);
+        assert!(logged.load(Ordering::Relaxed), "the skip is said");
+        assert_eq!(
+            automatic_hook_lane(lane(raw), &logged),
+            None,
+            "and stays skipped"
+        );
+
+        let bundle = "/Applications/aterm (dev).app/Contents/MacOS/aterm";
+        assert_eq!(automatic_hook_lane(lane(bundle), &logged), lane(bundle));
+    }
+
+    /// The master switch reaches the automatic hook install: an explicit
+    /// `[harness] enabled = false` (either TOML spelling) withdraws, and
+    /// everything else — an empty file, an unset key, `true`, a non-boolean,
+    /// unparseable text — is the default ON. `agents_auto_prime = false`
+    /// outranks it: that pass touches nothing.
+    #[test]
+    fn the_harness_master_switch_withdraws_the_hooks_and_defaults_on() {
+        for off in [
+            "[harness]\nenabled = false\n",
+            "harness.enabled = false\n",
+            "[harness]\nenabled = true\nenabled = false # last wins\n",
+        ] {
+            assert!(!harness_enabled_from_text(off), "{off:?}");
+        }
+        for on in [
+            "",
+            "[harness]\n",
+            "[harness]\nenabled = true\n",
+            "[other]\nenabled = false\n",
+            "[harness]\nenabled = \"no\"\n",
+            "[harness]\n# enabled = false\n",
+            "this is not toml [[[",
+        ] {
+            assert!(harness_enabled_from_text(on), "{on:?}");
+        }
+        assert_eq!(hook_plan(true, true), HookPlan::Install);
+        assert_eq!(hook_plan(true, false), HookPlan::Withdraw);
+        assert_eq!(hook_plan(false, true), HookPlan::Nothing);
+        assert_eq!(hook_plan(false, false), HookPlan::Nothing);
+    }
 
     /// The throttle: the first spawn is due, a burst inside the window is not,
     /// the window's edge is inclusive, and a clock step backwards is harmless.
@@ -1409,15 +1655,25 @@ mod agent_prime_tests {
     /// outcome is what the pass returned — so a reader sees the truth.
     #[test]
     fn a_pass_records_exactly_what_it_did() {
-        assert_eq!(run_agent_prime(false, None), AgentPrimeOutcome::Disabled);
+        assert_eq!(
+            run_agent_prime(false, None, None),
+            AgentPrimeOutcome::Disabled
+        );
         assert_eq!(agent_prime_outcome(), Some(AgentPrimeOutcome::Disabled));
-        assert_eq!(run_agent_prime(true, None), AgentPrimeOutcome::NoHome);
+        assert_eq!(run_agent_prime(true, None, None), AgentPrimeOutcome::NoHome);
         assert_eq!(agent_prime_outcome(), Some(AgentPrimeOutcome::NoHome));
 
         let home = aterm_tempfile::tempdir().expect("scratch home");
         std::fs::create_dir_all(home.path().join(".codex")).expect("detect codex");
-        let AgentPrimeOutcome::Ran(pass) = run_agent_prime(true, Some(home.path().to_path_buf()))
-        else {
+        // Under the process env lock with `$XDG_CONFIG_HOME` UNSET: the pass
+        // reads it (an OpenCode row follows it), and a parallel test that
+        // scopes it (`agent_identity`'s never-writes-into-the-human's-XDG
+        // test) otherwise lends this pass a second detected agent — and this
+        // pass writes into THAT test's scratch "human" tree. Measured
+        // 2026-09-22: both failed together, 2 runs in 3.
+        let AgentPrimeOutcome::Ran(pass) = aterm_log::env::scoped_unset("XDG_CONFIG_HOME", || {
+            run_agent_prime(true, Some(home.path().to_path_buf()), None)
+        }) else {
             panic!("enabled with a home must run");
         };
         assert!(pass.changed(), "{}", pass.summary);

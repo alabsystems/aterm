@@ -256,10 +256,12 @@ fn bring_up(
 ) -> Ready {
     let build = crate::stages::driver_build_cmd(ctx, smoke_build_args())
         .capture(Capture::Append(sb.gui_log.clone()));
-    if !exec_run(&build, ctx.exec_env()).ok {
-        r.fail(format!(
-            "{tag}: targo build -p aterm-gui -p aterm-ctl failed"
-        ));
+    let built = exec_run(&build, ctx.exec_env());
+    if !built.ok {
+        r.fail_child(
+            &built,
+            format!("{tag}: targo build -p aterm-gui -p aterm-ctl failed"),
+        );
         r.raw(smoke_log_tail(log_label, &sb.gui_log));
         return Ready::Stopped;
     }

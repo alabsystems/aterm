@@ -1928,6 +1928,11 @@ pub(crate) fn discard_build(build_dir: &Path) {
     // a pin named, and a later reinstall under this build number must start from the
     // signed manifest, never from a verdict about a tree that is gone.
     clear_stage_refusal(build_dir);
+    // And the rendered-shim sidecar (`<build>.harness`, the wrapper design §1.3): it
+    // describes a prelude for a tree that no longer exists, and a later build reusing
+    // this number would otherwise inherit it. Added with the suffix rather than after
+    // the first leak.
+    crate::harness::clear_sidecar(build_dir);
 }
 
 /// The default prefix under `home`. On macOS `…/Library/Application Support/aterm/pkg`

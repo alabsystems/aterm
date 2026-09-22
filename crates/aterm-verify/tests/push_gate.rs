@@ -155,17 +155,34 @@ impl Push {
     /// Run the hook on exactly this ref line — the four fields git hands a
     /// pre-push hook: local ref, local sha, remote ref, remote sha.
     fn push_line(&self, line: &str, bypass: bool) -> (i32, String) {
+        self.push_line_in(line, bypass, &self.root, &[])
+    }
+
+    /// [`Self::push_line`] from `cwd`, with `extra` in the hook's environment —
+    /// for the laws about a hook that cannot resolve its repository.
+    fn push_line_in(
+        &self,
+        line: &str,
+        bypass: bool,
+        cwd: &Path,
+        extra: &[(&str, &str)],
+    ) -> (i32, String) {
         let mut c = Command::new("bash");
         c.arg(Self::hook())
             .arg("origin")
             .arg("git@example.invalid:x/y.git")
-            .current_dir(&self.root)
+            .current_dir(cwd)
             .env_remove("ATERM_PUSH_NO_GATE")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if bypass {
             c.env("ATERM_PUSH_NO_GATE", "1");
+        }
+        for (k, v) in extra {
+            c.env(k, v);
         }
         let mut child = c.spawn().expect("the hook runs");
         child
@@ -378,6 +395,36 @@ fn a_clean_merge_contract_receipt_admits_the_push() {
     assert!(err.contains("carry a passing gate receipt"), "{err}");
 }
 
+/// GIT'S CHATTER IS NOT THE ANSWER. For one day this hook read the repository
+/// root as `$(git rev-parse --show-toplevel 2>&1)`, folding stderr into the
+/// VALUE — and git writes to stderr while SUCCEEDING whenever a `GIT_TRACE`
+/// variable is exported. Measured 2026-09-21 before the fix: with `GIT_TRACE=1`
+/// the command exits 0 and prints the right path, `$root` becomes the trace
+/// lines plus the path, `[ -d "$root" ]` is false, and a push whose commit
+/// carries a PASSING receipt is REFUSED with "the repository could not be
+/// resolved" about a repository git resolved perfectly. Fail-closed, so nothing
+/// ungated ever escaped — but this hook's whole contract is that a refusal
+/// NAMES what it could not check, and here it named something that was not so.
+#[test]
+fn git_chatter_on_a_successful_command_does_not_become_the_repository_root() {
+    for var in ["GIT_TRACE", "GIT_TRACE2", "GIT_TRACE_PERFORMANCE"] {
+        let p = Push::new("atv-push-trace");
+        p.receipt(&green(&p.sha));
+        let line = format!("refs/heads/main {} refs/heads/main {ZERO}\n", p.sha);
+        let (code, err) = p.push_line_in(&line, false, &p.root, &[(var, "1")]);
+        assert_eq!(
+            code, 0,
+            "{var}=1 makes git chatty on stderr while succeeding; the push still \
+             carries a passing receipt and must be admitted: {err}"
+        );
+        assert!(err.contains("carry a passing gate receipt"), "{var}: {err}");
+        assert!(
+            !err.contains("could not be resolved"),
+            "{var}: the hook must not diagnose a healthy repository as unresolvable: {err}"
+        );
+    }
+}
+
 /// A PASS over HEAD **plus uncommitted work** verified bytes nobody is pushing.
 #[test]
 fn a_pass_on_a_dirty_tree_is_refused() {
@@ -440,6 +487,182 @@ fn a_receipt_the_hook_cannot_parse_refuses_the_push() {
         code, 1,
         "a file without the magic line is no receipt: {err}"
     );
+}
+
+/// A HOOK THAT CANNOT JUDGE REFUSES. MEASURED 2026-09-21, before the fix: the
+/// shipped hook with `GIT_DIR` pointing at nothing — and the same hook run from
+/// a directory that is no repository — exited 0 with NOTHING on stderr. That
+/// was `[ -n "$root" ] || exit 0`, and during the full-disk episode of
+/// 2026-09-20 it let cb770c598 reach origin/main with no passing receipt:
+/// nothing else in the file admits a plain commit without one. A pre-push hook
+/// only ever runs inside a repository, so an unresolvable root is a broken
+/// environment, and a broken environment is a refusal that says what it could
+/// not check and names both escapes.
+#[test]
+fn a_hook_that_cannot_resolve_its_repository_refuses_and_says_so() {
+    let p = Push::new("atv-push-no-repo");
+    // A passing receipt exists; through a broken GIT_DIR it is unreachable,
+    // and unreachable must never read as "nothing to judge".
+    p.receipt(&green(&p.sha));
+    let nowhere = p.root.join("nowhere");
+    let line = format!("refs/heads/main {} refs/heads/main {ZERO}\n", p.sha);
+    let (code, err) = p.push_line_in(
+        &line,
+        false,
+        &p.root,
+        &[("GIT_DIR", nowhere.to_str().expect("utf-8 path"))],
+    );
+    assert_eq!(
+        code, 1,
+        "an unresolvable repository is a refusal, never exit 0: {err}"
+    );
+    assert!(
+        err.contains("REFUSED") && err.contains("could not be checked"),
+        "{err}"
+    );
+    assert!(
+        err.contains("repository could not be resolved"),
+        "…and it says WHAT it could not check: {err}"
+    );
+    assert!(
+        err.contains("ATERM_PUSH_NO_GATE=1") && err.contains("--no-verify"),
+        "…and names both escapes: {err}"
+    );
+
+    // Outside any repository at all — a ceiling keeps git from finding one
+    // above the scratch directory, whatever the machine keeps in /tmp.
+    let outside = p.root.parent().expect("scratch").join("outside");
+    fs::create_dir_all(&outside).expect("mkdir");
+    let ceiling = outside
+        .parent()
+        .expect("scratch")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+    let (code, err) = p.push_line_in(
+        &line,
+        false,
+        &outside,
+        &[("GIT_CEILING_DIRECTORIES", ceiling.as_str())],
+    );
+    assert_eq!(code, 1, "no repository is a refusal, never exit 0: {err}");
+    assert!(err.contains("repository could not be resolved"), "{err}");
+
+    // The named escape still works when nothing else can — it is checked
+    // before the environment is, on purpose.
+    let (code, err) = p.push_line_in(
+        &line,
+        true,
+        &p.root,
+        &[("GIT_DIR", nowhere.to_str().expect("utf-8 path"))],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("GATE BYPASSED"), "{err}");
+}
+
+/// THE RECEIPTS DIRECTORY MUST BE A DIRECTORY THE HOOK CAN READ. MEASURED
+/// 2026-09-21, before the fix: a regular file at `.aterm-verify/receipts`
+/// refused, and so did a mode-000 receipts directory holding a PASSING
+/// receipt — both as "no gate receipt for this commit", which sends the
+/// operator to run a gate whose receipt write then fails on the same path.
+/// Refusing was never the problem; the diagnosis was. Both now refuse as what
+/// they are: an environment the hook cannot judge, with the path named.
+#[cfg(unix)]
+#[test]
+fn a_receipts_path_that_is_not_a_readable_directory_refuses_as_unjudgeable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // A regular file where the receipts directory should be.
+    let p = Push::new("atv-push-receipts-file");
+    fs::create_dir_all(p.root.join(".aterm-verify")).expect("mkdir");
+    fs::write(receipt::dir(&p.root), "not a directory\n").expect("write");
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("could not be checked")
+            && err.contains(".aterm-verify/receipts/ is not a directory"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("no gate receipt"),
+        "the refusal names the environment, not a missing receipt: {err}"
+    );
+
+    // The state directory itself as a file.
+    let p = Push::new("atv-push-state-file");
+    fs::write(p.root.join(".aterm-verify"), "not a directory\n").expect("write");
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains(".aterm-verify/ is not a directory"), "{err}");
+
+    // A receipts directory the hook cannot read, holding a receipt that would
+    // admit the push — the one direction that must never open.
+    let p = Push::new("atv-push-receipts-unreadable");
+    p.receipt(&green(&p.sha));
+    let dir = receipt::dir(&p.root);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let (code, err) = p.push(&p.sha, false);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod back");
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains(".aterm-verify/receipts/ is not a readable directory"),
+        "{err}"
+    );
+    assert!(!err.contains("no gate receipt"), "{err}");
+
+    // And readable again, the same receipt admits: the refusal was the mode.
+    let (code, err) = p.push(&p.sha, false);
+    assert_eq!(code, 0, "{err}");
+}
+
+/// A RECEIPT THE HOOK CANNOT READ IS NOT "NO RECEIPT". Measured before the fix:
+/// a mode-000 receipt refused with `head: … Permission denied` on stderr and
+/// then "the receipt does not say whether the tree was clean" — fail-closed by
+/// accident of an empty field, not by design. Now it is named.
+#[cfg(unix)]
+#[test]
+fn a_receipt_the_hook_cannot_read_refuses_as_unjudgeable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let p = Push::new("atv-push-receipt-unreadable");
+    p.receipt(&green(&p.sha));
+    let file = receipt::dir(&p.root).join(&p.sha);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let (code, err) = p.push(&p.sha, false);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("chmod back");
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("could not be checked") && err.contains("exists but cannot be read"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("Permission denied"),
+        "no tool noise, one sentence: {err}"
+    );
+}
+
+/// A GIT COMMAND THAT FAILS IS NOT AN ANSWER. The claim and merge admissions
+/// ask git about the remote's tip; when that tip is not in this repository (a
+/// push over a remote that moved and was never fetched), `git merge-base
+/// --is-ancestor` FAILS rather than answering "no". Measured before the fix:
+/// the failure read as "not a claim", and the push was refused as "no gate
+/// receipt" — the right exit, the wrong sentence. Now it is refused as what it
+/// is, with the question the operator has to answer first.
+#[test]
+fn a_git_failure_inside_the_judgement_refuses_as_unjudgeable() {
+    let p = Push::new("atv-push-git-fails");
+    let unfetched = "1".repeat(40);
+    let (code, err) = p.push_line(
+        &format!("refs/heads/main {} refs/heads/main {unfetched}\n", p.sha),
+        false,
+    );
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("could not be checked") && err.contains("merge-base --is-ancestor failed"),
+        "{err}"
+    );
+    assert!(err.contains("is that tip fetched?"), "{err}");
+    assert!(!err.contains("no gate receipt"), "{err}");
 }
 
 /// Deleting a ref pushes no code, so there is nothing to have gated.
@@ -512,12 +735,24 @@ fn the_claim_the_gate_prints_is_what_the_hook_was_just_measured_doing() {
     p.receipt(&green(&p.sha));
     let (admitted, _) = p.push(&p.sha, false);
     let (bypassed, _) = p.push(&p.sha, true);
+    let nowhere = p.root.join("nowhere");
+    let (unjudgeable, _) = p.push_line_in(
+        &format!("refs/heads/main {} refs/heads/main {ZERO}\n", p.sha),
+        false,
+        &p.root,
+        &[("GIT_DIR", nowhere.to_str().expect("utf-8 path"))],
+    );
 
     assert_eq!((blocked, admitted), (1, 0), "the hook blocks, then admits");
     assert_eq!(bypassed, 0, "the bypass works");
+    assert_eq!(unjudgeable, 1, "and a hook that cannot judge refuses");
     assert!(
         claim.contains("BLOCKS") && claim.contains("receipt"),
         "the claim must say what was just measured: {claim}"
+    );
+    assert!(
+        claim.contains("REFUSES when it cannot judge"),
+        "…including that it fails CLOSED, which was just measured: {claim}"
     );
     assert!(
         claim.contains("ATERM_PUSH_NO_GATE=1"),

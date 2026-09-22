@@ -1111,6 +1111,12 @@ pub(crate) struct Config {
     /// (and on `aterm pkg machine apply`); the GUI only displays and edits it.
     /// Absent ⇒ both on. See [`MachineConfig`].
     pub(crate) machine: Option<MachineConfig>,
+    /// The aterm WRAPPER's durable master switch (`[harness]`, design
+    /// `docs/DESIGN-aterm-wrapper-2026-09-17.md` §4.6.2). Absent ⇒ ON. It is
+    /// here rather than in the harness's own config so the kill switch never
+    /// depends on the thing it kills; `aterm harness status` reads this same
+    /// file itself, with no GUI in the path. See [`HarnessConfig`].
+    pub(crate) harness: Option<HarnessConfig>,
 }
 
 /// Source used to produce a terminal's live, human-readable description.
@@ -2526,6 +2532,32 @@ pub(crate) struct PresenceConfig {
     pub(crate) rim: Option<bool>,
 }
 
+/// The `[harness]` table (design `docs/DESIGN-aterm-wrapper-2026-09-17.md`
+/// §4.6.2): the DURABLE master switch for the aterm wrapper — the harness
+/// that watches, classifies and journals over a vendor program running inside
+/// a session.
+///
+/// It lives HERE and not in the harness's own config precisely so it still
+/// works when the harness tree is missing, broken or mid-update: *"the kill
+/// switch may never depend on the thing it kills"* (design §4.6.2). Everything
+/// finer — which capabilities are on, and the policy each one follows — lives
+/// in the harness's own state, and `aterm harness enable|disable` is what
+/// edits it. No key exists in both homes.
+///
+/// Absent ⇒ ON, which is what [`Config::harness_enabled`] encodes: a fresh
+/// machine has no `aterm.toml`, and reading that as "the owner switched it
+/// off" would make the product inert out of the box for a reason nothing
+/// displays.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct HarnessConfig {
+    /// The master switch. Absent ⇒ ON; `false` re-renders the `agents/` twin
+    /// without the harness prelude, so the NEXT launch is plain. Sessions
+    /// already running keep what they launched with until they exit.
+    /// `$ATERM_NO_HARNESS` bypasses one session without writing anything.
+    pub(crate) enabled: Option<bool>,
+}
+
 /// The `[output_streak]` table — PRISM WAKE
 /// (`docs/DESIGN-output-streak-2026-08-30.md`). ON BY DEFAULT, which is the
 /// inverse of `[matrix_rain]` beside it and the same posture as
@@ -3658,10 +3690,13 @@ impl Config {
         )
     }
 
-    /// Whether load-adaptive effect shedding may force the Reduced state under a
-    /// sustained render-overload session (Change #1). DEFAULT `true`; `false` opts out
-    /// so animations follow `motion` / the OS Reduce-Motion flag alone. `motion =
-    /// "full"` overrides the shed regardless of this. See [`crate::App::motion_policy`].
+    /// Whether load-adaptive effect shedding may force the Reduced state for
+    /// DECORATIVE effects under a sustained render-overload session (Change #1).
+    /// DEFAULT `true`; `false` opts out so animations follow `motion` / the OS
+    /// Reduce-Motion flag alone. `motion = "full"` overrides the shed regardless
+    /// of this. Functional motion (the wheel glide, the scroll pill) is never
+    /// shed under either value. See [`crate::App::motion_policy`] and
+    /// [`crate::App::effect_policy`].
     pub(crate) fn load_adaptive_motion_or_default(&self) -> bool {
         self.load_adaptive_motion.unwrap_or(true)
     }
@@ -4619,6 +4654,23 @@ impl Config {
     /// rim is painted.
     pub(crate) fn presence_rim_enabled(&self) -> bool {
         self.presence.as_ref().and_then(|p| p.rim).unwrap_or(true)
+    }
+
+    /// The `[harness] enabled` RESOLVED bit (default TRUE): whether the aterm
+    /// wrapper arms on the next launch.
+    ///
+    /// The DURABLE half only. `$ATERM_NO_HARNESS` bypasses one session and is
+    /// deliberately NOT folded in here: this resolver answers "what does the
+    /// file say", which is what the Settings row seeds from and what
+    /// `aterm harness` reads out of the same file with no GUI in the path.
+    /// The per-session bypass is the harness's own read
+    /// (`aterm_agent::harness::mark`), so the switch the owner can see in
+    /// Settings never silently means something else than the file.
+    pub(crate) fn harness_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.enabled)
+            .unwrap_or(true)
     }
 
     /// The `[packages]` `auto_update` RESOLVED bit (default TRUE — today's 6h
@@ -8244,6 +8296,13 @@ pub(crate) fn resolve_cursor_glow(
         duration: std::time::Duration::from_millis(inputs.duration_ms.clamp(30, 2_000)),
         length: inputs.length.clamp(1, 512),
         intensity,
+        // FAIL-CLOSED at construction. This resolver has no window and no
+        // focus to offer, and `App::glow_config()` — the windowless variant
+        // `trail status` reads — comes through here too. The FRAME path is
+        // the one thing that knows whose window a key would land in, so it
+        // overwrites this in `tick_cursor_fx`; anything that never reaches a
+        // frame honestly cues nothing.
+        audible: false,
         radius: if beam_only { 0.0 } else { radius },
         ring: !beam_only && inputs.ring,
         dark_theme,
@@ -9075,6 +9134,18 @@ impl App {
         // pre-Commit wake gate drops the progress wakes that would raise a bar —
         // but the guard belongs here, next to its reason, rather than depending
         // on a gate two files away that exists for a different purpose.
+        //
+        // AND NOT BEFORE IT EITHER — by design, and recorded here so nobody
+        // "fixes" it by deferring the bar. The "update staged" bar is raised
+        // when a build is ARMED, before any attempt exists, so its one row
+        // lands on every session seconds before the park: on 2026-09-22 it
+        // shrank 56-row sessions to 55, and a Claude Code tab whose DECSC slot
+        // sat on row 55 refused the visible-checkpoint set on every release
+        // from v0.87.0 to v0.90.0. The fix was the wire's bound on that slot
+        // (`seamless::checkpoint_meta_bound_violation`), not this shrink: a
+        // resize a second before a handoff is ordinary desk state the
+        // checkpoint must carry, and a 55-row refusal in the log under a
+        // 56-row window is this shrink, not a mystery.
         if self.pending_update_handoff.is_some() || self.incoming_handoff_pending {
             return false;
         }

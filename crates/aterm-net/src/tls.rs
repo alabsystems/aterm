@@ -934,6 +934,25 @@ mod tests {
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
         let pin = cert_fingerprint(TEST_CERT_DER);
         let (svc_a, mut svc_b) = CtlStream::pair().unwrap();
+        // LIVENESS, NOT LATENCY — the bound the deterministic siblings carry
+        // and this test, re-introduced by checkpoint 3373fe738 from the racy
+        // original that f32765ec0's re-land had replaced, did not. Without it
+        // the two `read_to_end`s below and the client's `read_exact` can block
+        // forever, and they did: measured 2026-09-21 inside the merge gate on
+        // the fleet's Intel Mac, this test wedged for the ceiling's full three
+        // hours with the client in FIN_WAIT_2, the relay's three clones of the
+        // accepted socket in CLOSE_WAIT, and the downloader parked on
+        // `up.join()` behind the directional half-close — the request and the
+        // client's close_notify race through the relay unsequenced, which the
+        // re-land's own message says a test cannot assume. A bound turns that
+        // into a named failure in a minute. It passes alone in 0.02 s and
+        // 30/30 under six CPU spinners; the race needs whole-workspace
+        // scheduling, so sequencing it like
+        // `graceful_local_eof_half_closes_without_killing_the_request_direction`
+        // is the durable fix and is still owed.
+        svc_b
+            .set_read_timeout(Some(NET_TEST_LIVENESS_BOUND))
+            .unwrap();
         let mut response = (0..(128 * 1024))
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
@@ -968,6 +987,8 @@ mod tests {
         });
 
         let tcp = TcpStream::connect(addr).unwrap();
+        // The client's half of the same bound (see the service side above).
+        tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
         let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
         client.stream().write_all(b"one-shot request\n").unwrap();
         client.stream().flush().unwrap();
@@ -982,7 +1003,17 @@ mod tests {
             .unwrap();
 
         let mut got = vec![0; expected_response.len()];
-        client.stream().read_exact(&mut got).unwrap();
+        client.stream().read_exact(&mut got).unwrap_or_else(|error| {
+            panic!(
+                "the client's read_exact stalled past {NET_TEST_LIVENESS_BOUND:?} ({error}): the \
+                 relay never delivered the whole response after a request-first half-close. \
+                 The measured shape of this stall: the client in FIN_WAIT_2, the relay's three \
+                 clones of the accepted socket (tcp_down / tcp_wr / tcp_up) in CLOSE_WAIT, \
+                 svc_a half-closed for writing by the downloader, and the downloader parked on \
+                 `up.join()` because the reverse direction never reached EOF — the unsequenced \
+                 request-vs-close_notify race this test carries"
+            )
+        });
         assert_eq!(
             got, expected_response,
             "every response byte must survive request-first half-close"

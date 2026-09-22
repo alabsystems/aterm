@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_types::mouse::WheelDir;
-use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta};
+use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, TouchPhase};
 use winit::window::CursorIcon;
 
 use aterm_core::terminal::{CustodyTransition, Terminal};
@@ -4980,8 +4980,37 @@ impl App {
 
     /// `MouseWheel` -> when an app is tracking the mouse, report wheel up/down at
     /// the cell under the pointer; otherwise scroll the scrollback viewport (the
-    /// everyday "scroll up to see history" gesture).
+    /// everyday "scroll up to see history" gesture). The phase-less form: a
+    /// `TouchPhase::Moved` event — the tests' entry (production enters through
+    /// [`Self::on_mouse_wheel_phased`] from the winit seam).
+    #[cfg(test)]
     pub(crate) fn on_mouse_wheel(&mut self, wid: WindowId, delta: MouseScrollDelta) {
+        self.on_mouse_wheel_phased(wid, delta, TouchPhase::Moved);
+    }
+
+    /// [`Self::on_mouse_wheel`] with winit's gesture PHASE. The phase changes
+    /// nothing about routing or bytes; it is read once, after the event has
+    /// been handled: a precise gesture's `Ended`/`Cancelled` (the finger lifted
+    /// — on macOS the momentum tail that may follow re-tracks from wherever the
+    /// band is, continuously) RELEASES the tracked band so its rest-settle to a
+    /// whole row starts now rather than `TRACK_REST_MS` later. Done here, on the
+    /// way out, because the `Ended` event itself usually carries a zero delta
+    /// that the axis guard drops before anything else sees it.
+    pub(crate) fn on_mouse_wheel_phased(
+        &mut self,
+        wid: WindowId,
+        delta: MouseScrollDelta,
+        phase: TouchPhase,
+    ) {
+        self.on_mouse_wheel_inner(wid, delta);
+        if matches!(delta, MouseScrollDelta::PixelDelta(_))
+            && matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled)
+        {
+            self.release_scroll_track(wid);
+        }
+    }
+
+    fn on_mouse_wheel_inner(&mut self, wid: WindowId, delta: MouseScrollDelta) {
         // INTERACTIVE INPUT PENDING (G17): a wheel/trackpad gesture is a human
         // waiting on the UI thread exactly as a key press is, and this handler
         // is about to queue several terminal-mutex acquisitions per event. Arm
@@ -4997,7 +5026,34 @@ impl App {
         let conn_card = self.conn_card_claims_pointer(wid);
         let session_picker = self.session_picker_claims_pointer(wid);
         let connection_map = self.connection_map_claims_pointer(wid);
+        // DIRECT MANIPULATION (2026-09-22): the event's VERTICAL PIXEL delta,
+        // taken BEFORE `wheel_notches` banks it (banking is destructive: it
+        // keeps only the whole rows for the seam and a direction flip forfeits
+        // the remainder — right for the seam's bytes, wrong for a finger that
+        // reversed by 3 px). `None` for a notch, a horizontal swipe, or no axis.
+        let track_px = match delta {
+            MouseScrollDelta::PixelDelta(p)
+                if wheel_axis(p.x, p.y, f64::EPSILON) == Some(WheelAxis::Vertical) =>
+            {
+                Some(p.y)
+            }
+            _ => None,
+        };
         let Some((dir, lines)) = self.wheel_notches(wid, delta) else {
+            // SUB-NOTCH. The seam's bank holds the fraction for its next whole
+            // row (bytes for a tracking app are exactly what they were), and a
+            // precise delta ALSO moves the local band by its pixels right now —
+            // unless a modal card or a native view claims the pointer, which
+            // swallow the whole gesture as they do its whole rows below.
+            if let Some(dy_px) = track_px
+                && !(palette
+                    || conn_card
+                    || session_picker
+                    || connection_map
+                    || self.active_native_view(wid).is_some())
+            {
+                self.track_precise_scroll(wid, dy_px);
+            }
             return;
         };
         // CHROME AND NATIVE VIEWS ARE VERTICAL SURFACES. The palette card and a
@@ -5077,15 +5133,15 @@ impl App {
         // control `mouse` verb a different answer than a human hand — exactly the
         // source-blindness the seam exists to guarantee.
         //
-        // The delta's KIND rides beside the call, not inside the event: it
-        // changes how a chained delta joins an in-flight glide (a display
-        // policy — `scroll_wheel_animated_with`), never the bytes the seam
+        // The delta's KIND (and, for a precise delta, its pixels) rides beside
+        // the call, not inside the event: it changes how the delta moves the
+        // LOCAL band (a display policy — `scroll_wheel_animated_with`: a notch
+        // eases, a precise delta tracks 1:1), never the bytes the seam
         // produces, so the Human/Controller byte-equality invariant is untouched
         // and the `mouse` verb's grammar gains no field. Cleared before return
         // so nothing else ever reads a stale kind.
-        let precise = matches!(delta, MouseScrollDelta::PixelDelta(_));
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.wheel_precise = precise;
+            ws.wheel_precise_px = track_px;
         }
         self.input(
             wid,
@@ -5100,7 +5156,105 @@ impl App {
             Source::Human,
         );
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.wheel_precise = false;
+            ws.wheel_precise_px = None;
+        }
+    }
+
+    /// DIRECT MANIPULATION (2026-09-22), the SUB-NOTCH half: a precise vertical
+    /// delta that banked no whole row moves the local band by `dy_px` NOW.
+    ///
+    /// HOW THE ROUTE IS LEARNED WITHOUT SPLITTING THE SEAM'S DECISION. A
+    /// sub-notch delta produces no bytes, so the seam (whose contract is
+    /// bytes-or-fallback for a WHOLE-row event, `lines >= 1`) is not consulted;
+    /// the controller `mouse` verb cannot express a sub-notch gesture (no pixel
+    /// field), so there is no Controller twin for this path to diverge from —
+    /// the whole-row path above is byte-for-byte what it was for both sources.
+    /// The route is learned in two tiers:
+    ///
+    /// 1. The lock-free `ModeMirror` word (the SAME `mouse_tracking_enabled`
+    ///    the seam's `wheel_route_for` reads under its lock): tracking ON with
+    ///    no bypass modifier means an app owns the wheel — bank for the seam,
+    ///    release any band still tracking from before the app took the mouse,
+    ///    take no lock.
+    /// 2. Otherwise, while a glide of THIS engine is armed (a tracked band, or
+    ///    a notch ease — `scroll_wheel_animated_with`'s `same` test), the route
+    ///    was Viewport when the seam or the probe below armed it, and the delta
+    ///    joins it with NO lock. THE BOUND: an app that takes the mouse or enters
+    ///    the alt screen with DEC 1007 mid-gesture gets local band motion for at
+    ///    most the remainder of the current row — the next banked row reaches
+    ///    the seam, routes Report/AltScroll, and `input_wheel` releases the
+    ///    band. With none armed — the gesture's first delta —
+    ///    ONE short lock reads the facts and evaluates the seam's own pure
+    ///    [`crate::input::wheel_route_for`] (Shift/Alt bypass, tracking, alt
+    ///    screen + DEC 1007 — the `ModeMirror` has no alt-screen twin, so the
+    ///    lock is where AltScroll is told apart from Viewport). One acquisition
+    ///    per gesture, against the seam's one per row; a tracked band then costs
+    ///    the engine a lock only at each row crossing (`engine_row`).
+    ///
+    /// Reduced motion has no sub-row band (an animation-class effect; whole
+    /// rows still arrive through the seam and snap), and is checked BEFORE the
+    /// probe so it never pays the lock.
+    fn track_precise_scroll(&mut self, wid: WindowId, dy_px: f64) {
+        use aterm_types::mouse::SHIFT_MASK;
+        // The SAME gate the whole-row glide resolves (`effect_policy`: OS Reduce
+        // Motion, `motion = "reduced"`, an unfocused window — never the
+        // load-shed latch, which sheds decoration, not the reader's own hand).
+        if !self.smooth_scroll_animates(wid) {
+            return;
+        }
+        let Some(front) = self.front_terminal_mirror(wid) else {
+            return;
+        };
+        let Some(modes) = self
+            .pool
+            .get(front.session)
+            .map(|owner| owner.ctx.modes.clone())
+        else {
+            return;
+        };
+        let term = front.term;
+        let mods = self.mouse_modifiers(wid);
+        // Tier 1 honours exactly the lock-free half of the seam's bypass: Shift
+        // reserves the wheel for the terminal on every screen; Alt's bypass is
+        // alt-screen-conditional (`wheel_route_for`) and the mirror carries no
+        // alt-screen bit, so Alt cannot be honoured here and falls to tier 3.
+        if modes.mouse_tracking_enabled() && mods & SHIFT_MASK == 0 {
+            self.release_scroll_track(wid);
+            return;
+        }
+        let cell_h = self.win_cell_size(wid).1.max(1) as i64;
+        let same = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.scroll_glide.as_ref())
+            .is_some_and(|st| std::sync::Arc::ptr_eq(&st.term, &term) && st.cell_h == cell_h);
+        let viewport = if same {
+            None
+        } else {
+            let t = term_lock(&term);
+            if crate::input::wheel_route_for(&t, mods) != crate::input::WheelRoute::Viewport {
+                return;
+            }
+            Some(crate::input::WheelViewport {
+                display_offset: t.grid().display_offset(),
+                scrollback_lines: t.grid().scrollback_lines(),
+                rows: t.rows(),
+            })
+        };
+        self.scroll_wheel_animated_with(wid, &term, 0, viewport, Some(dy_px));
+    }
+
+    /// Start a tracked band's rest-settle NOW (`Glide::release`): the gesture
+    /// ended, or the seam just reported a precise delta to an app. A no-op for
+    /// a notch ease or a settle already in flight, and for no glide at all.
+    pub(crate) fn release_scroll_track(&mut self, wid: WindowId) {
+        let now = Instant::now();
+        if let Some(st) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.scroll_glide.as_mut())
+        {
+            st.glide.release(now);
         }
     }
 

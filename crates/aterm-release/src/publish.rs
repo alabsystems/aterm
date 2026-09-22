@@ -13306,7 +13306,9 @@ fn prove_evergreen_pointer_serves_this_cut(ctx: &CutCtx, slug: &str) -> Result<(
         return Err(Error::new(format!(
             "the evergreen pointer https://github.com/{slug}/releases/latest/download/{asset} \
              {observed}, not {} — every credential-less install discovers the channel head \
-             from that pointer and would never see this cut. Make this release the latest \
+             from that pointer, and this cut is not what it names; the cut's law is that the \
+             pointer NAMES this tag, whatever a client may elect around it. Make this release \
+             the latest \
              (`gh release edit {} -R {slug} --latest`), then `cargo ship cut --resume`.",
             ctx.tag, ctx.tag
         )));

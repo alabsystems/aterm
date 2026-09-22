@@ -81,6 +81,8 @@ pub(crate) fn push_grid_quad(
             h: (band_end - yy) as u16,
             color: premul,
             alpha,
+            color2: premul,
+            alpha2: alpha,
         });
         yy = band_end;
     }
@@ -134,6 +136,8 @@ pub(crate) fn push_fx_rect(
             // ADDITIVE light — this emitter has no other mode (see
             // [`GlowQuad::alpha`]).
             alpha: 0,
+            color2: premul,
+            alpha2: 0,
         });
         yy = band_end;
     }

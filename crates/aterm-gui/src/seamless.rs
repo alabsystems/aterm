@@ -468,6 +468,10 @@ pub(crate) enum ScreenDigestRefusal {
         rows: u16,
         cols: u16,
         history_lines: u32,
+        /// The first bound the meta broke, named. `None` only when every named
+        /// bound held and the carried line count alone is over the handoff
+        /// maximum (`dimension_grid_cap`).
+        violation: Option<MetaBoundViolation>,
     },
     DimensionsRefused {
         local_id: u64,
@@ -536,10 +540,20 @@ impl std::fmt::Display for ScreenDigestRefusal {
                 rows,
                 cols,
                 history_lines,
-            } => write!(
-                formatter,
-                "session {local_id}: meta out of bounds at {rows}x{cols} with {history_lines} carried line(s)"
-            ),
+                violation,
+            } => {
+                write!(
+                    formatter,
+                    "session {local_id}: meta out of bounds at {rows}x{cols} with {history_lines} carried line(s): "
+                )?;
+                match violation {
+                    Some(violation) => write!(formatter, "{violation}"),
+                    None => write!(
+                        formatter,
+                        "history_lines={history_lines} must be at most MAX_HANDOFF_HISTORY_LINES={MAX_HANDOFF_HISTORY_LINES}"
+                    ),
+                }
+            }
             Self::DimensionsRefused {
                 local_id,
                 rows,
@@ -721,11 +735,12 @@ fn screen_digest_refs(
     for (local_id, checkpoint) in &screens {
         let local_id = *local_id;
         let meta = CheckpointMeta::from_checkpoint(checkpoint);
-        let cap = checkpoint_grid_cap(&meta).ok_or(ScreenDigestRefusal::MetaUnbounded {
+        let cap = checkpoint_grid_cap(&meta).ok_or_else(|| ScreenDigestRefusal::MetaUnbounded {
             local_id,
             rows: checkpoint.rows,
             cols: checkpoint.cols,
             history_lines: checkpoint.history_lines,
+            violation: checkpoint_meta_bound_violation(&meta),
         })?;
         let admitted = admit_checkpoint_dimensions(
             &mut aggregate_cells,
@@ -1021,49 +1036,299 @@ fn take_control_sidecar(
         .flatten()
 }
 
-fn checkpoint_cursor_is_bounded(
-    cursor: &aterm_core::terminal::GridCursorRepr,
-    rows: u16,
-    cols: u16,
-) -> bool {
-    cursor.cursor_row < rows
-        && cursor.cursor_col < cols
-        && cursor.scroll_top <= cursor.scroll_bottom
-        && cursor.scroll_bottom < rows
-        && cursor.margin_left <= cursor.margin_right
-        && cursor.margin_right < cols
-        // Grid resize deliberately never shrinks the stop vector: stops beyond
-        // the current width must survive a later grow. Require coverage of every
-        // active column, while independently capping the carried allocation at
-        // the engine's protocol maximum.
-        && cursor.tab_stops.len() >= usize::from(cols)
-        && cursor.tab_stops.len() <= usize::from(aterm_core::grid::MAX_GRID_COLS)
+/// The relation a meta value had to satisfy against its bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundRule {
+    /// `value < limit`.
+    Below,
+    /// `value <= limit`.
+    AtMost,
+    /// `value >= limit`.
+    AtLeast,
 }
 
-fn checkpoint_meta_is_bounded(meta: &CheckpointMeta) -> bool {
+impl std::fmt::Display for BoundRule {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Below => "must be below",
+            Self::AtMost => "must be at most",
+            Self::AtLeast => "must be at least",
+        })
+    }
+}
+
+/// The first bound a visible-checkpoint meta broke, named field by field.
+///
+/// DIAGNOSTIC ONLY, like the [`ScreenDigestRefusal`] that carries it: nothing
+/// here touches the hash. It exists because `meta out of bounds at 55x149`
+/// cost a morning of reading `checkpoint_meta_is_bounded` against a live
+/// process that could not be asked which of its fourteen conjuncts was false
+/// (2026-09-22: it was `saved_cursor_main.cursor_row`, see
+/// `SavedCursorRepr::capture`). Every arm of the predicate now says which
+/// value, which bound, and by how much.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetaBoundViolation {
+    /// The meta member the value lives in (`cursor`, `alt_cursor`,
+    /// `saved_cursor_main`, `saved_cursor_alt`), or `""` for a top-level field.
+    pub(crate) slot: &'static str,
+    /// The field, in the meta's own spelling.
+    pub(crate) field: &'static str,
+    pub(crate) value: u64,
+    pub(crate) rule: BoundRule,
+    /// The bound's own name (`rows`, `cols`, `scroll_bottom`, `MAX_GRID_COLS`, …),
+    /// or `""` for a literal bound, which prints as the number alone.
+    pub(crate) limit_name: &'static str,
+    pub(crate) limit: u64,
+}
+
+impl std::fmt::Display for MetaBoundViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            slot,
+            field,
+            value,
+            rule,
+            limit_name,
+            limit,
+        } = *self;
+        if !slot.is_empty() {
+            write!(formatter, "{slot}.")?;
+        }
+        if limit_name.is_empty() {
+            write!(formatter, "{field}={value} {rule} {limit}")
+        } else {
+            write!(formatter, "{field}={value} {rule} {limit_name}={limit}")
+        }
+    }
+}
+
+/// The first bound a per-grid cursor projection breaks, if any, in the order
+/// the wire's consumer checks them. `slot` names the meta member for the
+/// report (`cursor` / `alt_cursor`).
+fn grid_cursor_bound_violation(
+    cursor: &aterm_core::terminal::GridCursorRepr,
+    slot: &'static str,
+    rows: u16,
+    cols: u16,
+) -> Option<MetaBoundViolation> {
+    let broke = |field, value: u64, rule, limit_name, limit: u64| MetaBoundViolation {
+        slot,
+        field,
+        value,
+        rule,
+        limit_name,
+        limit,
+    };
+    let rows_limit = u64::from(rows);
+    let cols_limit = u64::from(cols);
+    let tab_stops = u64::try_from(cursor.tab_stops.len()).unwrap_or(u64::MAX);
+    if cursor.cursor_row >= rows {
+        return Some(broke(
+            "cursor_row",
+            u64::from(cursor.cursor_row),
+            BoundRule::Below,
+            "rows",
+            rows_limit,
+        ));
+    }
+    if cursor.cursor_col >= cols {
+        return Some(broke(
+            "cursor_col",
+            u64::from(cursor.cursor_col),
+            BoundRule::Below,
+            "cols",
+            cols_limit,
+        ));
+    }
+    if cursor.scroll_top > cursor.scroll_bottom {
+        return Some(broke(
+            "scroll_top",
+            u64::from(cursor.scroll_top),
+            BoundRule::AtMost,
+            "scroll_bottom",
+            u64::from(cursor.scroll_bottom),
+        ));
+    }
+    if cursor.scroll_bottom >= rows {
+        return Some(broke(
+            "scroll_bottom",
+            u64::from(cursor.scroll_bottom),
+            BoundRule::Below,
+            "rows",
+            rows_limit,
+        ));
+    }
+    if cursor.margin_left > cursor.margin_right {
+        return Some(broke(
+            "margin_left",
+            u64::from(cursor.margin_left),
+            BoundRule::AtMost,
+            "margin_right",
+            u64::from(cursor.margin_right),
+        ));
+    }
+    if cursor.margin_right >= cols {
+        return Some(broke(
+            "margin_right",
+            u64::from(cursor.margin_right),
+            BoundRule::Below,
+            "cols",
+            cols_limit,
+        ));
+    }
+    // Grid resize deliberately never shrinks the stop vector: stops beyond
+    // the current width must survive a later grow. Require coverage of every
+    // active column, while independently capping the carried allocation at
+    // the engine's protocol maximum.
+    if tab_stops < cols_limit {
+        return Some(broke(
+            "tab_stops.len()",
+            tab_stops,
+            BoundRule::AtLeast,
+            "cols",
+            cols_limit,
+        ));
+    }
+    if tab_stops > u64::from(aterm_core::grid::MAX_GRID_COLS) {
+        return Some(broke(
+            "tab_stops.len()",
+            tab_stops,
+            BoundRule::AtMost,
+            "MAX_GRID_COLS",
+            u64::from(aterm_core::grid::MAX_GRID_COLS),
+        ));
+    }
+    None
+}
+
+/// The first bound `meta` breaks, in the order the wire's consumer checks
+/// them — so the field a refusal names is the one the successor would have
+/// refused on first. `None` is the whole predicate holding.
+fn checkpoint_meta_bound_violation(meta: &CheckpointMeta) -> Option<MetaBoundViolation> {
     let rows = meta.rows;
     let cols = meta.cols;
-    rows > 0
-        && cols > 0
-        && rows <= aterm_core::grid::MAX_GRID_ROWS
-        && cols <= aterm_core::grid::MAX_GRID_COLS
-        && checkpoint_cursor_is_bounded(&meta.cursor, rows, cols)
-        && meta
-            .alt_cursor
-            .as_ref()
-            .is_none_or(|cursor| checkpoint_cursor_is_bounded(cursor, rows, cols))
-        && meta
-            .saved_cursor_main
-            .as_ref()
-            .is_none_or(|cursor| cursor.cursor_row < rows && cursor.cursor_col < cols)
-        && meta
-            .saved_cursor_alt
-            .as_ref()
-            .is_none_or(|cursor| cursor.cursor_row < rows && cursor.cursor_col < cols)
-        && meta
-            .current_working_directory
-            .as_ref()
-            .is_none_or(|cwd| cwd.len() <= 8 * 1024 && !cwd.contains('\0'))
+    let top = |field, value: u64, rule, limit_name, limit: u64| MetaBoundViolation {
+        slot: "",
+        field,
+        value,
+        rule,
+        limit_name,
+        limit,
+    };
+    if rows == 0 {
+        return Some(top("rows", 0, BoundRule::AtLeast, "", 1));
+    }
+    if cols == 0 {
+        return Some(top("cols", 0, BoundRule::AtLeast, "", 1));
+    }
+    if rows > aterm_core::grid::MAX_GRID_ROWS {
+        return Some(top(
+            "rows",
+            u64::from(rows),
+            BoundRule::AtMost,
+            "MAX_GRID_ROWS",
+            u64::from(aterm_core::grid::MAX_GRID_ROWS),
+        ));
+    }
+    if cols > aterm_core::grid::MAX_GRID_COLS {
+        return Some(top(
+            "cols",
+            u64::from(cols),
+            BoundRule::AtMost,
+            "MAX_GRID_COLS",
+            u64::from(aterm_core::grid::MAX_GRID_COLS),
+        ));
+    }
+    if let Some(violation) = grid_cursor_bound_violation(&meta.cursor, "cursor", rows, cols) {
+        return Some(violation);
+    }
+    if let Some(violation) = meta
+        .alt_cursor
+        .as_ref()
+        .and_then(|cursor| grid_cursor_bound_violation(cursor, "alt_cursor", rows, cols))
+    {
+        return Some(violation);
+    }
+    // THE DECSC SLOTS ARE BOUNDED BY THE PROTOCOL, NOT BY THE GRID. A saved
+    // cursor is absolute coordinates that nothing reads until DECRC or a 1049
+    // exit, and those clamp to the grid AT THAT MOMENT (`Grid::set_cursor`;
+    // xterm's `CursorRestore` likewise, over a `sc->row` its `ScreenResize`
+    // never touched). `Terminal::resize` therefore leaves `cursor_save` alone,
+    // so after a shrink an honest slot names a row the grid no longer has —
+    // and if the grid grows back before the slot is read, the cursor lands on
+    // its original row, which is the behaviour a restored engine must keep.
+    //
+    // Bounding the slot at `rows`/`cols` here is what refused every automatic
+    // self-update from v0.87.0 through v0.90.0 on the owner's daily driver
+    // (2026-09-22): the "update staged" bar takes one chrome row, every 56-row
+    // session was 55 rows at the park, and the Claude Code tab's slot — saved
+    // by 1049 from a prompt on row 55 — read `55 >= 55`. Clamping the slot at
+    // capture instead was measured lossy (the successor grows back to 56 rows
+    // seconds later and its 1049 exit then landed one row above the live
+    // engine's), so the bound is the engine's own ceiling: a row the slot could
+    // only carry if it were forged. The restore path indexes nothing with it
+    // (`SavedCursorRepr::into_saved` builds a bare `Cursor`), so the ceiling is
+    // a sanity bound, not a memory bound.
+    let max_rows = aterm_core::grid::MAX_GRID_ROWS;
+    let max_cols = aterm_core::grid::MAX_GRID_COLS;
+    for (slot, saved) in [
+        ("saved_cursor_main", meta.saved_cursor_main),
+        ("saved_cursor_alt", meta.saved_cursor_alt),
+    ] {
+        let Some(saved) = saved else {
+            continue;
+        };
+        if saved.cursor_row >= max_rows {
+            return Some(MetaBoundViolation {
+                slot,
+                field: "cursor_row",
+                value: u64::from(saved.cursor_row),
+                rule: BoundRule::Below,
+                limit_name: "MAX_GRID_ROWS",
+                limit: u64::from(max_rows),
+            });
+        }
+        if saved.cursor_col >= max_cols {
+            return Some(MetaBoundViolation {
+                slot,
+                field: "cursor_col",
+                value: u64::from(saved.cursor_col),
+                rule: BoundRule::Below,
+                limit_name: "MAX_GRID_COLS",
+                limit: u64::from(max_cols),
+            });
+        }
+    }
+    if let Some(cwd) = meta.current_working_directory.as_ref() {
+        let len = u64::try_from(cwd.len()).unwrap_or(u64::MAX);
+        if len > 8 * 1024 {
+            return Some(top(
+                "current_working_directory.len()",
+                len,
+                BoundRule::AtMost,
+                "8 KiB",
+                8 * 1024,
+            ));
+        }
+        let nul_bytes =
+            u64::try_from(cwd.bytes().filter(|byte| *byte == 0).count()).unwrap_or(u64::MAX);
+        if nul_bytes > 0 {
+            return Some(top(
+                "current_working_directory NUL bytes",
+                nul_bytes,
+                BoundRule::AtMost,
+                "",
+                0,
+            ));
+        }
+    }
+    None
+}
+
+/// `true` when every named bound holds — [`checkpoint_meta_bound_violation`]
+/// is `None`. The predicate's own spelling, kept for the cap and the tests.
+fn checkpoint_meta_is_bounded(meta: &CheckpointMeta) -> bool {
+    checkpoint_meta_bound_violation(meta).is_none()
 }
 
 fn parse_checkpoint_meta(carry: &ScreenCarry) -> Option<CheckpointMeta> {
@@ -3275,6 +3540,9 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
                 // IDENTITY (session identities, 2026-09-17): the label rides the
                 // record; the shell keeps the identity's env across the exec.
                 identity: rec.identity.clone(),
+                // BROADCAST OPT-INS (round 23): the topic set rides the record,
+                // validated on the way onto the fabric (`fabric::parse_topics`).
+                topics: rec.topics.clone(),
             })
         })
         .collect::<Option<Vec<_>>>();
@@ -3780,6 +4048,271 @@ mod tests {
         assert!(
             !checkpoint_meta_is_bounded(&oversized),
             "oversize vector is rejected before restore/allocation growth"
+        );
+    }
+
+    /// The desk that refused every automatic update from v0.87.0 to v0.90.0 on
+    /// the owner's daily driver (measured 2026-09-22): a Claude Code tab started
+    /// from a shell prompt on the LAST row of a 56-row grid (1049 saves that
+    /// cursor into the main DECSC slot), then the "update staged" status bar
+    /// takes one row of chrome and every session is 55 rows when the park runs.
+    /// The engine leaves the slot raw, as xterm does, so the checkpoint carries
+    /// `saved_cursor_main.cursor_row == rows` — honest state — and the whole
+    /// set used to be refused as `meta out of bounds`. The wire now bounds a
+    /// DECSC slot by the engine's ceiling rather than the grid, the slot
+    /// travels raw, and the digest commits.
+    #[test]
+    fn a_saved_cursor_on_the_old_bottom_row_survives_the_status_bars_one_row_shrink() {
+        let mut t = aterm_core::terminal::Terminal::new(56, 149);
+        for i in 0..60 {
+            t.process(format!("$ command {i}\r\n").as_bytes());
+        }
+        t.process(b"$ claude");
+        assert_eq!(t.cursor().row, 55, "the prompt sits on the last row");
+        t.process(b"\x1b[?1049h");
+        t.resize(55, 149);
+        let checkpoint = t
+            .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
+            .expect("Ground");
+        let meta = CheckpointMeta::from_checkpoint(&checkpoint);
+        assert_eq!(meta.rows, 55);
+        assert_eq!(
+            meta.saved_cursor_main.map(|saved| saved.cursor_row),
+            Some(55),
+            "the wire carries the slot RAW, on a row the grid no longer has"
+        );
+        assert_eq!(checkpoint_meta_bound_violation(&meta), None);
+        assert!(checkpoint_meta_is_bounded(&meta));
+        assert!(
+            screen_digest(&[(0, checkpoint)]).is_ok(),
+            "the visible checkpoint set commits canonically"
+        );
+    }
+
+    /// Every conjunct of the bound predicate names the value, the bound and
+    /// the relation — the first broken one, in the consumer's order — and the
+    /// refusal that carries it prints the sentence the log needed on 2026-09-22.
+    #[test]
+    fn a_meta_out_of_bounds_names_the_field_the_value_and_the_bound() {
+        let max_rows = aterm_core::grid::MAX_GRID_ROWS;
+        let max_cols = aterm_core::grid::MAX_GRID_COLS;
+        let mut t = aterm_core::terminal::Terminal::new(6, 40);
+        t.process(b"\x1b7");
+        let checkpoint = t.checkpoint_visible().expect("Ground");
+        let meta = CheckpointMeta::from_checkpoint(&checkpoint);
+        assert_eq!(checkpoint_meta_bound_violation(&meta), None);
+
+        let mut forged = meta.clone();
+        forged
+            .saved_cursor_main
+            .as_mut()
+            .expect("DECSC left a main slot")
+            .cursor_row = max_rows;
+        let violation = checkpoint_meta_bound_violation(&forged)
+            .expect("no grid can have put a cursor on row MAX_GRID_ROWS");
+        assert_eq!(
+            violation,
+            MetaBoundViolation {
+                slot: "saved_cursor_main",
+                field: "cursor_row",
+                value: u64::from(max_rows),
+                rule: BoundRule::Below,
+                limit_name: "MAX_GRID_ROWS",
+                limit: u64::from(max_rows),
+            }
+        );
+        assert!(!checkpoint_meta_is_bounded(&forged));
+        let refusal = ScreenDigestRefusal::MetaUnbounded {
+            local_id: 0,
+            rows: 6,
+            cols: 40,
+            history_lines: 0,
+            violation: Some(violation),
+        };
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "session 0: meta out of bounds at 6x40 with 0 carried line(s): \
+                 saved_cursor_main.cursor_row={max_rows} must be below MAX_GRID_ROWS={max_rows}"
+            )
+        );
+
+        let named = |mutate: fn(&mut CheckpointMeta)| {
+            let mut meta = meta.clone();
+            mutate(&mut meta);
+            checkpoint_meta_bound_violation(&meta).map(|violation| {
+                (
+                    violation.slot,
+                    violation.field,
+                    violation.value,
+                    violation.rule,
+                    violation.limit_name,
+                    violation.limit,
+                )
+            })
+        };
+        // A DECSC slot past the CURRENT grid is honest state, not a refusal.
+        assert_eq!(
+            named(|m| m.saved_cursor_main.as_mut().unwrap().cursor_row = 6),
+            None
+        );
+        assert_eq!(
+            named(|m| m.saved_cursor_main.as_mut().unwrap().cursor_col = 40),
+            None
+        );
+        assert_eq!(
+            named(|m| m.rows = 0),
+            Some(("", "rows", 0, BoundRule::AtLeast, "", 1))
+        );
+        assert_eq!(
+            named(|m| m.cursor.cursor_col = 40),
+            Some(("cursor", "cursor_col", 40, BoundRule::Below, "cols", 40))
+        );
+        assert_eq!(
+            named(|m| m.cursor.scroll_bottom = 6),
+            Some(("cursor", "scroll_bottom", 6, BoundRule::Below, "rows", 6))
+        );
+        assert_eq!(
+            named(|m| m.cursor.scroll_top = 9),
+            Some((
+                "cursor",
+                "scroll_top",
+                9,
+                BoundRule::AtMost,
+                "scroll_bottom",
+                5
+            ))
+        );
+        assert_eq!(
+            named(|m| m.cursor.tab_stops.truncate(39)),
+            Some((
+                "cursor",
+                "tab_stops.len()",
+                39,
+                BoundRule::AtLeast,
+                "cols",
+                40
+            ))
+        );
+        assert_eq!(
+            named(|m| m.saved_cursor_main.as_mut().unwrap().cursor_col =
+                aterm_core::grid::MAX_GRID_COLS),
+            Some((
+                "saved_cursor_main",
+                "cursor_col",
+                u64::from(max_cols),
+                BoundRule::Below,
+                "MAX_GRID_COLS",
+                u64::from(max_cols)
+            ))
+        );
+        assert_eq!(
+            named(|m| m.current_working_directory = Some("a\0b".into())),
+            Some((
+                "",
+                "current_working_directory NUL bytes",
+                1,
+                BoundRule::AtMost,
+                "",
+                0
+            ))
+        );
+        // A literal bound prints as the number alone.
+        assert_eq!(
+            MetaBoundViolation {
+                slot: "",
+                field: "rows",
+                value: 0,
+                rule: BoundRule::AtLeast,
+                limit_name: "",
+                limit: 1,
+            }
+            .to_string(),
+            "rows=0 must be at least 1"
+        );
+        // The unnamed remainder: the carried line count alone over its maximum.
+        let history = ScreenDigestRefusal::MetaUnbounded {
+            local_id: 3,
+            rows: 6,
+            cols: 40,
+            history_lines: 257,
+            violation: None,
+        };
+        assert_eq!(
+            history.to_string(),
+            "session 3: meta out of bounds at 6x40 with 257 carried line(s): \
+             history_lines=257 must be at most MAX_HANDOFF_HISTORY_LINES=256"
+        );
+    }
+
+    /// EVERY REACHABLE ENGINE STATE IS ADMITTED BY THE WIRE. The 2026-09-22
+    /// root cause was honest engine state that the producer's own predicate
+    /// refused; the conjuncts of `checkpoint_meta_bound_violation` are pinned
+    /// one at a time above and together here. A terminal is driven through
+    /// the sequences that move every field the predicate reads — DECSC/DECRC
+    /// on both screens, 1047/1049, DECSTBM, DECLRMM+DECSLRM, origin mode,
+    /// TBC/HTS, RIS — interleaved with shrinks, grows, narrowings and
+    /// widenings, and at every Ground state it passes through the visible
+    /// checkpoint set must commit canonically. The geometry stays inside the
+    /// per-grid cell budget so the only refusal this walk can meet is a real
+    /// producer/predicate disagreement.
+    #[test]
+    fn every_reachable_engine_state_is_admitted_by_the_wire() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut t = aterm_core::terminal::Terminal::new(24, 80);
+        let mut admitted = 0_u32;
+        for step in 0..3000_u32 {
+            let roll = next();
+            let a = u16::try_from((roll >> 8) % 64).expect("< 64") + 1;
+            let b = u16::try_from((roll >> 24) % 96).expect("< 96") + 1;
+            match roll % 20 {
+                0 => t.process(b"$ command\r\n"),
+                1 => t.process(format!("\x1b[{a};{b}H").as_bytes()),
+                2 => t.process(b"\x1b7"),
+                3 => t.process(b"\x1b8"),
+                4 => t.process(b"\x1b[?1049h"),
+                5 => t.process(b"\x1b[?1049l"),
+                6 => t.process(b"\x1b[?1047h"),
+                7 => t.process(b"\x1b[?1047l"),
+                8 => t.process(format!("\x1b[{};{}r", a.min(b), a.max(b)).as_bytes()),
+                9 => t.process(b"\x1b[r"),
+                10 => t.process(format!("\x1b[?69h\x1b[{};{}s", a.min(b), a.max(b)).as_bytes()),
+                11 => t.process(b"\x1b[?69l"),
+                12 => t.process(b"\x1b[?6h"),
+                13 => t.process(b"\x1b[?6l"),
+                14 => t.process(b"\x1b[3g"),
+                15 => t.process(b"\x1bH\t"),
+                16 => t.process(b"\x1bc"),
+                17 => t.process(&[b'x'; 200]),
+                _ => t.resize(a, b),
+            }
+            let Some(checkpoint) = t.checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize) else {
+                continue;
+            };
+            let meta = CheckpointMeta::from_checkpoint(&checkpoint);
+            if let Some(violation) = checkpoint_meta_bound_violation(&meta) {
+                panic!(
+                    "step {step}: the engine at {}x{} produced a meta its own wire refuses: {violation}",
+                    meta.rows, meta.cols
+                );
+            }
+            if let Err(refusal) = screen_digest(&[(0, checkpoint)]) {
+                panic!(
+                    "step {step}: the engine at {}x{} was refused: {refusal}",
+                    meta.rows, meta.cols
+                );
+            }
+            admitted += 1;
+        }
+        assert!(
+            admitted > 2000,
+            "the walk must reach Ground states: {admitted}"
         );
     }
 
@@ -4899,6 +5432,7 @@ mod tests {
                 control: None,
                 frozen_path: false,
                 identity: None,
+                topics: Vec::new(),
             });
             live.push((local_id, master, 4000 + index as i32));
             if let Some(carry) = carry {

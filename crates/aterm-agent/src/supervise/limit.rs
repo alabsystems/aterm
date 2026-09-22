@@ -357,6 +357,22 @@ pub fn parse_zone(text: &str) -> Option<i64> {
     Some(if sign == "-" { -v } else { v })
 }
 
+/// Whether `c` would break a payload that promises to be ONE LINE.
+///
+/// `char::is_control()` alone is NOT that question and it is the trap every
+/// hand-rolled sweep in this tree has fallen into: it is Cc-only
+/// (`U+0000..=U+001F`, `U+007F..=U+009F`), so `U+2028` LINE SEPARATOR and
+/// `U+2029` PARAGRAPH SEPARATOR — which are Zl and Zp, and which a terminal,
+/// a JSON reader and an editor all treat as line breaks — pass straight
+/// through. This predicate is the one home of that rule; [`one_line`] folds
+/// what it names to a space and the harness's one-line surfaces (the
+/// statusline, the usage HUD, the alignment sidecar's wire word) drop or fold
+/// it the same way rather than each asking the wrong question.
+#[must_use]
+pub fn breaks_a_line(c: char) -> bool {
+    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
+}
+
 /// A rules file as ONE turn's text: every line break and control character a
 /// space, runs of spaces one, the ends trimmed — the wire frames a request
 /// per line, and Claude Code submits on Enter.
@@ -364,11 +380,7 @@ pub fn one_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut space = true;
     for c in text.chars() {
-        let c = if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
-            ' '
-        } else {
-            c
-        };
+        let c = if breaks_a_line(c) { ' ' } else { c };
         if c == ' ' {
             if !space {
                 out.push(' ');

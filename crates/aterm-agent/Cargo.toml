@@ -46,10 +46,28 @@ aterm-ctl = { path = "../aterm-ctl" }
 # supplies O_NOFOLLOW/O_DIRECTORY for private state and WAL admission.
 aterm-digest = { workspace = true }
 libc = { workspace = true }
+# The ONE identity token the alignment tuple is keyed by: `APP_VERSION`, which
+# design §3.1 of the wrapper defines as what `aterm --version` prints after the
+# `aterm ` prefix. Not a new edge in the BUILD graph — `aterm-ctl` above already
+# pulls aterm-types — and the alternative was guessing the token or inventing an
+# environment variable to carry it, either of which would key a cached probe
+# verdict by a string nothing measured.
+aterm-types = { workspace = true }
+# The harness core reads two JSON shapes Claude Code writes (the statusLine
+# input and the transcript's usage rows) through the workspace's own parser.
+# A leaf: its one dependency is `serde`, already in the shipped graph.
+aterm-json = { workspace = true }
+# THE launch-nonce reader. `turn id=<epoch>:<producer>:<seq>` is parsed
+# server-side by `LaunchNonce::from_hex(epoch)?`, and a harness that mints an
+# `<epoch>` the server cannot parse types nothing at all — so the fence on a
+# typed act asks the SAME reader rather than re-deriving "32 lowercase hex".
+# Already in this crate's dev graph and in the lock; a leaf pair
+# (aterm-pty + aterm-uds) with no third-party package behind it, and no cycle:
+# aterm-session does not depend on aterm-agent.
+aterm-session = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
 # The E2E loopback-TLS remote-Turn test drives a real `dial_and_relay` bridge and a
 # channel-bound capability. Transport-only test deps; no cycle (aterm-net ⊄ aterm-agent).
 aterm-net = { workspace = true }
-aterm-session = { workspace = true }

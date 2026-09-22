@@ -38,13 +38,14 @@ use aterm_spec::derive::{
     exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
     fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
     flash_limiter_window_model, focus_modifier_cache_model, gpu_loss_recovery_model,
-    gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
-    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
-    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
-    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
-    kitty_flush_worker_model, kitty_pin_merge_model, kitty_sidecar_durability_model,
-    kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
-    manual_config_completion_model, manual_config_diagnostics_lane_model,
+    gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
+    harness_failure_recovery_model, harness_ledger_ring_model, harness_turn_observation_model,
+    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
+    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
+    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
+    kitty_collectibles_model, kitty_flush_worker_model, kitty_pin_merge_model,
+    kitty_sidecar_durability_model, kitty_sing_detector_model, layout_coordinate_reset_model,
+    ligature_gate_model, manual_config_completion_model, manual_config_diagnostics_lane_model,
     manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
     motion_policy_model, native_async_delivery_model, native_capture_source_model,
     native_close_plan_model, native_config_observation_handoff_model,
@@ -410,6 +411,196 @@ fn derived_operator_leadership_proves_and_catches_split_brain() {
 fn derived_operator_fleet_fault_proves_and_catches_blocked_egress() {
     let model = operator_fleet_fault_model();
     assert_operator_model_shape(&model, |_| false);
+    assert_proves_and_catches(&model);
+}
+
+/// The harness models (design §11 items 5 and 7) get the operator's shape
+/// obligations — full committed-config action coverage, every action exercised
+/// at `Buggy = 1`, no wedge before a legitimate terminal — and the per-invariant
+/// non-vacuity sweep run HERE, by name.
+///
+/// The one obligation `assert_operator_model_shape` carries that this cannot:
+/// enrolment in `xref::model_registry()`, which lives in `src/xref.rs` — a file
+/// this slice does not own. Until that line lands these two models are outside
+/// the workspace-wide ratchet (`non_vacuity_ratchet.rs`), so the sweep is
+/// spelled out at each call site rather than left to a registry that does not
+/// list them: a model swept by nothing is the silence that ratchet exists to
+/// refuse.
+fn assert_harness_model_shape(model: &Model, bounds_guards: &[&str]) {
+    assert!(
+        !aterm_spec::xref::model_registry()
+            .into_iter()
+            .any(|candidate| candidate.name == model.name),
+        "{} is registered now — delete this helper's registry caveat and route it through \
+         `assert_operator_model_shape`",
+        model.name
+    );
+
+    verify::audit_dead_negative_controls(model, &[]).unwrap_or_else(|reason| {
+        panic!(
+            "{} must have full committed-config action coverage: {reason}",
+            model.name
+        )
+    });
+
+    let buggy = aterm_spec::interp::with_buggy(model, 1);
+    let declared: std::collections::BTreeSet<_> =
+        model.actions.iter().map(|action| action.name).collect();
+    assert_eq!(
+        aterm_spec::interp::fired_actions(&buggy),
+        declared,
+        "{} must remain bounded and exercise every action at Buggy=1",
+        model.name
+    );
+
+    let deadlock =
+        aterm_spec::interp::find_deadlock(&aterm_spec::interp::with_buggy(model, 0), |_| false);
+    assert!(
+        deadlock.is_none(),
+        "{} must never wedge: the ring is always reopenable and the ladder always \
+         re-askable: {deadlock:?}",
+        model.name
+    );
+
+    assert_every_invariant_carries_a_mutant(model, bounds_guards);
+}
+
+/// §11 item 5: the bounded, lossy ledger ring. `Buggy = 1` reproduces a reopen
+/// that hands the torn tail's slot out a second time, a rotation that forgets
+/// two segments, and a rotation that forgets none — one per design claim.
+#[test]
+fn derived_harness_ledger_ring_proves_and_catches_slot_reuse_and_wrong_rotation() {
+    let model = harness_ledger_ring_model();
+    assert_harness_model_shape(&model, &["FillBounded"]);
+
+    // The historical defect this ring was written against, stated as a trace:
+    // a writer dies mid-record, and the reopen that does not count the
+    // fragment's slot hands that id out again.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut torn = buggy.init_state();
+    for action in ["Rotate", "Tear", "Reopen"] {
+        assert!(buggy.fire(action, &mut torn), "{action}: {torn:?}");
+    }
+    assert_eq!(torn["nextid"], 2, "the torn slot 2 is handed out again");
+    assert!(
+        !buggy.check_invariant("NoReuse", &torn),
+        "a reopen that forgets the fragment must be caught by NoReuse"
+    );
+    let mut healthy = model.init_state();
+    for action in ["Rotate", "Tear", "Reopen"] {
+        assert!(model.fire(action, &mut healthy));
+    }
+    assert_eq!(healthy["nextid"], 3, "the real ring burns the torn slot");
+    assert!(model.check_invariant("NoReuse", &healthy));
+
+    assert_proves_and_catches(&model);
+}
+
+/// §11 item 7: the limit-recovery ladder. `Buggy = 1` starts a second automatic
+/// action while one awaits its verdict — and that single defect falsifies the
+/// budget too, because two actions tested before either landed spend two slots
+/// out of a bound that had room for one.
+#[test]
+fn derived_harness_failure_recovery_proves_and_catches_a_second_action_in_flight() {
+    let model = harness_failure_recovery_model();
+    assert_harness_model_shape(&model, &["Bounds"]);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut queued = buggy.init_state();
+    for action in [
+        "ClassifySession5h",
+        "StartSwitch",
+        "SecondActionWhileInFlight",
+    ] {
+        assert!(buggy.fire(action, &mut queued), "{action}: {queued:?}");
+    }
+    assert_eq!(queued["inflight"], 2);
+    assert!(!buggy.check_invariant("OneInFlight", &queued));
+    assert!(
+        buggy.check_invariant("BudgetHeld", &queued),
+        "nothing has landed yet: the overspend is the consequence, not the defect"
+    );
+
+    // ONE switch was admitted against the budget, and every action queued
+    // behind it lands under that same admission.
+    assert!(buggy.fire("Verdict", &mut queued));
+    for _ in 0..2 {
+        for action in ["SecondActionWhileInFlight", "Verdict"] {
+            assert!(buggy.fire(action, &mut queued), "{action}: {queued:?}");
+        }
+    }
+    assert_eq!(queued["spent"], 3, "three landed under a budget of two");
+    assert!(
+        !buggy.check_invariant("BudgetHeld", &queued),
+        "a second in-flight action must overspend the shared switch budget"
+    );
+
+    // The healthy engine refuses the second action, so the budget holds.
+    let mut one_at_a_time = model.init_state();
+    for action in [
+        "ClassifySession5h",
+        "StartSwitch",
+        "SecondActionWhileInFlight",
+    ] {
+        assert!(model.fire(action, &mut one_at_a_time));
+    }
+    assert_eq!(
+        one_at_a_time["inflight"], 1,
+        "the second is queued, not run"
+    );
+
+    assert_proves_and_catches(&model);
+}
+
+/// The grid spine's turn machine (design §4.2, §5.8.1). `Buggy = 1`
+/// reproduces the two defects the writer/reader asymmetry exists to prevent:
+/// `status` closing a turn the GRID opened — "did not look" read as "not
+/// busy" — and an exit that leaves the open turn behind.
+#[test]
+fn derived_harness_turn_observation_proves_and_catches_a_status_close_of_a_grid_turn() {
+    let model = harness_turn_observation_model();
+    assert_harness_model_shape(&model, &["Bounds"]);
+
+    // The defect, stated as a trace: the grid opens a turn, the next pass
+    // reads no grid (its `revision` did not move) and closes it anyway.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut flapped = buggy.init_state();
+    for action in ["GridOpensTurn", "StatusWouldCloseAGridTurn"] {
+        assert!(buggy.fire(action, &mut flapped), "{action}: {flapped:?}");
+    }
+    assert_eq!(flapped["turn"], 0, "the grid-opened turn was closed");
+    assert!(
+        !buggy.check_invariant("AGridTurnIsNeverClosedByStatusAlone", &flapped),
+        "a status-sourced close of a grid turn must be caught"
+    );
+    // ... and the real observer falls through that arm, leaving it open.
+    let mut held = model.init_state();
+    for action in ["GridOpensTurn", "StatusWouldCloseAGridTurn"] {
+        assert!(model.fire(action, &mut held), "{action}: {held:?}");
+    }
+    assert_eq!(held["turn"], 1, "the shipped arm changes nothing");
+    assert!(model.check_invariant("AGridTurnIsNeverClosedByStatusAlone", &held));
+
+    // A status-OPENED turn is a different fact: the weaker source may close
+    // what it opened, and that is not the defect above.
+    let mut own = model.init_state();
+    for action in ["StatusOpensTurn", "StatusClosesItsOwnTurn"] {
+        assert!(model.fire(action, &mut own), "{action}: {own:?}");
+    }
+    assert_eq!(own["turn"], 0);
+    assert_eq!(own["statusclosed"], 0, "closing its own turn is no witness");
+
+    // The second defect: the exit emits and the turn outlives the program.
+    let mut leaked = buggy.init_state();
+    for action in ["GridOpensTurn", "SessionExited"] {
+        assert!(buggy.fire(action, &mut leaked), "{action}: {leaked:?}");
+    }
+    assert_eq!(leaked["turn"], 1, "the turn was left in flight");
+    assert!(
+        !buggy.check_invariant("NoTurnSurvivesTheExit", &leaked),
+        "an exit that does not close the open turn must be caught"
+    );
+
     assert_proves_and_catches(&model);
 }
 
@@ -5366,6 +5557,61 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     );
     let ruleless = buggy.successors("ParkWithoutTheRule", &mid_word)[0].clone();
     assert!(!buggy.check_invariant("ParkedOnlyWhenTheLadderAdmits", &ruleless));
+
+    // THE 2026-09-21 AUDIT. A genuine physical failure at KeysOnly latches the
+    // lane; the clock keeps running underneath the latch; the lapse resumes
+    // the ladder at the phase the clock reached — never a fresh one.
+    let mut keys_only = model.init_state();
+    for _ in 0..2 {
+        keys_only = model.successors("Advance", &keys_only)[0].clone();
+    }
+    assert_eq!(keys_only["phase"], 2);
+    let latched = model.successors("PhysicalFailure", &keys_only)[0].clone();
+    assert_eq!(latched["latched"], 1);
+    assert!(
+        model.successors("Park", &latched).is_empty(),
+        "no park while a physical latch holds"
+    );
+    let aged = model.successors("Advance", &latched)[0].clone();
+    assert_eq!(aged["phase"], 3, "the clock advances under the latch");
+    let lapsed = model.successors("Lapse", &aged)[0].clone();
+    assert_eq!(lapsed["latched"], 0);
+    assert_eq!(
+        lapsed["phase"], 3,
+        "the lapse keeps the phase the clock reached"
+    );
+    assert!(model.check_invariant("TheLadderNeverRestarts", &lapsed));
+    assert_eq!(
+        model.successors("Park", &lapsed)[0]["landed"],
+        1,
+        "and a lapse at Land lands at the next poll"
+    );
+    assert!(
+        model.successors("LapseRestartsTheLadder", &aged).is_empty(),
+        "the healthy ladder has no lapse that restarts it"
+    );
+    let restarted = buggy.successors("LapseRestartsTheLadder", &aged)[0].clone();
+    assert_eq!(
+        restarted["phase"], 0,
+        "the mutant: a 600 s latch bought fifteen more minutes"
+    );
+    assert!(!buggy.check_invariant("TheLadderNeverRestarts", &restarted));
+
+    // A park that missed its budget is the machine being busy: the lane keeps
+    // its phase and is gated afresh. The mutant files it as a failure and
+    // latches — the same wedge as the incident, from a stopwatch.
+    let missed = model.successors("ParkMissed", &keys_only)[0].clone();
+    assert_eq!(missed["phase"], 2);
+    assert_eq!(missed["latched"], 0);
+    assert_eq!(missed["manual_only"], 0);
+    assert!(model.check_invariant("ActivityNeverLatchesManualOnly", &missed));
+    assert!(
+        !model.successors("Park", &missed).is_empty(),
+        "the re-park is gated afresh at the same phase"
+    );
+    assert!(model.successors("ParkMissLatches", &keys_only).is_empty());
+    let miss_latched = buggy.successors("ParkMissLatches", &keys_only)[0].clone();
+    assert!(!buggy.check_invariant("ActivityNeverLatchesManualOnly", &miss_latched));
 }
 
 /// A hidden tab may never present after its output wake. Its old latency sample

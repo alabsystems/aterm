@@ -657,17 +657,53 @@ fn get_line_returns_borrowed_for_hot_tier() {
 // Streaming-iterator parity oracles (ST-6)
 // =========================================================================
 
+fn streaming_parity_line(i: u16) -> Line {
+    use std::sync::Arc;
+
+    let text = format!("line-{i:03}: 日本語 e\u{0301} — linked output");
+    let mut attrs = Rle::new();
+    for (col, _) in text.chars().enumerate() {
+        attrs.push(if col < 4 {
+            CellAttrs::new(0x01_11_22_33, CellAttrs::DEFAULT.bg, 0)
+        } else {
+            CellAttrs::DEFAULT
+        });
+    }
+    let mut line = Line::with_hyperlinks_owned(
+        text,
+        attrs,
+        vec![HyperlinkSpan::with_id(
+            0,
+            4,
+            Arc::from("https://example.test/output"),
+            Some(Arc::from(format!("line-{i}"))),
+        )],
+    );
+    line.set_underline_colors(vec![UnderlineColorSpan::new(0, 4, 0x02_00_00_05)]);
+    line.set_wrapped(i % 3 == 1);
+    line
+}
+
 /// Differential oracle: the block-streaming forward iterator must yield
 /// EXACTLY what a per-line `get_line` walk yields, over a store populated in
 /// all three tiers and additionally front-truncated (non-zero front offsets
-/// are the trickiest segment-slicing case).
+/// are the trickiest segment-slicing case). Serialized comparisons preserve
+/// text, styles, links/IDs, underline colors and wrap flags, not just text.
 #[test]
 fn streaming_iter_matches_get_line_walk_memory() {
     // Small limits force all three tiers + multiple blocks/pages.
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+    let mut original = Vec::new();
     for i in 0..60 {
-        sb.push_str(&format!("line-{i:03}"));
+        let line = streaming_parity_line(i);
+        original.push(line.serialize());
+        sb.push_line(line);
     }
+    // The untrimmed walk visits complete pages and blocks at offset zero.
+    assert_eq!(
+        sb.iter().map(|l| l.serialize()).collect::<Vec<_>>(),
+        original
+    );
     // Front-truncate to a non-block-aligned boundary: cold front_offset > 0.
     sb.truncate(53).unwrap();
     assert!(
@@ -680,22 +716,29 @@ fn streaming_iter_matches_get_line_walk_memory() {
     );
     assert!(sb.hot_line_count() > 0, "oracle needs a populated hot tier");
 
-    let via_get: Vec<String> = (0..sb.line_count())
+    let via_get: Vec<_> = (0..sb.line_count())
         .map(|i| {
             sb.get_line(i)
                 .expect("no error")
                 .expect("line present")
-                .to_string()
+                .serialize()
         })
         .collect();
     let iter = sb.iter();
-    let via_iter: Vec<String> = iter.map(|l| l.to_string()).collect();
+    let via_iter: Vec<_> = iter.map(|l| l.serialize()).collect();
     assert_eq!(via_iter, via_get, "streaming iter must match get_line walk");
+    assert_eq!(via_iter, original[7..], "trim must keep the exact suffix");
 
     // And through the storage facade (its own streaming iterator).
-    let storage: ScrollbackStorage = sb.into();
-    let via_storage: Vec<String> = storage.iter().map(|l| l.to_string()).collect();
+    let mut storage: ScrollbackStorage = sb.into();
+    let via_storage: Vec<_> = storage.iter().map(|l| l.serialize()).collect();
     assert_eq!(via_storage, via_get);
+    // Removing the cold tier and one warm prefix exercises the partial-block
+    // arm beside full blocks, while retaining the same styles and identities.
+    storage.set_line_limit(Some(13));
+    assert_eq!(storage.cold_line_count(), 0);
+    let via_storage: Vec<_> = storage.iter().map(|l| l.serialize()).collect();
+    assert_eq!(via_storage, original[47..]);
 }
 
 /// Corrupt-segment parity: a corrupt warm block is skipped WHOLE, and
@@ -740,25 +783,29 @@ fn streaming_iter_matches_get_line_walk_disk() {
     let mut storage: ScrollbackStorage = DiskBackedScrollback::with_config(config)
         .expect("store")
         .into();
+    let mut original = Vec::new();
     for i in 0..60 {
-        storage
-            .push_line(Line::from(&*format!("dline-{i:03}")))
-            .unwrap();
+        let line = streaming_parity_line(i);
+        original.push(line.serialize());
+        storage.push_line(line).unwrap();
     }
-    // ScrollbackStorage exposes truncation through the line limit.
-    storage.set_line_limit(Some(53));
-    assert_eq!(storage.line_count(), 53);
-
-    let via_get: Vec<String> = (0..storage.line_count())
-        .map(|i| {
-            storage
-                .get_line(i)
-                .expect("no error")
-                .expect("line present")
-                .to_string()
-        })
-        .collect();
-    let via_iter: Vec<String> = storage.iter().map(|l| l.to_string()).collect();
-    assert_eq!(via_iter, via_get, "disk streaming iter must match get_line");
-    assert!(!via_get.is_empty());
+    // Full pages, a partial disk page followed by full pages, then a partial
+    // warm block after the disk tier has been completely removed.
+    for keep in [60, 53, 13] {
+        storage.set_line_limit(Some(keep));
+        assert_eq!(storage.line_count(), keep);
+        assert_eq!(storage.cold_line_count() == 0, keep == 13);
+        let via_get: Vec<_> = (0..storage.line_count())
+            .map(|i| {
+                storage
+                    .get_line(i)
+                    .expect("no error")
+                    .expect("line present")
+                    .serialize()
+            })
+            .collect();
+        let via_iter: Vec<_> = storage.iter().map(|l| l.serialize()).collect();
+        assert_eq!(via_iter, via_get, "disk streaming iter must match get_line");
+        assert_eq!(via_iter, original[60 - keep..], "keep={keep}");
+    }
 }

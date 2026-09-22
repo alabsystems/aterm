@@ -111,7 +111,7 @@ use crate::body::{via_ok, Body};
 use crate::ctl::{Ctl, Reply, REQUEST_LINE_MAX};
 use crate::mailbox::{Item, Mailbox, Source};
 use crate::presence::{self, Fields, Mode, Slot};
-use crate::state::{Asked, Deadline, StateDir, ASKED_KEEP, DEADLINES_KEEP};
+use crate::state::{Asked, Deadline, StateDir, TopicCursor, ASKED_KEEP, DEADLINES_KEEP};
 use crate::subject::{self, Reject};
 use crate::transport::{self, Closer, Conn, Transport};
 
@@ -210,6 +210,16 @@ const ROSTER_REFRESH: Duration = Duration::from_millis(2_000);
 /// `refresh_sessions` within one of those rounds. What is left for this sweep
 /// is only what NO round could have published.
 const GHOST_SWEEP: Duration = Duration::from_secs(60);
+
+/// How many `Fetch` pages one topic's backlog may walk per roster round.
+///
+/// A bound, not a budget: the scheduling loop is single-threaded and it is what
+/// takes the fleet halt, so a late subscriber asking for `since=@0` against a
+/// year of broadcasts must not be able to hold it. Four pages of 256 is up to a
+/// thousand records a round — a deeper backlog simply takes more rounds, and
+/// the cursor is persisted between them, so it also survives a restart
+/// mid-catch-up.
+const SAY_REPLAY_PAGES: usize = 4;
 
 /// How long a `state=live` row under this node must have gone unhosted, AS
 /// OBSERVED BY THIS BRIDGE, before its presence is retired.
@@ -753,6 +763,34 @@ pub struct Bridge {
     /// roster — so a session that is merely slow to be admitted never
     /// accumulates time here.
     ghosts: BTreeMap<String, Instant>,
+    /// `sid -> topic -> the next offset that topic may deliver from` — the
+    /// BROADCAST OPT-INS of every local session, with each one's cursor.
+    ///
+    /// The set is aterm's (`topic add`/`topic drop`); this is the bridge's copy
+    /// of it, sampled on the roster round, plus the one thing aterm cannot
+    /// know: where on the bus each topic resumes. A `since=head` entry is
+    /// resolved ONCE, against the head at the moment this bridge first learns
+    /// it; a `since=@<off>` entry starts at that offset. Every delivery moves
+    /// the cursor past the record, and the whole map is mirrored into
+    /// [`StateDir::set_topics`] so a restart resumes each topic where it was
+    /// instead of silently swallowing everything published while the bridge was
+    /// down.
+    topics: BTreeMap<String, BTreeMap<String, TopicCursor>>,
+    /// THE DRAIN POSITION of the broadcast face: the next offset the live
+    /// subscription is expected to hand over.
+    ///
+    /// Everything at or above it is covered by the subscription; everything
+    /// below a topic's cursor down to here is a GAP [`Bridge::catch_up_topics`]
+    /// owns. It starts at the subscription's `from` — which after a restart is
+    /// the lowest cursor any topic still owes, well below the bus head — and
+    /// climbs as records arrive.
+    say_drained_to: u64,
+    /// THE BUS HEAD of the broadcast face, as last known: the head read at
+    /// attach, then one past the highest say record taken.
+    ///
+    /// Not the drain position: after a restart with a gap the two differ by
+    /// the whole backlog, and `since=head` must mean the head of the bus.
+    say_bus_head: u64,
     /// `sid -> the meaning fields of its presence row` — `attention=`, `role=`,
     /// `detail=`, `phase=`, `context=`, `title=` — as last sampled, the
     /// `status revision=` the screen was last read at, and what is on the bus
@@ -906,6 +944,9 @@ impl Bridge {
             roster_due: Instant::now() + ROSTER_REFRESH,
             ghost_due: Instant::now() + GHOST_SWEEP,
             ghosts: BTreeMap::new(),
+            topics: BTreeMap::new(),
+            say_drained_to: 0,
+            say_bus_head: 0,
             presence: BTreeMap::new(),
             halts: BTreeMap::new(),
             halt_applied: false,
@@ -1436,6 +1477,16 @@ impl Bridge {
         self.epochs.retain(|sid, _| live.contains(sid));
         self.local.retain(|sid, _| live.contains(sid));
         self.presence.retain(|sid, _| live.contains(sid));
+        // AND THE BROADCAST CURSORS, in memory AND on disk: a session that has
+        // exited will never take delivery of a topic again, and a cursor file
+        // per session ever opened is the same unbounded growth the maps above
+        // are pruned for.
+        for sid in self.topics.keys() {
+            if !live.contains(sid) {
+                self.state.forget_topics(sid);
+            }
+        }
+        self.topics.retain(|sid, _| live.contains(sid));
         self.pending_admit.retain(|sid| live.contains(sid));
         // AND THE DEADLINES OF SESSIONS THAT ARE GONE. A verdict for an ask
         // whose asker has exited would land on a lane nobody drains; dropping
@@ -1595,6 +1646,188 @@ impl Bridge {
         }
     }
 
+    /// ONE BROADCAST RECORD, FANNED IN to the local sessions that asked for its
+    /// topic.
+    ///
+    /// The fan-in is the whole point of the design: ONE record on the log,
+    /// however many sessions read it. Each recipient gets the SAME delivery an
+    /// addressed message gets — the same ring, the same per-sender quota, the
+    /// same `task`/`control` demotion from a principal it does not accept —
+    /// plus `topic=<t>`, and nothing about being a broadcast relaxes any of
+    /// them: a shout from a stranger is a `note` in an agent's mailbox, not a
+    /// task.
+    ///
+    /// NOBODY IS A RECIPIENT BY DEFAULT, including the sender: delivery is
+    /// keyed on this bridge's copy of each session's `topic add` set, so a
+    /// session that never asked — the publishing one included — is simply not
+    /// in the loop below.
+    ///
+    /// A SESSION THAT IS BEHIND IS NOT A RECIPIENT EITHER: a cursor below the
+    /// drain position owns a backlog [`Bridge::catch_up_topics`] has not walked,
+    /// and delivering this record to it would move the cursor past that
+    /// backlog. The catch-up delivers this record too, in offset order.
+    fn on_say_record(&mut self, rec: &BrokerRecord) {
+        let (off, subject, raw) = rec;
+        // WHERE THE SUBSCRIPTION HAD REACHED BEFORE THIS RECORD. Every cursor
+        // at or above it is AT THE FRONTIER — no gap can exist below it — and
+        // every cursor under it is behind, with a backlog somebody else owns.
+        let frontier = self.say_drained_to;
+        self.say_drained_to = self.say_drained_to.max(off.saturating_add(1));
+        self.say_bus_head = self.say_bus_head.max(off.saturating_add(1));
+        // OBSERVER MODE DELIVERS NOTHING (§11.2) — and, unlike the addressed
+        // path, records nothing either: an `ev undeliverable` per broadcast per
+        // observer is a bus write for a message nobody on this node asked for.
+        if self.attachment == Attachment::Observer {
+            return;
+        }
+        let Some(say) = subject::parse_say(&self.cfg.fleet, subject) else {
+            // The filter is a WILDCARD; the parse is left-anchored and counts
+            // segments, so this is the arm an eight-segment forgery lands in.
+            // Not reported: a malformed subject names no local session, so
+            // there is nobody whose lane the notice would belong on.
+            return;
+        };
+        let (body, _raw_tail) = Body::decode(raw);
+        // The relay bound, on the writer, exactly as the addressed path applies
+        // it — see [`crate::body::VIA_MAX_HOPS`].
+        if !body.via.as_deref().is_none_or(via_ok) {
+            return;
+        }
+        let recipients: Vec<(String, u64)> = self
+            .topics
+            .iter()
+            .filter_map(|(sid, by_topic)| {
+                let cursor = by_topic.get(&say.topic)?;
+                (cursor.next >= frontier && cursor.next <= *off).then(|| (sid.clone(), cursor.next))
+            })
+            .collect();
+        let mut lane_lost = false;
+        for (sid, expect) in recipients {
+            if self.deliver_broadcast(&sid, &say, &body, *off, expect) == Delivery::Unaccounted {
+                lane_lost = true;
+            }
+        }
+        if lane_lost {
+            // The aterm lane is gone: nothing is written down, so the
+            // replacement bridge re-reads this record. The frontier sweep would
+            // otherwise move the cursor `deliver_broadcast` just declined to.
+            return;
+        }
+        self.advance_frontier(frontier, off.saturating_add(1));
+    }
+
+    /// Move every topic cursor AT THE FRONTIER past a record the subscription
+    /// has just handed over — the ones it matched and the ones it did not.
+    ///
+    /// The cursor is "read up to", not "last received": without this a
+    /// session on `a` falls behind every time anybody broadcasts on `b`, and
+    /// every roster round runs a catch-up over a stretch that holds nothing.
+    ///
+    /// ONLY the frontier. A cursor BELOW `frontier` belongs to a topic whose
+    /// backlog has not been walked yet, and moving it here would answer a
+    /// `since=@<off>` with silence.
+    fn advance_frontier(&mut self, frontier: u64, next: u64) {
+        let mut moved: Vec<String> = Vec::new();
+        for (sid, by_topic) in &mut self.topics {
+            let mut changed = false;
+            for cursor in by_topic.values_mut() {
+                if cursor.next >= frontier && cursor.next < next {
+                    cursor.next = next;
+                    changed = true;
+                }
+            }
+            if changed {
+                moved.push(sid.clone());
+            }
+        }
+        for sid in moved {
+            self.persist_topics(&sid);
+        }
+    }
+
+    /// One broadcast record to ONE subscribed session, from the cursor value
+    /// `expect` the caller read.
+    fn deliver_broadcast(
+        &mut self,
+        sid: &str,
+        say: &subject::SayAddr,
+        body: &Body,
+        off: u64,
+        expect: u64,
+    ) -> Delivery {
+        // THE KIND IS IN THE BODY, not in the subject (round 23): `to=say:<t>`
+        // spends its one leaf on the TOPIC, because the topic is what
+        // subscribers name and the subject budget is unreclaimed. An absent or
+        // unknown `kind=` decodes to `None` and is a `note` — the floor, not a
+        // refusal, so an older or newer peer's record still arrives as
+        // something.
+        let addr = subject::InAddr {
+            node: self.node.clone(),
+            sid: sid.to_string(),
+            src: say.node.clone(),
+            kind: body.kind.clone().unwrap_or_else(|| "note".to_string()),
+        };
+        let (kind, demoted, _stray) = self.classify_delivery(&addr, body);
+        let outcome = self.deliver_line(&DeliverLine {
+            addr: &addr,
+            body,
+            off,
+            kind: &kind,
+            demoted: demoted.as_deref(),
+            // A BROADCAST ANSWERS NO ASK. `re=`/`late=` and the deadline settle
+            // are asker-lane facts, and a shout carrying `re=` is a stranger's
+            // claim about a conversation it was not in.
+            late: false,
+            topic: Some(&say.topic),
+        });
+        // AN UNACCOUNTED DELIVERY LEAVES THE CURSOR: aterm is gone, the process
+        // is on its way out, and a replacement bridge must re-offer this record.
+        if outcome == Delivery::Unaccounted {
+            return outcome;
+        }
+        self.advance_topic(sid, &say.topic, expect, off.saturating_add(1));
+        outcome
+    }
+
+    /// Move one session's cursor for one topic past a record, and persist it.
+    ///
+    /// MONOTONE, and durable on every step: the cursor IS the delivery
+    /// guarantee across a bridge restart, and one that moved in memory only
+    /// would re-offer the record after a crash — which the ring would dedup,
+    /// but only while it still holds the offset.
+    ///
+    /// AND NEVER ACROSS A GAP: `expect` is the cursor the caller read before
+    /// it delivered, and a cursor that has moved since covers records this
+    /// delivery did not.
+    fn advance_topic(&mut self, sid: &str, topic: &str, expect: u64, next: u64) {
+        let moved = {
+            let Some(by_topic) = self.topics.get_mut(sid) else {
+                return;
+            };
+            let Some(cursor) = by_topic.get_mut(topic) else {
+                return;
+            };
+            if cursor.next != expect || next <= cursor.next {
+                return;
+            }
+            cursor.next = next;
+            true
+        };
+        if moved {
+            self.persist_topics(sid);
+        }
+    }
+
+    /// Write one session's whole cursor set to the state dir.
+    fn persist_topics(&mut self, sid: &str) {
+        let Some(snapshot) = self.topics.get(sid).cloned() else {
+            return;
+        };
+        if let Err(e) = self.state.set_topics(sid, &snapshot) {
+            eprintln!("aterm-link: the broadcast cursors of {sid} could not be persisted: {e}");
+        }
+    }
+
     /// Validate and hand one record to the endpoint. Shared by the live group
     /// drain and the post-relaunch refill, so a refilled row is classified by
     /// exactly the code that classified it the first time.
@@ -1654,8 +1887,6 @@ impl Bridge {
             return self.refuse_locally(&addr, &body, off, "via");
         }
         let (kind, demoted, stray) = self.classify_delivery(&addr, &body);
-        let trust = trust_of(&addr.src, body.via.is_some());
-        let from = self.render_from(&addr, &body);
         // A REPLY SETTLES THE ASK IT NAMES (R8), before anything can refuse the
         // row: the answer is on the bus whether or not this endpoint takes it,
         // and the deadline sweep re-reads the bus before any verdict anyway.
@@ -1677,6 +1908,40 @@ impl Bridge {
                     .get(&re)
                     .is_some_and(|asker| *asker == addr.sid)
             });
+        self.deliver_line(&DeliverLine {
+            addr: &addr,
+            body: &body,
+            off,
+            kind: &kind,
+            demoted: demoted.as_deref(),
+            late,
+            topic: None,
+        })
+    }
+
+    /// BUILD AND SEND ONE `deliver` LINE — the half shared by an ADDRESSED
+    /// record and a BROADCAST one.
+    ///
+    /// Everything above it differs (an addressed record is parsed off this
+    /// node's own `in` lane, checked for self-lane forgery and committed to a
+    /// group cursor; a broadcast is matched against a topic set and cursored per
+    /// session), and everything from here down must NOT: the ring, the
+    /// per-sender quota, the demotion, the `trust=` word, the line bound and the
+    /// truncation notice are the properties an agent's mailbox is defined by,
+    /// and a second copy of them is a second set of them. `topic` is the only
+    /// field the broadcast path adds.
+    fn deliver_line(&mut self, row: &DeliverLine<'_>) -> Delivery {
+        let &DeliverLine {
+            addr,
+            body,
+            off,
+            kind,
+            demoted,
+            late,
+            topic,
+        } = row;
+        let trust = trust_of(&addr.src, body.via.is_some());
+        let from = self.render_from(addr, body);
         // A `control` RECORD IS NOW AN ORDINARY INBOX ROW (round 21). It used
         // to also MOVE something — §6.6's handover, which took the keyboard for
         // the claimant and decided who a later `term/in` would be fed from —
@@ -1688,6 +1953,12 @@ impl Bridge {
             "deliver {} off={off} from={from} kind={kind} trust={trust}",
             addr.sid
         );
+        // THE ONE FIELD A BROADCAST ADDS. It names WHY this row is in this
+        // mailbox — the session asked for the topic — which an addressed row
+        // never has to explain, and it is what the agent replies to.
+        if let Some(t) = topic {
+            line.push_str(&format!(" topic={t}"));
+        }
         if let Some(re) = body.re {
             line.push_str(&format!(" re={re}"));
         }
@@ -1739,7 +2010,7 @@ impl Bridge {
         // metadata alone does not fit, which is a verdict, not a body to cut.
         let Some(budget) = REQUEST_LINE_MAX.checked_sub(line.len() + " len= text=".len() + 20)
         else {
-            return self.refuse_locally(&addr, &body, off, "oversize");
+            return self.refuse_delivery(addr, body, off, topic, "oversize");
         };
         let (encoded, cut) = encode_bounded(&body.text, budget);
         if cut {
@@ -1757,7 +2028,7 @@ impl Bridge {
         // this defect arrived the first time. A line that does not fit earns a
         // verdict here rather than an `InvalidInput` nobody accounted for.
         if line.len() > REQUEST_LINE_MAX {
-            return self.refuse_locally(&addr, &body, off, "oversize");
+            return self.refuse_delivery(addr, body, off, topic, "oversize");
         }
         if self.fault == Fault::LoseAtermBeforeDeliver {
             self.fault = Fault::None;
@@ -1772,7 +2043,7 @@ impl Bridge {
                 // on their own lane, rather than to drop the record silently.
                 // The reason travels as ONE TOKEN — see [`reason_token`].
                 let why = reason_token(reply.header());
-                self.refuse_locally(&addr, &body, off, &why)
+                self.refuse_delivery(addr, body, off, topic, &why)
             }
             Err(e) => {
                 // THREE OUTCOMES, NOT TWO, and [`Ctl::lost`] is the question that
@@ -1790,11 +2061,17 @@ impl Bridge {
                 if self.ctl.lost() {
                     Delivery::Unaccounted
                 } else {
-                    self.refuse_locally(&addr, &body, off, "refused")
+                    self.refuse_delivery(addr, body, off, topic, "refused")
                 }
             }
         };
-        if cut && outcome == Delivery::Accounted {
+        // …AND THE TRUNCATION NOTICE, which is a BUS RECORD. On a broadcast it
+        // would be one record per subscriber for one shout, which is exactly the
+        // multiplication §6 forbids ("one record per broadcast"); the cut is
+        // still auditable from the row itself, whose `len=` exceeds what
+        // arrived. See [`Bridge::refuse_delivery`] for the same rule on the
+        // refusal.
+        if cut && outcome == Delivery::Accounted && topic.is_none() {
             self.publish_ev_for(
                 Some(&addr.sid),
                 // BOTH NUMBERS IN THE SAME UNIT. `len=` is the body's decoded
@@ -1811,6 +2088,38 @@ impl Bridge {
             );
         }
         outcome
+    }
+
+    /// A REFUSED DELIVERY, told to whoever it is owed to.
+    ///
+    /// An ADDRESSED record's refusal is owed to the SENDER: they chose this
+    /// recipient, `post --wait-ack` is waiting on the answer, and the design's
+    /// rule is that `ERR quota` travels back on the sender's own lane rather
+    /// than losing the record silently ([`Bridge::refuse_locally`]).
+    ///
+    /// A BROADCAST's is owed to nobody on the bus: the recipient chose the
+    /// topic, not the sender, and one refusal record per subscriber would
+    /// multiply a shout by its audience (§6: one record per broadcast). The
+    /// endpoint counts it in the recipient's `dropped=`; here it is accounted
+    /// and the cursor moves on, so a full ring is not re-offered forever.
+    fn refuse_delivery(
+        &mut self,
+        addr: &subject::InAddr,
+        body: &Body,
+        off: u64,
+        topic: Option<&str>,
+        why: &str,
+    ) -> Delivery {
+        match topic {
+            Some(t) => {
+                eprintln!(
+                    "aterm-link: broadcast off={off} topic={t} not delivered to {}: {why}",
+                    addr.sid
+                );
+                Delivery::Accounted
+            }
+            None => self.refuse_locally(addr, body, off, why),
+        }
     }
 
     /// Whether a record on our own lane at `off` is a FORGERY rather than one of
@@ -2930,6 +3239,35 @@ impl Bridge {
         self.observe(started, answer, Some("read")).ok()
     }
 
+    /// WHERE THE BROADCAST FACE SUBSCRIBES FROM: the lowest cursor any local
+    /// session's topic still owes, or the broker's HEAD when none does.
+    ///
+    /// The head is read with `fetch(.., max = 0)` — the broker's head query, one
+    /// round trip that returns no records — because `Last` would answer the
+    /// newest record PER SUBJECT, and a broadcast topic reuses one subject per
+    /// (sender, topic): its last-value answer is not a backlog and its mark is
+    /// not this face's head.
+    ///
+    /// `None` only when the head cannot be read, which is an attach failure like
+    /// any other: subscribing from 0 instead would replay the fleet's entire
+    /// broadcast history into every session that had asked for a topic.
+    ///
+    /// Answers BOTH numbers — `(from, head)` — because they are different after
+    /// a restart with a gap and the caller needs each for its own thing: the
+    /// subscription starts at `from`, and `since=head` resolves to `head`.
+    fn broadcast_floor(&mut self, filter: &str) -> Option<(u64, u64)> {
+        let owed = self
+            .topics
+            .values()
+            .flat_map(|by_topic| by_topic.values().map(|c| c.next))
+            .min();
+        let conn = self.conn.as_mut()?;
+        let started = Instant::now();
+        let head = conn.fetch(0, filter, 0).map(|(_, (_, head))| head);
+        let head = self.observe(started, head, Some("read")).ok()?;
+        Some((owed.map_or(head, |owed| owed.min(head)), head))
+    }
+
     /// The second half of [`Bridge::read_fleet_halts`]: the standing halts
     /// REBUILT FROM THE BUS, not merged into what this process remembered —
     /// the retained rows ARE the standing state, and a human whose row is gone
@@ -2986,6 +3324,15 @@ impl Bridge {
         let sids: Vec<String> = self.locals.values().cloned().collect();
         for sid in sids {
             self.observe_local_control(&sid);
+            // AND THE BROADCAST OPT-INS. The set lives in aterm (`topic add`),
+            // nothing on the bus announces a change to it, and it is a LEVEL
+            // like `attention=` — still true when it is read late — so the
+            // roster round is where it is sampled, on a tick that is already
+            // paying for a round trip per session. The cost of the latency is
+            // stated where the verb is documented: a topic added between two
+            // rounds takes effect on the next one, within [`ROSTER_REFRESH`].
+            self.sample_topics(&sid);
+
             // THE ESCALATION IS A ROSTER OBSERVATION TOO — and so is the rest
             // of the row's meaning. A10's notifier and A8's glance read
             // `attention=` off the presence row, and a session sets it locally
@@ -3019,6 +3366,160 @@ impl Bridge {
                 .is_some_and(|slot| slot.due(mode, Instant::now()).now())
             {
                 self.publish_session_presence(&sid, "live");
+            }
+        }
+    }
+
+    /// ONE session's BROADCAST OPT-INS, off one `topic ls` — and the cursor
+    /// each one resumes from.
+    ///
+    /// THE RESOLUTION HAPPENS ONCE PER ADD, HERE. aterm answers an INTENT
+    /// (`since=head` or `since=@<off>`); a cursor is a position, and only this
+    /// side knows where the bus is. An entry whose `serial=` this bridge already
+    /// holds keeps its cursor whatever the session still says, because by then
+    /// records have been delivered against it — re-reading `since=@0` off a
+    /// standing `ls` would replay the whole backlog on every roster round.
+    ///
+    /// PER ADD, NOT PER NAME: `serial=` is the endpoint's serial for the add, so
+    /// `drop` then `add` under one name inside one roster round is a different
+    /// entry here, and its `since=` is read.
+    ///
+    /// AN ENDPOINT THAT DOES NOT KNOW THE VERB ANSWERS `ERR`, and that is not a
+    /// reason to forget what this bridge is holding: a downgrade mid-flight
+    /// would otherwise drop every cursor and every opt-in with it. Only an `OK`
+    /// — the session's own answer — replaces the set. An endpoint too old to
+    /// print `serial=` reads as generation 0, which is stable, so it keeps the
+    /// pre-`serial` behaviour rather than re-resolving every round.
+    fn sample_topics(&mut self, sid: &str) {
+        let Ok(reply) = self.ctl_request(&format!("@{sid} topic ls")) else {
+            return;
+        };
+        if !reply.ok() {
+            return;
+        }
+        let have = self.topics.get(sid).cloned().unwrap_or_default();
+        let head = self.say_bus_head;
+        let mut wanted: BTreeMap<String, TopicCursor> = BTreeMap::new();
+        for row in reply.rows() {
+            let mut words = row.split_whitespace();
+            if words.next() != Some("topic") {
+                continue;
+            }
+            let Some(topic) = words.next().filter(|t| subject::is_topic(t)) else {
+                continue;
+            };
+            let mut since = "head";
+            let mut serial = 0u64;
+            for word in words {
+                if let Some(v) = word.strip_prefix("since=") {
+                    since = v;
+                } else if let Some(v) = word.strip_prefix("serial=") {
+                    serial = v.parse().unwrap_or(0);
+                }
+            }
+            let next = have
+                .get(topic)
+                .filter(|held| held.serial == serial)
+                .map_or_else(
+                    || {
+                        since
+                            .strip_prefix('@')
+                            .and_then(|n| n.parse::<u64>().ok())
+                            .unwrap_or(head)
+                    },
+                    |held| held.next,
+                );
+            wanted.insert(topic.to_string(), TopicCursor { next, serial });
+        }
+        if wanted != have {
+            if wanted.is_empty() {
+                self.topics.remove(sid);
+                self.state.forget_topics(sid);
+            } else {
+                self.topics.insert(sid.to_string(), wanted);
+                self.persist_topics(sid);
+            }
+        }
+        self.catch_up_topics(sid);
+    }
+
+    /// THE LATE SUBSCRIBER'S BACKLOG: everything between a topic's cursor and
+    /// the live face's drain position, read off the log and delivered.
+    ///
+    /// The live subscription covers `[say_drained_to, ∞)`; a `topic add …
+    /// since=@<n>` with `n` below that names records the subscription has
+    /// already passed, and a subscription re-anchored to reach them would
+    /// re-deliver the whole interval to every OTHER session as well. So the gap
+    /// is read directly, with the same bounded `Fetch` the refill uses.
+    ///
+    /// ONE WALK FOR ALL OF THIS SESSION'S OWED TOPICS, over the same filter
+    /// the live face uses, so a replay arrives in offset order exactly as the
+    /// live path does.
+    ///
+    /// BOUNDED, AND RESUMABLE: at most [`SAY_REPLAY_PAGES`] pages per session
+    /// per roster round, and every cursor is persisted as it moves, so a deep
+    /// backlog is caught up over several rounds — and across a restart —
+    /// instead of parking the scheduling loop, which would delay the halt this
+    /// whole mailbox is ordered around.
+    fn catch_up_topics(&mut self, sid: &str) {
+        let filter = subject::say_filter(&self.cfg.fleet);
+        for _ in 0..SAY_REPLAY_PAGES {
+            let owed: BTreeMap<String, u64> = self
+                .topics
+                .get(sid)
+                .map(|by_topic| {
+                    by_topic
+                        .iter()
+                        .filter(|(_, c)| c.next < self.say_drained_to)
+                        .map(|(t, c)| (t.clone(), c.next))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let Some(from) = owed.values().copied().min() else {
+                return;
+            };
+            let Some(conn) = self.conn.as_mut() else {
+                return;
+            };
+            let started = Instant::now();
+            let page = conn.fetch(from, &filter, 256);
+            let Ok((rows, (next, _))) = self.observe(started, page, Some("read")) else {
+                return;
+            };
+            for (off, subject, raw) in rows {
+                // STRICTLY BELOW THE DRAIN POSITION. A record at or past it is
+                // one the subscription will deliver (or already has), and
+                // delivering it here too would spend a `deliver` the ring is
+                // only going to dedup.
+                if off >= self.say_drained_to {
+                    break;
+                }
+                let Some(say) = subject::parse_say(&self.cfg.fleet, &subject) else {
+                    continue;
+                };
+                let Some(expect) = owed.get(&say.topic).copied().filter(|c| *c <= off) else {
+                    continue;
+                };
+                let (body, _raw_tail) = Body::decode(&raw);
+                if !body.via.as_deref().is_none_or(via_ok) {
+                    continue;
+                }
+                if self.deliver_broadcast(sid, &say, &body, off, expect) == Delivery::Unaccounted {
+                    return;
+                }
+            }
+            // `next` is one past the last offset the broker SCANNED, so the
+            // walk advances even through a stretch that matched nothing — and
+            // every owed topic has now been read up to there, whether or not
+            // this page held anything for it.
+            let reached = next.max(from.saturating_add(1)).min(self.say_drained_to);
+            for (topic, expect) in owed {
+                let now = self
+                    .topics
+                    .get(sid)
+                    .and_then(|m| m.get(&topic))
+                    .map_or(expect, |c| c.next);
+                self.advance_topic(sid, &topic, now, reached);
             }
         }
     }
@@ -3328,12 +3829,12 @@ impl Bridge {
     /// disagree for every screen there is. §6.6 says so in as many words —
     /// `fp16` "is deliberately NOT byte-identical to aterm's own `turn`
     /// `hash=` … so the two must never be compared" — and this comment used to
-    /// say the opposite, which is an invitation to build a `gen=`-fenced
+    /// say the opposite, which is an invitation to build a `serial=`-fenced
     /// approval out of a `hash=` a driver already has and watch every record it
     /// fences be refused `reason=gen` for a units mismatch two doc comments
     /// asserted away.
     ///
-    /// `None` when the screen cannot be read, and that REFUSES a `gen=`-bearing
+    /// `None` when the screen cannot be read, and that REFUSES a `serial=`-bearing
     /// record rather than admitting it — an unreadable screen is not a matching
     /// one.
     fn live_gen(&mut self, sid: &str) -> Option<String> {
@@ -3433,10 +3934,19 @@ impl Bridge {
             }
         }
         for post in drain.posts {
-            match self.resolve_to(&post.to, Some(&post.sid)) {
-                Route::To(subject) => {
-                    let subject = format!("{subject}/{}", post.kind);
+            let routed = self.resolve_to(&post.to, Some(&post.sid));
+            match routed {
+                Route::To(_) | Route::Exact(_) => {
+                    // A directed message spends its last segment on the kind; a
+                    // broadcast spends it on the TOPIC and carries the kind in
+                    // the body.
+                    let (subject, in_body) = match routed {
+                        Route::To(prefix) => (format!("{prefix}/{}", post.kind), None),
+                        Route::Exact(subject) => (subject, Some(post.kind.clone())),
+                        _ => unreachable!("matched above"),
+                    };
                     let mut body = Body::new(crate::now_ms());
+                    body.kind = in_body;
                     body.from = Some(post.sid.clone());
                     body.re = post.re;
                     body.dl = post.dl;
@@ -3649,9 +4159,19 @@ impl Bridge {
         // implemented rather than the promise withdrawn — the withdrawal would
         // have to happen in `cmd_post` and the verb table, which are the
         // endpoint's.
-        if to == "say" {
+        // `say` and `say:<topic>` — the BROADCAST face. The subject's last
+        // segment is the topic (`say` alone means the topic "say", so every
+        // address that worked before still does), and the kind moves into the
+        // body: round 23 spends that segment on the thing subscribers name.
+        if to == "say" || to.starts_with("say:") {
+            let topic = to.strip_prefix("say:").unwrap_or("say");
+            if !subject::is_topic(topic) {
+                return Route::Unroutable;
+            }
             return match from_sid.filter(|s| subject::is_principal(s)) {
-                Some(sid) => Route::To(format!("/f/{fleet}/pub/{}/{sid}/say", self.node)),
+                Some(sid) => {
+                    Route::Exact(format!("/f/{fleet}/pub/{}/{sid}/say/{topic}", self.node))
+                }
                 // A `say` with no session behind it (a bridge-internal notice)
                 // has no owner face to speak under.
                 None => Route::Unroutable,
@@ -4064,6 +4584,58 @@ impl Bridge {
         let _ = closer.set_read_timeout(None);
         self.closers.push(closer);
         spawn_reader(sub, Source::Inbox, self.mailbox.clone());
+        // THE BROADCAST FACE — ONE SUBSCRIPTION FOR THE WHOLE FLEET.
+        //
+        // Not a group: a group subscription's cursor is shared with every other
+        // member of it, and a broadcast has no exactly-once obligation to
+        // anybody — the obligation is per RECIPIENT, and that is exactly what
+        // `self.topics`' per-(session, topic) cursors hold, durably. So the
+        // subscription starts wherever the earliest un-delivered topic sits, and
+        // each record is filtered per session on the way in.
+        //
+        // NO ROW HAS BEEN SAMPLED YET on the first attach of a process, so the
+        // cursors come off disk here, before the first roster round. That is the
+        // whole restart guarantee: a bridge that resubscribed from the head
+        // would skip every broadcast published while it was down, and no session
+        // would ever learn it had missed one.
+        for sid in self.locals.values().cloned().collect::<Vec<_>>() {
+            if self.topics.contains_key(&sid) {
+                // A RECONNECT, not a restart: what this process holds is at
+                // least as new as what is on disk (every step of a cursor is
+                // persisted as it is taken), and re-reading the file would
+                // rewind a cursor whose persist had failed.
+                continue;
+            }
+            let persisted = self.state.topics(&sid);
+            if !persisted.is_empty() {
+                self.topics.insert(sid, persisted);
+            }
+        }
+        let say_filter = subject::say_filter(&self.cfg.fleet);
+        let Some((say_from, say_head)) = self.broadcast_floor(&say_filter) else {
+            self.link_down("attach");
+            return false;
+        };
+        // THE TWO ARE NOT THE SAME NUMBER after a restart with a gap: the
+        // subscription starts at the lowest cursor still owed, which may be
+        // thousands of records back, while `head` is where the bus actually is.
+        // `since=head` must mean the latter.
+        self.say_drained_to = say_from;
+        self.say_bus_head = say_head;
+        let (client, closer) = match self.connect() {
+            Ok(c) => c,
+            Err(e) => {
+                self.link_down(link_reason(&e, "attach"));
+                return false;
+            }
+        };
+        let Ok(sub) = client.subscribe(say_from, &say_filter) else {
+            self.link_down("subscribe");
+            return false;
+        };
+        let _ = closer.set_read_timeout(None);
+        self.closers.push(closer);
+        spawn_reader(sub, Source::Say, self.mailbox.clone());
         // THE GHOST CANDIDATES ARE DISCOVERED HERE, ONCE PER ATTACH, so the
         // loop's sweep arm can be gated on the set being non-empty and a fleet
         // with no ghost pays nothing at all. This first call retires nothing —
@@ -4173,6 +4745,7 @@ impl Bridge {
                 Some(Item::Fleet(r)) => self.on_fleet_record(&r),
                 Some(Item::Event(line)) => self.on_event(&line),
                 Some(Item::Inbox(r)) => self.on_inbox_record(&r),
+                Some(Item::Say(r)) => self.on_say_record(&r),
                 Some(Item::Closed(Source::Aterm)) => {
                     eprintln!("aterm-link: aterm closed the bridge connection; exiting");
                     return Ok(());
@@ -4306,6 +4879,29 @@ fn last_all(conn: &mut Conn, filter: &str) -> io::Result<(Vec<BrokerRecord>, u64
     Err(io::Error::other(format!(
         "the last-value walk of {filter} did not finish within {LAST_PAGES_MAX} pages"
     )))
+}
+
+/// ONE `deliver` LINE'S FIELDS, as [`Bridge::deliver_record`] or
+/// [`Bridge::deliver_broadcast`] has already classified them.
+struct DeliverLine<'a> {
+    /// The lane the record is being delivered ON — synthesized for a broadcast
+    /// from the publishing node and the receiving session.
+    addr: &'a subject::InAddr,
+    /// The decoded record.
+    body: &'a Body,
+    /// The broker offset, which is the idempotency key the ring dedups on.
+    off: u64,
+    /// The kind the endpoint is told, after [`Bridge::classify_delivery`].
+    kind: &'a str,
+    /// The kind it CLAIMED, when that classification demoted it.
+    demoted: Option<&'a str>,
+    /// An answer that arrived after its ask was recorded expired. Never true
+    /// for a broadcast: a shout answers no ask.
+    late: bool,
+    /// The broadcast topic, when this is one. The only field the broadcast
+    /// path adds, and what turns off the two bus writes an addressed refusal
+    /// or truncation makes (see [`Bridge::refuse_delivery`]).
+    topic: Option<&'a str>,
 }
 
 /// The one-token `reason=` a refusal header becomes.
@@ -4453,7 +5049,12 @@ pub fn fetched_lines(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
     /// The six-segment owner+src prefix of the `in` subject to publish under.
+    /// The kind is appended as the last segment.
     To(String),
+    /// THE WHOLE SUBJECT, kind and all already decided — a broadcast's
+    /// `/f/<F>/pub/<node>/<sid>/say/<topic>`, where the last segment is the
+    /// TOPIC and the kind rides in the body ([`crate::body::Body::kind`]).
+    Exact(String),
     /// No address this fleet can reach: not a principal, not a hosted sid, and
     /// nobody advertises it.
     Unroutable,
@@ -4465,18 +5066,19 @@ pub enum Route {
 }
 
 impl Route {
-    /// The `reason=` token this verdict retires a post with. `To` has none — it
-    /// is not a verdict — and answers `unroutable` only so the type is total.
+    /// The `reason=` token this verdict retires a post with. `To` and `Exact`
+    /// have none — they are not verdicts — and answer `unroutable` only so the
+    /// type is total.
     #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
             Route::Ambiguous => "ambiguous",
-            Route::To(_) | Route::Unroutable => "unroutable",
+            Route::To(_) | Route::Exact(_) | Route::Unroutable => "unroutable",
         }
     }
 }
 
-/// `<content_seq>:<fp16>` out of one `text --json` frame — §6.6's `gen=`.
+/// `<content_seq>:<fp16>` out of one `text --json` frame — §6.6's `serial=`.
 ///
 /// PUBLIC because the test that proves the fence must compute the value the
 /// same way the fence does. A test with its own copy of this would pass the day
@@ -4510,11 +5112,22 @@ pub fn gen_of_frame(frame: &str) -> Option<String> {
 /// plain screen text and this one over a `text --json` rows array, so the two
 /// values never agree and §6.6 forbids comparing them. See
 /// [`Bridge::live_gen`].
+///
+/// THE PRIME IS THE ONE FNV PUBLISHES, and until round 22 it was not: this read
+/// `0x1000_0000_01b3`, which is 2^44 + 0x1b3, where FNV-64's multiplier is
+/// 2^40 + 0x1b3. The doc above already claimed to be "the same HASH" as
+/// `turn_ledger`'s and was not, and because the multiply only carries low bits
+/// upward the two agreed in their bottom forty bits and diverged above them —
+/// which is exactly how it was found, by a `--report-to` that hashed a screen
+/// here and compared it with the `hash=` `status` stamps. Nothing persisted a
+/// value: [`gen_of_frame`]'s token is only ever compared with another token
+/// from this same function, so the repair changes no recorded state.
+/// [`the_prime_is_fnvs_own`] pins it against the published vectors.
 pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         h ^= u64::from(*b);
-        h = h.wrapping_mul(0x1000_0000_01b3);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
 }
@@ -4882,6 +5495,7 @@ where
                 Ok(Some(rec)) => match source {
                     Source::Fleet => mailbox.push_fleet(rec, generation),
                     Source::Inbox => mailbox.push_inbox(rec, generation),
+                    Source::Say => mailbox.push_say(rec, generation),
                     Source::Aterm => {}
                 },
                 Ok(None) | Err(_) => {
@@ -4941,6 +5555,20 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **THE PRIME IS FNV'S OWN.** Pinned against the vectors FNV publishes,
+    /// because the value this returns is compared with a hash another crate
+    /// computes (`aterm-gui`'s `turn_ledger::fnv1a_64`, which `status` stamps a
+    /// screen with and `aterm-link hook --report-to` checks its rows against).
+    /// A multiplier of `0x1000_0000_01b3` — 2^44 + 0x1b3, which this was —
+    /// agrees with the real thing in the bottom forty bits and nowhere above,
+    /// so nothing but a cross-crate comparison or a published vector catches it.
+    #[test]
+    fn the_prime_is_fnvs_own() {
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
 
     /// TRUST IS COMPUTED, and it is computed from the two things a sender cannot
     /// choose: the cap-forced class of its `<src>` segment, and whether the
@@ -5097,14 +5725,14 @@ mod tests {
     #[test]
     fn the_docs_that_have_no_other_guard_still_match_the_code() {
         let src = include_str!("bridge.rs");
-        // §6.6's `gen=` fingerprint is deliberately NOT aterm's `turn` `hash=`,
+        // §6.6's `serial=` fingerprint is deliberately NOT aterm's `turn` `hash=`,
         // and the design says the two "must never be compared". Both doc
         // comments used to say the opposite — an invitation to fence a keystroke
         // with a `hash=` a driver already has and have every one refused
         // `reason=gen` for a units mismatch.
         assert!(
             src.contains("IT IS NOT aterm's `turn` `hash=`, AND THE TWO MUST NEVER BE COMPARED."),
-            "`live_gen` must say what the design says about `gen=` versus `hash=`"
+            "`live_gen` must say what the design says about `serial=` versus `hash=`"
         );
         // SPLIT, so this test's own prose is not the counterexample — the same
         // care `this_modules_doc_and_unsafe_surface_match_what_it_ships` takes.

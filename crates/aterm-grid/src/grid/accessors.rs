@@ -825,20 +825,42 @@ impl Grid {
         &self.storage.tab_stops
     }
 
-    /// Replace the tab stops with the given boolean slice.
+    /// Whether TBC 3 has suppressed the every-8 defaults on this grid — the
+    /// half of the tab state that is NOT the array. It must cross every seam
+    /// the array crosses; see [`Self::restore_tab_stops`].
+    #[must_use]
+    #[inline]
+    pub fn tab_defaults_suppressed(&self) -> bool {
+        self.storage.tab_defaults_suppressed
+    }
+
+    /// Replace the tab stops with the given boolean slice AND the suppression
+    /// flag that goes with them.
     ///
-    /// Used by checkpoint deserialization to restore custom tab stops (#7280).
-    /// A narrowed grid intentionally retains stops beyond its current width so a
-    /// later grow restores the user's exact semantics. Accept only a vector that
-    /// covers every active column and stays within [`crate::MAX_GRID_COLS`]; an
-    /// invalid untrusted projection is a no-op.
-    pub fn restore_tab_stops(&mut self, stops: &[bool]) {
+    /// Used by checkpoint deserialization to restore custom tab stops (#7280)
+    /// and by the alt-screen switch, which shares tab state between the two
+    /// screens per xterm. A narrowed grid intentionally retains stops beyond
+    /// its current width so a later grow restores the user's exact semantics.
+    /// Accept only a vector that covers every active column and stays within
+    /// [`crate::MAX_GRID_COLS`]; an invalid untrusted projection is a no-op.
+    ///
+    /// **`defaults_suppressed` IS NOT OPTIONAL, and that is the point.** TBC 3
+    /// ("clear ALL tab stops") is two facts: the cleared array, and the
+    /// standing instruction that a later WIDEN must not re-seed the every-8
+    /// default into the columns it adds. This function used to carry only the
+    /// first, so every seam that moved tab state between grids — the four
+    /// alt-screen switch sites and the seamless-update checkpoint — silently
+    /// dropped the second, and the next window resize resurrected stops the
+    /// application had explicitly erased. Taking it as a parameter makes each
+    /// of those seams state its answer instead of inheriting `false`.
+    pub fn restore_tab_stops(&mut self, stops: &[bool], defaults_suppressed: bool) {
         if stops.len() < usize::from(self.cols()) || stops.len() > usize::from(crate::MAX_GRID_COLS)
         {
             return;
         }
         self.storage.tab_stops.clear();
         self.storage.tab_stops.extend_from_slice(stops);
+        self.storage.tab_defaults_suppressed = defaults_suppressed;
     }
 
     // -------------------------------------------------------------------------

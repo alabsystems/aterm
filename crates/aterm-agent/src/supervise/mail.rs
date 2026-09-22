@@ -178,8 +178,35 @@ pub fn newest_id(body: &str) -> u64 {
 
 /// How many rows a mail body holds (a trailing newline ends the last row, it
 /// does not start another).
+///
+/// THE STAMP LINE IS NOT A ROW. Round 22 put `seq=<n> hash=<hex16>[ busy=1]`
+/// on the first line of every `--report-to` body, and counting it made
+/// `EVENT <sid> turn … rows=<n>` one more than the body's rows — against
+/// `lib.rs`'s promise that the field IS the body's row count. It is stripped
+/// here rather than at the one call site so nothing else can read the count
+/// the old way, and an ordinary body (no stamp) is unaffected.
 pub fn body_rows(body: &str) -> usize {
-    body.lines().count()
+    body.lines().filter(|l| !is_report_stamp(l)).count()
+}
+
+/// `seq=<digits> hash=<16 hex>[ busy=1]` and nothing else — the stamp line an
+/// `aterm-link hook --report-to` body opens with.
+fn is_report_stamp(line: &str) -> bool {
+    let mut toks = line.split(' ');
+    let (Some(seq), Some(hash)) = (toks.next(), toks.next()) else {
+        return false;
+    };
+    let tail = toks.next();
+    if toks.next().is_some() || !matches!(tail, None | Some("busy=1")) {
+        return false;
+    }
+    let (Some(seq), Some(hash)) = (seq.strip_prefix("seq="), hash.strip_prefix("hash=")) else {
+        return false;
+    };
+    !seq.is_empty()
+        && seq.chars().all(|c| c.is_ascii_digit())
+        && hash.len() == 16
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// What the lane hands the loop: a `report` from the watched worker, with
@@ -662,6 +689,36 @@ fn emit(out: &mut dyn Write, line: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **THE STAMP LINE IS NOT A ROW.** Round 22 put
+    /// `seq=<n> hash=<hex16>[ busy=1]` on the first line of every
+    /// `--report-to` body; counting it made `EVENT <sid> turn … rows=<n>` one
+    /// more than the body's rows, against the promise that the field IS the
+    /// body's row count. Only a real stamp is skipped — prose that merely
+    /// starts with `seq=` is a row like any other.
+    #[test]
+    fn body_rows_does_not_count_the_report_stamp() {
+        assert_eq!(
+            body_rows("one\ntwo\n"),
+            2,
+            "a body with no stamp is unchanged"
+        );
+        assert_eq!(
+            body_rows("seq=12 hash=0123456789abcdef\n⏺ done\n  next\n"),
+            2,
+            "the stamp is not a row"
+        );
+        assert_eq!(
+            body_rows("seq=12 hash=0123456789abcdef busy=1\n⏺ mid-turn\n"),
+            1,
+            "busy=1 rides the stamp"
+        );
+        // Not a stamp: prose that only looks like one.
+        assert_eq!(body_rows("seq=12 hash=nothex\nrow\n"), 2);
+        assert_eq!(body_rows("seq=x hash=0123456789abcdef\nrow\n"), 2);
+        assert_eq!(body_rows("seq=12 hash=0123456789abcdef and more\nrow\n"), 2);
+        assert_eq!(body_rows("seq=12\nrow\n"), 2);
+    }
     use super::super::prompt::fixtures::{composer, rows};
     use super::*;
     use std::collections::VecDeque;

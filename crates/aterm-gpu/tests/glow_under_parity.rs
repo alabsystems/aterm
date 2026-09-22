@@ -66,6 +66,8 @@ fn emit_under(
         color,
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: color,
+        alpha2: 0,
     })
 }
 
@@ -235,6 +237,8 @@ fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
                 color: 0x0070_3810,
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: 0x0070_3810,
+                alpha2: 0,
             },
             vec![
                 CharFg {
@@ -455,6 +459,8 @@ fn glow_under_disabled_bytes_identical_on_gpu() {
         color: 0x0060_3010,
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: 0x0060_3010,
+        alpha2: 0,
     });
     cleared.char_fg.push(CharFg {
         row: 0,
@@ -561,7 +567,11 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
         (6, (32 * cw) as i64, (40 * cw) as i64, 0x0012_0d05, 1),
         (7, (30 * cw) as i64, grid_w as i64 + 60, 0x0030_60c0, 255),
     ] {
-        mixed.extend(emit_under(r, x0, x1, ch, grid_w, color).map(|q| GlowQuad { alpha, ..q }));
+        mixed.extend(emit_under(r, x0, x1, ch, grid_w, color).map(|q| GlowQuad {
+            alpha,
+            alpha2: alpha,
+            ..q
+        }));
     }
     assert!(
         mixed.iter().filter(|q| q.alpha > 0).count() >= 4,
@@ -595,7 +605,11 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
     let same_but_additive: Vec<GlowQuad> = input
         .glow_under
         .iter()
-        .map(|q| GlowQuad { alpha: 0, ..*q })
+        .map(|q| GlowQuad {
+            alpha: 0,
+            alpha2: 0,
+            ..*q
+        })
         .collect();
     let mut twin = term.cell_frame(rows, cols);
     twin.glow_under = same_but_additive;
@@ -905,6 +919,8 @@ fn the_bed_is_never_boosted_or_bloomed() {
         color: aterm_render::premul_rgb(0x00FF_FFFF, 143),
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: aterm_render::premul_rgb(0x00FF_FFFF, 143),
+        alpha2: 0,
     };
     let core_rect = (
         core.x as usize,
@@ -1027,4 +1043,186 @@ fn the_bed_is_never_boosted_or_bloomed() {
         3 * ch * grid_w,
         "NON-VACUITY: every bed pixel must have been compared"
     );
+}
+
+/// **A GRADIENT QUAD IS BYTE-EXACT ACROSS THE BACKENDS** (2026-09-21,
+/// `GlowQuad::color2`). The CPU rasterizer ramps a quad's colour AND opacity
+/// per column with `aterm_render::glow_lerp`'s integer law; the GPU's
+/// `fs_glow` computes the same law from the exact instance bytes (`Uint8x4`,
+/// never the rasterizer's float interpolant). This pins the two to each other
+/// over every width the ribbon emits — `1, 2, 3, 7, 15, 40` px, the 15 being
+/// the owner's whole-cell slab — and every ramp shape the producers use:
+///
+/// * colour ramp WITH an opacity ramp `1 → 236` (source-over, fading in);
+/// * the mirror, `236 → 1` (fading out to the additive floor);
+/// * `alpha == 0` at BOTH ends with a colour ramp (additive light — the
+///   aurora's own shape);
+/// * equal non-zero alpha at both ends, colour-only ramp (a paint bed of one
+///   opacity changing hue).
+///
+/// The premises are the source-over pin's: block glyphs out to column 29, the
+/// field on bare ground to their right, a byte-exact base so every delta is
+/// the field's; and a flat control — the same field with `color2 == color`,
+/// `alpha2 == alpha` — is byte-exact too, so the gradient path and the flat
+/// path are both held, and the non-vacuity clause shows the gradient field
+/// differs from its flat twin (the ramp really is drawn).
+#[test]
+fn gradient_glow_under_is_byte_exact_cpu_vs_gpu() {
+    gradient_glow_under_parity(false);
+}
+
+/// [`gradient_glow_under_is_byte_exact_cpu_vs_gpu`] through the WGPU ORACLE
+/// arm (macOS: `disarm_metal_for_oracle`; elsewhere the wgpu path is the
+/// renderer, and the test above already runs it). The WGSL `fs_glow` is the
+/// live glow shader on every non-macOS backend, and until 2026-09-22 nothing
+/// on a Mac executed it: replacing its gradient law with the left colour left
+/// the whole aterm-gpu suite green (the review's mutation H). This runs the
+/// same field, the same widths and the same flat control through naga's
+/// translation of that WGSL.
+#[cfg(target_os = "macos")]
+#[test]
+fn gradient_glow_under_is_byte_exact_cpu_vs_wgpu_oracle() {
+    gradient_glow_under_parity(true);
+}
+
+fn gradient_glow_under_parity(oracle: bool) {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    if oracle {
+        gpu.disarm_metal_for_oracle();
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = oracle;
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (rows, cols) = (12usize, 40usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process("\x1b[?25l".as_bytes());
+    for r in 1..11usize {
+        term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
+    }
+    let (cw, ch) = cpu.cell_size();
+    let grid_w = cols * cw;
+
+    let base_input = term.cell_frame(rows, cols);
+    let cpu_base = cpu.render_input(&base_input);
+    let gpu_base = gpu.render_input(&mut win, &base_input, None);
+    assert_eq!(
+        max_channel_delta(&cpu_base.pixels, &gpu_base.pixels),
+        0,
+        "procedural-block base must be byte-exact so the stream deltas are effect-only"
+    );
+
+    // The field: on each row, the six widths side by side (one bare column
+    // between them) from column 30, each quad ramping `(rgb0, a0)` → `(rgb1,
+    // a1)`. The colours are PREMULTIPLIED by their end's own coverage, as
+    // every producer premultiplies (a source-over end never exceeds its
+    // alpha); an additive end is premultiplied by a coverage of its own.
+    const WIDTHS: [u16; 6] = [1, 2, 3, 7, 15, 40];
+    let ramps: [(u32, u32, u8, u8); 8] = [
+        (0x00FF_4020, 0x0020_40FF, 1, 236),
+        (0x0020_40FF, 0x00FF_4020, 236, 1),
+        (0x00FF_4020, 0x0020_40FF, 0, 0),
+        (0x0010_FF80, 0x00FF_1080, 0, 0),
+        (0x00FF_4020, 0x0020_40FF, 120, 120),
+        (0x0040_FF40, 0x0040_40FF, 255, 255),
+        (0x00FF_FFFF, 0x0000_0000, 200, 1),
+        (0x0000_0000, 0x00FF_FFFF, 1, 200),
+    ];
+    let mut field: Vec<GlowQuad> = Vec::new();
+    for (k, &(rgb0, rgb1, a0, a1)) in ramps.iter().enumerate() {
+        let row = 2 + k;
+        let mut x = (30 * cw) as u16;
+        for &w in &WIDTHS {
+            let (cov0, cov1) = if a0 == 0 && a1 == 0 {
+                (150u8, 40u8)
+            } else {
+                (a0, a1)
+            };
+            let x1 = (x + w).min(grid_w as u16);
+            if x1 > x {
+                field.push(GlowQuad {
+                    row: row as u16,
+                    x,
+                    y: (row * ch) as u16,
+                    w: x1 - x,
+                    h: ch as u16,
+                    color: aterm_render::premul_rgb(rgb0, cov0),
+                    alpha: a0,
+                    color2: aterm_render::premul_rgb(rgb1, cov1),
+                    alpha2: a1,
+                });
+            }
+            x = x1 + 1;
+        }
+    }
+    assert!(
+        field.iter().any(|q| q.alpha > 0 && q.alpha != q.alpha2),
+        "the field carries an opacity ramp"
+    );
+    assert!(
+        field
+            .iter()
+            .any(|q| q.alpha == 0 && q.alpha2 == 0 && q.color != q.color2),
+        "the field carries an additive colour ramp"
+    );
+    assert!(
+        field.iter().any(|q| q.w == 40),
+        "the widest quad fits the ground"
+    );
+
+    let mut input = term.cell_frame(rows, cols);
+    input.glow_under = field.clone();
+    let cpu_grad = cpu.render_input(&input);
+    let gpu_grad = gpu.render_input(&mut win, &input, None);
+    assert_ne!(
+        cpu_grad.pixels, cpu_base.pixels,
+        "the gradient field must actually paint (non-vacuous)"
+    );
+
+    // The FLAT control: every quad at its left end across its whole width.
+    let flat: Vec<GlowQuad> = field
+        .iter()
+        .map(|q| GlowQuad {
+            color2: q.color,
+            alpha2: q.alpha,
+            ..*q
+        })
+        .collect();
+    let mut flat_input = term.cell_frame(rows, cols);
+    flat_input.glow_under = flat;
+    let cpu_flat = cpu.render_input(&flat_input);
+    let gpu_flat = gpu.render_input(&mut win, &flat_input, None);
+    assert_ne!(
+        cpu_grad.pixels, cpu_flat.pixels,
+        "a gradient field must differ from its flat twin, or no ramp was drawn"
+    );
+
+    let delta = max_channel_delta(&cpu_grad.pixels, &gpu_grad.pixels);
+    let delta_flat = max_channel_delta(&cpu_flat.pixels, &gpu_flat.pixels);
+    eprintln!(
+        "gradient glow_under GPU (oracle={oracle}) vs CPU max per-channel delta = {delta} ({} \
+         quads); flat twin = {delta_flat}",
+        input.glow_under.len()
+    );
+    if gpu.additive_is_byte_exact() {
+        assert_byte_exact(
+            "gradient_glow_under_is_byte_exact_cpu_vs_gpu",
+            "gradient glow_under field",
+            &gpu,
+            delta,
+            format_args!("a gradient glow_under field must be BYTE-EXACT CPU==GPU (got {delta})"),
+        );
+        assert_byte_exact(
+            "gradient_glow_under_is_byte_exact_cpu_vs_gpu",
+            "flat twin of the gradient field",
+            &gpu,
+            delta_flat,
+            format_args!("the flat twin must be BYTE-EXACT CPU==GPU (got {delta_flat})"),
+        );
+    } else {
+        eprintln!("SKIP byte-exact gradient gate: downlevel sRGB offscreen (linear blend)");
+    }
 }

@@ -60,6 +60,7 @@ fn main() {
         duration: Duration::from_millis(900),
         length: 18,
         intensity: 0.9,
+        audible: true,
         radius: 0.6,
         ring: true,
         beam: true,

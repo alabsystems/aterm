@@ -4579,7 +4579,11 @@ fn spawn_live_zsh(
         .expect("prepare")
         .expect("zsh injection");
     let mut cmd = shell_command(zsh);
-    cmd.arg("-i")
+    // This interactive fixture reads commands from a pipe. An inherited
+    // controlling TTY must not redirect ZLE's reads or engage job control:
+    // background test runs otherwise hang or exit with a TTY read error.
+    // Keep -i so the real precmd/preexec hooks still run on every cycle.
+    cmd.args(["-i", "-o", "NO_ZLE", "-o", "NO_MONITOR"])
         .env("HOME", &fx.home)
         .env("PATH", "/usr/bin:/bin")
         .env("TERM", "dumb");

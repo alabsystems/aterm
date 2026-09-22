@@ -63,12 +63,14 @@ pub const STAMP_FILE: &str = ".aterm-verify-stamp";
 /// (directly, through a build script, or through cargo's own fingerprint), so a
 /// change is a reason a lane rebuilt. `PATH` and `RUSTDOC` stay out: no build
 /// script in this tree watches them. `CARGO_PROFILE_*` is matched by prefix.
-pub const LANE_ENV_VARS: [&str; 15] = [
+/// `CARGO_INCREMENTAL` left the list on 2026-09-21: the gate sets it to `0` in
+/// every child ([`crate::CHILD_ENV`]), so the caller's value never reaches a
+/// compile and a stamp that named it would explain a rebuild that did not happen.
+pub const LANE_ENV_VARS: [&str; 14] = [
     "RUSTFLAGS",
     "RUSTDOCFLAGS",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_BUILD_RUSTFLAGS",
-    "CARGO_INCREMENTAL",
     "RUSTC",
     "RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
@@ -903,11 +905,11 @@ fn lane_dirs(snap: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    for rel in [
-        "libc-oracle/target",
-        "libc-oracle/target-symgate",
-        "tools/freeze-safety-gate/target",
-    ] {
+    // ONE LIST, read from where the disk preflight keeps it: these are the same
+    // dirs [`crate::disk::remedy`] tells a refused operator to delete, and a
+    // second copy here drifted once already (`libc-oracle/target-symgate` was
+    // stamped as a lane and left out of the remedy, 2026-09-21).
+    for rel in crate::disk::NESTED_LANE_DIRS {
         let p = snap.join(rel);
         // A lane beneath a link is a directory outside the snapshot: never
         // stamped, never pruned.
@@ -974,9 +976,25 @@ pub fn judge_stamp(old: &str, new: &str) -> LaneVerdict {
     {
         return LaneVerdict::Prune { was, now };
     }
+    // A KEY IN ONLY ONE STAMP IS A ROSTER CHANGE, NOT AN ENVIRONMENT CHANGE —
+    // for the roster keys, which [`stamp_text`] ALWAYS writes, recording an
+    // absent variable as the literal `unset`. So a roster key that appears in
+    // one stamp and not the other can only mean [`LANE_ENV_VARS`] itself
+    // changed between the two runs, and a roster edit rebuilds nothing.
+    // Measured 2026-09-21: dropping `CARGO_INCREMENTAL` from the roster made
+    // every already-stamped lane on this machine announce `may rebuild cold —
+    // CARGO_INCREMENTAL changed since its last run`, after which nothing
+    // rebuilt — the exact false note the drop was made to prevent.
+    //
+    // The prefix keys (`CARGO_PROFILE_*`) are the opposite: they are written
+    // only when SET, so one appearing or disappearing IS the variable being set
+    // or unset, and it still counts.
+    let roster = |k: &String| !k.starts_with(LANE_ENV_PREFIX);
+    let in_both = |k: &String| old_env.contains_key(k) && new_env.contains_key(k);
     let changed: Vec<String> = old_env
         .keys()
         .chain(new_env.keys())
+        .filter(|k| in_both(k) || !roster(k))
         .filter(|k| old_env.get(*k) != new_env.get(*k))
         .cloned()
         .collect::<BTreeSet<_>>()
@@ -1132,6 +1150,51 @@ mod tests {
             judge_stamp(&old, &stamp_text(None, &a)),
             LaneVerdict::Warm,
             "an unknown commit is not evidence of a new compiler"
+        );
+    }
+
+    /// A ROSTER EDIT REBUILDS NOTHING, so it must not announce a cold rebuild.
+    ///
+    /// [`stamp_text`] writes every roster key on every run, an absent variable
+    /// as the literal `unset`, so a roster key in one stamp and not the other
+    /// can only mean [`LANE_ENV_VARS`] itself changed. Measured 2026-09-21:
+    /// dropping `CARGO_INCREMENTAL` from the roster made every already-stamped
+    /// lane here print `may rebuild cold — CARGO_INCREMENTAL changed since its
+    /// last run`, and then nothing rebuilt. The prefix keys are the opposite
+    /// case and still count, because they are written only when set.
+    #[test]
+    fn dropping_a_variable_from_the_roster_is_not_a_cold_lane() {
+        let env = lane_env([(OsString::from("RUSTFLAGS"), OsString::from("-Zx"))]);
+        let new = stamp_text(Some("c1"), &env);
+        // The same run, stamped by a client whose roster still carried one more
+        // variable: an extra `env` line, everything else identical.
+        let old = new.replace(
+            "env RUSTFLAGS",
+            "env CARGO_INCREMENTAL unset\nenv RUSTFLAGS",
+        );
+        assert!(old.contains("CARGO_INCREMENTAL") && !new.contains("CARGO_INCREMENTAL"));
+        assert_eq!(
+            judge_stamp(&old, &new),
+            LaneVerdict::Warm,
+            "a key the new roster does not write is a roster change, not an env change"
+        );
+        assert_eq!(
+            judge_stamp(&new, &old),
+            LaneVerdict::Warm,
+            "and symmetrically"
+        );
+        // A PROFILE key is written only when set, so its appearance is real.
+        let with_profile = lane_env([
+            (OsString::from("RUSTFLAGS"), OsString::from("-Zx")),
+            (
+                OsString::from("CARGO_PROFILE_DEV_DEBUG"),
+                OsString::from("1"),
+            ),
+        ]);
+        assert_eq!(
+            judge_stamp(&new, &stamp_text(Some("c1"), &with_profile)),
+            LaneVerdict::Cold(vec!["CARGO_PROFILE_DEV_DEBUG".to_string()]),
+            "setting a profile variable still rebuilds the lane"
         );
     }
 

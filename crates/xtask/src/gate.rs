@@ -4,7 +4,7 @@
 
 //! The local enforcement gate — aterm's replacement for CI (there is NO CI).
 //!
-//! Run via `cargo run -p xtask -- gate <check>`. The verbs named by
+//! Run via `targo --unverified run -p xtask -- gate <check>`. The verbs named by
 //! [`WRAPPED_BY_VERIFY_SH`] are wrapped by `tools/verify.sh` and so also run
 //! under the opt-in `cargo ship cut --gate`, which shells out to
 //! `tools/verify.sh --full`; the rest are manual. That list is DERIVED from the
@@ -5472,17 +5472,23 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
             // provenance-TRACKED when the executable it was exec'd from carries
             // `com.apple.provenance`, and a SCRIPT exec'd by path counts as that
             // executable (docs/RELEASING.md, the shim rule). A checkout written
-            // from a tracked shell — every shell inside aterm.app, every agent
-            // under a tagged `claude` — has every tracked file tagged (1,801 of
-            // them on the owner's machine, 2026-09-16), so exec'ing
+            // from a tracked shell — a shell inside a TAGGED aterm.app, an agent
+            // under a tagged `claude` — has the files THAT SHELL wrote tagged,
+            // which is most of a worked-in checkout and includes the guards
+            // (1,980 of the owner's 3,858 tracked files, 2026-09-22), so exec'ing
             // `tools/spin_guard.sh` tracked the guard, the guard tracked the
             // snapshot, and `proof_snapshot.py` refused its own take with
             // "published proof snapshot has extended metadata" even from a
             // launchd job, the one untracked lane there is. Measured the same
             // day: exec of the tagged script → tracked; `bash <script>` and
-            // `python3 <file>` → untracked. The interpreter is the system
-            // `env`'s `bash` (clean), `$0` is still the script's path, so the
-            // guards' `HERE="$(dirname "$0")"` resolves as before.
+            // `python3 <file>` → untracked. The interpreter is whatever `bash`
+            // `/usr/bin/env` finds first on PATH — /bin/bash here, and any
+            // replacement is a binary rather than a repo file, so it carries the
+            // tag only if its own installer was tracked. `$0` is still the
+            // script's path, so the guards' `HERE="$(dirname "$0")"` resolves as
+            // before, and a guard whose +x bit is gone now runs instead of
+            // failing the lane — the lane's own `exists()` check is what still
+            // catches a MISSING guard.
             let script_arg = script.to_string_lossy().into_owned();
             let mut via_bash: Vec<&str> = vec!["bash", script_arg.as_str()];
             via_bash.extend(args.iter().copied());

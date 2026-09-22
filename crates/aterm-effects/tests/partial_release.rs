@@ -70,6 +70,7 @@ fn cfg() -> GlowConfig {
         duration: Duration::from_millis(240),
         length: 18,
         intensity: 0.7,
+        audible: true,
         radius: 0.6,
         ring: true,
         beam: false,
@@ -296,6 +297,49 @@ fn a_suffix_the_program_cleared_leaves_and_the_prefix_stands() {
     h.program(b"\x1b[6;1HXXX\x1b[6;4H");
     assert_eq!(h.leaving(5), vec![0, 1, 2]);
     assert_eq!(h.retired(), 11);
+}
+
+/// **THE TAIL GOES WITH THE SUFFIX** (2026-09-21, the review's probe).
+/// `hello world ` — twelve keys, the last a typed trailing space the witness
+/// never armed (blank under it) — rested 200 ms, then the program clears
+/// from `w` on and parks the caret at the end. The span rule alone released
+/// `world` and left the trailing space lit five dark cells past `hello `:
+/// the one-cell stray the blank law forbids. The space goes with the
+/// cleared suffix (no standing glyph of the run lies right of it), `hello `
+/// stands (`hello` stands left of its space), the cohort keeps its clock.
+///
+/// RED before the tail closure: `leaving=[6, 7, 8, 9, 10]`, `live=[0, 1,
+/// 2, 3, 4, 5, 11]`.
+#[test]
+fn a_trailing_space_after_a_suffix_the_program_cleared_leaves_with_it() {
+    let mut h = Host::at_row(5);
+    h.type_str("hello world ");
+    assert_eq!(h.live(5), (0..12).collect::<Vec<u16>>());
+    h.idle(200);
+    h.program(b"\x1b[6;7H\x1b[K\x1b[6;13H");
+    assert_eq!(
+        h.leaving(5),
+        (6..12).collect::<Vec<u16>>(),
+        "`world` and the trailing space after it leave together"
+    );
+    assert_eq!(h.live(5), (0..6).collect::<Vec<u16>>(), "`hello ` stands");
+    assert_eq!(
+        h.cohorts(5),
+        vec![(false, false)],
+        "the cohort keeps its clock"
+    );
+    assert_eq!(h.retired(), 6, "six cells whose text went, counted once");
+    h.idle(FADE_MS);
+    assert_eq!(
+        h.cells(5).len(),
+        6,
+        "past the melt the suffix and its tail are out of the pool"
+    );
+    assert!(
+        h.lit_cols(5).iter().all(|&c| c < 6),
+        "no light past `hello `: {:?}",
+        h.lit_cols(5)
+    );
 }
 
 /// A whole clear AFTER a partial one is still the text gone whole: the

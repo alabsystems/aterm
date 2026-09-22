@@ -147,10 +147,11 @@ If neither variable is set, you are not inside aterm; ignore this section.";
 const RUST_NOTE: &str = "\
 ## Rust on this machine: the DEFAULT is the Trust toolchain (true in ANY terminal)
 aterm installs the ALab VERIFIED Rust toolchain beside stock Rust and atpkg's rc block puts
-it on PATH in every shell. USE IT: `targo` is cargo, `trustc` is rustc, `tippy` is clippy,
-`trustfmt` is rustfmt; `ty`, `ay`, `clean` are the verifiers. Stock `cargo`/`rustc` is the
-EXCEPTION here, never the default — a session-scoped reroute prints the `targo` spelling
-whenever you type one; if you must run stock anyway, say why in your reply. Name the lane:
+it on PATH in every shell. USE IT, BY NAME (in replies too): `targo` (not cargo),
+`trustc` (not rustc), `tippy` (not clippy), `trustfmt` (not rustfmt); `ty`, `ay`, `clean`
+are the verifiers. Stock `cargo`/`rustc` is the EXCEPTION here, never the default — a
+session-scoped reroute prints the `targo` spelling whenever you type one; if you must run
+stock anyway, say why in your reply. Name the lane:
 `targo trust <cmd>` (verified, fail-closed, proof report) or `targo --unverified <cmd>`
 (no proof claim); a bare `targo build` is refused on purpose, so that refusal is not a
 broken tool. Run `aterm help rust` in the project BEFORE the first build: it MEASURES which
@@ -1056,6 +1057,335 @@ impl AutoPrime {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The hook lane — Claude Code's hooks ride the same auto-prime pass
+// ---------------------------------------------------------------------------
+
+/// Where the hooks live in a Claude config tree (relative to the home).
+pub const CLAUDE_HOOKS_FILE: &str = ".claude/settings.json";
+
+/// How this crate reaches the hook installer, which lives in `aterm-link`
+/// (`aterm link hook …`) and not here: this crate is a std-only leaf shared by
+/// the CLI and the GUI, and the installer needs the settings-file merge, the
+/// self-test and the control socket — so it is RUN, as the one binary, never
+/// linked. `exe` is that binary (the running aterm, normally, CANONICAL — see
+/// [`HookLane::from_current_exe`]); `sock` is the instance socket for a
+/// self-test made where no session exists (the window's own pass: the hook's
+/// `--check` then answers `ok instance`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookLane {
+    pub exe: PathBuf,
+    pub sock: Option<String>,
+}
+
+/// The state of aterm's hook block in a settings file, as `hook status` prints
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookState {
+    /// Every event, this executable, this spelling.
+    Installed,
+    /// A complete block whose every command runs, written by ANOTHER aterm
+    /// executable (the path as printed) — the release app's block seen from
+    /// `/Applications/aterm (dev).app`, or the other way round. Live, not
+    /// stale: the automatic pass leaves it alone ([`HookLane::install`]).
+    InstalledBy(String),
+    /// An entry of ours is there but the block is not this build's (the
+    /// reason as printed).
+    Stale(String),
+    /// No entry of ours (or no file).
+    Absent,
+    /// The file could not be read as JSON; nothing is written to it.
+    Unreadable(String),
+    /// The installer could not be run at all (the reason).
+    Unavailable(String),
+}
+
+/// What the lane wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookWrite {
+    /// Nothing written: the block was already this build's — or, on the
+    /// automatic pass, another live aterm's complete block
+    /// ([`HookState::InstalledBy`]).
+    Current,
+    /// The block was absent and is now installed.
+    Installed,
+    /// The block was stale (or, when forced, another aterm's) and is now this
+    /// build's.
+    Updated,
+}
+
+impl HookLane {
+    /// The lane for the running executable, or `None` when it cannot be
+    /// named — and always `None` off unix: the installer is `aterm-link`, a
+    /// unix-only dependency of the one binary, so there `aterm link` answers
+    /// `link_unavailable` and a lane would log an error on every automatic
+    /// pass and make `aterm agents install` exit 1.
+    ///
+    /// The path is CANONICAL (falling back to the raw one when it cannot be
+    /// resolved): `~/.local/bin/aterm` is a symlink to
+    /// `/Applications/aterm.app/Contents/MacOS/aterm`, and the block written
+    /// and compared (`--exe`) must name the bundle, the same file whichever
+    /// spelling launched it.
+    #[must_use]
+    pub fn from_current_exe(sock: Option<String>) -> Option<Self> {
+        if !cfg!(unix) {
+            return None;
+        }
+        let exe = std::env::current_exe().ok()?;
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        Some(Self { exe, sock })
+    }
+
+    /// `<exe> link hook …`, or `<exe> hook …` for a binary named `aterm-link`
+    /// — the same rule the installer uses to spell the commands it writes.
+    fn command(&self, args: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.exe);
+        let base = self
+            .exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let base = base
+            .strip_suffix(std::env::consts::EXE_SUFFIX)
+            .unwrap_or(&base)
+            .to_string();
+        if base != "aterm-link" {
+            cmd.arg("link");
+        }
+        cmd.arg("hook");
+        cmd.args(args);
+        if let Some(sock) = &self.sock {
+            cmd.env("ATERM_CONTROL_SOCK", sock);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd
+    }
+
+    /// Run one hook verb, bounded by the vendor-facing installer's own
+    /// deadlines (six self-tests of ten seconds each, at most).
+    fn run(&self, args: &[&str]) -> Result<(String, String, bool), String> {
+        let out = self
+            .command(args)
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", self.exe.display()))?;
+        Ok((
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            out.status.success(),
+        ))
+    }
+
+    /// `hook status claude` for `settings`.
+    #[must_use]
+    pub fn status(&self, settings: &Path) -> HookState {
+        let exe = self.exe.display().to_string();
+        match self.run(&[
+            "status",
+            "claude",
+            "--settings",
+            &settings.display().to_string(),
+            "--exe",
+            &exe,
+        ]) {
+            Err(e) => HookState::Unavailable(e),
+            Ok((out, err, ok)) => {
+                if !ok {
+                    return HookState::Unavailable(if err.is_empty() { out } else { err });
+                }
+                let line = out.lines().last().unwrap_or("").trim();
+                match line {
+                    "installed" => HookState::Installed,
+                    l if l.starts_with("installed-by ") => {
+                        HookState::InstalledBy(l["installed-by ".len()..].to_string())
+                    }
+                    "absent" => HookState::Absent,
+                    l if l.starts_with("stale: ") => HookState::Stale(l[7..].to_string()),
+                    l if l.starts_with("unreadable: ") => {
+                        HookState::Unreadable(l[12..].to_string())
+                    }
+                    other => HookState::Unavailable(format!("status answered {other:?}")),
+                }
+            }
+        }
+    }
+
+    /// Install or update the block in `settings` when it is absent or stale:
+    /// `hook install claude --merge --keep-flags`, which self-tests every
+    /// command before it writes and keeps an operator's Stop flags (and a
+    /// `--gate-tools` gate or `--keep-alive` it finds) across the update. No
+    /// `--rewake`: since round 22 the Stop hook waits only with
+    /// `--keep-alive`, so the default block needs no async re-wake, and
+    /// forcing it would overwrite an operator's synchronous Stop. A current
+    /// block is left alone; an unreadable file is never written to.
+    ///
+    /// `force` decides a complete block ANOTHER live aterm wrote
+    /// ([`HookState::InstalledBy`]). `false` is the window's automatic pass:
+    /// that block is [`HookWrite::Current`] and left alone, so two installed
+    /// apps (the release app and `/Applications/aterm (dev).app`) never take
+    /// turns rewriting the file once a minute each. `true` is `aterm agents
+    /// install`, the operator asking THIS binary to own the hooks: only this
+    /// binary's own block is current, and another's is replaced.
+    ///
+    /// # Errors
+    ///
+    /// The installer's refusal, in its words.
+    pub fn install(&self, settings: &Path, force: bool) -> Result<HookWrite, String> {
+        let before = self.status(settings);
+        match before {
+            HookState::Installed => return Ok(HookWrite::Current),
+            HookState::InstalledBy(_) if !force => return Ok(HookWrite::Current),
+            HookState::Unreadable(why) => {
+                return Err(format!(
+                    "{} is not readable JSON ({why}); left alone",
+                    settings.display()
+                ));
+            }
+            HookState::Unavailable(why) => return Err(why),
+            HookState::InstalledBy(_) | HookState::Absent | HookState::Stale(_) => {}
+        }
+        let exe = self.exe.display().to_string();
+        let path = settings.display().to_string();
+        let (out, err, ok) = self.run(&[
+            "install",
+            "claude",
+            "--merge",
+            "--keep-flags",
+            "--settings",
+            &path,
+            "--exe",
+            &exe,
+        ])?;
+        if !ok {
+            // The first failed self-test names the cause for every one of
+            // them (one instance, one socket); the rest is the same line six
+            // times and the command that was tested.
+            let why = err
+                .lines()
+                .find(|l| l.contains("FAILED"))
+                .map(|l| {
+                    l.trim_start_matches("aterm-link hook install: ")
+                        .to_string()
+                })
+                .or_else(|| {
+                    err.lines()
+                        .find(|l| l.contains("REFUSED"))
+                        .map(str::to_string)
+                })
+                .unwrap_or(if err.is_empty() { out } else { err });
+            return Err(why);
+        }
+        Ok(match before {
+            HookState::Absent => HookWrite::Installed,
+            _ => HookWrite::Updated,
+        })
+    }
+
+    /// `hook remove claude`: aterm's entries out, everything else kept.
+    /// Answers the installer's line (`removed <n>` / `nothing to remove`).
+    ///
+    /// # Errors
+    ///
+    /// The installer's refusal.
+    pub fn remove(&self, settings: &Path) -> Result<String, String> {
+        let (out, err, ok) = self.run(&[
+            "remove",
+            "claude",
+            "--settings",
+            &settings.display().to_string(),
+        ])?;
+        if ok {
+            Ok(out.lines().last().unwrap_or("").to_string())
+        } else {
+            Err(if err.is_empty() { out } else { err })
+        }
+    }
+
+    /// The master switch's half of the automatic pass: with `[harness]
+    /// enabled = false` in `aterm.toml`, take THIS executable's own block
+    /// ([`HookState::Installed`]) back out through [`HookLane::remove`], and
+    /// touch nothing else. `Ok(Some(line))` is the installer's answer when a
+    /// block was removed; `Ok(None)` means there was nothing of ours to take
+    /// out — a complete block ANOTHER aterm wrote ([`HookState::InstalledBy`])
+    /// is that aterm's to manage and is left alone, and a stale, absent,
+    /// unreadable or unreachable one is never written to.
+    ///
+    /// Consent basis for the default-ON install this withdraws: the owner's
+    /// instruction of 2026-09-21, *"claude code harness for aterm must be
+    /// BATTERIES INCLUDED ON BY DEFAULT for features"*. The durable
+    /// `harness.enabled = false` is the owner's recorded way to say no, so
+    /// the window honours it here instead of re-installing once a minute.
+    ///
+    /// # Errors
+    ///
+    /// The installer's refusal to remove, in its words.
+    pub fn withdraw_own(&self, settings: &Path) -> Result<Option<String>, String> {
+        match self.status(settings) {
+            HookState::Installed => self.remove(settings).map(Some),
+            HookState::InstalledBy(_)
+            | HookState::Stale(_)
+            | HookState::Absent
+            | HookState::Unreadable(_)
+            | HookState::Unavailable(_) => Ok(None),
+        }
+    }
+}
+
+/// [`HookLane::withdraw_own`] against the human's Claude settings file under
+/// `home` — the same file [`auto_prime_with_lane`] installs into.
+///
+/// # Errors
+///
+/// The installer's refusal to remove.
+pub fn withdraw_hooks_with_lane(home: &Path, lane: &HookLane) -> Result<Option<String>, String> {
+    lane.withdraw_own(&home_join(
+        home,
+        xdg_config_home().as_deref(),
+        CLAUDE_HOOKS_FILE,
+    ))
+}
+
+/// The one-word state for a status row.
+fn hook_state_word(state: &HookState) -> String {
+    match state {
+        HookState::Installed => "installed".to_string(),
+        HookState::InstalledBy(path) => format!("installed (by {path})"),
+        HookState::Stale(why) => format!("stale (install updates it): {why}"),
+        HookState::Absent => "absent".to_string(),
+        HookState::Unreadable(why) => format!("unreadable — left alone: {why}"),
+        HookState::Unavailable(why) => format!("unavailable: {why}"),
+    }
+}
+
+/// Whether `exe` is an INSTALLED aterm — one whose path may be written into a
+/// human's `~/.claude/settings.json` by the automatic pass — rather than a raw
+/// build in a cargo target tree. False when the path (canonical where it can
+/// be resolved, so a `~/.local/bin` link is judged by what it points at) has a
+/// component whose name starts with `target` (`target`, `target.noindex`,
+/// `target-gate.noindex`, …) followed, anywhere later, by a `debug` or
+/// `release` component; true for everything else — an `.app` bundle in
+/// `/Applications` (the dev bundle included), the atpkg store. A build-tree
+/// path in the settings file points every Claude session's hooks at a binary
+/// that the next rebuild replaces and `targo clean` deletes. `aterm agents
+/// install`, the operator's explicit ask, is not gated by this.
+#[must_use]
+pub fn installed_exe(exe: &Path) -> bool {
+    let resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let mut in_target = false;
+    for component in resolved.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if in_target && (name == "debug" || name == "release") {
+            return false;
+        }
+        if name.starts_with("target") {
+            in_target = true;
+        }
+    }
+    true
+}
+
 /// Fold one agent's primer write and its skill writes into the agent's outcome.
 /// `Installed` means the PRIMER was new (the agent is primed for the first
 /// time); any other write is an update; a foreign skill only shows when nothing
@@ -1063,6 +1393,7 @@ impl AutoPrime {
 fn fold_outcome(
     primer: Result<PrimerWrite, String>,
     skills: &[Result<SkillWrite, String>],
+    hooks: Option<&Result<HookWrite, String>>,
 ) -> Outcome {
     let primer = match primer {
         Ok(p) => p,
@@ -1071,13 +1402,17 @@ fn fold_outcome(
     if let Some(e) = skills.iter().find_map(|s| s.as_ref().err()) {
         return Outcome::Error(e.clone());
     }
+    if let Some(Err(e)) = hooks {
+        return Outcome::Error(format!("hooks: {e}"));
+    }
     if matches!(primer, PrimerWrite::Created | PrimerWrite::Appended) {
         return Outcome::Installed;
     }
     let skill_written = skills
         .iter()
         .any(|s| matches!(s, Ok(SkillWrite::Installed | SkillWrite::Updated)));
-    if primer == PrimerWrite::Replaced || skill_written {
+    let hooks_written = matches!(hooks, Some(Ok(HookWrite::Installed | HookWrite::Updated)));
+    if primer == PrimerWrite::Replaced || skill_written || hooks_written {
         return Outcome::Updated;
     }
     if skills.iter().any(|s| matches!(s, Ok(SkillWrite::Foreign))) {
@@ -1126,7 +1461,22 @@ fn outcome_word(o: &Outcome) -> String {
 /// so the cap can clip only the list's tail — never the switch or a row's word.
 #[must_use]
 pub fn auto_prime(home: &Path) -> AutoPrime {
-    auto_prime_with_xdg(home, xdg_config_home().as_deref())
+    auto_prime_with_xdg(home, xdg_config_home().as_deref(), None)
+}
+
+/// [`auto_prime`] with the HOOK LANE: for a detected Claude Code, aterm's
+/// hook block in `~/.claude/settings.json` is installed when absent and
+/// updated when stale, through `lane` ([`HookLane::install`]) — the
+/// batteries-included default since 2026-09-21, when a permission box in a
+/// bypass-permissions tab sat unanswered because the hooks that answer it
+/// existed and nothing installed them. Without a lane the pass is
+/// [`auto_prime`]. The file is listed in the row's `wrote` like any other,
+/// and an installer refusal is the row's `Error`. The pass never forces: a
+/// complete block another live aterm wrote ([`HookState::InstalledBy`]) is
+/// left alone, so two installed apps never rewrite the file in turn.
+#[must_use]
+pub fn auto_prime_with_lane(home: &Path, lane: Option<&HookLane>) -> AutoPrime {
+    auto_prime_with_xdg(home, xdg_config_home().as_deref(), lane)
 }
 
 /// [`auto_prime`] over a SESSION IDENTITY's directory ([`agent_homes`]): every
@@ -1139,12 +1489,15 @@ pub fn auto_prime(home: &Path) -> AutoPrime {
 /// `AGENTS.md` and command file into the human's tree.
 #[must_use]
 pub fn auto_prime_identity(dir: &Path) -> AutoPrime {
-    auto_prime_with_xdg(dir, None)
+    // No lane: an identity's hooks are CARRIED from the human's settings by
+    // the spawn seam (`agent_identity::carry_claude_hooks`), commands
+    // included, so they need no self-test and no socket here.
+    auto_prime_with_xdg(dir, None, None)
 }
 
 // Capture the environment at the public boundary. Every operation in one pass
 // uses the same roots; scratch-home tests supply their own complete path context.
-fn auto_prime_with_xdg(home: &Path, xdg: Option<&Path>) -> AutoPrime {
+fn auto_prime_with_xdg(home: &Path, xdg: Option<&Path>, lane: Option<&HookLane>) -> AutoPrime {
     let mut agents = Vec::new();
     for a in AGENT_FILES.iter().filter(|a| detected(home, xdg, a)) {
         let primer = upsert_primer_file(&home_join(home, xdg, a.file), &block_for(a));
@@ -1152,6 +1505,11 @@ fn auto_prime_with_xdg(home: &Path, xdg: Option<&Path>) -> AutoPrime {
             .iter()
             .map(|s| install_skill_file(&home_join(home, xdg, s.path), s.body))
             .collect();
+        // The hooks, for the one agent with a hook contract, through the lane
+        // — unforced: another live aterm's complete block stays its own.
+        let hooks: Option<Result<HookWrite, String>> = lane
+            .filter(|_| a.name == "claude")
+            .map(|lane| lane.install(&home_join(home, xdg, CLAUDE_HOOKS_FILE), false));
         // Exactly the paths THIS pass wrote — decided from the write results
         // before they are folded into the row's one-word outcome (see
         // `AgentOutcome::wrote`).
@@ -1167,10 +1525,13 @@ fn auto_prime_with_xdg(home: &Path, xdg: Option<&Path>) -> AutoPrime {
                 wrote.push(format!("~/{}", skill.path));
             }
         }
+        if matches!(hooks, Some(Ok(HookWrite::Installed | HookWrite::Updated))) {
+            wrote.push(format!("~/{CLAUDE_HOOKS_FILE}"));
+        }
         agents.push(AgentOutcome {
             agent: a.name,
             product: a.product,
-            outcome: fold_outcome(primer, &skills),
+            outcome: fold_outcome(primer, &skills, hooks.as_ref()),
             wrote,
         });
     }
@@ -1300,10 +1661,40 @@ fn select<'a>(names: &[String]) -> Result<Vec<&'a AgentFile>, String> {
 /// failure (corrupt block, I/O error), 2 usage.
 #[must_use]
 pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
-    agents_report_with_xdg(home, args, xdg_config_home().as_deref())
+    agents_report_with_lane(home, args, HookLane::from_current_exe(None).as_ref())
 }
 
-fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (String, i32) {
+/// [`agents_report`] with the hook lane spelled out — the CLI's own
+/// executable and no socket. Inside an aterm session the installer's
+/// self-test reaches the instance through `$ATERM_PARENT_SESSION_ID`; outside
+/// one it asks the instance found the way `aterm ctl` finds one
+/// (`$ATERM_CONTROL_SOCK`, then the `latest` alias or the newest live
+/// instance) and answers `ok instance`. It refuses only when no instance is
+/// reachable, and the row reports that refusal. `install` here FORCES
+/// ([`HookLane::install`]): it is the operator asking this binary to own the
+/// hooks, so a block another aterm wrote is replaced.
+#[must_use]
+pub fn agents_report_with_lane(
+    home: &Path,
+    args: &[String],
+    lane: Option<&HookLane>,
+) -> (String, i32) {
+    agents_report_with_xdg(home, args, xdg_config_home().as_deref(), lane)
+}
+
+fn agents_report_with_xdg(
+    home: &Path,
+    args: &[String],
+    xdg: Option<&Path>,
+    lane: Option<&HookLane>,
+) -> (String, i32) {
+    let hooks_row = |verdict: &str| {
+        format!(
+            "{:<9} {:<30} {verdict}\n",
+            "  hooks",
+            display_path(home, xdg, CLAUDE_HOOKS_FILE)
+        )
+    };
     let sub = args.first().map(String::as_str).unwrap_or("status");
     let names = args.get(1..).unwrap_or(&[]);
     match sub {
@@ -1360,10 +1751,18 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                         display_path(home, xdg, s.path)
                     );
                 }
+                // The hooks are one more managed artifact of Claude's — a
+                // marked block inside the vendor's settings file, read by the
+                // installer that owns it (`aterm link hook status`).
+                if let Some(lane) = lane.filter(|_| a.name == "claude" && detected(home, xdg, a)) {
+                    let state = lane.status(&home_join(home, xdg, CLAUDE_HOOKS_FILE));
+                    out.push_str(&hooks_row(&hook_state_word(&state)));
+                }
             }
             out.push_str(
-                "\n`aterm agents install` installs/updates the primer AND the bundled skills\n\
-                 for detected agents; `aterm agents primer` prints the block for manual pasting.\n",
+                "\n`aterm agents install` installs/updates the primer, the bundled skills AND\n\
+                 (for Claude Code) the aterm hooks in its settings file for detected agents;\n\
+                 `aterm agents primer` prints the block for manual pasting.\n",
             );
             let _ = writeln!(out, "{AUTO_PRIME_NOTE}");
             (out, 0)
@@ -1430,6 +1829,21 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                         "  skill",
                         display_path(home, xdg, s.path)
                     );
+                }
+                if let Some(lane) = lane.filter(|_| a.name == "claude") {
+                    // Forced: the operator asked THIS binary, so another
+                    // aterm's block is replaced rather than deferred to.
+                    let settings = home_join(home, xdg, CLAUDE_HOOKS_FILE);
+                    let verdict = match lane.install(&settings, true) {
+                        Ok(HookWrite::Current) => "already installed".to_string(),
+                        Ok(HookWrite::Installed) => "installed".to_string(),
+                        Ok(HookWrite::Updated) => "updated".to_string(),
+                        Err(e) => {
+                            failed = true;
+                            format!("ERROR: {e}")
+                        }
+                    };
+                    out.push_str(&hooks_row(&verdict));
                 }
             }
             (out, i32::from(failed))
@@ -1500,6 +1914,16 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
                         display_path(home, xdg, s.path)
                     );
                 }
+                if let Some(lane) = lane.filter(|_| a.name == "claude") {
+                    let verdict = match lane.remove(&home_join(home, xdg, CLAUDE_HOOKS_FILE)) {
+                        Ok(line) => line,
+                        Err(e) => {
+                            failed = true;
+                            format!("ERROR: {e}")
+                        }
+                    };
+                    out.push_str(&hooks_row(&verdict));
+                }
             }
             // A removal the next session would silently undo is a trap; the
             // knob that makes it stick rides on the same screen.
@@ -1515,6 +1939,47 @@ fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (
 
 #[cfg(test)]
 mod tests {
+
+    /// **THE SKILL AGENTS READ MUST NAME EVERY STREAM.** `DRIVE_SKILL_BODY` is
+    /// installed into an agent's context, so a stream missing from its list is
+    /// a stream that surface never learns exists — which is what happened to
+    /// `mail` for a whole round. Checked against the ONE vocabulary.
+    #[test]
+    fn the_drive_skill_names_every_subscribe_stream() {
+        // THE `Streams ⊆ …` LINE, not the whole document: the skill says
+        // `--mail` and `mail:kinds=` elsewhere, so a search over the body
+        // passes while the LIST agents read omits the stream — the defect.
+        let line = super::DRIVE_SKILL_BODY
+            .lines()
+            .find(|l| l.contains("Streams ⊆"))
+            .expect("the skill states the stream list");
+        let list = line
+            .split('`')
+            .find(|seg| seg.contains("screen,"))
+            .expect("the list is in backticks");
+        // A LITERAL ROSTER, for the reason the refusal's test gives: iterating
+        // `SUBSCRIBE_STREAMS` cannot catch a deletion from `SUBSCRIBE_STREAMS`.
+        for stream in [
+            "screen",
+            "cursor",
+            "events",
+            "cells",
+            "bytes",
+            "mail",
+            "sessions",
+            "timestamps",
+            "trim",
+        ] {
+            assert!(
+                aterm_types::control_verbs::SUBSCRIBE_STREAMS.contains(&stream),
+                "the vocabulary must name `{stream}`"
+            );
+            assert!(
+                list.split([',', '|']).any(|t| t == stream),
+                "the installed drive skill's LIST must name `{stream}`: {list}"
+            );
+        }
+    }
     use super::*;
 
     // A scratch HOME is not sufficient isolation: a caller's XDG_CONFIG_HOME
@@ -1522,11 +1987,11 @@ mod tests {
     // These wrappers drive the production implementations with complete fixture
     // roots, without modifying process-global environment in parallel tests.
     fn auto_prime(home: &Path) -> AutoPrime {
-        auto_prime_with_xdg(home, None)
+        auto_prime_with_xdg(home, None, None)
     }
 
     fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
-        agents_report_with_xdg(home, args, None)
+        agents_report_with_xdg(home, args, None, None)
     }
 
     fn status_line(home: &Path) -> String {
@@ -1600,6 +2065,11 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
     /// lives behind `aterm help permissions`; what is here is the pointer plus
     /// the three refusals, which are useless if the agent has to already suspect
     /// a permissions wall to go looking for them.
+    ///
+    /// The tools are named AS THEMSELVES — `tippy` (not clippy), not "`tippy`
+    /// is clippy" — because an agent primed with the latter ran `targo tippy`
+    /// and wrote "clippy" in its reply (owner correction, 2026-09-22). The
+    /// rewording costs the block nothing: the budget did not move.
     #[test]
     fn rust_note_has_its_own_budget_and_says_the_default_is_trust() {
         // Its own budget — it must not be smuggled into PRIMER_BODY's 1_150/13,
@@ -1619,9 +2089,10 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         // point at the measuring command, and carry its own gate sentence.
         for needle in [
             "DEFAULT is the Trust toolchain",
-            "`targo` is cargo",
-            "`trustc` is rustc",
-            "`tippy` is clippy",
+            "BY NAME (in replies too)",
+            "`targo` (not cargo)",
+            "`trustc` (not rustc)",
+            "`tippy` (not clippy)",
             "targo trust <cmd>",
             "targo --unverified <cmd>",
             "aterm help rust",
@@ -2775,7 +3246,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         // Negative control for ignoring relocation: the default root really has
         // an agent, but the active config has none. It must not be detected or
         // written, and the diagnostic must name where detection actually looked.
-        let absent = auto_prime_with_xdg(home.path(), xdg);
+        let absent = auto_prime_with_xdg(home.path(), xdg, None);
         assert!(absent.agents.is_empty(), "{}", absent.summary);
         assert!(!absent.changed());
         assert!(
@@ -2790,7 +3261,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
 
         let active_file = config.path().join("opencode/AGENTS.md");
         let active_dir = config.path().join("opencode");
-        let (report, code) = agents_report_with_xdg(home.path(), &[], xdg);
+        let (report, code) = agents_report_with_xdg(home.path(), &[], xdg, None);
         assert_eq!(code, 0, "{report}");
         assert!(
             report.lines().any(|line| line
@@ -2814,7 +3285,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
         }
         assert!(!report.contains("~/.config/opencode"));
-        let (report, code) = agents_report_with_xdg(home.path(), &["install".into()], xdg);
+        let (report, code) = agents_report_with_xdg(home.path(), &["install".into()], xdg, None);
         assert_eq!(code, 0, "{report}");
         assert!(
             report.lines().any(|line| line
@@ -2833,7 +3304,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         std::fs::create_dir_all(active_file.parent().unwrap()).unwrap();
         let active_user = "# The active OpenCode instructions\n";
         std::fs::write(&active_file, active_user).unwrap();
-        let installed = auto_prime_with_xdg(home.path(), xdg);
+        let installed = auto_prime_with_xdg(home.path(), xdg, None);
         assert_eq!(installed.agents.len(), 1, "{}", installed.summary);
         assert_eq!(installed.agents[0].agent, "opencode");
         assert_eq!(installed.agents[0].outcome, Outcome::Installed);
@@ -2852,11 +3323,11 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             assert_eq!(std::fs::read_to_string(path).unwrap(), skill.body);
         }
         assert_eq!(
-            auto_prime_with_xdg(home.path(), xdg).agents[0].outcome,
+            auto_prime_with_xdg(home.path(), xdg, None).agents[0].outcome,
             Outcome::Unchanged
         );
         assert!(status_line_with_xdg(home.path(), xdg).contains("opencode installed"));
-        let (report, code) = agents_report_with_xdg(home.path(), &["install".into()], xdg);
+        let (report, code) = agents_report_with_xdg(home.path(), &["install".into()], xdg, None);
         assert_eq!(code, 0, "{report}");
         assert!(
             report.lines().any(|line| line
@@ -2874,7 +3345,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             "{report}"
         );
 
-        let (report, code) = agents_report_with_xdg(home.path(), &["remove".into()], xdg);
+        let (report, code) = agents_report_with_xdg(home.path(), &["remove".into()], xdg, None);
         assert_eq!(code, 0, "{report}");
         assert!(
             report
@@ -3152,7 +3623,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         for r in agent_homes() {
             std::fs::create_dir_all(dir.join(r.sub)).unwrap();
         }
-        let pass = auto_prime_with_xdg(&dir, None);
+        let pass = auto_prime_with_xdg(&dir, None, None);
         assert_eq!(
             pass.agents.iter().map(|a| a.agent).collect::<Vec<_>>(),
             agent_homes().map(|r| r.agent).collect::<Vec<_>>(),
@@ -3222,7 +3693,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         assert!(!dir.join(".config").exists());
         // The CONTRAST, the leak as measured: the same pass with the human's
         // redirection honored detects the human's OpenCode and writes into it.
-        let leaked = auto_prime_with_xdg(&dir, Some(&xdg));
+        let leaked = auto_prime_with_xdg(&dir, Some(&xdg), None);
         assert!(
             leaked.agents.iter().any(|a| a.agent == "opencode"),
             "{}",
@@ -3554,5 +4025,397 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             join_with_xdg(home, Some(xdg), ".codex/prompts/aterm-fabric.md"),
             PathBuf::from("/h/.codex/prompts/aterm-fabric.md")
         );
+    }
+    // -----------------------------------------------------------------------
+    // The hook lane
+    // -----------------------------------------------------------------------
+
+    /// A stand-in for `aterm link hook …`: a shell script that answers
+    /// `status` from a marker file, `install` by writing it (or refusing when
+    /// a `refuse` file sits beside it, the way the real installer refuses a
+    /// failed self-test), and `remove` by deleting it. An `installed-by` file
+    /// beside it makes a complete block ANOTHER aterm's (`status` answers
+    /// `installed-by /somewhere`) until `install` writes this one's. It records
+    /// every argv it was given in `<dir>/calls`, so a test can read what the
+    /// lane asked for.
+    #[cfg(unix)]
+    fn fake_installer(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let exe = dir.join(name);
+        std::fs::write(
+            &exe,
+            r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/calls"
+[ -n "$ATERM_CONTROL_SOCK" ] && echo "sock=$ATERM_CONTROL_SOCK" >> "$(dirname "$0")/calls"
+# find --settings
+settings=
+prev=
+for a in "$@"; do [ "$prev" = "--settings" ] && settings="$a"; prev="$a"; done
+verb=$1; [ "$verb" = "link" ] && verb=$3 || verb=$2
+case "$verb" in
+  status) if [ -f "$settings" ]; then
+            if grep -q stale "$settings"; then echo "stale: missing Notification"
+            elif [ -f "$(dirname "$0")/installed-by" ]; then echo "installed-by /somewhere"
+            else echo installed; fi
+          else echo absent; fi ;;
+  install) if [ -f "$(dirname "$0")/refuse" ]; then echo "self-test Stop FAILED: not ok no aterm" >&2; exit 2; fi
+           rm -f "$(dirname "$0")/installed-by"
+           mkdir -p "$(dirname "$settings")"; echo '{"hooks":{"x":1}}' > "$settings" ;;
+  remove) if [ -f "$settings" ]; then rm "$settings"; echo "removed 6"; else echo "nothing to remove"; fi ;;
+esac
+"#,
+        )
+        .expect("write the fake installer");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        exe
+    }
+
+    #[cfg(unix)]
+    fn calls(exe: &Path) -> String {
+        std::fs::read_to_string(exe.parent().unwrap().join("calls")).unwrap_or_default()
+    }
+
+    /// **The hooks ride the auto-prime pass.** Absent → installed (and the
+    /// settings file is in `wrote`); a second pass is unchanged and runs no
+    /// installer; stale → updated; a refusal is the row's error and the
+    /// primer and skills still land. The lane is asked as `<exe> link hook …`
+    /// for a binary not named `aterm-link`, with the socket in its
+    /// environment.
+    #[cfg(unix)]
+    #[test]
+    fn the_hook_lane_installs_updates_and_reports_a_refusal() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let exe = fake_installer(home.path(), "aterm");
+        let lane = HookLane {
+            exe: exe.clone(),
+            sock: Some("/tmp/a.sock".into()),
+        };
+        let settings = home.path().join(CLAUDE_HOOKS_FILE);
+
+        let first = auto_prime_with_xdg(home.path(), None, Some(&lane));
+        assert_eq!(first.agents.len(), 1);
+        assert_eq!(
+            first.agents[0].outcome,
+            Outcome::Installed,
+            "{}",
+            first.summary
+        );
+        assert!(
+            first.agents[0]
+                .wrote
+                .contains(&format!("~/{CLAUDE_HOOKS_FILE}")),
+            "{:?}",
+            first.agents[0].wrote
+        );
+        assert!(settings.exists(), "the installer was run");
+        let log = calls(&exe);
+        assert!(log.contains("link hook status claude --settings"), "{log}");
+        assert!(
+            log.contains("link hook install claude --merge --keep-flags --settings"),
+            "{log}"
+        );
+        assert!(
+            log.contains("sock=/tmp/a.sock"),
+            "the socket rides the environment: {log}"
+        );
+        assert!(log.contains(&format!("--exe {}", exe.display())), "{log}");
+
+        // Second pass: current, nothing written, no installer run.
+        let _ = std::fs::remove_file(exe.parent().unwrap().join("calls"));
+        let second = auto_prime_with_xdg(home.path(), None, Some(&lane));
+        assert_eq!(
+            second.agents[0].outcome,
+            Outcome::Unchanged,
+            "{}",
+            second.summary
+        );
+        assert!(!second.changed());
+        let log = calls(&exe);
+        assert!(log.contains("status"), "{log}");
+        assert!(
+            !log.contains("install"),
+            "a current block runs no installer: {log}"
+        );
+
+        // Stale: updated.
+        std::fs::write(&settings, "stale").unwrap();
+        let third = auto_prime_with_xdg(home.path(), None, Some(&lane));
+        assert_eq!(
+            third.agents[0].outcome,
+            Outcome::Updated,
+            "{}",
+            third.summary
+        );
+        assert!(
+            third.agents[0].wrote == vec![format!("~/{CLAUDE_HOOKS_FILE}")],
+            "{:?}",
+            third.agents[0].wrote
+        );
+
+        // A refusal: the row's error names the installer's words; the primer
+        // and skills were still written.
+        std::fs::remove_file(&settings).unwrap();
+        let refuse = exe.parent().unwrap().join("refuse");
+        std::fs::write(&refuse, "").unwrap();
+        let refused = auto_prime_with_xdg(home.path(), None, Some(&lane));
+        std::fs::remove_file(&refuse).unwrap();
+        match &refused.agents[0].outcome {
+            Outcome::Error(e) => assert!(e.contains("hooks:") && e.contains("no aterm"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!settings.exists(), "a refusal writes nothing");
+        assert!(home.path().join(".claude/CLAUDE.md").exists());
+
+        // Without a lane the pass is the old pass: no hooks, no installer.
+        let _ = std::fs::remove_file(exe.parent().unwrap().join("calls"));
+        let plain = auto_prime_with_xdg(home.path(), None, None);
+        assert_eq!(plain.agents[0].outcome, Outcome::Unchanged);
+        assert_eq!(calls(&exe), "", "no lane, no installer");
+    }
+
+    /// `aterm-link` by name is asked `hook …`, not `link hook …`; an
+    /// unreadable file is left alone and said; a lane whose binary cannot run
+    /// is `unavailable`.
+    #[cfg(unix)]
+    #[test]
+    fn the_lane_spells_the_command_by_the_binarys_name_and_says_what_it_cannot_do() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let exe = fake_installer(home.path(), "aterm-link");
+        let lane = HookLane {
+            exe: exe.clone(),
+            sock: None,
+        };
+        let settings = home.path().join(CLAUDE_HOOKS_FILE);
+        assert_eq!(lane.status(&settings), HookState::Absent);
+        assert!(
+            calls(&exe).starts_with("hook status claude"),
+            "{}",
+            calls(&exe)
+        );
+        assert!(!calls(&exe).contains("sock="), "no socket, no variable");
+
+        let missing = HookLane {
+            exe: home.path().join("no-such-binary"),
+            sock: None,
+        };
+        match missing.status(&settings) {
+            HookState::Unavailable(why) => assert!(why.contains("cannot run"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(missing.install(&settings, false).is_err());
+        assert!(missing.install(&settings, true).is_err());
+    }
+
+    /// The status, install and remove reports carry a `hooks` row for a
+    /// detected Claude, and none for the others or without a lane.
+    #[cfg(unix)]
+    #[test]
+    fn the_agents_report_carries_a_hooks_row_for_claude() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let exe = fake_installer(home.path(), "aterm");
+        let lane = HookLane { exe, sock: None };
+        let (status, code) = agents_report_with_xdg(home.path(), &[], None, Some(&lane));
+        assert_eq!(code, 0, "{status}");
+        assert_eq!(status.matches("  hooks").count(), 1, "{status}");
+        assert!(
+            status.contains("  hooks   ~/.claude/settings.json        absent"),
+            "{status}"
+        );
+
+        let (install, code) =
+            agents_report_with_xdg(home.path(), &["install".into()], None, Some(&lane));
+        assert_eq!(code, 0, "{install}");
+        assert!(
+            install.contains("  hooks   ~/.claude/settings.json        installed"),
+            "{install}"
+        );
+        let (again, _) =
+            agents_report_with_xdg(home.path(), &["install".into()], None, Some(&lane));
+        assert!(
+            again.contains("  hooks   ~/.claude/settings.json        already installed"),
+            "{again}"
+        );
+
+        let (remove, code) =
+            agents_report_with_xdg(home.path(), &["remove".into()], None, Some(&lane));
+        assert_eq!(code, 0, "{remove}");
+        assert!(
+            remove.contains("  hooks   ~/.claude/settings.json        removed 6"),
+            "{remove}"
+        );
+
+        let (plain, _) = agents_report_with_xdg(home.path(), &[], None, None);
+        assert!(!plain.contains("  hooks"), "no lane, no row: {plain}");
+    }
+
+    /// **Another live aterm's block.** `installed-by <path>` is parsed and
+    /// shown as `installed (by <path>)`. The AUTOMATIC pass (`force` false)
+    /// leaves it alone — current, nothing written, no installer run — so the
+    /// release app and the dev app never take turns rewriting the file; `aterm
+    /// agents install` (`force` true) is the operator asking THIS binary, and
+    /// replaces it. Forced or not, this binary's own block is current.
+    #[cfg(unix)]
+    #[test]
+    fn the_automatic_pass_defers_to_another_aterms_block_and_install_takes_it_over() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let exe = fake_installer(home.path(), "aterm");
+        let lane = HookLane {
+            exe: exe.clone(),
+            sock: None,
+        };
+        let settings = home.path().join(CLAUDE_HOOKS_FILE);
+        let theirs = r#"{"hooks":{"theirs":1}}"#;
+        std::fs::write(&settings, theirs).unwrap();
+        let marker = exe.parent().unwrap().join("installed-by");
+        std::fs::write(&marker, "").unwrap();
+        let clear_calls = || {
+            let _ = std::fs::remove_file(exe.parent().unwrap().join("calls"));
+        };
+
+        assert_eq!(
+            lane.status(&settings),
+            HookState::InstalledBy("/somewhere".into())
+        );
+        let (status, code) = agents_report_with_xdg(home.path(), &[], None, Some(&lane));
+        assert_eq!(code, 0, "{status}");
+        assert!(
+            status.contains("  hooks   ~/.claude/settings.json        installed (by /somewhere)"),
+            "{status}"
+        );
+
+        // Unforced: left alone, directly and through the automatic pass.
+        clear_calls();
+        assert_eq!(lane.install(&settings, false), Ok(HookWrite::Current));
+        let pass = auto_prime_with_xdg(home.path(), None, Some(&lane));
+        assert!(
+            !pass.agents[0]
+                .wrote
+                .contains(&format!("~/{CLAUDE_HOOKS_FILE}")),
+            "{:?}",
+            pass.agents[0].wrote
+        );
+        let log = calls(&exe);
+        assert!(log.contains("hook status claude"), "{log}");
+        assert!(
+            !log.contains("hook install"),
+            "another aterm's block runs no installer on the automatic pass: {log}"
+        );
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), theirs);
+
+        // Forced, directly: replaced, reported as an update.
+        clear_calls();
+        assert_eq!(lane.install(&settings, true), Ok(HookWrite::Updated));
+        assert!(
+            calls(&exe).contains("hook install claude --merge"),
+            "{}",
+            calls(&exe)
+        );
+        assert_eq!(lane.status(&settings), HookState::Installed);
+        // Now this binary's own: current either way, and no installer run.
+        clear_calls();
+        assert_eq!(lane.install(&settings, true), Ok(HookWrite::Current));
+        assert_eq!(lane.install(&settings, false), Ok(HookWrite::Current));
+        assert!(!calls(&exe).contains("hook install"), "{}", calls(&exe));
+
+        // Forced, through `aterm agents install`: the row says it updated.
+        std::fs::write(&settings, theirs).unwrap();
+        std::fs::write(&marker, "").unwrap();
+        let (install, code) =
+            agents_report_with_xdg(home.path(), &["install".into()], None, Some(&lane));
+        assert_eq!(code, 0, "{install}");
+        assert!(
+            install.contains("  hooks   ~/.claude/settings.json        updated"),
+            "{install}"
+        );
+        assert_ne!(std::fs::read_to_string(&settings).unwrap(), theirs);
+    }
+
+    /// **The master switch withdraws only our own block.** With `[harness]
+    /// enabled = false` the window calls [`HookLane::withdraw_own`]: this
+    /// executable's block ([`HookState::Installed`]) is removed through `hook
+    /// remove claude`; another aterm's complete block
+    /// ([`HookState::InstalledBy`]) and an absent file run no remover and are
+    /// left byte-identical.
+    #[cfg(unix)]
+    #[test]
+    fn withdraw_removes_our_own_block_and_leaves_another_aterms_alone() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let exe = fake_installer(home.path(), "aterm");
+        let lane = HookLane {
+            exe: exe.clone(),
+            sock: None,
+        };
+        let settings = home.path().join(CLAUDE_HOOKS_FILE);
+        let clear_calls = || {
+            let _ = std::fs::remove_file(exe.parent().unwrap().join("calls"));
+        };
+
+        // Absent: nothing to take out, no remover run.
+        assert_eq!(withdraw_hooks_with_lane(home.path(), &lane), Ok(None));
+        assert!(!calls(&exe).contains("hook remove"), "{}", calls(&exe));
+
+        // Another aterm's complete block: left alone, byte for byte.
+        let theirs = r#"{"hooks":{"theirs":1}}"#;
+        std::fs::write(&settings, theirs).unwrap();
+        let marker = exe.parent().unwrap().join("installed-by");
+        std::fs::write(&marker, "").unwrap();
+        clear_calls();
+        assert_eq!(lane.withdraw_own(&settings), Ok(None));
+        assert!(!calls(&exe).contains("hook remove"), "{}", calls(&exe));
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), theirs);
+
+        // Our own block: removed through the installer.
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(lane.status(&settings), HookState::Installed);
+        clear_calls();
+        assert_eq!(
+            withdraw_hooks_with_lane(home.path(), &lane),
+            Ok(Some("removed 6".to_string()))
+        );
+        let log = calls(&exe);
+        assert!(log.contains("link hook remove claude --settings"), "{log}");
+        assert_eq!(lane.status(&settings), HookState::Absent);
+    }
+
+    /// A raw build in a cargo target tree is not an installed aterm; a bundle
+    /// (the dev bundle included) and the atpkg store are. The paths do not
+    /// exist, so the judgement is made on the path as given.
+    #[test]
+    fn a_build_tree_binary_is_not_an_installed_exe() {
+        for raw in [
+            "/Users//x/aterm/target/release/aterm",
+            "/Users//x/aterm/target.noindex/debug/aterm",
+            "/Users//x/aterm/target-gate.noindex/aarch64-apple-darwin/release/aterm",
+        ] {
+            assert!(!installed_exe(Path::new(raw)), "{raw}");
+        }
+        for installed in [
+            "/Applications/aterm.app/Contents/MacOS/aterm",
+            "/Applications/aterm (dev).app/Contents/MacOS/aterm",
+            "/Users//x/Library/Application Support/aterm/pkg/store/aterm/1/bin/aterm",
+        ] {
+            assert!(installed_exe(Path::new(installed)), "{installed}");
+        }
+    }
+
+    /// The lane names the running binary by its CANONICAL path (a
+    /// `~/.local/bin` link writes the bundle's), and there is no lane off
+    /// unix, where `aterm link` does not exist.
+    #[test]
+    fn the_lane_is_the_canonical_executable_and_unix_only() {
+        let lane = HookLane::from_current_exe(Some("/tmp/s.sock".into()));
+        if cfg!(unix) {
+            let lane = lane.expect("a unix build has a lane");
+            let exe = std::env::current_exe().unwrap();
+            assert_eq!(lane.exe, std::fs::canonicalize(&exe).unwrap_or(exe));
+            assert_eq!(lane.sock.as_deref(), Some("/tmp/s.sock"));
+        } else {
+            assert_eq!(lane, None);
+        }
     }
 }

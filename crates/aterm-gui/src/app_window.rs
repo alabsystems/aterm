@@ -347,6 +347,15 @@ impl App {
             // freeze every reader onto a successor this very call had just
             // cancelled. `stand_down_prelaunched_successor` shuts the gate and
             // falls back to the poke by itself.
+            //
+            // UNIX ONLY, like the stand-down and the struct it takes: the only
+            // writer of `update_handoff_prelaunch` is the macOS
+            // `prelaunch_out_of_band_handoff`, so on Windows the field is `None`
+            // for the life of the process and this branch is unreachable —
+            // `HandoffPrelaunch` is `allow(dead_code)` off unix for the same
+            // reason. Left ungated, this call made the shipped Windows binary
+            // unbuildable from df183f2f9 (2026-09-21) until 2026-09-22.
+            #[cfg(unix)]
             if self.update_handoff_prelaunch.is_some() {
                 self.note_update_handoff_activity();
                 self.stand_down_prelaunched_successor(

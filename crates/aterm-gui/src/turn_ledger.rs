@@ -198,7 +198,7 @@ impl TurnLedger {
     /// record (`partition_point` returns 0), which is the behaviour the
     /// events-resume `GAP … events-resync=` frame is built on: `low_id()`
     /// reports the drop-oldest eviction, `since` does not silently swallow it.
-    pub(crate) fn since(&self, after: Option<u64>) -> impl Iterator<Item = &TurnRecord> {
+    pub(crate) fn since(&self, after: Option<u64>) -> impl ExactSizeIterator<Item = &TurnRecord> {
         let start = match after {
             None => 0,
             Some(a) => self.records.partition_point(|r| r.id <= a),

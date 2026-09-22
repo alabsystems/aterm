@@ -683,6 +683,8 @@ mod tests {
             h: 1,
             color: 7,
             alpha: 0,
+            color2: 7,
+            alpha2: 0,
         }];
         let sentinel = out.clone();
         let mut off = on(0x00FF_FFFF, true);

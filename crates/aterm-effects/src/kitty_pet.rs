@@ -4995,6 +4995,14 @@ impl PetBrain {
                 && self.pending_bell.is_none()
                 && self.pending_cheer.is_none()
                 && !self.pending_sulk
+                // THE VERDICT'S OWN LATCH joins them on the wave-1 terms, and
+                // for the wave-1 reason exactly: `note_command_done` can set
+                // it BETWEEN ticks on a retired cat, it IS counted by
+                // `needs_frames`, and its only consumer is the vigil crouch's
+                // arm on the live path — so one noted here must meet the slow
+                // arm, which DROPS it, rather than riding this path forever.
+                && !self.pending_vigil_pounce
+                && self.vigil_cheer.is_none()
                 // A flow latch cannot outlive its TTL, and the sweep that
                 // retires it lives on the slow path — so a stale one costs
                 // exactly ONE ordinary frame (byte-identical to this arm's)
@@ -5093,6 +5101,9 @@ impl PetBrain {
             self.pending_cheer = None;
             self.pending_sulk = false;
             self.pending_flow = None;
+            // …and THE VERDICT with them: a strike aimed at a prompt row
+            // nobody can see, and the cheer that strike was carrying.
+            self.drop_verdict_latches();
             // …and v2's offers with them: an arrival nobody can watch and a
             // star over an invisible cat are offers to nobody, and the hue is
             // a level about a body that is not on glass.
@@ -5432,6 +5443,12 @@ impl PetBrain {
             self.pending_cheer = None;
             self.pending_sulk = false;
             self.pending_flow = None;
+            // …and THE VERDICT with them: reduced motion has no strike to
+            // throw — a flight at the prompt row is the one thing this arm
+            // exists to refuse — and so nothing to carry the cheer on. The
+            // ledger already moved at note time (the petting precedent): what
+            // the verdict BOUGHT lands, the theater does not.
+            self.drop_verdict_latches();
             // v2's offers are theater too: reduced motion has no notice to
             // play and no paw to put out (the impulse is a `Land` there by
             // law, and a landing is a pose, not an edge to wait for). The hue
@@ -9973,6 +9990,43 @@ impl PetBrain {
         self.hiding = false;
     }
 
+    /// **THE VERDICT'S LATCHES, DROPPED** — the one clear BOTH shed arms owed,
+    /// stated once so the next latch added to the vigil is added here too.
+    ///
+    /// `pending_vigil_pounce`, the `vigil_cheer` the strike hands on, and the
+    /// `vigil` flag itself are the only [`Self::needs_frames`] terms whose
+    /// SOLE consumer is the vigil crouch's own arm (`PetAction::Crouch if
+    /// self.vigil`) — and that arm lives BELOW the early return of the hidden
+    /// arm and of the reduced-motion / load-shed arm. Neither dropped them, so
+    /// ONE frame of either stranded the latch for the life of the session:
+    /// `needs_frames()` true forever, the host pacing 60 fps, and the cat
+    /// asleep with nothing on glass changing.
+    ///
+    /// It needs no setting to reach. An UNFOCUSED window resolves to reduced
+    /// motion, and so does an adaptive load shed — which is the state a long
+    /// build is most likely to be in at the instant it finishes, which is
+    /// exactly when the verdict fires.
+    ///
+    /// A RED verdict released the lane at once, because `pending_sulk` was
+    /// already in both arms' clear lists. That asymmetry is what named the
+    /// missing latch.
+    ///
+    /// The FLAG goes with the latches because both arms settle the body — Sit,
+    /// Sleep, or a fade to nothing — so the door is not where the cat is
+    /// standing any more, and a `vigil` left true against a seat closes
+    /// `vigil_t`'s own `!self.vigil` re-entry gate for the rest of the
+    /// session: the cat never takes the door again.
+    ///
+    /// The LEDGER is untouched, which is what makes this a drop and not a
+    /// loss: the contentment the verdict bought moved at note time
+    /// ([`Self::note_command_done`]), exactly as the petting precedent these
+    /// arms already follow. What is dropped is theater.
+    fn drop_verdict_latches(&mut self) {
+        self.pending_vigil_pounce = false;
+        self.vigil_cheer = None;
+        self.vigil = false;
+    }
+
     /// A conservative middle band of the natural body, in absolute grid
     /// cells. The same top/bottom containment as `PetFrame::body_px` keeps
     /// a cat on row zero touchable without admitting the terminal chrome.
@@ -12688,6 +12742,88 @@ mod tests {
             "the next lawful sighting wears the latest parked identity"
         );
         assert!(pet.pending_worn.is_none());
+    }
+
+    /// **ONE SHED FRAME MUST NOT PIN THE FRAME LANE FOREVER.** The verdict's
+    /// strike (`pending_vigil_pounce`), the cheer it carries (`vigil_cheer`)
+    /// and the `vigil` flag are counted by [`PetBrain::needs_frames`], and
+    /// their ONLY consumer is the vigil crouch's arm — which sits below the
+    /// early return of both shed arms. Neither arm dropped them, so a single
+    /// reduced-motion or hidden frame anywhere in the half-second after a
+    /// green verdict left `needs_frames()` true for the rest of the session:
+    /// 60 fps on a sleeping cat, with nothing on glass changing.
+    ///
+    /// It takes no setting to reach — an UNFOCUSED window resolves to reduced
+    /// motion, which is the state a long build is most likely to be in at the
+    /// moment it finishes. The RED verdict released the lane the whole time,
+    /// because `pending_sulk` was already in both clear lists; that asymmetry
+    /// is the control this test keeps.
+    #[test]
+    fn a_shed_frame_after_a_verdict_never_strands_the_frame_lane() {
+        fn at_the_door(t0: Instant) -> (PetBrain, Instant) {
+            let mut pet = PetBrain::default();
+            let (mut t, _) = type_run(&mut pet, t0, 10, 20, 6, 0.12);
+            let end = t + Duration::from_secs_f32(VIGIL_AFTER + 1.0);
+            while t < end {
+                t += Duration::from_millis(50);
+                pet.note_executing(t, true);
+                let mut sn = sense(t, Some((10, 20)));
+                sn.output_burst = true;
+                let _ = pet.tick(sn);
+            }
+            for _ in 0..20 {
+                t += Duration::from_millis(100);
+                pet.note_executing(t, true);
+                let _ = pet.tick(sense(t, Some((10, 20))));
+            }
+            (pet, t)
+        }
+
+        /// Run the verdict out, injecting one shed frame at `shed_at` (or
+        /// none). Returns the frame the lane was released on, if ever.
+        fn release_frame(t0: Instant, shed_at: Option<usize>, hidden: bool) -> Option<usize> {
+            let (mut pet, t) = at_the_door(t0);
+            assert!(pet.vigil, "fixture: the cat is at the door");
+            pet.note_command_done(t, false, Some(40_000));
+            let mut t_g = t;
+            for k in 0..2_000 {
+                t_g += Duration::from_millis(16);
+                pet.note_executing(t_g, false);
+                let mut sn = sense(t_g, Some((10, 20)));
+                if shed_at == Some(k) {
+                    if hidden {
+                        sn.caret = None;
+                    } else {
+                        sn.reduced_motion = true;
+                    }
+                }
+                let _ = pet.tick(sn);
+                if !pet.needs_frames() {
+                    return Some(k);
+                }
+            }
+            None
+        }
+
+        let t0 = Instant::now();
+        // The CONTROL: the live path has always released it.
+        assert!(
+            release_frame(t0, None, false).is_some(),
+            "fixture: the live path releases the lane"
+        );
+        // …and one shed frame, anywhere across the window in which the strike
+        // is owed, must not change that. Before the fix every one of these
+        // returned None — the lane was still pinned 2 000 frames later.
+        for k in [0usize, 1, 5, 17, 33] {
+            assert!(
+                release_frame(t0, Some(k), false).is_some(),
+                "one REDUCED frame at {k} pinned the frame lane for good"
+            );
+            assert!(
+                release_frame(t0, Some(k), true).is_some(),
+                "one HIDDEN frame at {k} pinned the frame lane for good"
+            );
+        }
     }
 
     /// **THE VERDICT, sense 1 — the pet.** A command's exit code, in the body.
@@ -28815,7 +28951,16 @@ mod tests {
                     early(PetAction::Sleep, &frames) && !early(PetAction::Sleep, &plain)
                 }
                 Trick::Stretch => saw(PetGlyphId::PetStretch) && saw(PetGlyphId::PetStretchHind),
-                Trick::Jump => did(PetAction::Leap) && after.iter().any(|f| f.lift > 0.3),
+                // THE ARC IS THE VERB — "a jump that stays flat reads as a
+                // slide" ([`ARC_BASE`]) — so the height is asserted against
+                // the height the law NAMES, not against a magic literal 45 %
+                // below it. This arm is the only assertion on a pounce arc's
+                // height in the crate, so that slack was the whole guard:
+                // measured, `ARC_BASE = 0.35` (a hop a third flatter than the
+                // law) left all 2287 tests green.
+                Trick::Jump => {
+                    did(PetAction::Leap) && after.iter().any(|f| f.lift >= ARC_BASE - 0.05)
+                }
                 Trick::Play => saw(PetGlyphId::PetPlaybow) && saw(PetGlyphId::PetBat),
                 Trick::Roll => saw(PetGlyphId::PetRoll0) && saw(PetGlyphId::PetRoll1),
                 Trick::Purr => {
@@ -28827,19 +28972,41 @@ mod tests {
                 // this very window, for about half of [`GROOM_HOLD`].
                 Trick::Groom => held_for(&|f| f.pose == PetGlyphId::PetGroom) >= GROOM_HOLD - 0.05,
                 Trick::Speak => mote(PetMoteKind::Note),
-                // THE SONG is a RUN, and that is the whole of what separates
-                // it from `speak`'s single note on glass: at some instant
-                // more than one ♪ is in the air at once. A one-note `sing`
-                // (a dropped counter, a beat that never fired twice) fails
-                // here while `mote(Note)` alone would still pass.
-                Trick::Sing => after.iter().any(|f| {
-                    f.motes
+                // THE SONG IS A RUN ON A BEAT — and CONCURRENCY, which is
+                // what this arm used to measure ("more than one ♪ in the air
+                // at once"), is MAXIMISED by the degenerate case the law
+                // exists to refuse: collapse the beat and all four ♪ are
+                // dealt in four consecutive frames, so MORE of them overlap,
+                // not fewer. Measured: zero `song_next` at both its sites
+                // packs 0.78 s of song into 64 ms and the old arm stayed
+                // green. So assert the two things the verb actually promises,
+                // each against the constant that IS its law — every ♪ reaches
+                // the glass, and the last one is a whole song of beats after
+                // the first.
+                Trick::Sing => {
+                    let notes = |f: &PetFrame| {
+                        f.motes
+                            .iter()
+                            .flatten()
+                            .filter(|m| m.kind == PetMoteKind::Note)
+                            .count()
+                    };
+                    assert!(
+                        plain.iter().all(|f| notes(f) == 0),
+                        "fixture: an untold cat sings nothing"
+                    );
+                    let first = after.iter().position(|f| notes(f) >= 1);
+                    let all = after
                         .iter()
-                        .flatten()
-                        .filter(|m| m.kind == PetMoteKind::Note)
-                        .count()
-                        >= 2
-                }),
+                        .position(|f| notes(f) >= usize::from(SONG_NOTES));
+                    match (first, all) {
+                        (Some(a), Some(b)) => {
+                            (b - a) as f32 * 0.016
+                                >= (f32::from(SONG_NOTES) - 1.0) * SONG_BEAT - 0.05
+                        }
+                        _ => false,
+                    }
+                }
                 Trick::Look => {
                     let held = after
                         .iter()
@@ -28855,7 +29022,18 @@ mod tests {
                     .iter()
                     .any(|f| f.action == PetAction::Crouch && f.under_ink),
                 Trick::Boo => saw(PetGlyphId::PetStartle),
-                Trick::Scold => saw(PetGlyphId::PetDroop) || saw(PetGlyphId::PetDroopSit),
+                // THE BEAT IS THE NOTICE. [`EAR_FLAT_HOLD`] is DERIVED as a
+                // duration — "a notice is one hold, and a disappointment is
+                // read in two" — so presence is not what this arm is for.
+                // The groom/purr/paw arms were tightened for exactly this
+                // shape and scold was missed: measured, cutting the brief
+                // branch of `droop_hold` to one frame turns the ear-flat beat
+                // into a 16 ms twitch on BOTH its producers while the whole
+                // crate stays green.
+                Trick::Scold => {
+                    held_for(&|f| matches!(f.pose, PetGlyphId::PetDroop | PetGlyphId::PetDroopSit))
+                        >= EAR_FLAT_HOLD - 0.05
+                }
                 Trick::Treat => did(PetAction::Frolic) && mote(PetMoteKind::Note),
             };
             assert!(seen, "{trick:?} performed nothing observable");

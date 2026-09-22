@@ -586,6 +586,8 @@ fn glow_input(cpu_cell: (usize, usize), rows: usize, cols: usize) -> RenderInput
             color: premul_rgb(base, *a),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(base, *a),
+            alpha2: 0,
         });
     }
     input
@@ -999,6 +1001,8 @@ fn palette_input(
             color: premul_rgb(m.rgb, m.cov),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(m.rgb, m.cov),
+            alpha2: 0,
         });
         cells.push((row, col));
     }

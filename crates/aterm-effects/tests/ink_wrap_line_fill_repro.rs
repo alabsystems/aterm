@@ -94,6 +94,7 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         duration: Duration::from_millis(240),
         length: 18,
         intensity: 0.7,
+        audible: true,
         radius: 0.6,
         ring: true,
         beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),

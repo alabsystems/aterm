@@ -133,6 +133,30 @@ pub fn claude_prompt_ready_pattern() -> &'static str {
     r"(^|\s)❯(\s|$)"
 }
 
+/// The Claude-COMPOSER-ready signal: an input caret (`❯`) followed by a
+/// first character that is NOT a digit.
+///
+/// MEASURED: Claude Code's approval box draws its highlighted choice as
+/// ` ❯ 1. Yes`, which [`claude_prompt_ready_pattern`] matches character for
+/// character — so a `key if=<that> enter` guarded on the plain caret arms on
+/// an approval box and the Enter selects the highlighted option. This pattern
+/// is the composer-shaped one: `❯ /model opus` matches, `❯ 1. Yes` does not,
+/// because `aterm_phase::phase`'s own composer reader separates the two the
+/// same way (an option row is a caret, digits, then `.`).
+///
+/// It is deliberately STRICTER than that reader — a caret row whose text
+/// starts with any digit does not match — because the tie breaks toward not
+/// pressing: a guard that does not arm answers `OK skipped` and writes
+/// nothing, and that is the safe answer. It is a guard, never a licence:
+/// a caller that types must ALSO refuse while an approval box is on the
+/// screen, because the box and a composer row can be visible at once.
+#[must_use]
+pub fn claude_composer_ready_pattern() -> &'static str {
+    // One wire token: no literal space may appear here (`key if=<re>` splits
+    // the control line on whitespace).
+    r"(^|\s)❯\s+[^\s0-9]"
+}
+
 /// A driven turn: type a prompt, submit it, then block until the agent's turn
 /// completes — the surface goes `idle for `[`idle`], then a best-effort
 /// prompt-ready confirm — and read the settled surface. The [`ControlClient`]
@@ -226,6 +250,10 @@ impl<E: std::fmt::Display> std::fmt::Display for TurnError<E> {
 pub mod drive_cli;
 /// The `aterm fleet` CLI (binary-era `aterm-fleet`), callable in-process.
 pub mod fleet_cli;
+/// The harness core: the pure judgments behind the aterm wrapper (rm policy,
+/// the bounded ledger, the usage view, the limit classifier). No socket, no
+/// hook answer, no typing — see the module doc for what is deliberately absent.
+pub mod harness;
 /// The supervisor: read-only classification, prompt parsing, the worker's phase,
 /// and the `await-turn` / `supervise` / `watch` loop behind `aterm drive`.
 pub mod supervise;
@@ -539,6 +567,71 @@ impl<S: Read + Write> RelayClient<S> {
         }
         Ok(out)
     }
+
+    /// The transport underneath, so a caller that needs a second HANDLE on
+    /// the same connection can take one (`try_clone` on a `CtlStream`). The
+    /// harness wire uses it for exactly one thing: shutting down a
+    /// connection parked in an `await` from the thread that decided the wait
+    /// is over, which is what makes "whichever answers first" a cancellation
+    /// rather than an abandoned thread.
+    pub fn transport(&self) -> &S {
+        &self.io
+    }
+
+    /// Send one control line and read ONE reply line (`OK …` or `ERR …`),
+    /// returned verbatim. The caller decides what the words mean; nothing is
+    /// interpreted here.
+    ///
+    /// # Errors
+    /// I/O errors writing the request or reading the reply, and a request
+    /// carrying an embedded line terminator.
+    pub fn request_line(&mut self, line: &str) -> std::io::Result<String> {
+        self.write_line(line)?;
+        self.read_line()
+    }
+
+    /// Send one control line and read a COUNTED reply: the header, then the
+    /// `n` body lines when the header is `OK <n>` and `<n>` is a number.
+    ///
+    /// A header that is not counted (`OK schema=1 …`, `ERR …`) returns with
+    /// an empty body and no further read — the discriminator is the first
+    /// token parsing as a count, which is what the `Lines` framing means on
+    /// the wire and what `Status` framing never produces.
+    ///
+    /// # Errors
+    /// I/O errors, or a count past the client's own line bound.
+    pub fn request_counted(&mut self, line: &str) -> std::io::Result<(String, String)> {
+        self.write_line(line)?;
+        let header = self.read_line()?;
+        let count: Option<usize> = header
+            .strip_prefix("OK ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|tok| tok.parse().ok());
+        let Some(count) = count else {
+            return Ok((header, String::new()));
+        };
+        if count > MAX_TEXT_LINES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "reply line count exceeds the bound",
+            ));
+        }
+        let mut body = String::new();
+        for _ in 0..count {
+            body.push_str(&self.read_line()?);
+            body.push('\n');
+        }
+        Ok((header, body))
+    }
+
+    /// Read ONE line a server PUSHED on a connection that is already parked
+    /// on a stream (`subscribe`). Nothing is written.
+    ///
+    /// # Errors
+    /// I/O errors, and `UnexpectedEof` when the stream ends.
+    pub fn next_pushed(&mut self) -> std::io::Result<String> {
+        self.read_line()
+    }
 }
 
 impl RelayClient<aterm_uds::CtlStream> {
@@ -697,10 +790,12 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        refuse. A tie breaks toward not-read-only.
     phase [@sid]       One read, one word: busy | prompt | limited | idle |
                        question. For a prompt the parsed box follows: `kind`,
-                       `command`, `description`, `classify` (a Bash box), one
-                       `option N …` per option, then `cancel esc` or `cancel
-                       none`. For busy, `reason <where>: <rule>` names the signal
-                       that fired. For limited, `message <text>` and `reset
+                       `command`, `description`, one `note <text>` per note
+                       row (a Bash box's warning rows, e.g. the critical-path
+                       `rm` warning), `classify` (a Bash box), one `option N …`
+                       per option, then `cancel esc` or `cancel none`. For
+                       busy, `reason <where>: <rule>` names the signal that
+                       fired. For limited, `message <text>` and `reset
                        <text|->`. A prompt wins over busy, busy over limited,
                        limited over question — except a busy that is only a
                        background monitor, which a limit notice or a question
@@ -1169,9 +1264,12 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        offset an answer names as re=; from: the attested
                        sender; nothing of the body — trust= is in the inbox
                        row, and the body is yours to read). The worker's
-                       end-of-turn `report` (round 12's hooks post it from
-                       the Stop hook, `aterm link hook install claude
-                       --report-to @<you>`) is folded into the idle point of
+                       end-of-turn `report` (the Stop hook posts what the
+                       worker's SCREEN says, `aterm link hook install claude
+                       --report-to @<you>`; its body opens with a
+                       `seq=<n> hash=<hex16>[ busy=1]` stamp line, which
+                       `rows=` below does NOT count) is folded into the idle
+                       point of
                        the same turn: the point is HELD — nothing printed —
                        until the report lands or --idle-grace S (default 180)
                        runs out, the screen read once per 20 s step of the

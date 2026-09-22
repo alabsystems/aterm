@@ -317,6 +317,8 @@ impl QuadSink<'_> {
                 // ADDITIVE light — this emitter has no other mode (see
                 // [`GlowQuad::alpha`]).
                 alpha: 0,
+                color2: premul,
+                alpha2: 0,
             });
             self.budget -= 1;
             yy = band_end;
@@ -472,6 +474,8 @@ fn bound_additive_overlap(quads: &mut [GlowQuad]) {
     }
     for q in quads {
         q.color = scale_rgb_floor(q.color, MAX_VIEWPORT_OVERLAY, peak);
+        // Both ends, so a flat quad stays flat (`GlowQuad::color2`).
+        q.color2 = scale_rgb_floor(q.color2, MAX_VIEWPORT_OVERLAY, peak);
     }
 }
 
@@ -1458,6 +1462,8 @@ mod tests {
             h,
             color,
             alpha: 0,
+            color2: color,
+            alpha2: 0,
         };
         let mut gradient = vec![
             quad(0, 0, 0, 20, 10, 0x00C8_C8C8),
@@ -1550,6 +1556,8 @@ mod tests {
             h,
             color,
             alpha: 0,
+            color2: color,
+            alpha2: 0,
         };
         let shapes: [&[GlowQuad]; 5] = [
             &[],

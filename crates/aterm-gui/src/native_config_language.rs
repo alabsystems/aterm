@@ -62,6 +62,50 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Bottom HUD",
         effect_label: "No effect",
     },
+    // THE FLOATING PROGRESS CARD LEFT ITS PARTY TRIM BEHIND. The card was replaced by
+    // the in-grid progress bars, and the CHANGELOG records the outcome as "a stale key
+    // in `aterm.toml` is ignored" — which is true, and is exactly the half the author
+    // could already see. What they were told instead was the forward-compatibility
+    // sentence, the same wrong reading as the Scene keys below. `app_config`'s own
+    // decorative-effects header already calls this key retired in so many words; this
+    // is the registry finally agreeing with it.
+    RetiredConfigKeyMetadata {
+        key: "pkg_progress_effects",
+        feature: "Package progress card",
+        effect_label: "No effect",
+    },
+    // THE SCENES REMOVAL LEFT ITS CONFIG BEHIND. `6995b25ac` ("SCENE-1 delete the
+    // Scenes / \"Living Panels\" feature") deleted the `Scene` HUD panel and all four
+    // of its keys from `Config`, but never listed them here — so an `aterm.toml` that
+    // still carries `show_scene_hud = true` was told the key "is unknown to this aterm
+    // build; it will be preserved for forward compatibility". That is the FORWARD story
+    // (a key from a NEWER aterm this build will honour once it catches up) told about a
+    // BACKWARD key, and it is the one reading with no recovery in it: the author waits
+    // for a band that is never coming back. The sibling `show_hud` above is the same
+    // shape of key from the same bottom band and has always said "was removed"; these
+    // four were simply missed. Named "Scene HUD" because that is what the removal
+    // commit and the CHANGELOG call the panel, and because it puts these rows beside
+    // "Bottom HUD" in Modified rather than inventing a second vocabulary for one band.
+    RetiredConfigKeyMetadata {
+        key: "show_scene_hud",
+        feature: "Scene HUD",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "scene_rows",
+        feature: "Scene HUD",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "scene_skin",
+        feature: "Scene HUD",
+        effect_label: "No effect",
+    },
+    RetiredConfigKeyMetadata {
+        key: "scene_panels",
+        feature: "Scene HUD",
+        effect_label: "No effect",
+    },
     RetiredConfigKeyMetadata {
         key: "sparkle_words.feline.idle",
         feature: "Keyword Kitty idle animation",
@@ -786,6 +830,17 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Software update source",
         ConfigSchemaKind::Table,
         &["upgrade", "release", "github"],
+        false,
+    ),
+    // The `[harness]` table (design DESIGN-aterm-wrapper-2026-09-17 §4.6.2):
+    // its one Bool leaf rides the native registry (`prefs::NESTED_LEAVES`);
+    // this header is what lets Manual complete `[harness]` and what the dotted
+    // leaf's prefix rule requires.
+    manual(
+        "harness",
+        "aterm harness",
+        ConfigSchemaKind::Table,
+        &["harness", "wrapper", "claude", "agent"],
         false,
     ),
     manual(
@@ -5159,6 +5214,134 @@ intensity = 0.25
             }),
             "retired Bottom HUD keys must never be suggested: {key_assist:?}"
         );
+    }
+
+    /// A KEY FROM A DELETED FEATURE IS NOT A KEY FROM THE FUTURE. `show_scene_hud`
+    /// and its three siblings left with the Scenes / "Living Panels" band in
+    /// `6995b25ac`, but they were never registered as retired, so the unknown-key
+    /// walk fell through to the forward-compatibility sentence: the owner's own
+    /// `aterm.toml` was told the key "is unknown to this aterm build; it will be
+    /// preserved for forward compatibility". Both halves mislead — it is known, and
+    /// it is preserved for the PAST — and the reading has no recovery in it: it
+    /// invites the author to wait for a band that is never coming back. The sibling
+    /// `show_hud` has always said "was removed"; these four now say it too.
+    #[test]
+    fn retired_scene_keys_say_the_feature_was_removed_not_that_the_key_is_from_the_future() {
+        let source = concat!(
+            "show_scene_hud = true\n",
+            "scene_rows = 12\n",
+            "scene_skin = \"#AABBCC\"\n",
+            "scene_panels = [\"meadow\", \"cosmos\"]\n",
+        );
+        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
+        assert_eq!(
+            document.to_string(),
+            source,
+            "Manual must not destructively rewrite retired configuration"
+        );
+        assert!(
+            aterm_toml::from_str::<crate::app_config::Config>(source).is_ok(),
+            "retired compatibility keys remain loadable while their values are inert"
+        );
+
+        let analysis = analyze(source);
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let keys = ["show_scene_hud", "scene_rows", "scene_skin", "scene_panels"];
+        assert_eq!(
+            analysis.diagnostics.len(),
+            keys.len(),
+            "each authored retired key gets one precise warning: {:?}",
+            analysis.diagnostics
+        );
+        let active_fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
+        for key in keys {
+            assert!(is_compatibility_only_key(key));
+            let retired = retired_config_key(key).expect("retired Scene HUD metadata");
+            assert_eq!(retired.feature, "Scene HUD");
+            assert_eq!(retired.effect_label, "No effect");
+            assert!(
+                config_schema_entry(key).is_none(),
+                "retired Scene keys are not active Manual schema entries"
+            );
+            assert!(
+                active_fields.iter().all(|field| field.key != key),
+                "retired Scene keys must stay out of Settings and Advanced"
+            );
+
+            let matching = analysis
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains(key))
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{key}: {:?}", analysis.diagnostics);
+            assert_eq!(matching[0].severity, ConfigDiagnosticSeverity::Warning);
+            assert_eq!(
+                matching[0].message,
+                format!(
+                    "Scene HUD was removed; {key} has no effect (the authored value will be preserved)"
+                ),
+            );
+            // THE TWO SENTENCES THIS BUG PUT ON SCREEN, named so they cannot come back.
+            assert!(!matching[0].message.contains("unknown"));
+            assert!(!matching[0].message.contains("forward compatibility"));
+        }
+
+        // A key that does nothing is never the answer to someone else's typo, and
+        // never an offer in its own right.
+        let key_source = "scene_";
+        let key_assist = assist(key_source, key_source.len());
+        assert!(
+            key_assist.completions.iter().all(|completion| {
+                keys.iter()
+                    .all(|key| !completion.insertion.starts_with(key))
+            }),
+            "retired Scene keys must never be suggested: {key_assist:?}"
+        );
+    }
+
+    /// THE FAMILY INVARIANT, stated once over the whole registry rather than three
+    /// times over three families. Every retired key is a key from the PAST, so the one
+    /// sentence it must never be given is the one reserved for a key from the FUTURE:
+    /// "unknown to this aterm build … preserved for forward compatibility" is the
+    /// walk's fall-through, and a key that reaches it has no recovery in its story. The
+    /// three families that were each missed in turn — the Scene band, the floating
+    /// progress card, the bottom HUD — all failed in exactly this way, so the check
+    /// belongs to the list and not to any one of them.
+    #[test]
+    fn every_retired_top_level_key_says_it_was_removed_and_never_that_it_is_from_the_future() {
+        let top_level: Vec<&str> = RETIRED_CONFIG_KEYS
+            .iter()
+            .map(|entry| entry.key)
+            .filter(|key| !key.contains('.'))
+            .collect();
+        assert!(
+            top_level.len() >= 8,
+            "the sweep should cover every un-nested retired key: {top_level:?}"
+        );
+        for key in top_level {
+            let source = format!("{key} = true\n");
+            let analysis = analyze(&source);
+            assert!(!analysis.has_errors(), "{key}: {:?}", analysis.diagnostics);
+            assert_eq!(
+                analysis.diagnostics.len(),
+                1,
+                "{key} gets exactly one story: {:?}",
+                analysis.diagnostics
+            );
+            let message = &analysis.diagnostics[0].message;
+            let feature = retired_config_key(key).expect("retired metadata").feature;
+            assert_eq!(
+                message,
+                &format!(
+                    "{feature} was removed; {key} has no effect (the authored value will be preserved)"
+                ),
+            );
+            assert!(!message.contains("unknown"), "{key}: {message}");
+            assert!(
+                !message.contains("forward compatibility"),
+                "{key}: {message}"
+            );
+        }
     }
 
     #[test]

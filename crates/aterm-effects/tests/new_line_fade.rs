@@ -73,6 +73,7 @@ fn cfg() -> GlowConfig {
         duration: Duration::from_millis(240),
         length: 18,
         intensity: 0.7,
+        audible: true,
         radius: 0.6,
         ring: true,
         beam: false,
@@ -284,6 +285,12 @@ impl Host {
 
     fn retired(&self) -> u64 {
         self.glow.v2_status().map_or(0, |s| s.retired)
+    }
+
+    /// `ribbon_followed=`: the cells the follow pass carried to another
+    /// row with their text (2026-09-21).
+    fn followed(&self) -> u64 {
+        self.glow.v2_status().map_or(0, |s| s.followed)
     }
 
     /// Seconds since the last key.
@@ -731,40 +738,53 @@ fn a_declined_hidden_relocation_with_the_old_row_s_text_intact_moves_only_the_mi
     assert!(!h.lit(5));
 }
 
-/// **AND WHEN THE TEXT WENT WITH THE CARET, THE FAST MELT STANDS.** The same
-/// hidden relocation, but the screen was cleared and `hello world` re-drawn
-/// on the caret's new row — an input box re-laid elsewhere: light left where
-/// the text used to be, the text visibly moved. The witness sees the run's
-/// glyphs gone from its row and present on the caret's, and retires the
-/// band on `RETIRE_MELT_S`, inside the 150 ms the stray-rainbow ruling
-/// allows. GREEN on main (through `retire_row` and the witness both) and
-/// green here through the witness alone: no regression to the stray fix.
+/// **AND WHEN THE TEXT WENT WITH THE CARET, THE BAND GOES WITH IT.** The
+/// same hidden relocation, but the screen was cleared and `hello world`
+/// re-drawn on the caret's new row — an input box re-laid elsewhere.
+///
+/// RE-PINNED 2026-09-21 (the band follows its text; `rk::witness`'s follow
+/// pass, `Engine::follow_rows`). Until then this pinned the fast melt: the
+/// witness saw the run's glyphs gone from its row and present on the
+/// caret's and retired the band on `RETIRE_MELT_S` — light left where the
+/// text used to be was the stray the melt was built for. Now the run's
+/// glyphs are found two rows down at their own columns, gone from their
+/// own row, and the run is TRANSLATED there with its clocks intact: no
+/// cell is stamped, nothing is retired, and the band stands under the
+/// text the hand typed, on the caret's row. The stray fix is not regressed
+/// — a relocation whose text is NOT found retires exactly as before
+/// (`a_relocated_input_box_retires_the_band_…`'s sibling in
+/// `abandoned_ribbon.rs`, and the true re-layout control in
+/// `composer_box_growth_wrap.rs`).
 #[test]
-fn a_declined_hidden_relocation_whose_text_went_with_it_still_melts_fast() {
+fn a_declined_hidden_relocation_whose_text_went_with_it_carries_the_band_with_it() {
     let mut h = hello(5);
     h.program(b"\x1b[?25l");
     h.program(b"\x1b[2J\x1b[8;1Hhello world\x1b[?25h");
     let c = h.term.cursor();
     assert_eq!((c.row, c.col), (7, 11), "the caret went with the text");
     let want: Vec<u16> = (0..TEXT.len() as u16).collect();
-    assert_eq!(
-        h.leaving(5),
-        want,
-        "every cell of the moved band is retired on the frame"
+    assert!(
+        h.leaving(5).is_empty() && h.cells(5).is_empty(),
+        "the band left row 5 with its text, unstamped: {:?}",
+        h.cells(5)
     );
-    assert_eq!(h.retired(), TEXT.len() as u64);
-    assert!(!h.lit(7), "row 7 holds text nobody typed here: dark");
+    assert_eq!(h.live(7), want, "…and stands under it on row 7");
+    assert_eq!(h.retired(), 0, "nothing was retired by content");
+    assert_eq!(
+        h.followed(),
+        TEXT.len() as u64,
+        "every cell of the band followed its text"
+    );
+    assert!(h.lit(7), "row 7 is lit under the text the hand typed");
+    assert!(!h.lit(5));
     h.idle(200);
     assert!(
         h.since_key() < GRACE_S,
         "inside the grace: the swoosh could not have taken it"
     );
-    assert!(
-        h.cells(5).is_empty(),
-        "row 5 is out of the pool inside 200 ms"
-    );
-    assert!(!h.lit(5));
-    assert!((RETIRE_MELT_S * 1000.0) as u64 <= 150);
+    assert_eq!(h.live(7), want, "…and still stands 200 ms on");
+    assert!(h.cells(5).is_empty());
+    assert!(h.lit(7));
 }
 
 /// The transcript's spinner, as Claude Code paints it on the row the

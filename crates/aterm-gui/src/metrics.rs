@@ -2215,6 +2215,52 @@ static H_PRESENT_GLASS: Histogram = Histogram::new();
 static LAST_PRESENT_GLASS_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_PRESENT_GLASS_NS: AtomicU64 = AtomicU64::new(0);
 static PRESENT_GLASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Per-tag ledgers (`aterm_gpu::present_glass::PresentTag`): a shown frame is
+/// booked under its OWN tag, a skipped one under its ATTRIBUTION
+/// (`GlassReport::skip_attribution` — the lane that replaced it, or its own
+/// occlusion, or `spaced` when nothing replaced it and the compositor simply
+/// dropped it). Together they answer the question the plain skip counter could
+/// not: WHICH pacing lane is paying for pixels no one sees.
+static PRESENT_GLASS_SHOWN_BY: [AtomicU64; aterm_gpu::present_glass::PresentTag::COUNT] =
+    [const { AtomicU64::new(0) }; aterm_gpu::present_glass::PresentTag::COUNT];
+static PRESENT_GLASS_SKIPPED_BY: [AtomicU64; aterm_gpu::present_glass::PresentTag::COUNT] =
+    [const { AtomicU64::new(0) }; aterm_gpu::present_glass::PresentTag::COUNT];
+/// `label:count` pairs of the NON-ZERO slots, comma-joined, `none` when every
+/// slot is zero — the shape of `frame_refill_full_causes`, so a reader that
+/// parses one parses the other.
+fn sparse_pairs(pairs: &[(&str, u64)]) -> String {
+    if pairs.is_empty() {
+        return "none".to_string();
+    }
+    pairs
+        .iter()
+        .map(|(label, count)| format!("{label}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The same pairs as a JSON object (`{}` when empty), the structured twin.
+fn sparse_object(pairs: &[(&str, u64)]) -> String {
+    let body = pairs
+        .iter()
+        .map(|(label, count)| format!("\"{label}\":{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+/// The non-zero entries of a per-tag ledger, in `PresentTag::ALL` order.
+fn tag_pairs(
+    slots: &[AtomicU64; aterm_gpu::present_glass::PresentTag::COUNT],
+) -> Vec<(&'static str, u64)> {
+    aterm_gpu::present_glass::PresentTag::ALL
+        .iter()
+        .filter_map(|tag| {
+            let count = slots[tag.index()].load(Ordering::Relaxed);
+            (count != 0).then_some((tag.as_str(), count))
+        })
+        .collect()
+}
 
 /// Install this ledger as `aterm_gpu`'s present→glass sink, once per process at
 /// GUI entry. Until it runs no presented handler is registered at all.
@@ -2223,15 +2269,18 @@ pub fn install_present_glass_sink() {
 }
 
 /// Book one presented-handler sample (runs on a Metal/CoreAnimation thread).
-fn note_present_glass(sample: aterm_gpu::present_glass::GlassSample) {
-    match sample {
+fn note_present_glass(report: aterm_gpu::present_glass::GlassReport) {
+    match report.sample {
         aterm_gpu::present_glass::GlassSample::OnGlass { ns } => {
             H_PRESENT_GLASS.record(ns);
             LAST_PRESENT_GLASS_NS.store(ns, Ordering::Relaxed);
             MAX_PRESENT_GLASS_NS.fetch_max(ns, Ordering::Relaxed);
+            PRESENT_GLASS_SHOWN_BY[report.tag.index()].fetch_add(1, Ordering::Relaxed);
         }
         aterm_gpu::present_glass::GlassSample::Skipped => {
             PRESENT_GLASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            PRESENT_GLASS_SKIPPED_BY[report.skip_attribution().index()]
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -2245,7 +2294,8 @@ pub fn present_glass_fields_text() -> String {
     format!(
         " n_present_glass={} present_glass_p50_ms={:.2} present_glass_p95_ms={:.2} \
          present_glass_p99_ms={:.2} last_present_glass_ms={:.2} \
-         max_present_glass_ms={:.2} present_glass_skipped={}",
+         max_present_glass_ms={:.2} present_glass_skipped={} \
+         present_glass_shown_by={} present_glass_skipped_by={}",
         h.count(),
         p(0.50),
         p(0.95),
@@ -2253,6 +2303,8 @@ pub fn present_glass_fields_text() -> String {
         ms(LAST_PRESENT_GLASS_NS.load(Ordering::Relaxed)),
         ms(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed)),
         PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed),
+        sparse_pairs(&tag_pairs(&PRESENT_GLASS_SHOWN_BY)),
+        sparse_pairs(&tag_pairs(&PRESENT_GLASS_SKIPPED_BY)),
     )
 }
 
@@ -2266,7 +2318,8 @@ pub fn present_glass_fields_json() -> String {
         ",\"n_present_glass\":{},\"present_glass_p50_ms\":{:.2},\
          \"present_glass_p95_ms\":{:.2},\"present_glass_p99_ms\":{:.2},\
          \"last_present_glass_ms\":{:.2},\"max_present_glass_ms\":{:.2},\
-         \"present_glass_skipped\":{}",
+         \"present_glass_skipped\":{},\"present_glass_shown_by\":{},\
+         \"present_glass_skipped_by\":{}",
         h.count(),
         p(0.50),
         p(0.95),
@@ -2274,6 +2327,8 @@ pub fn present_glass_fields_json() -> String {
         ms(LAST_PRESENT_GLASS_NS.load(Ordering::Relaxed)),
         ms(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed)),
         PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed),
+        sparse_object(&tag_pairs(&PRESENT_GLASS_SHOWN_BY)),
+        sparse_object(&tag_pairs(&PRESENT_GLASS_SKIPPED_BY)),
     )
 }
 
@@ -3310,6 +3365,12 @@ pub fn reset() {
     LAST_PRESENT_GLASS_NS.store(0, Ordering::Relaxed);
     MAX_PRESENT_GLASS_NS.store(0, Ordering::Relaxed);
     PRESENT_GLASS_SKIPPED.store(0, Ordering::Relaxed);
+    for slot in &PRESENT_GLASS_SHOWN_BY {
+        slot.store(0, Ordering::Relaxed);
+    }
+    for slot in &PRESENT_GLASS_SKIPPED_BY {
+        slot.store(0, Ordering::Relaxed);
+    }
     // The main-loop turn census is a window stat like every other `max_` on this
     // line: a driver that resets, drives a workload and reads must see THAT
     // workload's worst main-thread turn, not the launch storm's.
@@ -3368,6 +3429,24 @@ pub struct Snapshot {
     /// extraction, no terminal-mutex grid walk — because the engine had not
     /// moved since the fill. See [`note_frame_refill_skipped`].
     pub frame_refills_skipped: u64,
+    /// OFFSCREEN rasterizations (the `image` / `window` / `snapshot`
+    /// introspection path): how many, the last one's cost, and the worst.
+    ///
+    /// [`record_offscreen_raster`] has maintained all three since the on-glass
+    /// ledger was cleaned of them — correctly, because an `image` between two
+    /// presents shrinks a real hitch out of existence and one taken long after
+    /// the last present books a phantom gap. But the counters it moved that
+    /// work INTO reached no surface, so the observability its own doc promises
+    /// ("keep headless/introspection runs observable") was never delivered:
+    /// a full-frame raster moved no published number at all, and the cure had
+    /// removed the contamination and the visibility together.
+    ///
+    /// Deliberately NOT folded back into `frames` / `max_frame_render_ms` /
+    /// `slow_frames` / `max_frame_gap_ms` — that contamination is the bug these
+    /// were split off to fix.
+    pub offscreen_rasters: u64,
+    pub last_offscreen_raster_ns: u64,
+    pub max_offscreen_raster_ns: u64,
     pub pre_present_attempts: u64,
     pub last_pre_present_ns: u64,
     pub pre_present_total_ns: u64,
@@ -3626,6 +3705,9 @@ pub fn snapshot() -> Snapshot {
         frame_refills_scoped: FRAME_REFILLS_SCOPED.load(Ordering::Relaxed),
         frame_refills_full: FRAME_REFILLS_FULL.load(Ordering::Relaxed),
         frame_refills_skipped: FRAME_REFILLS_SKIPPED.load(Ordering::Relaxed),
+        offscreen_rasters: OFFSCREEN_RASTERS.load(Ordering::Relaxed),
+        last_offscreen_raster_ns: LAST_OFFSCREEN_RASTER_NS.load(Ordering::Relaxed),
+        max_offscreen_raster_ns: MAX_OFFSCREEN_RASTER_NS.load(Ordering::Relaxed),
         pre_present_attempts: PRE_PRESENT_ATTEMPTS.load(Ordering::Relaxed),
         last_pre_present_ns: LAST_PRE_PRESENT_NS.load(Ordering::Relaxed),
         pre_present_total_ns: PRE_PRESENT_TOTAL_NS.load(Ordering::Relaxed),
@@ -4793,34 +4875,75 @@ mod present_glass_tests {
         H_PRESENT_GLASS, MAX_PRESENT_GLASS_NS, PRESENT_GLASS_SKIPPED, SCHEDULER_STATE,
         note_present_glass, present_glass_fields_json, present_glass_fields_text, reset,
     };
-    use aterm_gpu::present_glass::GlassSample;
+    use aterm_gpu::present_glass::{GlassReport, GlassSample, PresentTag};
     use std::sync::atomic::Ordering;
 
+    fn report(sample: GlassSample, tag: PresentTag, successor: PresentTag) -> GlassReport {
+        GlassReport {
+            sample,
+            tag,
+            successor,
+        }
+    }
+
     /// The compositor leg is published beside the application-side slices: an
-    /// on-glass sample lands in the distribution and the max, a skipped drawable
-    /// only in its own counter, and `reset` clears all three.
+    /// on-glass sample lands in the distribution, the max and its own tag's
+    /// shown ledger; a skipped drawable only in the skip counter and the ledger
+    /// of the lane that REPLACED it; and `reset` clears all of it. Empty ledgers
+    /// print `none` / `{}`, never a bare `key=`.
     #[test]
     fn glass_samples_book_on_glass_and_skipped_apart_and_reset_clears_them() {
         let _serial = SCHEDULER_STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
-        note_present_glass(GlassSample::OnGlass { ns: 7_000_000 });
-        note_present_glass(GlassSample::Skipped);
+        let text = present_glass_fields_text();
+        assert!(
+            text.ends_with(" present_glass_shown_by=none present_glass_skipped_by=none"),
+            "{text}"
+        );
+        let json = present_glass_fields_json();
+        assert!(json.ends_with(",\"present_glass_skipped_by\":{}"), "{json}");
+
+        note_present_glass(report(
+            GlassSample::OnGlass { ns: 7_000_000 },
+            PresentTag::Spaced,
+            PresentTag::Spaced,
+        ));
+        // A frame replaced by a hot-burst successor: charged to `hot_burst`.
+        note_present_glass(report(
+            GlassSample::Skipped,
+            PresentTag::Spaced,
+            PresentTag::HotBurst,
+        ));
         assert_eq!(H_PRESENT_GLASS.count(), 1, "a skip is not a duration");
         assert_eq!(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed), 7_000_000);
         assert_eq!(PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed), 1);
         let text = present_glass_fields_text();
         assert!(text.contains(" n_present_glass=1 "), "{text}");
         assert!(text.contains(" max_present_glass_ms=7.00 "), "{text}");
-        assert!(text.ends_with(" present_glass_skipped=1"), "{text}");
+        assert!(text.contains(" present_glass_skipped=1 "), "{text}");
+        assert!(text.contains(" present_glass_shown_by=spaced:1 "), "{text}");
+        assert!(
+            text.ends_with(" present_glass_skipped_by=hot_burst:1"),
+            "{text}"
+        );
         let json = present_glass_fields_json();
         assert!(json.contains("\"n_present_glass\":1,"), "{json}");
-        assert!(json.contains("\"present_glass_skipped\":1"), "{json}");
+        assert!(json.contains("\"present_glass_skipped\":1,"), "{json}");
+        assert!(
+            json.contains("\"present_glass_shown_by\":{\"spaced\":1}"),
+            "{json}"
+        );
+        assert!(
+            json.ends_with("\"present_glass_skipped_by\":{\"hot_burst\":1}"),
+            "{json}"
+        );
         reset();
         assert_eq!(H_PRESENT_GLASS.count(), 0);
         assert_eq!(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed), 0);
         assert_eq!(PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed), 0);
+        assert!(present_glass_fields_text().ends_with(" present_glass_skipped_by=none"));
     }
 }
 

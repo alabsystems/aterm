@@ -1094,7 +1094,11 @@ mod tests {
         let (mut app, wid, sid, _ctx) = app_with_stub();
         let revision = app.session_status.revision(sid);
         let record = app.session_status_record(sid).expect("live");
-        assert!(record.ends_with(" hand=- level=quiet story=0"), "{record}");
+        // The round-19 tail, with round 22's screen stamp appended after it.
+        assert!(
+            record.contains(" hand=- level=quiet story=0 seq="),
+            "{record}"
+        );
         assert_eq!(
             app.presence_chrome_line(),
             "presence rim=none level=quiet band=\"\" sentence=\"\"",
@@ -1107,7 +1111,10 @@ mod tests {
         assert_eq!(rim, "none", "a story has no rim");
         assert_eq!(app.presence_level(wid), Level::Story);
         let record = app.session_status_record(sid).expect("live");
-        assert!(record.ends_with(" hand=- level=story story=1"), "{record}");
+        assert!(
+            record.contains(" hand=- level=story story=1 seq="),
+            "{record}"
+        );
         assert_eq!(
             app.session_status.revision(sid),
             revision,
@@ -1148,7 +1155,7 @@ mod tests {
             "a bidi override never reaches the chrome"
         );
         let record = app.session_status_record(sid).expect("live");
-        assert!(record.ends_with(" level=story story=2"), "{record}");
+        assert!(record.contains(" level=story story=2 seq="), "{record}");
         assert_eq!(
             app.tell_story(9999, StoryVerb::Timeout, ""),
             Err("no such session")
@@ -1162,7 +1169,7 @@ mod tests {
         app.on_presence_wake(&_ctx.self_id, false);
         let record = app.session_status_record(sid).expect("live");
         assert!(
-            record.ends_with(" hand=turn:41 level=driven story=2"),
+            record.contains(" hand=turn:41 level=driven story=2 seq="),
             "{record}"
         );
         let chrome = app.presence_chrome_line();

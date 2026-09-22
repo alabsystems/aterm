@@ -93,6 +93,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 control: None,
                 frozen_path: false,
                 identity: None,
+                topics: Vec::new(),
             })
             .collect(),
     })
@@ -688,6 +689,12 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             control: Some(handoff_carry::stamp(b"{}")),
             frozen_path: true,
             identity: Some("worker".to_string()),
+            // NON-EMPTY on purpose: the topic set is consent, and this is the
+            // roundtrip that proves a seamless update does not drop it.
+            topics: vec![
+                "build.failed head 1".to_string(),
+                "sat-comp @42 2".to_string(),
+            ],
         }],
     };
     let wire = new.to_toml().unwrap();
@@ -1036,6 +1043,7 @@ fn a_since_turn_resume_after_a_dropped_ledger_is_told_of_the_loss() {
             h.ctx.byte_fanout.clone(),
             h.ctx.turns.clone(),
             h.ctx.timeline.clone(),
+            h.ctx.fabric.clone(),
         );
         store.write().unwrap_or_else(|p| p.into_inner()).register(h);
         let registry = crate::subscribe::new_registry();

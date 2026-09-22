@@ -320,13 +320,11 @@ impl StreamingSearch {
                     // (No capacity hint: growth-on-push keeps the allocation
                     // provably bounded for the L0 gate; contents identical.)
                     let mut row_widths: Vec<usize> = Vec::new();
-                    let col_map_first = crate::grapheme::ColumnMap::new(&text);
-                    row_widths.push(col_map_first.total_columns());
+                    row_widths.push(crate::grapheme::display_columns(&text));
                     let mut joined = text;
                     for cont_row in row.saturating_add(1)..logical_end {
                         if let Some(cont_text) = content.get_row_text(cont_row) {
-                            let cont_cols =
-                                crate::grapheme::ColumnMap::new(&cont_text).total_columns();
+                            let cont_cols = crate::grapheme::display_columns(&cont_text);
                             row_widths.push(cont_cols);
                             joined.push_str(&cont_text);
                         } else {

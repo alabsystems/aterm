@@ -54,6 +54,17 @@ pub enum Lane {
     /// smoke, under the rung or under the pack (in `target/` the test stage
     /// relinked `aterm-gui` with dev features).
     DriverTarget,
+    /// `target/conformance-release/` — the RELEASE `aterm` the live-conformance
+    /// suites JUDGE, and the one lane this gate did not invent: it is the exact
+    /// directory `crates/aterm-conformance/tests/support/mod.rs`'s `release_bin`
+    /// builds into, so [`lane_dir`] must spell it the way that helper spells it
+    /// or the artifact gets built twice instead of primed once.
+    ///
+    /// It lives UNDER `target/` and is still a lane of its own, because a lane
+    /// is a cargo target directory and cargo's build lock is taken per target
+    /// directory: the main lane's children never open this one, so priming it
+    /// contends with nothing the build stage is doing.
+    ConformanceRelease,
 }
 
 /// Every stage of the gate.
@@ -80,6 +91,9 @@ pub enum StageId {
     FreezeGate,
     ProofInventory,
     DriverBuilds,
+    /// The RELEASE `aterm` the paint, spin and untracked-staging suites judge,
+    /// built in its own lane at t0 so the test stage finds it warm.
+    ConformanceRelease,
     ControlSocketSmoke,
     GuiSmoke,
     RedrawConformance,
@@ -150,14 +164,36 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::RegexTarget => under_root("target-regex"),
         Lane::XtaskTarget => under_root("target-xtask"),
         Lane::DriverTarget => under_root("target-drivers"),
+        // Spelled as `release_bin` spells it — `root.join("target/conformance-release")`
+        // in `crates/aterm-conformance/tests/support/mod.rs`. A second spelling
+        // of the same artifact is a second BUILD, which is the one thing this
+        // lane exists to prevent.
+        Lane::ConformanceRelease => under_root("target/conformance-release"),
     }
+}
+
+/// Will this run's test stage run a suite that builds the conformance RELEASE
+/// artifact for itself?
+///
+/// Three do — `aterm-conformance`'s `paint` and `spin`, and `atpkg`'s
+/// `untracked_stage` — and all three reach it through the same `release_bin`
+/// helper, so the question is exactly "does the selection compile one of those
+/// two crates". Whole-tree always does. A narrowing that selects neither runs
+/// no suite that would ever open the lane, and priming it would be a minutes-long
+/// build for nobody — the same reason the regex and sealed lanes are REMOVED
+/// rather than skipped under a scope that has nothing for them.
+#[must_use]
+fn primes_conformance_release(ctx: &Ctx) -> bool {
+    ctx.scope.includes_crate("aterm-conformance") || ctx.scope.includes_crate("atpkg")
 }
 
 /// Build the run's stage list.
 ///
 /// Two things can remove a stage entirely (as opposed to skipping it):
-///  * `--scope` narrowing away from `aterm-search` drops the regex lane, and away
-///    from `aterm-link` the sealed fabric lane, because there is nothing for either
+///  * `--scope` narrowing away from `aterm-search` drops the regex lane, away
+///    from `aterm-link` the sealed fabric lane, and away from BOTH
+///    `aterm-conformance` and `atpkg` the conformance-release prime
+///    ([`primes_conformance_release`]), because there is nothing for any of them
 ///    to run — the script never printed the regex lane's header either;
 ///  * `--fast` drops the two `--full`-only stages.
 ///
@@ -289,6 +325,44 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "driver builds (smoke, redraw and objc binaries)",
         Lane::DriverTarget,
     ));
+    // THE CONFORMANCE RELEASE ARTIFACT (2026-09-22) — the driver-builds row's
+    // twin, one lane over, and for the identical reason: a build the ladder
+    // used to pay for INSIDE a stage that measures, while every other core
+    // idled.
+    //
+    // `crates/aterm-conformance/tests/support/mod.rs`'s `release_bin` builds
+    // `--locked --release -p aterm` into `target/conformance-release` and hands
+    // the binary to the paint, spin and untracked-staging suites — which judge
+    // the RELEASE artifact and refuse to run without one. Cargo runs test
+    // binaries ONE AT A TIME, so whichever of the three sorts first pays for
+    // that whole release build inside the test stage's own time, with nothing
+    // else in the gate running. MEASURED on a `--fast` run of 2026-09-22
+    // (`ATERM_VERIFY_TIMINGS`): `test (--workspace)` was 33 of the run's 36
+    // minutes, and its two slowest suites were `untracked_stage` (424 s) and
+    // `paint` (417 s) out of 581.
+    //
+    // This row runs THE SAME argv, in THE SAME directory, from THE SAME cwd —
+    // `stages::conformance_release_cmd` is the one place that argv is written,
+    // and `stages.rs`'s tests pin it against the helper's source. Measured
+    // 2026-09-22 on the owner's Mac: the build is 325.9 s cold and 0.18 s warm
+    // when both invocations carry the same environment. They do NOT today, and
+    // `stages.rs`'s section header says exactly how much of it the suites still
+    // redo and why (cargo's own per-package `CARGO_*` variables, forwarded by
+    // the helper into its nested cargo, which two build scripts track).
+    //
+    // NOT in `after_lanes` of anything, and nothing waits on this lane: the
+    // point is to overlap the build stage, and a waiter would put the cost back
+    // on the critical path it was taken off. Nor is it MEASUREMENT risk of the
+    // kind that made the test run wait for tippy: the three suites that would
+    // otherwise build this artifact are precisely the ones that take THIS
+    // lane's cargo lock, so none of them can run while this row still holds it.
+    if primes_conformance_release(ctx) {
+        v.push(spec(
+            StageId::ConformanceRelease,
+            "conformance release artifact (paint/spin/untracked_stage build it otherwise)",
+            Lane::ConformanceRelease,
+        ));
+    }
     // THE SEALED FABRIC RUNG (2026-09-14), a DRIVER-lane stage declared behind
     // the driver builds. `tests/two_nodes_sealed.rs` is `#![cfg(feature =
     // "sealed")]`, so the workspace test run compiles the one test covering the
@@ -627,6 +701,7 @@ mod tests {
                 StageId::FreezeGate,
                 StageId::ProofInventory,
                 StageId::DriverBuilds,
+                StageId::ConformanceRelease,
                 StageId::SealedLane,
                 StageId::AtpkgTooling,
                 StageId::ControlSocketSmoke,
@@ -657,6 +732,9 @@ mod tests {
     /// could find was a previous run's. Its row is still here, still before the
     /// smokes — what moved is where in this order it sits, and that is exactly
     /// what a stage-set proof must let through and an order proof must not.
+    /// The conformance-release prime joined on 2026-09-22 and is the second
+    /// added row; like the two feature lanes it is filtered by the crates whose
+    /// suites use it, so it is counted through the same predicate.
     #[test]
     fn every_stage_of_the_18f19eea6_ladder_is_still_planned_in_order() {
         const FAST_18F19EEA6: [StageId; 29] = [
@@ -724,13 +802,21 @@ mod tests {
                         scope.label()
                     );
                 }
+                let added = 1 + usize::from(primes_conformance_release(&c));
                 assert_eq!(
                     new.len(),
-                    old.len() + 1,
-                    "{mode:?} / {}: the only new row is driver builds: {new:?}",
+                    old.len() + added,
+                    "{mode:?} / {}: the only new rows are driver builds and the \
+                     conformance-release prime: {new:?}",
                     scope.label()
                 );
                 assert!(new.contains(&StageId::DriverBuilds));
+                assert_eq!(
+                    new.contains(&StageId::ConformanceRelease),
+                    primes_conformance_release(&c),
+                    "{mode:?} / {}",
+                    scope.label()
+                );
             }
         }
     }
@@ -1017,17 +1103,24 @@ mod tests {
     }
 
     #[test]
-    fn scoping_away_from_aterm_search_removes_the_regex_lane_only() {
-        // Two feature lanes, each following its own crate: the regex lane is
-        // aterm-search's and the sealed lane is aterm-link's. A scope that holds
-        // neither drops exactly those two and nothing else.
+    fn a_scope_removes_exactly_the_lanes_whose_crates_it_dropped() {
+        // Three rows follow their own crates: the regex lane is aterm-search's,
+        // the sealed lane is aterm-link's, and the conformance-release prime
+        // belongs to the two crates whose suites build that artifact
+        // (aterm-conformance, atpkg). A scope that holds none of them drops
+        // exactly those three and nothing else.
         let scoped = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-grid")));
         assert!(!scoped.contains(&StageId::RegexLane));
         assert!(!scoped.contains(&StageId::SealedLane));
+        assert!(!scoped.contains(&StageId::ConformanceRelease));
         let full = ids(&ctx(Mode::Fast, Scope::workspace()));
         let expected: Vec<StageId> = full
             .into_iter()
-            .filter(|i| *i != StageId::RegexLane && *i != StageId::SealedLane)
+            .filter(|i| {
+                *i != StageId::RegexLane
+                    && *i != StageId::SealedLane
+                    && *i != StageId::ConformanceRelease
+            })
             .collect();
         assert_eq!(scoped, expected, "no other stage is dropped by a scope");
         assert!(
@@ -1036,6 +1129,108 @@ mod tests {
         let link_only = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-link")));
         assert!(link_only.contains(&StageId::SealedLane));
         assert!(!link_only.contains(&StageId::RegexLane));
+    }
+
+    /// THE PRIME FOLLOWS THE SUITES THAT WOULD OTHERWISE BUILD IT.
+    ///
+    /// `release_bin` is reached from `aterm-conformance`'s paint and spin suites
+    /// and from `atpkg`'s untracked-staging suite, and from nowhere else (grep
+    /// of the tree, 2026-09-22). So the row is planned whole-tree, planned
+    /// whenever a narrowing selects either crate, and REMOVED — not skipped —
+    /// when it selects neither, because a minutes-long release build for a test
+    /// stage that will never open the directory is the opposite of what this row
+    /// is for.
+    #[test]
+    fn the_conformance_release_prime_follows_the_crates_whose_suites_build_it() {
+        let has = |scope: Scope| {
+            for mode in [Mode::Fast, Mode::Full] {
+                let c = ctx(mode, scope.clone());
+                assert_eq!(
+                    ids(&c).contains(&StageId::ConformanceRelease),
+                    primes_conformance_release(&c),
+                    "{mode:?} / {}",
+                    scope.label()
+                );
+            }
+            ids(&ctx(Mode::Fast, scope)).contains(&StageId::ConformanceRelease)
+        };
+        assert!(has(Scope::workspace()), "--fast and --full both prime it");
+        assert!(has(Scope::crate_only("aterm-conformance")));
+        assert!(has(Scope::crate_only("atpkg")));
+        assert!(has(Scope::changed(
+            "main",
+            vec!["aterm-grid".into(), "atpkg".into()],
+            true
+        )));
+        assert!(!has(Scope::crate_only("aterm-grid")));
+        assert!(!has(Scope::changed("main", vec!["aterm-gui".into()], true)));
+        assert!(
+            !has(Scope::changed("main", vec![], true)),
+            "a selection that compiles nothing runs no suite either"
+        );
+    }
+
+    /// THE PRIME IS SCHEDULED TO OVERLAP, WHICH IS ITS WHOLE POINT.
+    ///
+    /// It must start at t0 (declared before the first exclusive barrier, so no
+    /// barrier can hold it back), own a lane nothing else is in (so no earlier
+    /// stage in it can queue it), wait on no lanes, never be exclusive, and —
+    /// above all — be awaited by NOBODY: a waiter would put the release build
+    /// back on the critical path it was taken off. `target/conformance-release`
+    /// is not `target/`, so the main lane's build never queues on it either.
+    #[test]
+    fn the_conformance_release_prime_overlaps_everything_and_blocks_nobody() {
+        for mode in [Mode::Fast, Mode::Full] {
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("aterm-conformance"),
+                Scope::crate_only("atpkg"),
+            ] {
+                let p = plan(&ctx(mode, scope.clone()));
+                let what = format!("{mode:?} / {}", scope.label());
+                let prime = p
+                    .iter()
+                    .position(|s| s.id == StageId::ConformanceRelease)
+                    .unwrap_or_else(|| panic!("{what}: the prime is planned"));
+                assert_eq!(p[prime].lane, Lane::ConformanceRelease, "{what}");
+                assert_ne!(p[prime].lane, Lane::MainTarget, "{what}");
+                assert!(!p[prime].exclusive, "{what}");
+                assert!(p[prime].after_lanes.is_empty(), "{what}");
+                // Alone in its lane: nothing serialises in front of it.
+                assert_eq!(
+                    p.iter()
+                        .filter(|s| s.lane == Lane::ConformanceRelease)
+                        .count(),
+                    1,
+                    "{what}"
+                );
+                // Before the first barrier, so it is startable at t0.
+                let barrier = p
+                    .iter()
+                    .position(|s| s.exclusive)
+                    .expect("an exclusive stage");
+                assert!(prime < barrier, "{what}: a barrier would delay it");
+                let nothing_yet = vec![false; p.len()];
+                assert!(
+                    crate::sched::ready(&p, &nothing_yet, &nothing_yet, 0, prime),
+                    "{what}: the prime must be startable with nothing else finished"
+                );
+                // And nobody waits for it.
+                assert!(
+                    p.iter()
+                        .all(|s| !s.after_lanes.contains(&Lane::ConformanceRelease)),
+                    "{what}: a waiter puts the build back on the critical path"
+                );
+                for i in 0..p.len() {
+                    assert!(
+                        !crate::sched::awaited(&p, i).any(|j| j == prime),
+                        "{what}: {:?} awaits the prime",
+                        p[i].id
+                    );
+                }
+                crate::sched::check_after_lanes(&p).expect("the plan cannot deadlock");
+            }
+        }
     }
 
     #[test]
@@ -1055,6 +1250,7 @@ mod tests {
                 StageId::FreezeGate => Lane::FreezeGateTarget,
                 StageId::LibcOracle => Lane::LibcOracleTarget,
                 StageId::RegexLane => Lane::RegexTarget,
+                StageId::ConformanceRelease => Lane::ConformanceRelease,
                 StageId::Formatting | StageId::FeatureGates | StageId::ProofInventory => {
                     Lane::XtaskTarget
                 }
@@ -1106,6 +1302,14 @@ mod tests {
             dir(&c, Lane::DriverTarget).as_deref(),
             Some("/repo/target-drivers")
         );
+        // THE HELPER'S OWN PATH, not a path of this gate's choosing:
+        // `release_bin` builds into `<root>/target/conformance-release`, and a
+        // lane that named any other directory would prime an artifact nothing
+        // reads while the suites still built their own.
+        assert_eq!(
+            dir(&c, Lane::ConformanceRelease).as_deref(),
+            Some("/repo/target/conformance-release")
+        );
         assert_eq!(
             dir(&c, Lane::FreezeGateTarget).as_deref(),
             Some("/repo/tools/freeze-safety-gate/target")
@@ -1126,6 +1330,14 @@ mod tests {
         assert_eq!(
             dir(&c, Lane::RegexTarget).as_deref(),
             Some("/repo/target-regex")
+        );
+        // …and the conformance lane least of all: the suites' helper computes
+        // its directory from the workspace root and knows nothing about a
+        // caller's redirect, so a lane that followed one would prime a
+        // directory the suites never open.
+        assert_eq!(
+            dir(&c, Lane::ConformanceRelease).as_deref(),
+            Some("/repo/target/conformance-release")
         );
         // A relative root still yields absolute side-lane dirs.
         c.root = PathBuf::from("relative-repo");
@@ -1148,6 +1360,7 @@ mod tests {
         // 32 since 2026-09-13: the driver builds row.
         // 33 since 2026-09-14: the sealed fabric lane — the one test covering the
         // vendored astream-aead is feature-gated and ran on no cadence before it.
-        assert_eq!(plan(&nothing_installed).len(), 33);
+        // 34 since 2026-09-22: the conformance-release prime.
+        assert_eq!(plan(&nothing_installed).len(), 34);
     }
 }

@@ -382,6 +382,10 @@ mod tests {
             "unclassified: the runtime config service's entry worker",
         ),
         (
+            "aterm-claimant-census",
+            "unclassified: lists the bundles claiming this app's identifier",
+        ),
+        (
             "aterm-consent-probe",
             "unclassified: probes macOS full-disk-access consent",
         ),

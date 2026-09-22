@@ -34,8 +34,8 @@ impl WarmTier {
 
     /// Decode the block containing logical line `idx` and return OWNED lines
     /// from `idx` through the end of that block — the bulk-walk primitive
-    /// (ST-6). One decode + one `split_off` per block: no per-line binary
-    /// search, no per-line `Line` clone, and NO touch of the render-path
+    /// (ST-6). One decode per block, splitting only a partial prefix: no
+    /// per-line binary search or `Line` clone, and NO touch of the render-path
     /// block cache. Quarantined blocks error without a doomed decode,
     /// exactly like `get_line`.
     ///
@@ -67,6 +67,12 @@ impl WarmTier {
             return Err(ScrollbackError::Quarantined(block.line_count()));
         }
         let mut lines = block.decompress()?;
+        // A sequential walk enters every full block at zero. Move the decoded
+        // buffer straight out: split_off(0) preserves the source capacity and
+        // allocates a spare buffer that this function immediately discards.
+        if line_in_block == 0 {
+            return Ok(lines);
+        }
         // `min` keeps split_off total; a short decode yields a short
         // (possibly empty) segment, which the streaming iterator treats as
         // end-of-data — fail-closed, never a panic.

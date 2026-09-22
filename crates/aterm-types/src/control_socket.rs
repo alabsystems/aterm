@@ -247,6 +247,40 @@ pub fn graph_entry_sock(body: &str) -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+/// ONE spelling per socket file, whichever way a path arrived at it.
+///
+/// The discovery graph carries socket paths written by TWO code paths: the
+/// instance's own bind path as the launch plan spelled it, and the
+/// canonicalized form `proxy::set_self_sock` records for every later
+/// registration. On unix those agree once symlinks are resolved. On Windows
+/// `std::fs::canonicalize` answers the verbatim `\\?\C:\…` form, so the same
+/// `aterm-<pid>.sock` reached the client as `C:\…\aterm-16172.sock` from one
+/// session's entry and `\\?\C:\…\aterm-16172.sock` from the next — and the
+/// client's dedupe, which canonicalizes each side and compares, could not
+/// collapse them because Windows refuses to `canonicalize` an AF_UNIX socket
+/// file at all (it is a reparse point CreateFile will not open). MEASURED
+/// 2026-09-22 on aterm 0.90.0: `aterm ctl instances` printed the one live
+/// instance twice, once per spelling, and `ls` printed every session twice.
+///
+/// This strips the verbatim-disk prefix and, on Windows, folds ASCII case
+/// (NTFS paths compare case-insensitively), and is the key both the writer
+/// and the reader use. Off Windows it is the identity.
+#[must_use]
+pub fn socket_key(path: &str) -> String {
+    let stripped = path.strip_prefix(r"\\?\").unwrap_or(path);
+    // Only a DRIVE path is un-verbatimed; `\\?\UNC\server\share` has no shorter
+    // spelling every API accepts, and a unix path never carries the prefix.
+    let drive = stripped.len() >= 2
+        && stripped.as_bytes()[1] == b':'
+        && stripped.as_bytes()[0].is_ascii_alphabetic();
+    let text = if drive { stripped } else { path };
+    if cfg!(windows) {
+        text.to_ascii_lowercase()
+    } else {
+        text.to_string()
+    }
+}
+
 /// The `pid <n>` line of a discovery graph entry — the pid of the HOSTING
 /// instance that wrote the entry. Written so `aterm-ctl`'s `instances`/`ls`
 /// discovery can report a pid even for an EXPLICIT-`$ATERM_CONTROL_SOCK`
@@ -291,6 +325,42 @@ pub fn symlink_targets_pid(target: &str, pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two spellings Windows hands the discovery graph for ONE socket must
+    /// key the same; a UNC verbatim path and a unix path must pass untouched.
+    #[test]
+    fn socket_key_collapses_the_verbatim_drive_spelling_and_nothing_else() {
+        let plain = r"C:\Users\u\AppData\Local\Temp\aterm\aterm-16172.sock";
+        let verbatim = r"\\?\C:\Users\u\AppData\Local\Temp\aterm\aterm-16172.sock";
+        assert_eq!(socket_key(plain), socket_key(verbatim));
+        assert_ne!(
+            socket_key(plain),
+            socket_key(r"C:\Users\u\AppData\Local\Temp\aterm\aterm-16173.sock")
+        );
+        // A verbatim UNC path keeps its prefix: there is no shorter spelling
+        // (compared case-blind, since the key folds case on Windows).
+        assert!(
+            socket_key(r"\\?\UNC\server\share\aterm.sock")
+                .to_ascii_lowercase()
+                .starts_with(r"\\?\unc\")
+        );
+        // Unix paths are untouched off Windows and merely case-folded on it,
+        // where they cannot occur anyway.
+        let unix = "/var/folders/x/aterm/aterm-42.sock";
+        assert_eq!(
+            socket_key(unix),
+            if cfg!(windows) {
+                unix.to_ascii_lowercase()
+            } else {
+                unix.to_string()
+            }
+        );
+        // Case folds on Windows only: NTFS compares case-insensitively.
+        assert_eq!(
+            socket_key(r"C:\A\aterm-1.sock") == socket_key(r"c:\a\aterm-1.sock"),
+            cfg!(windows)
+        );
+    }
 
     #[test]
     fn directive_disables_on_off_values() {

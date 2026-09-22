@@ -36,6 +36,7 @@ fn wrapped_columns(coalesced: bool, glyph_width: u16, boundary_class: TypedClass
         duration: Duration::from_millis(400),
         length: 24,
         intensity: 1.0,
+        audible: true,
         radius: 0.6,
         ring: true,
         beam: false,

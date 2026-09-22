@@ -313,7 +313,7 @@ fn is_alarm_body(body: &str) -> bool {
 /// or backtick substitution found INSIDE double quotes (its command still
 /// runs), turning find's `\(`/`\)` into bare parens so the splitter sees the
 /// group, and keeping any other backslash escape verbatim.
-fn strip_quotes(src: &str) -> String {
+pub(crate) fn strip_quotes(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
@@ -413,7 +413,7 @@ fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char
 /// (find's `\;`) is literal, never a separator, and the `&` of a redirect
 /// (`2>&1`, `&>f`, `<&3`) stays in its token — only a job-control `&` splits,
 /// so the command run after `ls &` is a head of its own.
-fn split_segments(s: &str) -> Vec<Vec<String>> {
+pub(crate) fn split_segments(s: &str) -> Vec<Vec<String>> {
     let mut segments = Vec::new();
     let mut cur = String::new();
     let flush = |cur: &mut String, segments: &mut Vec<Vec<String>>| {
@@ -462,13 +462,13 @@ fn split_segments(s: &str) -> Vec<Vec<String>> {
 }
 
 /// The program name of a token: its basename, so `/bin/rm` and `rm` agree.
-fn program(tok: &str) -> &str {
+pub(crate) fn program(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
 }
 
 /// An output redirect token: `Some(target)` when `tok` redirects (`>`, `>>`,
 /// `2>`, `&>`, `>|`, `>file`); `None` when the target is the NEXT token.
-fn redirect_target(tok: &str) -> Option<Option<&str>> {
+pub(crate) fn redirect_target(tok: &str) -> Option<Option<&str>> {
     let pos = tok.find('>')?;
     // `<>` and `<(` are not output redirects; `->`/`=>` inside a word are, in
     // shell, so they are refused (a tie breaks toward not-read-only).
@@ -480,7 +480,7 @@ fn redirect_target(tok: &str) -> Option<Option<&str>> {
     Some((!rest.is_empty()).then_some(rest))
 }
 
-fn redirect_is_safe(target: &str) -> bool {
+pub(crate) fn redirect_is_safe(target: &str) -> bool {
     target.starts_with('&') || target == "/dev/null"
 }
 
@@ -504,7 +504,7 @@ fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &str)> {
 /// The NEGATIVE filter: any danger token anywhere, a redirect to a file, a
 /// `find -delete` / `-exec <writer>`, `sed -i`, an inline-code interpreter, a
 /// python heredoc, or `xargs` feeding a writer.
-fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
+pub(crate) fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
     for seg in segments {
         for (i, tok) in seg.iter().enumerate() {
             let prog = program(tok);
@@ -659,7 +659,7 @@ const XARGS_VALUE_FLAGS: &[&str] = &[
 
 /// The POSITIVE filter on one segment: `None` when its head is a read-only
 /// program (with the git / tmutil / python refinements), else the reason.
-fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) -> Option<String> {
+pub(crate) fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) -> Option<String> {
     head_from(seg, 0, python_allow)
 }
 
@@ -889,7 +889,7 @@ fn head_from<S: AsRef<str>>(seg: &[String], mut j: usize, python_allow: &[S]) ->
 /// program; a `w`/`W`/`e` command or an `s///w` / `s///e` flag in a sed
 /// script; a program file (`-f`) this scan cannot read. Every word is looked
 /// at, not only heads, so `xargs awk …` and `timeout 5 sed …` are covered.
-fn program_scan(cmd: &str) -> Option<String> {
+pub(crate) fn program_scan(cmd: &str) -> Option<String> {
     for seg in raw_words(cmd) {
         for (i, w) in seg.iter().enumerate() {
             let reason = match program(w) {
@@ -1205,7 +1205,7 @@ fn sed_script_writes(script: &str) -> Option<String> {
 /// where [`split_segments`] splits (a `$(…)` or backtick substitution, inside
 /// double quotes too, is its own segment): what a program's argument really
 /// says, which the quote-stripped tokens cannot.
-fn raw_words(src: &str) -> Vec<Vec<String>> {
+pub(crate) fn raw_words(src: &str) -> Vec<Vec<String>> {
     let chars: Vec<char> = src.chars().collect();
     let mut scan = WordScan {
         chars: &chars,

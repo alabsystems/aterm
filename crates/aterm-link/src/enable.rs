@@ -3502,8 +3502,14 @@ pub fn fix_for(warning: &str) -> String {
          directory's permissions"
             .to_string()
     } else if s("the bus advertises") {
-        "a presence row from an instance that is gone: it clears when a bridge of that node \
-         republishes; relaunch the instance that hosted the session, or ignore it"
+        // NOT "relaunch and it clears". A bridge retires only what it can PROVE
+        // unhosted — its own incarnation's rows, and one whose will it
+        // witnessed — so a row left by an incarnation that died without a will
+        // survives every relaunch. That is §10's residual, and the flag below
+        // is the only thing that ends it.
+        "a presence row no local instance hosts: `aterm fabric doctor --retire-ghosts` lists \
+         it and, with `--yes`, publishes `exited` for it. A relaunch does NOT clear a row \
+         whose incarnation died without a will — the new bridge cannot prove it dead"
             .to_string()
     } else if s("fleet halt standing") {
         "only the human who set the halt can withdraw it (their `/f/<F>/fleet/<h>/halt` row); ask \
@@ -3518,7 +3524,170 @@ pub fn fix_for(warning: &str) -> String {
 
 /// `aterm fabric doctor`.
 #[must_use]
-pub fn doctor() -> ExitCode {
+/// `--retire-ghosts`: publish `exited` for every presence row this node
+/// advertises LIVE that no local instance hosts.
+///
+/// THE ROUND-21 RESIDUAL, made an operator's decision. The bridge's own sweep
+/// ([`crate::bridge::Bridge::retire_ghost_presence`]) retires only what it can
+/// PROVE unhosted — its own incarnation's rows and one whose will it witnessed
+/// — so a row left by an incarnation that died without a will stays live for
+/// ever and mail to it is accepted and never delivered. Nobody but the operator
+/// can supply the missing fact, so this is where they supply it.
+///
+/// DRY BY DEFAULT: it lists and exits. With a `y` (or `--yes`) it publishes.
+///
+/// IT REFUSES WHILE A LOCAL BRIDGE RUNS, and that is not caution for its own
+/// sake: a record is published under the NODE's producer id at a sequence
+/// reserved through the state dir, and `StateDir::reserve_sequence` is an
+/// unlocked file write. A CLI racing a live bridge for the next sequence would
+/// hand the broker a `(producer_id, seq)` pair it has already seen, which it
+/// answers with the original offset and appends NOTHING — a retire that
+/// reports success and did not happen. Stopping the bridge first is a real
+/// cost; a silent no-op is worse.
+fn retire_ghosts_action(yes: bool) -> ExitCode {
+    let report = match fabric::gather() {
+        Ok(r) => r,
+        Err(off) => {
+            println!("{}", off.message());
+            return ExitCode::from(2);
+        }
+    };
+    // THE SAME GATE `status` USES, and for the same reason. An instance that
+    // did not answer is in the report with no sessions, so every live row on
+    // this node reads unhosted — and retiring one that instance is hosting
+    // perfectly well is the worst thing this command could do. `status`
+    // refuses to NAME such a row; this refuses to touch any of them.
+    let silent = fabric::unanswered(&report);
+    if !silent.is_empty() {
+        println!(
+            "aterm fabric doctor --retire-ghosts: refused — {} local instance(s) did not \
+             answer, so no row on this node can be shown unhosted:",
+            silent.len()
+        );
+        for why in &silent {
+            println!("  ! {why}");
+        }
+        println!(
+            "  fix: make every instance answerable (`aterm fabric status` names each one), \
+             then re-run"
+        );
+        return ExitCode::from(2);
+    }
+    let local = fabric::local_nodes(&report.instances, report.node.as_deref());
+    let ghosts: Vec<(String, String)> = fabric::ghost_rows(&report.sessions, &local)
+        .into_iter()
+        .map(|s| (s.sid.clone(), s.node.clone()))
+        .collect();
+    if ghosts.is_empty() {
+        println!(
+            "aterm fabric doctor --retire-ghosts: no ghost rows — every presence row this \
+             node advertises live is hosted here"
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{} presence row(s) this node advertises LIVE that no local instance hosts:",
+        ghosts.len()
+    );
+    for (sid, node) in &ghosts {
+        println!("  @{} on {}", safe(sid, 64), safe(node, 64));
+    }
+    // A RUNNING BRIDGE REFUSES THE PUBLISH, NOT THE LISTING. The listing is
+    // the whole value of a dry run and costs nothing; it is the write that
+    // would race the bridge for this node's publish sequence.
+    let bridge = running_bridge(&report.instances);
+    if !yes && !confirmed() {
+        if let Some(pid) = bridge {
+            println!(
+                "  note: publishing is refused while the instance at pid {pid} hosts a \
+                 running bridge — see the fix below"
+            );
+            print_bridge_remedy(pid);
+        }
+        println!("  nothing published (dry). Re-run with --yes, or answer y.");
+        return ExitCode::SUCCESS;
+    }
+    if let Some(pid) = bridge {
+        println!(
+            "  refused: the instance at pid {pid} hosts a running bridge. It owns this \
+             node's publish sequence, and a CLI that raced it for one would be deduped by \
+             the broker — a retire that says OK and appends nothing."
+        );
+        print_bridge_remedy(pid);
+        return ExitCode::from(2);
+    }
+    match fabric::publish_exited(&report, &ghosts) {
+        Ok(n) => {
+            println!("  published `exited` for {n} row(s)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            println!("  could not publish: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The remedy that actually works.
+///
+/// NOT `aterm fabric off`: that boots the broker out, removes `[fabric]` and
+/// the rendezvous file, and leaves the running instance's bridge up until it
+/// is relaunched — so a re-run is refused again, and once the instance IS
+/// relaunched `gather()` finds no command and exits 2. The bridge belongs to
+/// an instance; quitting that instance is what releases the sequence, and the
+/// broker is a separate process that keeps running and keeps the log.
+fn print_bridge_remedy(pid: u32) {
+    println!("  fix: quit the aterm instance at pid {pid} (the broker keeps running and");
+    println!("       keeps the log), re-run this command, then relaunch the instance.");
+    println!("       Do NOT use `aterm fabric off`: it removes the fabric config and the");
+    println!("       rendezvous file, and the bridge stays up until the instance exits.");
+}
+
+/// The pid of a local instance whose bridge is up, if one is.
+fn running_bridge(instances: &[fabric::InstanceView]) -> Option<u32> {
+    instances
+        .iter()
+        .find(|i| {
+            // A BRIDGE PROCESS IS A BRIDGE, whatever its link is doing.
+            // `bridge_pids` is the observed truth — a child that exists — and
+            // it is what settles the two cases the state words miss: a
+            // `stale` link (connected, owing an answer) and a bridge whose
+            // `fabric status` this report could not read. Either one still
+            // owns this node's publish sequence.
+            !i.bridge_pids.is_empty()
+                || i.supervised == Some(true)
+                || matches!(i.fabric.as_deref(), Some("connected" | "stalled" | "stale"))
+        })
+        .map(|i| i.pid)
+}
+
+/// A y/N on stdin. Anything but `y`/`yes` is no, and a stdin that cannot be
+/// read (a pipe, a cron) is NO — an unattended run must never retire a row.
+fn confirmed() -> bool {
+    use std::io::{IsTerminal as _, Write as _};
+    // A TTY OR NOTHING. Reading whatever stdin happens to be turned every
+    // piped `y` into consent — `echo y | aterm fabric doctor --retire-ghosts`
+    // published without `--yes` — and an inherited idle pipe (a cron, a CI
+    // step, a harness that forgot to close stdin) parked `read_line` for ever.
+    // There is exactly one way to say yes without a terminal, and it is
+    // `--yes`, which says so in the argv where an operator can see it.
+    if !std::io::stdin().is_terminal() {
+        println!("  stdin is not a terminal: taking that as NO (pass --yes to mean yes)");
+        return false;
+    }
+    print!("  publish `exited` for these rows? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
+    if retire_ghosts {
+        return retire_ghosts_action(yes);
+    }
     match fabric::gather() {
         Err(off) => {
             println!("{}", off.message());
@@ -3560,6 +3729,41 @@ pub fn doctor() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A BRIDGE PROCESS IS A BRIDGE, whatever its link is doing.** The
+    /// refusal exists because a running bridge owns this node's publish
+    /// sequence, and that is true of a bridge whose link went `stale` and of
+    /// one whose `fabric status` this report could not read. `bridge_pids` is
+    /// the observed truth — a child that exists — so it decides first.
+    #[test]
+    fn running_bridge_sees_a_stale_one_and_a_bare_pid() {
+        let inst = |fabric: Option<&str>, supervised, pids: Vec<u32>| fabric::InstanceView {
+            pid: 42,
+            fabric: fabric.map(str::to_string),
+            supervised,
+            bridge_pids: pids,
+            ..fabric::InstanceView::default()
+        };
+        assert_eq!(
+            running_bridge(&[inst(None, None, vec![99])]),
+            Some(42),
+            "a bridge child exists: that is a running bridge"
+        );
+        assert_eq!(
+            running_bridge(&[inst(Some("stale"), Some(false), vec![])]),
+            Some(42),
+            "a stale link is a bridge that still owns the sequence"
+        );
+        assert_eq!(
+            running_bridge(&[inst(Some("connected"), None, vec![])]),
+            Some(42)
+        );
+        assert_eq!(
+            running_bridge(&[inst(Some("absent"), Some(false), vec![])]),
+            None
+        );
+        assert_eq!(running_bridge(&[]), None);
+    }
     use super::*;
 
     /// **A PLANTED NAME IS NEVER WRITTEN THROUGH** (round 16 review, defect 4).

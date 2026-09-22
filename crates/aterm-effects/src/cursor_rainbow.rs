@@ -1215,6 +1215,8 @@ impl CursorRainbow {
             let end = rings.get(i + 1).map_or(quads.len(), |&(next, _, _)| next);
             for q in &mut quads[start..end] {
                 q.color = best[i];
+                // The ring's quads are flat: both ends take the equalised colour.
+                q.color2 = best[i];
             }
         }
         self.rim_scratch = scratch;
@@ -1395,6 +1397,8 @@ fn push_ring_rect(
             // ADDITIVE light — this emitter has no other mode (see
             // [`GlowQuad::alpha`]).
             alpha: 0,
+            color2: premul,
+            alpha2: 0,
         });
         yy = band_end;
     }
@@ -1759,6 +1763,7 @@ mod tests {
             duration: Duration::from_millis(240),
             length: 18,
             intensity: 1.0,
+            audible: true,
             radius: 0.6,
             ring: true,
             dark_theme: true,
@@ -4232,6 +4237,7 @@ mod tests {
             duration: Duration::from_millis(240),
             length: 18,
             intensity: 1.0,
+            audible: true,
             radius: 0.6,
             ring: true,
             dark_theme: true,

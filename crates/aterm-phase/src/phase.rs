@@ -15,13 +15,27 @@
 //! (`⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt`). That is why the
 //! status row is the primary signal, not the footer.
 //!
+//! The spinner row is read by its SHAPE, never by a list of glyphs. Measured
+//! 2026-09-20, again on 2.1.267: `✶ Bloviating…` and `✳ Tempering… (15s ·
+//! thinking with xhigh effort)` ran above the frame, and a row whose glyph the
+//! reader could not name — or a row the release had INDENTED — read IDLE the
+//! moment the footer dropped `esc to interrupt`. A list of glyphs is a list of
+//! the releases we happened to look at, and reading a running turn as idle is
+//! the one misreading a supervisor must never make: it types into a worker
+//! mid-turn. So the shape decides — one non-ASCII glyph that is none of the
+//! transcript's own markers, ONE space, a capitalised verb, an ellipsis, an
+//! optional parenthesised timing — and the measured list survives only to keep
+//! the loose rows recognised (`✻ Cooked for 4s · done 2:41 PM`, which has no
+//! ellipsis; `*`, which is ASCII).
+//!
 //! A signal counts only in the LIVE ZONE. Claude Code draws its composer
 //! between two full-width rules (the top one may carry a right-aligned label,
 //! `──── sandboxed ─`); the rows under the bottom rule are the FOOTER. The
-//! STATUS ROW is the lowest row above the top rule that starts, in column 0,
-//! with a spinner glyph — a spinner, `Waiting for …`, or the done row a
-//! finished turn leaves — found before any row only the transcript has: the
-//! worker's `⏺` message or tool call, or output under the `⎿` gutter. What
+//! STATUS ROW is the lowest row above the top rule that starts with a spinner
+//! glyph — a spinner, `Waiting for …`, or the done row a finished turn leaves
+//! — in column 0, or at any indent when the row has the full spinner shape,
+//! found before any row only the transcript has: the worker's `⏺` message or
+//! tool call, or output under the `⎿` gutter. What
 //! sits between the status row and the top rule never hides it, whatever it
 //! is: a `⎿  Tip:` row, a todo list, a right-aligned hint of any length, the
 //! session survey (`● How is Claude doing this session?`), a banner, a queued
@@ -85,8 +99,55 @@ impl Phase {
 }
 
 /// The glyphs Claude Code's spinner cycles through, plus the static ones it
-/// leaves on a row mid-thought.
+/// leaves on a row mid-thought — the ones we have MEASURED. It is not the
+/// busy decision (see [`is_spinner_glyph`]): a release that adds a glyph must
+/// not read as idle. It keeps the LOOSE status rows recognised, the ones the
+/// shape rule cannot claim because they have no ellipsis (`✻ Cooked for 4s
+/// · done 2:41 PM`) or no non-ASCII glyph (`*`).
 const SPINNERS: &[char] = &['✢', '✽', '✻', '✶', '✳', '✧', '✦', '⚡', '·', '*'];
+
+/// Glyphs that lead a row the spinner never leads: the transcript's own
+/// markers (`⏺`/`●` the worker's message or tool call, `⎺` the gutter under
+/// it), the composer's caret, the footer's mode arrows, a workflow's progress
+/// ring. Without this list the shape rule below would read `⏺ Bloviating…`
+/// — the worker SAYING what it is about to do — as a live spinner, and a
+/// finished turn would never read idle again.
+const NOT_SPINNER: &[char] = &['⏺', '●', '⎿', '❯', '⏵', '◯'];
+
+/// One glyph that can lead Claude Code's spinner row: one we measured, or ANY
+/// non-ASCII glyph that is not punctuation of the layout ([`NOT_SPINNER`]) and
+/// not a letter or digit. Measured 2026-09-20 on Claude Code 2.1.267, where
+/// `✶ Bloviating…` and `✳ Tempering… (15s · thinking with xhigh effort)` ran
+/// above the frame: a list of glyphs is a list of the releases we happened to
+/// look at, and a session whose spinner we cannot name reads IDLE — the one
+/// misreading a supervisor must never make, because it types into a worker
+/// mid-turn.
+fn is_spinner_glyph(g: char) -> bool {
+    SPINNERS.contains(&g) || (!g.is_ascii() && !NOT_SPINNER.contains(&g) && !g.is_alphanumeric())
+}
+
+/// The SHAPE of Claude Code's spinner row, whatever glyph it is cycling:
+/// `^\s*<glyph> <Capitalised…>( \(<timing>\))?` — one spinner glyph, ONE
+/// space (the `⎺  ` gutter's two are what that one space rules out), a
+/// capitalised verb, and text that runs into an ellipsis before any
+/// parenthesised timing. Indentation is allowed: the row is not always in
+/// column 0. Tight enough that the transcript cannot wear it, and the only
+/// thing [`SPINNERS`] is not asked about.
+fn is_spinner_shape(row: &str) -> bool {
+    let t = row.trim_start();
+    let mut cs = t.chars();
+    if !cs.next().is_some_and(is_spinner_glyph) {
+        return false;
+    }
+    let Some(text) = cs.as_str().strip_prefix(' ') else {
+        return false;
+    };
+    if !text.starts_with(char::is_uppercase) {
+        return false;
+    }
+    let head = text.split(" (").next().unwrap_or(text);
+    head.contains('…') || head.contains("...")
+}
 
 /// Classify one screen. A prompt wins over busy: a worker blocked on an
 /// approval box cannot proceed however many background shells its footer
@@ -321,15 +382,19 @@ fn is_workflow_progress(row: &str) -> bool {
     row.trim_start().starts_with('◯') && (row.contains("agents done") || row.contains("agent done"))
 }
 
-/// `^\s*[✢✽✻✶✳✧✦⚡·*]\s+\S+…` — a spinner glyph, whitespace, then a word that
-/// runs into an ellipsis (`…` or `...`).
+/// `^\s*<glyph>\s+\S+…` — a spinner glyph ([`is_spinner_glyph`], never the
+/// list alone, so an unnamed glyph is still a spinner), whitespace, then a
+/// word that runs into an ellipsis (`…` or `...`). The one-word rule stays:
+/// this is the WHOLE-SCREEN scan, where several words ending in an ellipsis
+/// are anyone's prose; the status row reads those through
+/// [`is_activity_row`].
 pub fn is_spinner_row(row: &str) -> bool {
     let t = row.trim_start();
     let mut cs = t.chars();
     let Some(g) = cs.next() else {
         return false;
     };
-    if !SPINNERS.contains(&g) {
+    if !is_spinner_glyph(g) {
         return false;
     }
     let rest = cs.as_str();
@@ -351,7 +416,7 @@ pub fn is_spinner_row(row: &str) -> bool {
 fn is_activity_row(row: &str) -> bool {
     let t = row.trim_start();
     let mut cs = t.chars();
-    if !cs.next().is_some_and(|g| SPINNERS.contains(&g)) {
+    if !cs.next().is_some_and(is_spinner_glyph) {
         return false;
     }
     let rest = cs.as_str();
@@ -453,10 +518,14 @@ fn status_block(rows: &[String], top: usize) -> StatusBlock {
 
 /// A row that can be the status row: a spinner glyph in column 0, then
 /// whitespace (`✶ Deliberating…`, `· Mustering… (38s)`, `✻ Cooked for 4s ·
-/// done 2:41 PM`).
+/// done 2:41 PM`) — or, wherever it sits on the row, the full spinner
+/// [shape](is_spinner_shape), so that an INDENTED live row is still the
+/// status row and not something the walk steps over on its way to the
+/// transcript.
 pub fn is_glyph_row(row: &str) -> bool {
     let mut cs = row.chars();
-    cs.next().is_some_and(|g| SPINNERS.contains(&g)) && cs.next().is_some_and(char::is_whitespace)
+    (cs.next().is_some_and(|g| SPINNERS.contains(&g)) && cs.next().is_some_and(char::is_whitespace))
+        || is_spinner_shape(row)
 }
 
 /// A row only the transcript has: the worker's message or tool call in column
@@ -1386,6 +1455,75 @@ mod tests {
         assert_eq!(signal(&r), None);
         assert_eq!(status_row(&r), None, "the worker's row comes first");
         assert_eq!(worker_phase(&r), Phase::Idle);
+    }
+
+    /// The two spinner rows measured on a Claude Code 2.1.267 screen, each as
+    /// a fixture, and the three ways a release moves one out from under a
+    /// glyph list: a glyph the list does not have, an indented row, and a
+    /// footer that does not say `esc to interrupt` (it does not always say it
+    /// while a turn runs). Busy is decided by the footer's phrase and by the
+    /// spinner row's SHAPE — one non-ASCII glyph, one space, a capitalised
+    /// verb, an ellipsis, an optional parenthesised timing — never by a list
+    /// of the glyphs the versions we happened to measure cycle through.
+    #[test]
+    fn the_spinner_row_reads_busy_by_its_shape_not_by_a_glyph_list() {
+        const BLOVIATING: &str = include_str!("fixtures/spinner-bloviating.txt");
+        const TEMPERING: &str = include_str!("fixtures/spinner-tempering.txt");
+        for (name, text) in [("bloviating", BLOVIATING), ("tempering", TEMPERING)] {
+            let measured = saved_screen(text);
+            let at = measured
+                .iter()
+                .position(|r| r.contains('…'))
+                .unwrap_or_else(|| panic!("{name}: the fixture has no spinner row"));
+            assert!(
+                measured.iter().any(|r| r.contains("esc to interrupt")),
+                "{name}: the fixture is the measured screen, the footer's phrase and all"
+            );
+            assert_eq!(worker_phase(&measured), Phase::Busy, "{name}: as measured");
+
+            // The footer does not always carry the phrase. Then the spinner
+            // row is the only thing left saying a turn is running.
+            let quiet: Vec<String> = measured
+                .iter()
+                .map(|r| r.replace(" · esc to interrupt", ""))
+                .collect();
+            assert!(!quiet.iter().any(|r| r.contains("esc to interrupt")));
+            let glyph = quiet[at].chars().next().expect("a glyph");
+            let tail = &quiet[at][glyph.len_utf8()..];
+            for (how, row) in [
+                ("the measured glyph", quiet[at].clone()),
+                ("a glyph the list does not have", format!("✹{tail}")),
+                ("indented", format!("  {}", quiet[at])),
+                ("indented, and unlisted", format!("  ✹{tail}")),
+            ] {
+                let mut r = quiet.clone();
+                r[at] = row.clone();
+                assert_eq!(
+                    signal(&r).as_deref(),
+                    Some("status row: spinner"),
+                    "{name}, {how}: {row:?}"
+                );
+                assert_eq!(worker_phase(&r), Phase::Busy, "{name}, {how}");
+            }
+        }
+    }
+
+    /// The shape must not hand the transcript's own markers to the status
+    /// row: `⏺ Bloviating…` is the worker SAYING what it is about to do, and
+    /// a turn that ended on such a row is idle, ellipsis and all.
+    #[test]
+    fn a_transcript_marker_never_reads_as_a_spinner_row() {
+        for glyph in ['⏺', '●', '⎿'] {
+            let said = format!("{glyph} Bloviating… (15s · thinking with xhigh effort)");
+            let r = screen(
+                &[&said, "", ""],
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+            );
+            assert!(!is_glyph_row(&r[0]), "{glyph}: status row");
+            assert_eq!(busy_reason(&r[0]), None, "{glyph}: whole-screen rule");
+            assert_eq!(signal(&r), None, "{glyph}");
+            assert_eq!(worker_phase(&r), Phase::Idle, "{glyph}");
+        }
     }
 
     /// `wait_bg.out`: a turn finished while a background workflow runs —

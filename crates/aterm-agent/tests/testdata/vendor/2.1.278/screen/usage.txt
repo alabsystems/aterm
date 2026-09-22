@@ -1,0 +1,46 @@
+
+✻ Sautéed for 6s · done 1:16 PM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Settings  Status   Config   Usage   Stats
+
+   Session
+
+   Total cost:            $0.2464
+   Total duration (API):  6s
+   Total duration (wall): 7s
+   Total code changes:    0 lines added, 0 lines
+   removed
+   Usage by model:
+       claude-haiku-4-5:  909 input, 14 output, 0
+   cache read, 0 cache write ($0.0010)
+          claude-opus-5:  4 input, 389 output, 67.5k
+   cache read, 20.2k cache write ($0.2454)
+   Prompt cache (main):   2 requests · 77% of input
+   tokens from cache · no misses · warm (1h TTL, last
+   activity 2s ago)
+
+   Current session · Resets 1:20pm
+   (America/Los_Angeles)
+   █████████▋
+
+   18% used
+
+   Current week (all models) · Resets Sep 23 at 12pm
+   (America/Los_Angeles)
+   ██████████████████████████████████▌
+
+   64% used
+
+   Current week (Fable) · Resets Sep 23 at 12pm
+   (America/Los_Angeles)
+   ██████████████████████████████████████████████████
+   ████
+   100% used
+
+   What's contributing to your limits usage?
+   Approximate, based on local sessions on this
+   machine — does not include other devices or
+   claude.ai
+
+   Last 24h · these are independent characteristics
+   of your usage, not a breakdown                     ↓

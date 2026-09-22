@@ -9,20 +9,48 @@ struct HdrU {
     float2 _pad;
 };
 
+// The crown reads the SAME GlowInstance stream the bloom extract does — a rect
+// plus a colour PAIR (aterm_render::GlowQuad::color2) — and ramps it per
+// column with the identical integer law cell.metal's fs_glow uses, BEFORE its
+// boost, so a gradient quad is the same gradient in the crown as on the glass
+// and a flat pair is the identity (the bytes the Unorm8x4 decode delivered).
 struct HdrVsOut {
     float4 pos [[position]];
-    float4 color;
+    // The quad's left edge in SWAPCHAIN px (the rect's x plus the W1 band
+    // offset, both whole pixels) and its width.
+    float2 span [[flat]];
+    uint4 c0 [[flat]];
+    uint4 c1 [[flat]];
 };
 
-// Uint16x4 arrives as ushort4; widened to uint4 to mirror the WGSL vec4<u32>.
+// GLOW_ATTRS: 0 => Uint16x4 (rect), 1 => Uint8x4 (LEFT colour), 2 => Uint8x4
+// (RIGHT colour). Uint16x4 arrives as ushort4, Uint8x4 as uchar4; both are
+// widened to uint4 to mirror the WGSL vec4<u32>.
 //
 // BINDING LAW: vs_hdr_glow's uniform says [[buffer(0)]]; safe ONLY because the
 // instance stream for this [[stage_in]] sits at vertex-buffer index 30
 // (ffi.rs::INSTANCE_STREAM_SLOT) — see cell.metal's fuller statement.
 struct HdrVsIn {
     ushort4 rect_u [[attribute(0)]];
-    float4 color   [[attribute(1)]];
+    uchar4 c0      [[attribute(1)]];
+    uchar4 c1      [[attribute(2)]];
 };
+
+static inline uint glow_column(float pos_x, float2 span) {
+    return uint(clamp(floor(pos_x - span.x), 0.0, max(span.y - 1.0, 0.0)));
+}
+
+static inline uint4 glow_lerp4(uint4 c0, uint4 c1, uint i, uint w) {
+    uint m = 2u * min(i, w - 1u) + 1u;
+    return (c0 * (2u * w - m) + c1 * m + uint4(w)) / (2u * w);
+}
+
+// The fragment's premultiplied sRGB-space colour, ramped, as 0..1 floats.
+static inline float3 crown_color(HdrVsOut in) {
+    uint w = max(uint(in.span.y), 1u);
+    uint4 c = glow_lerp4(in.c0, in.c1, glow_column(in.pos.x, in.span), w);
+    return float3(c.rgb) / 255.0;
+}
 
 static inline float2 hdr_corner(uint vi) {
     const float2 c[6] = {
@@ -41,7 +69,9 @@ vertex HdrVsOut vs_hdr_glow(uint vi [[vertex_id]],
     float2 px = rect.xy + k * rect.zw + hu.content_off;
     HdrVsOut o;
     o.pos = float4(2.0 * px.x / hu.screen.x - 1.0, 1.0 - 2.0 * px.y / hu.screen.y, 0.0, 1.0);
-    o.color = vin.color;
+    o.span = float2(rect.x + hu.content_off.x, rect.z);
+    o.c0 = uint4(vin.c0);
+    o.c1 = uint4(vin.c1);
     return o;
 }
 
@@ -68,7 +98,7 @@ static inline float white_part(float3 c) {
 // WGSL smoothstep(low, high, x), argument for argument.
 fragment float4 fs_hdr_glow(HdrVsOut in [[stage_in]],
                             constant HdrU& hu [[buffer(0)]]) {
-    float3 c = clamp(in.color.rgb, float3(0.0), float3(1.0));
+    float3 c = clamp(crown_color(in), float3(0.0), float3(1.0));
     float3 lo = c / 12.92;
     float3 hi = pow((c + float3(0.055)) / 1.055, float3(2.4));
     // MSL select(a,b,cond) == cond ? b : a — the SAME argument order as WGSL's
@@ -85,7 +115,7 @@ fragment float4 fs_hdr_glow(HdrVsOut in [[stage_in]],
 // non-sRGB Unorm view, so blending works in code values (no s2l decode).
 fragment float4 fs_sdr_glow(HdrVsOut in [[stage_in]],
                             constant HdrU& hu [[buffer(0)]]) {
-    float3 c = clamp(in.color.rgb, float3(0.0), float3(1.0));
+    float3 c = clamp(crown_color(in), float3(0.0), float3(1.0));
     float bound = max(hu.headroom, 0.0);
     return float4(c * bound * max(hu.boost, 0.0), 0.0);
 }

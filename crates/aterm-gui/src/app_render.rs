@@ -5500,6 +5500,14 @@ fn acknowledge_successful_present(
     if content_presented {
         state.on_content_presented(presented_at);
     }
+    // THE INSTRUMENT'S REFERENCE STAMP: this present registered a compositor
+    // presented handler, and its registration instant (on the registration
+    // clock) is what the NEXT present's "burst" is decided against. A path that
+    // registers no handler (CPU, wgpu, the headless virtual target) leaves the
+    // stamp alone.
+    if let Some(registration) = aterm_gpu::present_glass::take_registration() {
+        state.last_registration_ns = Some(registration.registered_ns);
+    }
     SuccessfulPresentWindowOutcome {
         frame_interval,
         offscreen,
@@ -18128,6 +18136,8 @@ mod composed_cursor_effect_projection_tests {
                 color: 0x0012_3456,
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: 0x0012_3456,
+                alpha2: 0,
             },
             GlowQuad {
                 row: 0,
@@ -18138,6 +18148,8 @@ mod composed_cursor_effect_projection_tests {
                 color: 1,
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: 1,
+                alpha2: 0,
             },
         ];
         let halos = [
@@ -19529,6 +19541,17 @@ mod composed_cursor_effect_advance_tests {
             .map_or(0, |s| s.retired)
     }
 
+    /// `ribbon_followed=` on the composed window (2026-09-21): the cells the
+    /// follow pass carried to another row WITH their text.
+    fn composed_ribbon_followed(app: &App, wid: WindowId) -> u64 {
+        app.windows
+            .get(&wid)
+            .expect("test window")
+            .cursor_glow
+            .v2_status()
+            .map_or(0, |s| s.followed)
+    }
+
     /// Type `text` into the composed fixture one licensed key at a time, at
     /// the owner's 90 ms cadence, presenting a composed frame per key.
     /// Returns the clock of the last present.
@@ -19659,36 +19682,56 @@ mod composed_cursor_effect_advance_tests {
     }
 
     /// THE DEFECT: a program re-lays its input box two rows down with no key
-    /// behind it. The move is declined, the text under the old band is gone,
-    /// and the witness must retire every one of its eleven cells inside the
-    /// melt. RED before the composed path fed the witness: `ribbon_retired=0`,
-    /// eleven cells still LIVE, still lit 400 ms later.
+    /// behind it. The move is declined, and the text under the old band is
+    /// gone from its row. RED before the composed path fed the witness:
+    /// `ribbon_retired=0`, eleven cells still LIVE on the row the text left,
+    /// still lit 400 ms later.
+    ///
+    /// RE-PINNED 2026-09-21 (the band follows its text — `rk::witness`'s
+    /// follow pass, `Engine::follow_rows`; the single-pane twin is
+    /// `abandoned_ribbon.rs`'s
+    /// `a_relocated_input_box_carries_the_band_with_its_text_and_stamps_nothing`).
+    /// Until then this pinned the melt: all eleven cells retired where the
+    /// text WAS. The hand typed exactly those glyphs, and they stand two rows
+    /// down at their own columns, so the band is now TRANSLATED there on the
+    /// composed frame with every clock intact: nothing on the old row,
+    /// nothing retired, `ribbon_followed=11`. That count is still the proof
+    /// the composed path FEEDS the witness — the follow pass reads the same
+    /// samples, and a starved witness follows nothing and leaves all eleven
+    /// cells live on the old row.
     #[test]
-    fn a_relocated_input_box_retires_its_abandoned_band_on_a_composed_frame() {
+    fn a_relocated_input_box_carries_its_band_with_its_text_on_a_composed_frame() {
         for shape in [
             ComposedShape::Split(crate::tab_model::SplitAxis::Horizontal),
             ComposedShape::ThreePane,
             ComposedShape::Zoomed,
         ] {
-            let (mut app, wid, term, t, win_row, _) = composed_hello(shape);
+            let (mut app, wid, term, t, win_row, win_col) = composed_hello(shape);
             let t = composed_idle(&mut app, wid, t, 400);
             term_lock(&term).process(b"\x1b[2J\x1b[8;1Hhello world");
             let t = composed_idle(&mut app, wid, t, 16);
-            let leaving: Vec<(u16, bool)> = composed_ribbon_row(&app, wid, win_row)
-                .into_iter()
-                .filter(|&(_, leaving)| leaving)
-                .collect();
-            assert_eq!(
-                leaving.len(),
-                11,
-                "{shape:?}: every cell of the abandoned band is retired on the \
-                 composed frame"
+            assert!(
+                composed_ribbon_row(&app, wid, win_row).is_empty(),
+                "{shape:?}: the band left the row its text left: {:?}",
+                composed_ribbon_row(&app, wid, win_row)
             );
-            assert_eq!(composed_ribbon_retired(&app, wid), 11, "{shape:?}");
+            let carried: Vec<(u16, bool)> = (0..11).map(|k| (win_col + k, false)).collect();
+            assert_eq!(
+                composed_ribbon_row(&app, wid, win_row + 2),
+                carried,
+                "{shape:?}: …and stands under its text two rows down, live"
+            );
+            assert_eq!(composed_ribbon_followed(&app, wid), 11, "{shape:?}");
+            assert_eq!(composed_ribbon_retired(&app, wid), 0, "{shape:?}");
             let _ = composed_idle(&mut app, wid, t, 200);
             assert!(
                 composed_ribbon_row(&app, wid, win_row).is_empty(),
-                "{shape:?}: the abandoned band is out of the pool inside 200 ms"
+                "{shape:?}: nothing came back to the row the text left"
+            );
+            assert_eq!(
+                composed_ribbon_row(&app, wid, win_row + 2),
+                carried,
+                "{shape:?}: the band stays under its text 200 ms on"
             );
         }
     }
@@ -20922,6 +20965,72 @@ mod composed_cursor_effect_advance_tests {
             (a.cursor_fill, &a.glow, &a.trail),
             "negative control: the retired headless second lock tears effects from later cells"
         );
+    }
+
+    /// **A PANE'S SNAPSHOT RETIRES WITH ITS ROUTE.** `unfocused_pane_scratch`
+    /// holds one full per-pane grid snapshot per unfocused visible pane, and
+    /// its own doc says it is "pruned to the live pane set after each compose".
+    /// Both prune sites live INSIDE the composed route, so a window that split
+    /// and then unsplit — or switched to a single-pane, native or mixed tab —
+    /// kept every background pane's last snapshot for the life of the window.
+    /// The map is keyed by PANE INDEX, so unlike `leaf_render_cache` (keyed by
+    /// the process-unique `ViewId` and removed on view teardown) nothing on the
+    /// teardown path could address its entries at all.
+    ///
+    /// What that retains is not only cells (0.61 MiB for a 96x240 pane):
+    /// `RenderInput.images` holds `ImageRef { image: Arc<ImageData> }`, so a
+    /// stale entry becomes the sole owner of the raw payload of every inline
+    /// image that frame referenced — up to `MAX_IMAGE_BYTES` apiece — after the
+    /// pane, its session and its terminal are gone.
+    #[test]
+    fn only_the_composed_route_keeps_the_unfocused_pane_snapshots() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let view = app
+            .view_store
+            .insert_terminal(0)
+            .expect("a view identity for the Native arm");
+        let park = |app: &mut App| {
+            app.windows
+                .get_mut(&wid)
+                .expect("test window")
+                .unfocused_pane_scratch
+                .entry(0)
+                .or_default();
+        };
+        // THE COMPOSED ROUTE KEEPS THEM — it is the one that prunes to the live
+        // pane set, and this is the control: without it a "fix" that cleared
+        // unconditionally would pass every other case here.
+        park(&mut app);
+        App::retire_unfocused_pane_snapshots(
+            app.windows.get_mut(&wid).expect("test window"),
+            crate::VisibleContentRoute::Terminal { composed: true },
+        );
+        assert!(
+            !app.windows[&wid].unfocused_pane_scratch.is_empty(),
+            "the composed route prunes its own map and must keep it here"
+        );
+        // …and EVERY OTHER ROUTE retires them. Each of these shows no unfocused
+        // terminal pane this frame, and none of them prunes.
+        for route in [
+            crate::VisibleContentRoute::Terminal { composed: false },
+            crate::VisibleContentRoute::Heterogeneous,
+            crate::VisibleContentRoute::Native {
+                instance: crate::tab_model::AppInstanceId::from_stored(7),
+                view,
+            },
+        ] {
+            park(&mut app);
+            assert!(!app.windows[&wid].unfocused_pane_scratch.is_empty());
+            App::retire_unfocused_pane_snapshots(
+                app.windows.get_mut(&wid).expect("test window"),
+                route,
+            );
+            assert!(
+                app.windows[&wid].unfocused_pane_scratch.is_empty(),
+                "{route:?} kept a background pane's whole snapshot"
+            );
+        }
     }
 
     #[test]
@@ -23721,6 +23830,157 @@ mod motion_policy_tests {
             "the post-present latch edge must not retain a full-motion native frame"
         );
     }
+
+    /// SMOOTH SCROLL IS NOT A CASUALTY OF LOAD SHEDDING (the owner's 2026-09-22
+    /// report of blocky scrolling in a large Codex session is the case this
+    /// closes off; whether the latch tripped there was not measured). The latch is
+    /// engaged exactly as production engages it — `PERF_HYSTERESIS_FRAMES`
+    /// presents over 1.5× a 120 Hz budget — and it DOES shed decoration (the
+    /// control assertions). Then a focused window under the default config
+    /// takes a wheel notch: it must arm a glide, the mid-ease tick must keep
+    /// it armed, the compose tail must PRESENT the banked sub-row band, and
+    /// the shared settle must leave it alone. Against the single fold this
+    /// fails at the first post-latch assertion: the notch took the instant
+    /// whole-row branch and armed nothing. The tail proves the exemption is
+    /// narrow: the OS Reduce Motion flag still lands the glide and zeroes the
+    /// band, exactly as `motion.rs` proves.
+    #[test]
+    fn load_shed_latch_never_demotes_smooth_scroll() {
+        use crate::{WindowId, term_lock};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.config.motion = Some("auto".into());
+        app.config.load_adaptive_motion = None;
+        app.system_reduce_motion = false;
+        app.windows.get_mut(&wid).unwrap().focused = true;
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        {
+            let mut t = term_lock(&term);
+            for i in 0..60 {
+                t.process(format!("line {i}\r\n").as_bytes());
+            }
+            assert!(
+                t.grid().scrollback_lines() >= 10,
+                "test needs real scrollback"
+            );
+        }
+
+        // Engage the latch the way production does: K consecutive presents
+        // over 1.5× the 8.33 ms budget of a 120 Hz panel (13 ms > 12.5 ms).
+        let fi = Duration::from_micros(8_333);
+        let t0 = Instant::now();
+        for frame in 0..PERF_HYSTERESIS_FRAMES {
+            app.note_present_cost(
+                13_000_000,
+                fi,
+                t0 + Duration::from_millis(u64::from(frame) * 8),
+            );
+        }
+        // CONTROLS: the latch is engaged and decoration IS shed.
+        assert!(app.load_shed_active(), "control: the latch engaged");
+        assert_eq!(
+            app.motion_policy(true),
+            MotionPolicy::Reduced,
+            "control: the decorative fold is Reduced under the latch"
+        );
+        assert_eq!(
+            app.effect_policy(MotionEffect::CursorGlow, true),
+            MotionPolicy::Reduced,
+            "control: a decorative effect resolves through the latch"
+        );
+        // The functional pair resolves through accessibility alone.
+        assert_eq!(
+            app.effect_policy(MotionEffect::SmoothScroll, true),
+            MotionPolicy::Full
+        );
+        assert_eq!(
+            app.effect_policy(MotionEffect::ScrollPill, true),
+            MotionPolicy::Full
+        );
+        assert!(app.smooth_scroll_animates(wid));
+
+        // A wheel notch under the latch ARMS a glide (it snapped before).
+        let offset_before = term_lock(&term).grid().display_offset();
+        let wheel_at = Instant::now();
+        app.scroll_wheel_animated(wid, &term, 3);
+        assert!(
+            app.windows[&wid].scroll_glide.is_some(),
+            "a wheel notch under the load-shed latch must arm the glide"
+        );
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            offset_before,
+            "the notch eases; it does not snap the engine whole-row"
+        );
+        // Mid-ease (≤ 90 ms of a 180 ms glide) the tick samples and keeps the
+        // glide armed instead of landing it.
+        app.tick_scroll_glide(wid, wheel_at + Duration::from_millis(90));
+        assert!(
+            app.windows[&wid].scroll_glide.is_some(),
+            "the mid-ease tick must not land the glide under the latch"
+        );
+        // The compose tail PRESENTS whatever the bank holds (a known residual,
+        // so the assertion does not depend on the ease's wall-clock sample).
+        app.windows.get_mut(&wid).unwrap().scroll_frac_px = 5;
+        app.set_scroll_band(wid);
+        assert_eq!(
+            app.windows[&wid].input_scratch.scroll_frac_px, 5,
+            "the sub-row band must be presented under the latch"
+        );
+        assert!(
+            !app.settle_scroll_motion_if_reduced(wid, Instant::now()),
+            "the shared settle resolves Full and leaves the glide alone"
+        );
+        // A latch EDGE under a live glide leaves it armed. Clear the latch (K
+        // fast presents once the 1.5 s dwell has elapsed) and re-shed it with
+        // the glide still in flight: `flip_shed_latch` used to settle the glide
+        // whole-row on exactly this edge.
+        for frame in 0..PERF_HYSTERESIS_FRAMES {
+            app.note_present_cost(
+                0,
+                fi,
+                t0 + Duration::from_millis(2_000 + u64::from(frame) * 8),
+            );
+        }
+        assert!(!app.load_shed_active(), "control: the latch cleared");
+        for frame in 0..PERF_HYSTERESIS_FRAMES {
+            app.note_present_cost(
+                13_000_000,
+                fi,
+                t0 + Duration::from_millis(2_100 + u64::from(frame) * 8),
+            );
+        }
+        assert!(app.load_shed_active(), "control: the latch re-engaged");
+        assert!(
+            app.windows[&wid].scroll_glide.is_some(),
+            "a shed edge must not land a glide in flight"
+        );
+
+        // THE EXEMPTION IS NARROW: accessibility still demotes exactly as proven.
+        app.system_reduce_motion = true;
+        assert_eq!(
+            app.effect_policy(MotionEffect::SmoothScroll, true),
+            MotionPolicy::Reduced
+        );
+        assert!(
+            app.settle_scroll_motion_if_reduced(wid, Instant::now()),
+            "OS Reduce Motion lands the glide"
+        );
+        assert!(app.windows[&wid].scroll_glide.is_none());
+        assert_eq!(app.windows[&wid].scroll_frac_px, 0);
+        app.set_scroll_band(wid);
+        assert_eq!(app.windows[&wid].input_scratch.scroll_frac_px, 0);
+        // …and so does the unfocused demotion (W11b), latch or no latch.
+        app.system_reduce_motion = false;
+        assert_eq!(
+            app.effect_policy(MotionEffect::SmoothScroll, false),
+            MotionPolicy::Reduced
+        );
+    }
 }
 
 /// One frame's terminal-state snapshot for [`App::tick_cursor_fx`] — the exact
@@ -24091,6 +24351,12 @@ pub(crate) struct CursorFxTick {
     /// Cursor light and companions combine this with `shed_envelope` instead of
     /// inheriting the latch's hard Reduced step.
     pub cursor_motion: crate::motion::MotionPolicy,
+    /// The policy for FUNCTIONAL motion (SmoothScroll, ScrollPill): the
+    /// accessibility/focus fold with the load-shed latch left out
+    /// (`App::effect_policy`), resolved on `motion_focus` — the SAME focus
+    /// input `set_scroll_band` uses, so the frame key's `scroll_frac_px` term
+    /// and the presented band are one gate.
+    pub scroll_motion: crate::motion::MotionPolicy,
     /// Effective adaptive-shed amplitude after the user's `motion = "full"`
     /// and `load_adaptive_motion = false` opt-outs. Shared by cursor light,
     /// cursor bodies, and both companion presentations.
@@ -25188,18 +25454,24 @@ impl App {
     }
 
     /// Resolve the MOTION POLICY (W11) for a window whose focus state is
-    /// `focused` — THE one call every decorative-animation consumer (and every
-    /// future motion feature: smooth scroll, ink-fade, …) makes. Pure + total:
-    /// config `motion` (auto/full/reduced) folded with the live OS "Reduce
-    /// Motion" flag and the window focus (unfocused always demotes to static).
-    /// See [`crate::motion`] for the proven reduced-motion totality invariant.
+    /// `focused` — THE one call every decorative-animation consumer makes.
+    /// Pure + total: config `motion` (auto/full/reduced) folded with the live
+    /// OS "Reduce Motion" flag and the window focus (unfocused always demotes
+    /// to static), PLUS the load-shed latch below. See [`crate::motion`] for
+    /// the proven reduced-motion totality invariant.
+    ///
+    /// FUNCTIONAL motion (the wheel glide, the scroll pill) must NOT consume
+    /// this fold: the latch is a render-cost heuristic and those effects are
+    /// the terminal answering the user's hand. They resolve through
+    /// [`Self::effect_policy`], which exempts them from the latch alone.
     pub(crate) fn motion_policy(&self, focused: bool) -> crate::motion::MotionPolicy {
         // LOAD-ADAPTIVE EFFECT SHEDDING (Change #1): a sustained RENDER-overload session
         // forces the SAME proven zero-amplitude state as OS Reduce Motion so aterm stays
-        // responsive — every governed effect (aurora/comet/sparkle/scene/stream-fade)
+        // responsive — every DECORATIVE effect (aurora/comet/sparkle/scene/stream-fade)
         // drops to amplitude 0 and the `should_repaint` content early-out re-engages.
         // Routed through the existing `MotionPolicy::Reduced` (byte-tested in `motion.rs`)
-        // rather than any new per-effect gate.
+        // rather than any new per-effect gate; the per-effect EXEMPTION for functional
+        // motion lives in `effect_policy`, not here.
         //
         // But it YIELDS to the user's EXPLICIT intent: `motion = "full"` means "always
         // animate" (it already overrides the OS Reduce-Motion flag), and
@@ -25211,6 +25483,60 @@ impl App {
             return crate::motion::MotionPolicy::Reduced;
         }
         crate::motion::MotionPolicy::resolve(mode, self.system_reduce_motion, focused)
+    }
+
+    /// The motion policy for ONE effect — [`Self::motion_policy`] for every
+    /// decorative effect, and for FUNCTIONAL motion
+    /// ([`MotionEffect::load_shed_exempt`](crate::motion::MotionEffect::load_shed_exempt):
+    /// the M1 wheel glide, the scroll pill) the proven accessibility fold
+    /// ALONE, with the load-shed latch left out.
+    ///
+    /// Why the latch may not touch scrolling: it trips on `PERF_HYSTERESIS_FRAMES`
+    /// presents over `PERF_SHED_FACTOR`× budget and then HOLDS for
+    /// `PERF_SHED_DWELL_MIN`..`PERF_SHED_DWELL_MAX` (1.5–30 s). Under the old
+    /// single fold that dwell turned every wheel notch into an instant whole-row
+    /// `scroll_display`, landed the in-flight glide on the latch edge and forced
+    /// the sub-row band to 0 — manual scrolling would go blocky for as long as
+    /// the latch held (the owner's 2026-09-22 report of blocky scrolling in a
+    /// large Codex session is the case this closes off; whether the latch
+    /// actually tripped there was not measured — read `perf_reduced` /
+    /// `shed_transitions` on that instance), and the Full
+    /// repaints a glide forces are exactly the frames that keep the clear
+    /// threshold out of reach, so the latch could hold for the whole scroll.
+    /// Shedding decoration keeps the terminal responsive; shedding the response
+    /// to the user's own hand is the opposite of responsive.
+    ///
+    /// What still demotes an exempt effect, exactly as [`crate::motion`] proves:
+    /// OS Reduce Motion (under `auto`), `motion = "reduced"`, and an unfocused
+    /// window. `motion = "full"` / `load_adaptive_motion = false` are unchanged
+    /// (they already bypassed the latch for every effect).
+    pub(crate) fn effect_policy(
+        &self,
+        effect: crate::motion::MotionEffect,
+        focused: bool,
+    ) -> crate::motion::MotionPolicy {
+        if effect.load_shed_exempt() {
+            crate::motion::MotionPolicy::resolve(
+                self.config.motion_mode(),
+                self.system_reduce_motion,
+                focused,
+            )
+        } else {
+            self.motion_policy(focused)
+        }
+    }
+
+    /// Whether the M1 SmoothScroll effect (the glide, the sub-row band
+    /// translate, the overscroll bounce) animates for window `wid` — the ONE
+    /// gate its every consumer shares (the wheel reducer, the glide and bounce
+    /// ticks, the settle reducer, the compose-tail band, and the frame key's
+    /// `scroll_frac_px` term via [`CursorFxTick::scroll_motion`]), so the key
+    /// and the presented band can never disagree. Focus is the window's own OS
+    /// focus OR the recording pin ([`Self::motion_focus`]).
+    pub(crate) fn smooth_scroll_animates(&self, wid: WindowId) -> bool {
+        let focused = self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused));
+        self.effect_policy(crate::motion::MotionEffect::SmoothScroll, focused)
+            .animate(crate::motion::MotionEffect::SmoothScroll)
     }
 
     /// The focus bit the MOTION seam (W11) consumes for window `id`: the real
@@ -25455,13 +25781,13 @@ impl App {
         self.perf_flip_at = Some(now);
         self.perf_reduced = shed;
         self.perf_run = 0;
-        if shed {
-            // Adaptive shedding is another Full→Reduced policy source. Settle
-            // retained scroll motion on the latch edge itself; explicit
-            // `motion = "full"` / adaptive opt-out remain Full because the
-            // shared resolver checks the effective policy before mutating.
-            self.settle_reduced_scroll_motion(now);
-        }
+        // The latch is NOT a SmoothScroll policy source (`effect_policy`
+        // exempts functional motion), so a shed edge settles no glide: the
+        // ease in flight keeps easing and the sub-row band keeps presenting.
+        // The settle this edge used to run is what landed a live glide
+        // whole-row mid-gesture. Config / OS / focus edges still settle at
+        // their own reducers, and `about_to_wait`'s prepass remains the
+        // defensive convergence for every real policy source.
     }
 
     /// The SOFT load-shed envelope in [0, 1] at `now`: ramps toward 0 while the
@@ -25803,6 +26129,12 @@ impl App {
             } else {
                 0.0
             },
+            // Read off the ENGINE, never re-derived from the config here: the
+            // row must report the seam the last tick actually LEFT, not a
+            // parallel derivation that could drift from the gate
+            // `cue_keystroke_shifted` tests on its first line — the same rule
+            // the `focused` field above states.
+            sound_seam: ws.cursor_glow.sound_seam_open(),
             // The presentation the same resolved config draws: the default
             // full-height v0.43 stream, or the underline/highlighter alternate
             // an explicit `… underline` spelling selects. Stable wire tokens.
@@ -25937,6 +26269,11 @@ impl App {
         // Keep the legacy hard-shed policy for downstream non-cursor effects.
         // Cursor-family consumers use `cursor_motion` plus the soft envelope.
         let motion = self.motion_policy(win_focused);
+        // Functional motion never inherits the latch; see `effect_policy`.
+        let scroll_motion = self.effect_policy(
+            crate::motion::MotionEffect::SmoothScroll,
+            self.motion_focus(id, raw_focused),
+        );
         let cursor_body_allowed = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::CursorBody);
@@ -25966,11 +26303,40 @@ impl App {
         // (`trail_gesture_voice`, hoisted above the window borrow below).
         let trail_voice = self.config.trail_sound_voice_for(trail_presentation);
         let mut glow_cfg = self.glow_config_for(trail_presentation);
+        // THE USER'S OWN BRIGHTNESS KNOB, read BEFORE the policy fold below —
+        // the one point at which the three different meanings of a zero
+        // `intensity` are still separable. `cursor_trail_intensity = 0` is how
+        // a person turns the aurora off without touching `cursor_trail`, and
+        // it was dark AND silent before the audio seam was split out. It is
+        // their explicit off (binding decision C), so it must stay silent;
+        // the two POLICY folds on the next line — accessibility and load
+        // shed — must not. Taken off the resolved config rather than the raw
+        // setting so a style PACK that resolves to zero counts too.
+        let user_lit = glow_cfg.intensity > 0.0;
         // Reduced motion ⇒ amplitude EXACTLY 0: the animator then clears its
         // state and emits nothing (proven zero, not merely dimmed). Load shed
         // rides in as the soft envelope instead (0 only after the fade-out).
         glow_cfg.intensity *=
             cursor_motion.amplitude(crate::motion::MotionEffect::CursorGlow) * shed_env;
+        // …and the AUDIO half, which the line above must not decide. That
+        // fold is two MOTION policies — the accessibility stage and the
+        // performance shed envelope — and neither may mute typing: a
+        // key-time click costs no GPU, and `Reduce Motion` is a motion
+        // setting, not an audio one. Before this split, a shed frame or a
+        // Reduce-Motion session zeroed `intensity`, the engine read that as
+        // "dark ⇒ silent", and every keystroke went quiet while `aterm ctl
+        // tone` still said `audio=live`.
+        //
+        // What DOES still decide audibility here: whose window the key landed
+        // in, and whether the person asked for any aurora at all
+        // (`user_lit`). The master switch and serious mode ride
+        // `glow_cfg.enabled`, and the sound knobs (`trail_sounds`,
+        // `trail_sound_volume`, the resize-quiet window, a dead audio worker)
+        // gate in `keystroke_click_audible` before a cue is minted.
+        // `win_focused` is the fold computed above — the same value `trail
+        // status` prints as `focused=` — so the row and the seam cannot
+        // drift.
+        glow_cfg.audible = win_focused && user_lit;
         // Fold the LIVE theme ground: on light themes the vapor (smoke/steam)
         // switches to source-over veils (HaloMode::Over) so it reads on white.
         glow_cfg.dark_theme = aterm_render::theme_is_dark(default_bg);
@@ -26170,10 +26536,15 @@ impl App {
             motion_pulse,
             &mut ws.cursor_cat,
         );
-        // TRAIL SOUND: hand the spawn edge's cues to the synth. The engine
-        // only records cues when it actually spawned light, so every gate the
-        // aurora honours (style off, reduced motion ⇒ intensity 0, unfocused
-        // demotion) already silences the sound by construction; the explicit
+        // TRAIL SOUND: hand the spawn edge's cues to the synth. This drain
+        // carries the ECHO-born cues, which the engine records only where it
+        // actually spawned light — so for THEM every gate the aurora honours
+        // (style off, reduced motion ⇒ intensity 0, unfocused demotion) still
+        // silences the sound by construction. That is NOT true of the
+        // KEY-TIME click any more: it is minted in `app_input` under
+        // `keystroke_click_audible` and the engine's `audible` verdict, and
+        // reaches the synth without passing here, precisely so a shed or
+        // motion-reduced frame still sounds its keys. The explicit
         // raw-focus check additionally mutes the recording-pinned case
         // (`motion_focus`) — a watched background window may animate but must
         // not talk over the foreground one. Cues are ALWAYS drained (a muted
@@ -26799,6 +27170,7 @@ impl App {
             win_focused,
             motion,
             cursor_motion,
+            scroll_motion,
             shed_envelope: shed_env,
             glow_cfg,
             trail_color: trail_cfg.color,
@@ -27168,6 +27540,13 @@ impl App {
             let pane_col0 = u16::try_from(col).unwrap_or(u16::MAX);
             window.cursor_glow.note_pane_columns(pane_col0, pane_cols);
             window.cursor_trail.note_pane_columns(pane_col0, pane_cols);
+            // …and its ROWS, for the band's reach below a row: a stacked
+            // split's focused pane poured the comet's lower lobe and the
+            // vivid rail over the divider, because the only floor either
+            // asked about was the window grid's. Rainbow Kitty (v2) only —
+            // the v1 trail has no band and nothing that reaches below a row.
+            let pane_row0 = u16::try_from(row).unwrap_or(u16::MAX);
+            window.cursor_glow.note_pane_rows(pane_row0, pane_rows);
             let blink_recent = window
                 .last_blink_at
                 .is_some_and(|t| now.saturating_duration_since(t) <= BLINK_RECENT_MAX);
@@ -29492,6 +29871,41 @@ impl App {
         );
     }
 
+    /// **A PANE'S SNAPSHOT RETIRES WITH ITS ROUTE.**
+    ///
+    /// `WindowState::unfocused_pane_scratch` holds one full per-pane grid snapshot
+    /// per unfocused visible pane, and its own doc says it is "pruned to the live
+    /// pane set after each compose". Both prune sites live INSIDE the composed
+    /// route — the `retain` at the end of `redraw_compose_after_focused_extract`
+    /// and its twin on the composed capture path — so every other route kept what
+    /// the composed one had parked. A window that split and then unsplit, or
+    /// switched to a single-pane, native or mixed tab, held each background pane's
+    /// last snapshot for the life of the WINDOW.
+    ///
+    /// What that retains is not only cells (measured: 0.61 MiB for a 96x240 pane,
+    /// 1.22 MiB for a full 4K grid). `RenderInput.images` holds
+    /// `ImageRef { image: Arc<ImageData> }`, so a stale entry becomes the sole
+    /// owner of the raw payload of every inline image that frame referenced — up
+    /// to `MAX_IMAGE_BYTES` apiece — long after the pane, its session and its
+    /// terminal are gone. And because the map is keyed by PANE INDEX, nothing on
+    /// the teardown path could address its entries: unlike `leaf_render_cache`,
+    /// which is keyed by the process-unique `ViewId` and removed on view teardown,
+    /// there is no id to remove.
+    ///
+    /// Retiring them costs at most one unretained frame: the composed retain-gate
+    /// already falls back to a full repaint when an index is absent.
+    fn retire_unfocused_pane_snapshots(
+        ws: &mut crate::WindowState,
+        route: crate::VisibleContentRoute,
+    ) {
+        if !matches!(
+            route,
+            crate::VisibleContentRoute::Terminal { composed: true }
+        ) {
+            ws.unfocused_pane_scratch.clear();
+        }
+    }
+
     pub(crate) fn redraw_window(&mut self, id: WindowId) {
         self.redraw_window_with_layout(id, None);
     }
@@ -29682,6 +30096,12 @@ impl App {
             && let Some(ws) = self.windows.get_mut(&id)
         {
             ws.pet_hit_rect = None;
+        }
+        // THE PER-PANE SNAPSHOTS retire with their route — one rule, named
+        // once, so it can be asked directly (the redraw seam itself has no
+        // headless harness).
+        if let Some(ws) = self.windows.get_mut(&id) {
+            Self::retire_unfocused_pane_snapshots(ws, route);
         }
         let multi_pane = match route {
             crate::VisibleContentRoute::Terminal { composed } => {
@@ -30148,6 +30568,7 @@ impl App {
             ws.cursor_trail.note_context(is_alt);
             ws.cursor_glow.note_pane_columns(0, cols);
             ws.cursor_trail.note_pane_columns(0, cols);
+            ws.cursor_glow.note_pane_rows(0, rows);
             let blink_recent = ws
                 .last_blink_at
                 .is_some_and(|t| frame_started.saturating_duration_since(t) <= BLINK_RECENT_MAX);
@@ -30512,6 +30933,7 @@ impl App {
                 win_focused,
                 motion,
                 cursor_motion,
+                scroll_motion,
                 shed_envelope,
                 glow_cfg,
                 trail_color,
@@ -32117,7 +32539,7 @@ impl App {
             // invisible — byte-identical to the pre-pill path. Alt screen
             // suppressed (no scrollback there, like the sparkle words).
             let pill_fp = {
-                let animated = motion.animate(crate::motion::MotionEffect::ScrollPill);
+                let animated = scroll_motion.animate(crate::motion::MotionEffect::ScrollPill);
                 let alpha = ws.scroll_pill.alpha(frame_started, animated);
                 let hist = scrollback_lines;
                 let mut fp = 0u64;
@@ -32163,6 +32585,8 @@ impl App {
                                     color,
                                     // ADDITIVE light (see `GlowQuad::alpha`).
                                     alpha: 0,
+                                    color2: color,
+                                    alpha2: 0,
                                 });
                             }
                         }
@@ -32250,12 +32674,14 @@ impl App {
                 pill_fp,
                 preedit_fp: crate::preedit_fingerprint(&ws.preedit, ws.preedit_caret),
                 // M1b sub-row scroll: the banked residual PRESENTED this frame (gated
-                // by the SmoothScroll motion policy — Reduced ⇒ 0 ⇒ whole-row snap).
-                // A frac-only change dirties no cell, so it must live in the key or
-                // the smooth glide's re-present is swallowed by the early-out. The
-                // matching `input_scratch.scroll_frac_px` is set in the compose tail
+                // by the SmoothScroll policy — accessibility/focus only, never the
+                // load-shed latch — Reduced ⇒ 0 ⇒ whole-row snap). A frac-only
+                // change dirties no cell, so it must live in the key or the smooth
+                // glide's re-present is swallowed by the early-out. The matching
+                // `input_scratch.scroll_frac_px` is set in the compose tail
                 // (`set_scroll_band`) from the SAME gate, so key and present agree.
-                scroll_frac_px: if motion.animate(crate::motion::MotionEffect::SmoothScroll) {
+                scroll_frac_px: if scroll_motion.animate(crate::motion::MotionEffect::SmoothScroll)
+                {
                     ws.scroll_frac_px
                 } else {
                     0
@@ -32337,7 +32763,11 @@ impl App {
                 // Nothing visible changed since the last present. The exact
                 // refill found no projection drift, so consuming its paired
                 // damage is safe: `input_scratch` already holds that same grid.
-                // Refresh only window chrome and skip renderer/present work.
+                // Refresh only window chrome and skip renderer/present work —
+                // and close the output stamps this frame proved moved no pixels,
+                // so the NEXT real present does not book this idle stretch as
+                // its own latency (`discard_unpresented_output_stamps`).
+                self.discard_unpresented_output_stamps(id, frame_started);
                 if let Some(w) = &window {
                     self.apply_title(id, w, &title);
                 }
@@ -32443,23 +32873,28 @@ impl App {
             // frame purely to be discarded. Invalidate the age map on the skip
             // path so a later re-enable re-baselines (settled ink) instead of
             // fading in everything that changed while it was off.
-            let fade_tinted =
-                if crate::stream_fade::fade_update_needed(fade_on, ws.fade_shown) && !load_shed {
-                    // Under load-shed, skip the O(rows×cols) stream-fade fingerprint pass
-                    // (TYPING-3) — the `else` resets the age map, so ink settles to exact
-                    // bytes with no fade rather than costing a whole-grid diff every frame.
-                    ws.stream_fade.update(
-                        &mut ws.input_scratch.cells,
-                        ws.input_scratch.cols,
-                        (fade_token, fade_alt, fade_scrolled),
-                        fade_permitted,
-                        fade_ms,
-                        frame_started,
-                    )
-                } else {
-                    ws.stream_fade.reset();
-                    false
-                };
+            let fade_tinted = if crate::stream_fade::fade_update_needed(
+                fade_on,
+                ws.fade_shown,
+                fade_alt,
+                fade_scrolled,
+            ) && !load_shed
+            {
+                // Under load-shed, skip the O(rows×cols) stream-fade fingerprint pass
+                // (TYPING-3) — the `else` resets the age map, so ink settles to exact
+                // bytes with no fade rather than costing a whole-grid diff every frame.
+                ws.stream_fade.update(
+                    &mut ws.input_scratch.cells,
+                    ws.input_scratch.cols,
+                    (fade_token, fade_alt, fade_scrolled),
+                    fade_permitted,
+                    fade_ms,
+                    frame_started,
+                )
+            } else {
+                ws.stream_fade.reset();
+                false
+            };
             if fade_tinted || ws.fade_shown {
                 // Post-fill cell mutation (or the frame that ERASES the last
                 // tint) must not be masked by the snapshot-keyed render cache —
@@ -33606,6 +34041,7 @@ impl App {
         overlay: Option<OverlayGlow>,
     ) -> Result<Option<u64>, metrics::PresentDropReason> {
         let tray_floor_y = self.config_notice_tray_floor_y(id);
+        let app_frame_interval = self.frame_interval;
         // Disjoint borrows: the renderer (`self.backend`) and the target window's
         // present target + input snapshot are SEPARATE fields of `self`, so
         // destructuring lets both be borrowed mutably at once with no aliasing.
@@ -33688,6 +34124,17 @@ impl App {
             } else {
                 0
             };
+            // PRESENT → GLASS attribution (`aterm_gpu::present_glass`): the pacing
+            // FACTS this present is issued under. The tag itself — "within one
+            // refresh of this window's previous registration" — is decided at
+            // handler registration on the registration clock, not here, so a
+            // present that parks in `nextDrawable` between now and then is not
+            // called a burst it did not make.
+            let present_interval_ns =
+                u64::try_from(ws.frame_interval.unwrap_or(app_frame_interval).as_nanos())
+                    .unwrap_or(u64::MAX);
+            let present_hot = ws.input_hot;
+            let prev_registered_ns = ws.last_registration_ns;
             let input = &ws.input_scratch;
             let mut pending_surface = None;
             let presented = match (backend.gpu_mut(), ws.present.as_mut()) {
@@ -33698,6 +34145,12 @@ impl App {
                         window_gpu,
                     }),
                 ) => {
+                    aterm_gpu::present_glass::arm_present(aterm_gpu::present_glass::ArmedPresent {
+                        input_hot: present_hot,
+                        occluded: window_gpu.occluded_hint(),
+                        interval_ns: present_interval_ns,
+                        prev_registered_ns,
+                    });
                     let result = gpu.present_input_cropped_with_effects_transport(
                         window_gpu,
                         gpu_surface,
@@ -34087,6 +34540,69 @@ impl App {
         self.present_latency_ns_with_plan(wid, &plan)
     }
 
+    /// An early-out found NOTHING TO PRESENT: the composed frame is the last
+    /// one, byte for byte. Output that arrived before that compose therefore
+    /// moved no pixels, and the stamp its leading edge armed measures nothing a
+    /// person could see. Left in place it closes at the next REAL change and
+    /// books the whole idle stretch as that frame's `present_latency` — the
+    /// artifact the slow-present breadcrumb has to call an OPEN INTERVAL in its
+    /// own text. Measured 2026-09-21 on the owner's machine: a Claude Code
+    /// spinner whose repaints are often identical produced 100-200 ms "slow
+    /// output->present" lines every ten seconds, a 200 ms `max_present_latency`
+    /// and an 84 ms `present_p99`, while every frame that actually presented
+    /// did so in under 2 ms at p50 and 6 ms at p95.
+    ///
+    /// Discard exactly the stamps that predate `composed_at`. A burst that
+    /// lands AFTER the compose began is the next frame's real edge and is kept:
+    /// the update is a CAS against the value read, so the reader's
+    /// first-edge-wins `compare_exchange(0, now)` (`spawn::stamp_output_arrival`)
+    /// is never raced into a lost edge. The one imprecision is a burst stamped
+    /// before the compose whose PARSE had not landed when the compose read the
+    /// grid (an effect tick composing between the reader's stamp and its
+    /// parse): its edge is dropped and the frame that shows it books nothing.
+    /// That under-reports one sample in a microsecond race; the alternative
+    /// over-reported every idle stretch, forever, by design.
+    pub(crate) fn discard_unpresented_output_stamps(
+        &mut self,
+        wid: WindowId,
+        composed_at: Instant,
+    ) {
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return;
+        };
+        let composed_ns = u64::try_from(
+            composed_at
+                .saturating_duration_since(self.lat_epoch)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        for leaf in &plan.leaves {
+            let Some(sid) = self
+                .view_store
+                .get(leaf.view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+            else {
+                continue;
+            };
+            let Some(sess) = self.pool.get(sid) else {
+                continue;
+            };
+            let mut stamp = sess.last_output_ns.load(Ordering::Relaxed);
+            while stamp != 0 && stamp <= composed_ns {
+                match sess.last_output_ns.compare_exchange_weak(
+                    stamp,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => stamp = current,
+                }
+            }
+        }
+    }
+
     fn present_latency_ns_with_plan(
         &mut self,
         wid: WindowId,
@@ -34322,24 +34838,15 @@ impl App {
             return None;
         };
         self.prepare_layout_coordinate_space_from_plan(wid, route, &plan);
-        // THE CAPTURE OBSERVES THE CONSOLE TOO. Read here, above the `ws`
-        // borrow, for exactly the reason the glass path reads it above its
-        // own: the off path must not allocate or rebuild console perception.
-        // The facts themselves are taken under the SAME terminal lock as the
-        // cells below, and parked on the window for the decoration pass that
-        // ticks the pet — a capture that ticks the brain without observing
-        // the console is a capture that cannot see this layer at all.
-        let capture_pet_console_owned = {
-            let pet_glow = self.glow_config();
-            resident_pet_owner_present(
-                self.trail_presentation().pet_species.is_some(),
-                pet_glow.enabled
-                    && self
-                        .serious_mode_policy()
-                        .allows(crate::motion::SeriousEffect::CursorCat),
-                pet_glow.style,
-            )
-        };
+        // THE CAPTURE OBSERVES THE CONSOLE TOO — but the gate for it is
+        // applied at the OBSERVATION, in `app_introspect`'s decoration pass,
+        // beside the retirement that reads the same three inputs. It used to
+        // be computed here and parked on `WindowState::capture_pet_world` for
+        // that pass to read; no line ever read the field, so the gate was
+        // computed, banked and never applied, and the capture observed a
+        // console its own predicate said not to look at. The facts the pass
+        // consumes ride `TerminalCaptureFocus::pet_world`, read below under
+        // the same terminal lock as the cells.
         let (rows, cols, composed) = {
             let ws = self.windows.get(&wid)?;
             (usize::from(ws.rows), usize::from(ws.cols), composed)
@@ -34459,8 +34966,6 @@ impl App {
             let (focus, cursor_fx_sample) = {
                 let ws = self.windows.get_mut(&wid)?;
                 term.cell_frame_into(&mut ws.input_scratch, rows, cols);
-                ws.capture_pet_world = capture_pet_console_owned
-                    .then(|| aterm_effects::pet_world::PetWorldFacts::read(&term, *session));
                 let content_seq = ws.input_scratch.content_seq;
                 let dbg = if term.modes().reverse_video() {
                     term.default_foreground()
@@ -34646,8 +35151,6 @@ impl App {
             // authorized by this same DEC fence.
             if focused {
                 ws.composed_focus_scratch.clone_from(&ws.pane_scratch);
-                ws.capture_pet_world = capture_pet_console_owned
-                    .then(|| aterm_effects::pet_world::PetWorldFacts::read(&term, session));
             } else {
                 ws.unfocused_pane_scratch
                     .entry(pane_index)
@@ -38486,10 +38989,7 @@ impl App {
         // (mixed-DPI) — read from the per-window view, not the shared renderer's
         // currently-active size.
         let cell_h = self.win_cell_size(wid).1.max(1) as i32;
-        let focused = self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused));
-        let animate = self
-            .motion_policy(focused)
-            .animate(crate::motion::MotionEffect::SmoothScroll);
+        let animate = self.smooth_scroll_animates(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -41854,6 +42354,11 @@ mod config_notice_overlay_tests {
         let safe_row_usize = usize::from(safe_row);
         let tagged_glow = |row| aterm_render::GlowQuad {
             row,
+            // The right edge is stated explicitly: `Default` zeroes it, which
+            // is a ramp to black for any non-zero `color` (flat only because
+            // `color` is zero here too).
+            color2: 0,
+            alpha2: 0,
             ..Default::default()
         };
         let tagged_halo = |row| aterm_render::RainHalo {
@@ -42808,6 +43313,9 @@ mod find_bar_splice_tests {
         });
         input.nova_add.push(aterm_render::GlowQuad {
             row: 0,
+            // Explicit right edge — see `tagged_glow` above.
+            color2: 0,
+            alpha2: 0,
             ..Default::default()
         });
         input.cat_quads.push(aterm_render::SpriteQuad {
@@ -45697,6 +46205,8 @@ mod split_sparkle_tests {
             color: 0x0011_2233,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0011_2233,
+            alpha2: 0,
         }];
         translate_nova_into_pane(&mut nova, place(0, 40));
         assert_eq!(

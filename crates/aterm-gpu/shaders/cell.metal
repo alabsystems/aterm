@@ -77,10 +77,81 @@ fragment float4 fs_bg(BgVsOut in [[stage_in]]) {
     return float4(s2l(in.color.rgb), in.color.a);
 }
 
-// Glow (LUMEN aurora, One/One additive) emits its premultiplied colour RAW (no
-// sRGB decode). Same vertex path as fs_bg, different fragment.
-fragment float4 fs_glow(BgVsOut in [[stage_in]]) {
-    return in.color;
+// ---------------------------------------------------------------- GLOW
+// GLOW_ATTRS: 0 => Uint16x4 (rect), 1 => Uint8x4 (LEFT colour), 2 => Uint8x4
+// (RIGHT colour) — both colours RAW integer bytes, not normalized.
+//
+// A GlowInstance is the bg rect plus a colour PAIR, the quad's left and right
+// edges (aterm_render::GlowQuad::color2, 2026-09-21). The vertex stage hands
+// the fragment the pair and the rect's width [[flat]], and the fragment ramps
+// between the two ends PER COLUMN with the SAME integer law the CPU rasterizer
+// uses (aterm_render::glow_lerp), for alpha alike:
+//
+//     c(i) = (c0·(2w − m) + c1·m + w) / (2w),   m = 2i + 1
+//
+// A flat pair is the identity for every i (the historical bytes); a gradient
+// is continuous inside the quad. The rasterizer's float colour interpolant is
+// deliberately NOT used — its rounding is not the CPU's, and byte parity is
+// the contract. The fragment emits c / 255.0 RAW (no sRGB decode) into the
+// glow blend src + dst·(1 − src_a), which rounds once on store.
+struct GlowVsIn {
+    ushort4 rect_u [[attribute(0)]];
+    uchar4  c0     [[attribute(1)]];
+    uchar4  c1     [[attribute(2)]];
+};
+
+struct GlowVsOut {
+    float4 pos [[position]];
+    // The quad's left edge and width in device px, as whole numbers.
+    float2 span [[flat]];
+    // The fragment's x INSIDE THE QUAD, in the quad's own px: 0 at its left
+    // edge, its width at its right, interpolated linearly. Measured in the
+    // quad's space rather than as `pos.x - span.x` because the same pipeline
+    // draws the bloom EXTRACT into the HALF-RES bloom target under the
+    // full-res frame's uniforms: there `pos.x` is a half-res pixel and
+    // `span.x` a full-res one, and the difference clamped every fragment in
+    // the quad's left half toward the LEFT colour (the 2026-09-22 review: the
+    // halo over a red->blue ramp stayed red to its blue end).
+    float lx [[center_no_perspective]];
+    // The colour pair as exact bytes (r, g, b, a): premultiplied, a the mode.
+    uint4 c0 [[flat]];
+    uint4 c1 [[flat]];
+};
+
+vertex GlowVsOut vs_glow(uint vi [[vertex_id]],
+                         GlowVsIn vin [[stage_in]],
+                         constant Uniforms& u [[buffer(0)]]) {
+    float4 rect = float4(vin.rect_u);
+    float2 k = corner(vi);
+    float2 px = rect.xy + k * rect.zw;
+    GlowVsOut o;
+    o.pos = float4(to_ndc(px, u), 0.0, 1.0);
+    o.span = rect.xz;
+    o.lx = k.x * rect.z;
+    o.c0 = uint4(vin.c0);
+    o.c1 = uint4(vin.c1);
+    return o;
+}
+
+// The fragment's 0-based column inside its quad, from its x in the quad's own
+// px. At full res the pixel CENTRE interpolates to i + 0.5, so the floor is i
+// with half a pixel of margin either side; at half res each fragment reads the
+// quad's own column under its centre. The clamp only guards the edges.
+static inline uint glow_column(float lx, float w) {
+    return uint(clamp(floor(lx), 0.0, max(w - 1.0, 0.0)));
+}
+
+// aterm_render::glow_lerp, per channel and for alpha alike, at column i of a
+// w-wide quad (w >= 1: a zero-width quad rasterizes no fragment).
+static inline uint4 glow_lerp4(uint4 c0, uint4 c1, uint i, uint w) {
+    uint m = 2u * min(i, w - 1u) + 1u;
+    return (c0 * (2u * w - m) + c1 * m + uint4(w)) / (2u * w);
+}
+
+fragment float4 fs_glow(GlowVsOut in [[stage_in]]) {
+    uint w = max(uint(in.span.y), 1u);
+    uint4 c = glow_lerp4(in.c0, in.c1, glow_column(in.lx, in.span.y), w);
+    return float4(c) / 255.0;
 }
 
 // ---------------------------------------------------------------- RAIN HALO

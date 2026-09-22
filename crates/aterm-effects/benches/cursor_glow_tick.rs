@@ -344,6 +344,7 @@ fn cfg_for(style: GlowStyle) -> GlowConfig {
         // spark cap and the lifetimes, not the dial.
         length: usize::MAX,
         intensity: 1.0,
+        audible: true,
         radius: 0.4,
         ring: true,
         dark_theme: true,

@@ -499,17 +499,40 @@ pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
 /// `RENAME_SWAP` that moves the bundle this process was exec'd from to
 /// `aterm.app.rollback`, and boot-health confirmation then deletes it.
 ///
-/// # Why the existing probe cannot see it
+/// # Which path can see it — and which one cannot
 ///
-/// [`probe_fda`] reads `proc_pidpath`, which follows the vnode — so it reports
-/// the CURRENT name of the running image and looks perfectly healthy in exactly
-/// the broken state. Measured the same session: a live process's recorded path
-/// followed a rename of its binary (`victim` → `victim.rollback`) and went
-/// EMPTY once that file was deleted. The grant was silently not applying for
-/// four and a half hours and nothing in the posture said so.
+/// A process has TWO answers for "where is my executable", and they disagree
+/// for exactly this defect. **Read the kernel's, not the exec-time one.**
 ///
-/// This is a cheap, prompt-free `exists` check on a path the process already
-/// knows. It reads no protected location and raises no dialog.
+/// * `std::env::current_exe()` is `_NSGetExecutablePath` on macOS: the string
+///   captured at `execve`, frozen for the life of the process. It never
+///   follows a rename.
+/// * `proc_pidpath` asks the kernel for the vnode's CURRENT path. It follows a
+///   rename and answers nothing once the file is unlinked.
+///
+/// Measured 2026-09-21 with the updater's exact shape — `renamex_np` with
+/// `RENAME_SWAP`, then the boot-health delete:
+///
+/// ```text
+///              current_exe()                 proc_pidpath
+/// before       …/A.app/Contents/MacOS/p      …/A.app/Contents/MacOS/p
+/// after swap   …/A.app/Contents/MacOS/p      …/A.app.rollback/Contents/MacOS/p
+/// after GC     …/A.app/Contents/MacOS/p      (empty, rc=0)
+/// ```
+///
+/// So `current_exe()` reports `Live` in all three states: after the swap a NEW
+/// bundle occupies the frozen path, so an `exists` check on it succeeds and the
+/// enclosing directory is still named `.app`. Classifying that path made
+/// [`Displaced`](ImageAnchor::Displaced) and [`Deleted`](ImageAnchor::Deleted)
+/// unreachable for the one case this enum exists for — the owner's live verb
+/// printed `anchor=live` while `tccd` logged
+/// `responsible_path=/Applications/aterm.app.rollback/…` for that same pid.
+/// (This doc said the opposite until 2026-09-21, and the code followed it.)
+///
+/// Both reads are cheap and prompt-free: `proc_pidpath` on self is one
+/// `__proc_info` syscall, and the fallback is an `exists` check on a path the
+/// process already knows. Neither reads a protected location or raises a
+/// dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageAnchor {
     /// The running image is inside a `.app` that is still on disk under that
@@ -553,31 +576,107 @@ impl ImageAnchor {
     }
 }
 
-/// [`ImageAnchor`] for this process.
-#[must_use]
-pub fn image_anchor() -> ImageAnchor {
-    let exe = std::env::current_exe().ok();
-    classify_image_anchor(exe.as_deref(), Path::exists)
+/// What the kernel currently says about this process's own executable.
+///
+/// Three-valued on purpose: "the image has no path any more" and "this platform
+/// cannot tell me" are different facts, and collapsing them would report a
+/// deleted bundle on every non-macOS build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelfImage {
+    /// The kernel's current path for the running image.
+    At(PathBuf),
+    /// The kernel has no path for it: the file behind this process was
+    /// unlinked while it runs. `proc_pidpath` answers `rc=0` for that.
+    NoPath,
+    /// No vnode-following source here — a non-macOS build. Never a fault.
+    Unsupported,
 }
 
-/// The classification, pure over the path and an existence oracle.
+/// [`SelfImage`] for this process.
 ///
-/// `exists` is injected so the table test drives every arm without creating or
-/// deleting anything, and so the ordering below is testable: **deletion is
-/// checked first**, because a deleted bundle answers `None` from
-/// [`app_bundle_root`] for the same reason a renamed one does, and collapsing
-/// the two would report the more recoverable state for the less recoverable one.
+/// Asking about ourselves makes the answer unambiguous: the process certainly
+/// exists, so a `proc_pidpath` that cannot name it means the image has no path,
+/// not that the lookup failed.
 #[must_use]
-pub fn classify_image_anchor(exe: Option<&Path>, exists: impl Fn(&Path) -> bool) -> ImageAnchor {
-    let Some(exe) = exe else {
+pub fn self_image() -> SelfImage {
+    #[cfg(target_os = "macos")]
+    {
+        imp::self_image()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SelfImage::Unsupported
+    }
+}
+
+/// Resolve symlinks, keeping the original when the path cannot be resolved.
+///
+/// The two sources spell the same file differently: `_NSGetExecutablePath`
+/// hands back the string `execve` was given, while `proc_pidpath` reports the
+/// kernel's resolved path — so on a machine where the bundle sits under `/tmp`
+/// or `/var` one says `/tmp/…` and the other `/private/tmp/…`, and comparing
+/// them raw reports `Displaced` for a bundle nobody touched. (Caught by
+/// `tests/image_anchor_live.rs`, which runs out of `std::env::temp_dir()`.)
+///
+/// `realpath` is metadata-only and is NOT one of the TCC-gated operations
+/// (design §1.5, the same reasoning `atpkg::hooks::command_links_dir` records),
+/// so normalising here raises no dialog. A path that cannot be resolved — the
+/// collected rollback — keeps its raw spelling and is compared as it stands.
+fn resolved(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// [`ImageAnchor`] for this process.
+///
+/// Normalisation happens HERE rather than inside [`classify_image_anchor`] so
+/// the classifier stays pure over its inputs and its only filesystem reach
+/// remains the injected `exists` oracle.
+#[must_use]
+pub fn image_anchor() -> ImageAnchor {
+    let exe = std::env::current_exe().ok().map(resolved);
+    let live = match self_image() {
+        SelfImage::At(path) => SelfImage::At(resolved(path)),
+        absent => absent,
+    };
+    classify_image_anchor(exe.as_deref(), &live, Path::exists)
+}
+
+/// The classification, pure over the two paths and an existence oracle.
+///
+/// `exec` is the frozen exec-time path (`current_exe`), `live` is the kernel's
+/// current one (`proc_pidpath`). The whole detector is the disagreement between
+/// them — see the [`ImageAnchor`] header for the measurement. `exists` is
+/// injected so the table test drives every arm without creating or deleting
+/// anything.
+///
+/// Order, and why:
+///
+/// 1. **No exec path** ⇒ `Unknown`. Nothing to classify is not a fault.
+/// 2. **Not a bundled layout** ⇒ `NotBundled`, before anything else can call a
+///    `targo run` or a test binary broken. Judged on the exec path, which is
+///    the one that describes how this process was started.
+/// 3. **`live` is `NoPath`** ⇒ `Deleted`. Checked before displacement, because
+///    a deleted image is the less recoverable of the two.
+/// 4. **`live` is `At(p)`** ⇒ `Displaced` when `p`'s bundle root disagrees with
+///    the exec path's — either because `p` is no longer under a `.app` at all
+///    (`aterm.app.rollback`, the literal shape) or because it is under a
+///    DIFFERENT `.app` than the one this process was started from, which is
+///    what `RENAME_SWAP` produces and what a one-path classifier cannot see.
+/// 5. **`live` is `Unsupported`** ⇒ fall back to the exec path's existence.
+///    That cannot catch a swap, and says so.
+#[must_use]
+pub fn classify_image_anchor(
+    exec: Option<&Path>,
+    live: &SelfImage,
+    exists: impl Fn(&Path) -> bool,
+) -> ImageAnchor {
+    let Some(exec) = exec else {
         return ImageAnchor::Unknown;
     };
-    if !exists(exe) {
-        return ImageAnchor::Deleted;
-    }
     // A bundled LAYOUT is what makes `.app` the expected name. Without it there
-    // is nothing to be displaced from.
-    let components: Vec<Component<'_>> = exe.components().collect();
+    // is nothing to be displaced from, and an ordinary dev run must never be
+    // reported as a broken grant.
+    let components: Vec<Component<'_>> = exec.components().collect();
     let bundled_layout = components.len() >= 4
         && components
             .windows(2)
@@ -585,10 +684,27 @@ pub fn classify_image_anchor(exe: Option<&Path>, exists: impl Fn(&Path) -> bool)
     if !bundled_layout {
         return ImageAnchor::NotBundled;
     }
-    if app_bundle_root(exe).is_some() {
-        ImageAnchor::Live
-    } else {
-        ImageAnchor::Displaced
+    match live {
+        SelfImage::NoPath => ImageAnchor::Deleted,
+        SelfImage::At(path) => {
+            // `app_bundle_root` answers None for `…/aterm.app.rollback/…`
+            // because the enclosing directory's extension is `rollback`. A
+            // swap keeps a `.app` name but changes WHICH bundle, so compare
+            // the roots rather than merely testing for one.
+            match (app_bundle_root(path), app_bundle_root(exec)) {
+                (Some(live_root), Some(exec_root)) if live_root == exec_root => ImageAnchor::Live,
+                _ => ImageAnchor::Displaced,
+            }
+        }
+        // No vnode view: the exec-time path is all there is. This is the old,
+        // swap-blind behaviour, kept only where nothing better exists.
+        SelfImage::Unsupported => {
+            if exists(exec) {
+                ImageAnchor::Live
+            } else {
+                ImageAnchor::Deleted
+            }
+        }
     }
 }
 
@@ -923,6 +1039,495 @@ pub fn classify_dr(requirement: &str) -> DrClass {
         return DrClass::Identity;
     }
     DrClass::Unknown
+}
+
+// ---------------------------------------------------------------------------
+// Code identity of a bundle on disk
+// ---------------------------------------------------------------------------
+//
+// These readers were private to `aterm_gui::control_privacy`, where they could
+// only ever describe the ONE bundle this process runs from. They moved here on
+// 2026-09-22 because the claimant census below has to ask the same questions of
+// bundles it does not run from, and two implementations of "what is this
+// bundle's designated requirement" is exactly how a census and a self-report
+// come to disagree. `control_privacy` now delegates to them; the behaviour is
+// unchanged.
+
+/// `codesign -d -r- --verbose=2` over a bundle, stdout and stderr joined
+/// (`codesign -d` writes its report to stderr). `None` when it cannot run.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn codesign_report(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .arg("-d")
+        .arg("-r-")
+        .arg("--verbose=2")
+        .arg(root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Some(text)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn codesign_report(_root: &Path) -> Option<String> {
+    None
+}
+
+/// The `designated => …` clause of a `codesign -d -r-` report.
+///
+/// **`codesign` emits the clause TWO ways and only one of them is bare.** When
+/// the requirement was written into the signature it prints
+/// `designated => identifier "…" and anchor apple generic …`; when it is
+/// IMPLICIT — derived from the code rather than stored, which is what every
+/// ad-hoc signature has — it prints the same clause COMMENTED:
+///
+/// ```text
+/// # designated => cdhash H"4249c4f55957f293613399fb319b2e91cc7a3b26"
+/// ```
+///
+/// Matching only the bare form therefore returned `None` for exactly the
+/// bundles whose identity is unstable, so [`classify_dr`] saw an empty string
+/// and answered `Unknown` where the honest answer is [`DrClass::Cdhash`] —
+/// and, worse for [`classify_claimants`], two DIFFERENT ad-hoc bundles both
+/// read as the empty requirement and compared EQUAL. Measured 2026-09-22
+/// against two ad-hoc fixtures whose cdhashes differ; the census saw one
+/// conflict where there were two. The `#` is stripped here so the comparison
+/// is over the requirement itself.
+#[must_use]
+pub fn designated_requirement(report: &str) -> Option<String> {
+    report.lines().find_map(|line| {
+        let line = line.trim();
+        let clause = line
+            .strip_prefix('#')
+            .map_or(line, str::trim_start)
+            .trim_start();
+        clause
+            .starts_with("designated =>")
+            .then(|| clause.to_owned())
+    })
+}
+
+/// The Team ID, when the signature carries a real one. Apple prints
+/// `TeamIdentifier=not set` for an ad-hoc signature, which is not an id.
+#[must_use]
+pub fn team_identifier(report: &str) -> Option<String> {
+    report.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("TeamIdentifier=")?;
+        let value = value.trim();
+        (!value.is_empty() && value != "not set").then(|| value.to_owned())
+    })
+}
+
+/// How the running code is signed, from the same report. Fails toward the
+/// weaker claim: anything unrecognised is `unknown`, never `developer-id`.
+#[must_use]
+pub fn classify_signing(report: &str) -> &'static str {
+    if report.contains("code object is not signed at all") {
+        return "unsigned";
+    }
+    if report.lines().any(|line| line.trim() == "Signature=adhoc") {
+        return "adhoc";
+    }
+    if team_identifier(report).is_some() {
+        return "developer-id";
+    }
+    "unknown"
+}
+
+/// One XML plist string value, by exact key. Only XML plists are understood —
+/// the same precedent `aterm_update::which_copy` sets, and lossless for the
+/// shapes that matter here.
+#[must_use]
+pub fn plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let mut rest = text;
+    loop {
+        let at = rest.find("<key>")?;
+        let after = &rest[at + "<key>".len()..];
+        let end = after.find("</key>")?;
+        let found = after[..end].trim();
+        let tail = &after[end + "</key>".len()..];
+        if found == key {
+            let value = tail.trim_start().strip_prefix("<string>")?;
+            let close = value.find("</string>")?;
+            let value = value[..close].trim();
+            return (!value.is_empty()).then_some(value);
+        }
+        rest = tail;
+    }
+}
+
+/// Whether an `Info.plist`'s text carries the `ATermDevBuild` mark — the same
+/// key and the same fail-open reading as `aterm_update`'s own predicate, which
+/// is not reachable from here (its module is private to that crate). Fails
+/// OPEN: anything unclear is "not a dev build", so a corrupt plist can never
+/// invent a dev identity for a release.
+#[must_use]
+pub fn plist_marks_dev_build(text: &str) -> bool {
+    plist_string(text, "ATermDevBuild").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// A bounded text read: an `Info.plist` over the cap is unreadable rather than
+/// unbounded work.
+#[must_use]
+pub fn read_bounded(path: &Path) -> Option<String> {
+    const MAX_PLIST_BYTES: u64 = 1 << 20;
+    let meta = std::fs::metadata(path).ok()?;
+    (meta.len() <= MAX_PLIST_BYTES)
+        .then(|| std::fs::read_to_string(path).ok())
+        .flatten()
+}
+
+// ---------------------------------------------------------------------------
+// The claimant census
+// ---------------------------------------------------------------------------
+//
+// # Why this exists
+//
+// macOS keeps ONE TCC row per `(service, client, client_type)`, holding the
+// `csreq` — a code requirement — that `tccd` re-validates each requester
+// against. A requester that claims the client id but does NOT satisfy the
+// stored requirement is not merely denied: `tccd` answers
+// `ReqResult(... Denied (Service Policy), DB Action:Update, UpdateVerifierData)`
+// and publishes `TCCDEvent type=Create`, REPLACING the stored requirement with
+// the asker's own identity and resetting the grant. The last mismatching
+// claimant wins, and it wins for every copy that shares the identifier.
+//
+// That is a WRITE that escapes process scope, and it is why a per-process
+// self-report cannot see the failure. Measured on the owner's Mac 2026-09-21:
+// the owner granted Full Disk Access three times in 55 seconds; two grants were
+// destroyed by ad-hoc bundles in `~/aterm/dist` claiming the app's own
+// identifier, and every token the `privacy` verb printed (`dr=identity
+// grant_stable=yes anchor=live`) was true of the process reading it and said
+// nothing at all about the row.
+//
+// Every claimant in that incident was aterm's OWN output: `install.rs`'s
+// `rollback_path` renames the running bundle to `aterm.app.rollback` on every
+// in-place apply, and the release cutter keeps a second live install beside the
+// first. So the census does not need to search the disk — it needs to look
+// where aterm puts things, and to say plainly when it could not look
+// everywhere.
+//
+// # What it is NOT
+//
+// It does not read `TCC.db`. The stored requirement is not observable through
+// any supported API (Apple DTS), so the census reports what is ON DISK and
+// whether those bundles AGREE with each other — never what `tccd` currently
+// holds. Disagreement is the hazard; the census names it and stops.
+
+/// How much of the candidate space the census actually got to look at.
+///
+/// Three-valued because "nothing else claims this id" and "I could not finish
+/// looking" are different answers, and reporting the first for the second is
+/// the over-claim this whole surface exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Enumeration {
+    /// Every candidate root was readable and every entry classified.
+    Complete,
+    /// At least one root could not be read, so a claimant may be unseen.
+    Partial,
+    /// Nothing could be enumerated at all.
+    #[default]
+    Unavailable,
+}
+
+impl Enumeration {
+    /// The wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// One bundle on disk that claims a given `CFBundleIdentifier`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claimant {
+    /// The `.app` root.
+    pub path: PathBuf,
+    /// How its designated requirement is shaped.
+    pub dr: DrClass,
+    /// The `designated => …` clause verbatim, for a report that can be checked.
+    pub dr_text: String,
+    /// `developer-id` | `adhoc` | `unsigned` | `unknown`.
+    pub signing: &'static str,
+    /// The Team ID, when the signature carries a real one.
+    pub team: Option<String>,
+    /// Whether this is the bundle the calling process runs from.
+    pub running: bool,
+}
+
+impl Claimant {
+    /// Whether this claimant's identity DIFFERS from `other`'s in a way `tccd`
+    /// would resolve destructively.
+    ///
+    /// The comparison is the designated requirement itself, because that is
+    /// what `tccd` stores and re-validates — not the signing class, and not the
+    /// team. Two Developer-ID bundles from the same team share a requirement
+    /// and are harmless; an ad-hoc sibling carries a bare `cdhash` and is not.
+    ///
+    /// **An unreadable requirement CONFLICTS.** Two bundles whose requirement
+    /// could not be read are not thereby the same bundle, and treating the
+    /// empty string as a value that can match is how a census under-reports:
+    /// it is the failure this very method was written with (see
+    /// [`designated_requirement`]). Unknown fails toward naming the claimant,
+    /// which costs a line of report; the other direction costs the grant.
+    #[must_use]
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        let (mine, theirs) = (self.dr_text.trim(), other.dr_text.trim());
+        mine.is_empty() || theirs.is_empty() || mine != theirs
+    }
+}
+
+/// Every bundle found claiming one identifier, and how complete the look was.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Claimants {
+    /// The identifier asked about.
+    pub bundle_id: String,
+    /// Every claimant found, running copy included.
+    pub found: Vec<Claimant>,
+    /// How much of the candidate space was readable.
+    pub enumeration: Enumeration,
+}
+
+impl Claimants {
+    /// The claimants whose designated requirement disagrees with the running
+    /// copy's — the ones that can destroy a grant.
+    ///
+    /// Empty when the running copy is unknown: without a reference identity
+    /// there is nothing to disagree WITH, and guessing one would invent a
+    /// conflict. That case is visible as `enumeration` plus a `found` list the
+    /// reader can still see.
+    #[must_use]
+    pub fn conflicting(&self) -> Vec<&Claimant> {
+        let Some(running) = self.found.iter().find(|c| c.running) else {
+            return Vec::new();
+        };
+        self.found
+            .iter()
+            .filter(|c| !c.running && c.conflicts_with(running))
+            .collect()
+    }
+
+    /// Whether the census is entitled to say "nothing else claims this id".
+    ///
+    /// Only a COMPLETE enumeration may say so. A partial one that happened to
+    /// find nothing has not established absence.
+    #[must_use]
+    pub fn sole_claimant(&self) -> bool {
+        self.enumeration == Enumeration::Complete
+            && self.found.iter().filter(|c| !c.running).count() == 0
+    }
+}
+
+/// The identity of one bundle, as the census reads it.
+///
+/// Separated from [`Claimant`] so the classification can be driven by a test
+/// over fixtures without running `codesign` at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleIdentity {
+    /// `CFBundleIdentifier` from the bundle's `Info.plist`.
+    pub bundle_id: Option<String>,
+    /// The `designated => …` clause.
+    pub dr_text: String,
+    /// `developer-id` | `adhoc` | `unsigned` | `unknown`.
+    pub signing: &'static str,
+    /// The Team ID, when there is a real one.
+    pub team: Option<String>,
+}
+
+/// Read one bundle's identity from disk: its `Info.plist` and its signature.
+///
+/// Refuses a bundle under a protected root for the same reason
+/// [`readable_info_plist`] does — the census must never be the thing that
+/// raises the dialog it exists to explain.
+#[must_use]
+pub fn bundle_identity(root: &Path, protected: &[PathBuf]) -> Option<BundleIdentity> {
+    if is_under_protected_root(root, protected) {
+        return None;
+    }
+    let text = read_bounded(&root.join("Contents").join("Info.plist"));
+    let bundle_id = text
+        .as_deref()
+        .and_then(|t| plist_string(t, "CFBundleIdentifier"))
+        .map(str::to_owned);
+    let report = codesign_report(root);
+    Some(BundleIdentity {
+        bundle_id,
+        dr_text: report
+            .as_deref()
+            .and_then(designated_requirement)
+            .unwrap_or_default(),
+        signing: report.as_deref().map_or("unknown", classify_signing),
+        team: report.as_deref().and_then(team_identifier),
+    })
+}
+
+/// The directories the census looks in, most specific first.
+///
+/// Deliberately NOT a disk walk. aterm's co-claimants are its own outputs, and
+/// they are always SIBLINGS of an install: `rollback_path` puts the displaced
+/// bundle beside the live one (`install.rs`), the release cutter places a
+/// finished bundle beside its scratch (`aterm_release::bundle`), and a hand
+/// backup lands in the same folder. So the candidate roots are the directories
+/// that hold an aterm install — the running one first, then the conventional
+/// ones — and a `~/aterm/dist` that no roster knows about is covered because
+/// the process running from it contributes its own parent.
+#[must_use]
+pub fn claimant_search_roots(running: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push = |dir: PathBuf| {
+        if !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    };
+    if let Some(bundle) = running.and_then(app_bundle_root)
+        && let Some(parent) = bundle.parent()
+    {
+        push(parent.to_path_buf());
+    }
+    push(PathBuf::from("/Applications"));
+    if let Some(home) = home {
+        push(home.join("Applications"));
+    }
+    roots
+}
+
+/// Whether a directory entry is shaped like a bundle the census should read.
+///
+/// `foo.app` is the obvious one. `foo.app.rollback` is the one that matters:
+/// it is a complete, signed bundle carrying the same `CFBundleIdentifier` as
+/// the install it was displaced from, and it is what `tccd` attributed the
+/// owner's process to at 13:33:46 on 2026-09-21. A plain `.app` extension test
+/// would have missed exactly the bundle that destroyed the grant.
+#[must_use]
+pub fn looks_like_bundle(name: &str) -> bool {
+    let name = name.trim_end_matches('/');
+    if name.starts_with('.') {
+        return false;
+    }
+    name.to_ascii_lowercase().ends_with(".app")
+        || name
+            .to_ascii_lowercase()
+            .rsplit_once(".app.")
+            .is_some_and(|(head, tail)| !head.is_empty() && !tail.is_empty())
+}
+
+/// The census, pure over its inputs.
+///
+/// `entries` lists a directory (`None` when it could not be read, which is what
+/// downgrades the enumeration), and `identity` reads one bundle. Both are
+/// injected so the table test drives every arm without a filesystem or a
+/// `codesign`, and so the ORDERING is testable: a root that cannot be listed
+/// must downgrade the verdict rather than shrink the answer.
+#[must_use]
+pub fn classify_claimants(
+    bundle_id: &str,
+    running: Option<&Path>,
+    roots: &[PathBuf],
+    entries: impl Fn(&Path) -> Option<Vec<PathBuf>>,
+    identity: impl Fn(&Path) -> Option<BundleIdentity>,
+) -> Claimants {
+    let running_root = running.and_then(app_bundle_root);
+    let mut found: Vec<Claimant> = Vec::new();
+    let mut unreadable = 0usize;
+    let mut looked = 0usize;
+    for root in roots {
+        let Some(listing) = entries(root) else {
+            unreadable += 1;
+            continue;
+        };
+        looked += 1;
+        for candidate in listing {
+            let name = candidate
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !looks_like_bundle(&name) {
+                continue;
+            }
+            if found.iter().any(|c| c.path == candidate) {
+                continue;
+            }
+            let Some(id) = identity(&candidate) else {
+                // A bundle we were not allowed to read is NOT evidence of
+                // absence; it is a hole in the census.
+                unreadable += 1;
+                continue;
+            };
+            if id.bundle_id.as_deref() != Some(bundle_id) {
+                continue;
+            }
+            found.push(Claimant {
+                running: running_root.as_deref() == Some(candidate.as_path()),
+                path: candidate,
+                dr: classify_dr(&id.dr_text),
+                dr_text: id.dr_text,
+                signing: id.signing,
+                team: id.team,
+            });
+        }
+    }
+    // The running copy is a claimant even when its directory could not be
+    // listed: this process is the proof that it exists.
+    if let Some(root) = running_root
+        && !found.iter().any(|c| c.path == root)
+        && let Some(id) = identity(&root)
+        && id.bundle_id.as_deref() == Some(bundle_id)
+    {
+        found.push(Claimant {
+            path: root,
+            dr: classify_dr(&id.dr_text),
+            dr_text: id.dr_text,
+            signing: id.signing,
+            team: id.team,
+            running: true,
+        });
+    }
+    found.sort_by(|a, b| b.running.cmp(&a.running).then_with(|| a.path.cmp(&b.path)));
+    // A census that established the RUNNING copy has observed something, even
+    // if no directory would open: this process is the evidence. `Unavailable`
+    // is reserved for a look that produced nothing at all.
+    let enumeration = if looked == 0 && found.is_empty() {
+        Enumeration::Unavailable
+    } else if unreadable > 0 || looked == 0 {
+        Enumeration::Partial
+    } else {
+        Enumeration::Complete
+    };
+    Claimants {
+        bundle_id: bundle_id.to_string(),
+        found,
+        enumeration,
+    }
+}
+
+/// The census for one identifier, against the real filesystem.
+///
+/// Runs `codesign` once per candidate bundle, so it belongs off the event loop
+/// and behind a cache — never on a draw path.
+#[must_use]
+pub fn claimants_for(bundle_id: &str, running: Option<&Path>) -> Claimants {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let roots = claimant_search_roots(running, home.as_deref());
+    let protected = protected_roots(&[]);
+    classify_claimants(
+        bundle_id,
+        running,
+        &roots,
+        |dir| {
+            let read = std::fs::read_dir(dir).ok()?;
+            Some(read.flatten().map(|e| e.path()).collect())
+        },
+        |root| bundle_identity(root, &protected),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2055,8 +2660,8 @@ impl ConsentCache {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
-        INFO_PLIST_MAX_BYTES, ProbeOutcome, ResponsibleApp, ResponsibleError, display_name,
-        readable_info_plist, responsible_answer,
+        INFO_PLIST_MAX_BYTES, ProbeOutcome, ResponsibleApp, ResponsibleError, SelfImage,
+        display_name, readable_info_plist, responsible_answer,
     };
     use std::ffi::{CString, OsStr};
     use std::os::unix::ffi::OsStrExt;
@@ -2165,6 +2770,19 @@ mod imp {
         })
     }
 
+    /// [`SelfImage`] from `proc_pidpath` on our own pid.
+    ///
+    /// For SELF the two failure modes collapse into one useful fact: the
+    /// process demonstrably exists, so `rc=0` means the kernel has no path for
+    /// its image — it was unlinked — rather than a lookup that went wrong.
+    /// Measured 2026-09-21: `rc=0` is exactly what follows the boot-health
+    /// delete of `aterm.app.rollback`.
+    pub(super) fn self_image() -> SelfImage {
+        // SAFETY: `getpid` takes no arguments and cannot fail.
+        let me = unsafe { libc::getpid() };
+        pid_path(me).map_or(SelfImage::NoPath, SelfImage::At)
+    }
+
     /// `proc_pidpath` for one pid.
     fn pid_path(pid: i32) -> Option<PathBuf> {
         let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
@@ -2237,6 +2855,291 @@ mod tests {
         )));
     }
 
+    // -----------------------------------------------------------------
+    // The claimant census
+    // -----------------------------------------------------------------
+
+    fn id(bundle: &str, dr: &str, signing: &'static str) -> BundleIdentity {
+        BundleIdentity {
+            bundle_id: Some(bundle.to_string()),
+            dr_text: dr.to_string(),
+            signing,
+            team: None,
+        }
+    }
+
+    const DEV_ID: &str = "designated => identifier \"com.aterm.aterm\" and anchor apple \
+                          generic and certificate leaf[subject.OU] = A66A9P66Z7";
+
+    /// `codesign` prints an IMPLICIT requirement as a COMMENT, and every
+    /// ad-hoc signature has one. Matching only the bare form returned `None`
+    /// for exactly the bundles whose identity is unstable — so `dr=` read
+    /// `unknown` instead of `cdhash`, the "a rebuild invalidated your grant"
+    /// remediation (`aterm_cli`'s `churns`) never fired for a dev build, and
+    /// two DIFFERENT ad-hoc bundles both carried the empty requirement and
+    /// compared equal. Measured against real fixtures 2026-09-22.
+    #[test]
+    fn a_commented_designated_clause_is_still_a_designated_clause() {
+        let adhoc = "Executable=/x/aterm.app/Contents/MacOS/aterm\n\
+                     # designated => cdhash H\"4249c4f55957f293613399fb319b2e91cc7a3b26\"\n";
+        let clause = designated_requirement(adhoc).expect("the commented form is read");
+        assert!(clause.starts_with("designated => cdhash"), "{clause}");
+        assert!(
+            !clause.contains('#'),
+            "the comment marker is stripped: {clause}"
+        );
+        assert_eq!(classify_dr(&clause), DrClass::Cdhash);
+
+        // The bare form is unchanged.
+        let signed = format!("Executable=/x\n{DEV_ID}\n");
+        let clause = designated_requirement(&signed).expect("the bare form still reads");
+        assert_eq!(classify_dr(&clause), DrClass::Identity);
+
+        // A report with no clause at all is still None, not an empty string
+        // pretending to be a requirement.
+        assert_eq!(
+            designated_requirement("Executable=/x\nIdentifier=y\n"),
+            None
+        );
+    }
+
+    /// TWO ad-hoc bundles are not the same bundle. An unreadable requirement
+    /// must fail toward naming the claimant: the cost of a spurious line is a
+    /// line, the cost of a missed one is the grant.
+    #[test]
+    fn an_unreadable_requirement_conflicts_rather_than_matching() {
+        let mk = |dr: &str| Claimant {
+            path: PathBuf::from("/x/aterm.app"),
+            dr: classify_dr(dr),
+            dr_text: dr.to_string(),
+            signing: "adhoc",
+            team: None,
+            running: false,
+        };
+        assert!(
+            !mk(DEV_ID).conflicts_with(&mk(DEV_ID)),
+            "identical requirements agree"
+        );
+        assert!(
+            mk("designated => cdhash H\"aa\"").conflicts_with(&mk("designated => cdhash H\"bb\""))
+        );
+        assert!(
+            mk("").conflicts_with(&mk("")),
+            "two unknowns are not one identity"
+        );
+        assert!(mk("").conflicts_with(&mk(DEV_ID)));
+    }
+
+    /// THE CENSUS, as a table — the shape that actually happened.
+    ///
+    /// On 2026-09-21 the owner's disk held a Developer-ID `/Applications/aterm.app`
+    /// and two AD-HOC `com.aterm.aterm` bundles in `~/aterm/dist`, one of them
+    /// named `aterm.app.rollback`. Any process attributed to one of those made
+    /// `tccd` overwrite the stored requirement and reset Full Disk Access. The
+    /// census has to find all three, name the running one, and call the other
+    /// two conflicts.
+    #[test]
+    fn the_census_finds_every_claimant_including_a_rollback_sibling() {
+        let dist = PathBuf::from("/Users//a/aterm/dist");
+        let apps = PathBuf::from("/Applications");
+        let running_exe = PathBuf::from("/Users//a/aterm/dist/aterm.app/Contents/MacOS/aterm");
+        let entries = |dir: &Path| -> Option<Vec<PathBuf>> {
+            if dir == dist {
+                Some(vec![
+                    dist.join("aterm.app"),
+                    dist.join("aterm.app.rollback"),
+                    dist.join("aterm-b826-backup.app"),
+                    dist.join("notes.txt"),
+                ])
+            } else if dir == apps {
+                Some(vec![apps.join("aterm.app"), apps.join("Safari.app")])
+            } else {
+                Some(Vec::new())
+            }
+        };
+        let identity = |root: &Path| -> Option<BundleIdentity> {
+            let name = root.file_name()?.to_string_lossy().into_owned();
+            Some(match (root.starts_with(&dist), name.as_str()) {
+                (_, "Safari.app") => {
+                    id("com.apple.Safari", "designated => anchor apple", "unknown")
+                }
+                (true, "aterm.app") => {
+                    id("com.aterm.aterm", "designated => cdhash H\"aa\"", "adhoc")
+                }
+                (true, "aterm.app.rollback") => {
+                    id("com.aterm.aterm", "designated => cdhash H\"bb\"", "adhoc")
+                }
+                (true, _) => id("com.aterm.aterm", "designated => cdhash H\"cc\"", "adhoc"),
+                (false, _) => id("com.aterm.aterm", DEV_ID, "developer-id"),
+            })
+        };
+        let roots = vec![dist.clone(), apps.clone()];
+        let c = classify_claimants(
+            "com.aterm.aterm",
+            Some(&running_exe),
+            &roots,
+            entries,
+            identity,
+        );
+
+        assert_eq!(c.enumeration, Enumeration::Complete);
+        assert_eq!(
+            c.found.len(),
+            4,
+            "three dist bundles and the release: {:?}",
+            c.found
+        );
+        assert!(c.found[0].running, "the running copy sorts first");
+        assert_eq!(c.found[0].path, dist.join("aterm.app"));
+        assert!(
+            c.found
+                .iter()
+                .any(|x| x.path == dist.join("aterm.app.rollback")),
+            "the .rollback sibling is the one that destroyed the grant"
+        );
+        assert!(
+            !c.found.iter().any(|x| x.path == apps.join("Safari.app")),
+            "another program's bundle is not a claimant"
+        );
+        assert_eq!(
+            c.conflicting().len(),
+            3,
+            "everything that is not the running copy"
+        );
+        assert!(!c.sole_claimant());
+    }
+
+    /// The lone-install case, and the rule that only a COMPLETE look may say
+    /// "nothing else claims this". A root that cannot be listed downgrades the
+    /// verdict instead of shrinking the answer — the difference between "I
+    /// looked and there is nothing" and "I could not look".
+    #[test]
+    fn a_partial_census_never_claims_to_be_the_sole_claimant() {
+        let apps = PathBuf::from("/Applications");
+        let exe = apps.join("aterm.app/Contents/MacOS/aterm");
+        let only = |root: &Path| -> Option<BundleIdentity> {
+            root.ends_with("aterm.app")
+                .then(|| id("com.aterm.aterm", DEV_ID, "developer-id"))
+        };
+
+        let complete = classify_claimants(
+            "com.aterm.aterm",
+            Some(&exe),
+            &[apps.clone()],
+            |_| Some(vec![apps.join("aterm.app")]),
+            only,
+        );
+        assert!(complete.sole_claimant(), "one readable root, one claimant");
+        assert!(complete.conflicting().is_empty());
+
+        // The same disk, one root unreadable.
+        let partial = classify_claimants(
+            "com.aterm.aterm",
+            Some(&exe),
+            &[apps.clone(), PathBuf::from("/nope")],
+            |dir| (dir == apps).then(|| vec![apps.join("aterm.app")]),
+            only,
+        );
+        assert_eq!(partial.enumeration, Enumeration::Partial);
+        assert_eq!(partial.found.len(), 1, "it still found what it could");
+        assert!(
+            !partial.sole_claimant(),
+            "a hole in the census is not evidence of absence"
+        );
+
+        // Nothing readable at all.
+        let blind = classify_claimants(
+            "com.aterm.aterm",
+            None,
+            &[PathBuf::from("/nope")],
+            |_| None,
+            |_| None,
+        );
+        assert_eq!(blind.enumeration, Enumeration::Unavailable);
+        assert!(!blind.sole_claimant());
+        assert!(
+            blind.conflicting().is_empty(),
+            "no reference identity, no claim"
+        );
+    }
+
+    /// The running copy is a claimant even when its own directory could not be
+    /// listed: this process is the proof that it exists. Without this the
+    /// census could report conflicts with no reference to compare against.
+    #[test]
+    fn the_running_copy_is_always_counted() {
+        let exe = PathBuf::from("/opt/weird/aterm.app/Contents/MacOS/aterm");
+        let c = classify_claimants(
+            "com.aterm.aterm",
+            Some(&exe),
+            &[PathBuf::from("/nope")],
+            |_| None,
+            |root| {
+                root.ends_with("aterm.app")
+                    .then(|| id("com.aterm.aterm", DEV_ID, "developer-id"))
+            },
+        );
+        assert_eq!(c.found.len(), 1);
+        assert!(c.found[0].running);
+        assert_eq!(c.enumeration, Enumeration::Partial, "a root was unreadable");
+    }
+
+    /// `foo.app.rollback` is a bundle. A plain `.app` extension test would
+    /// have missed the exact directory `tccd` attributed the owner's process to
+    /// at 13:33:46 on 2026-09-21.
+    #[test]
+    fn a_rollback_sibling_looks_like_a_bundle() {
+        for yes in [
+            "aterm.app",
+            "aterm.app.rollback",
+            "aterm.APP",
+            "aterm-b826-backup.app",
+            "Some Name.app.previous",
+        ] {
+            assert!(looks_like_bundle(yes), "{yes}");
+        }
+        for no in [
+            "notes.txt",
+            "aterm",
+            ".app",
+            ".aterm.app",
+            "apple.appointments",
+            "",
+        ] {
+            assert!(!looks_like_bundle(no), "{no}");
+        }
+    }
+
+    /// The search roots are the directories that hold an aterm install, most
+    /// specific first, de-duplicated. The running bundle's PARENT is what
+    /// covers a `~/aterm/dist` no roster knows about.
+    #[test]
+    fn the_search_roots_start_where_this_process_runs_from() {
+        let exe = PathBuf::from("/Users//a/aterm/dist/aterm.app/Contents/MacOS/aterm");
+        let home = PathBuf::from("/Users//a");
+        let roots = claimant_search_roots(Some(&exe), Some(&home));
+        assert_eq!(roots[0], PathBuf::from("/Users//a/aterm/dist"), "{roots:?}");
+        assert!(roots.contains(&PathBuf::from("/Applications")));
+        assert!(roots.contains(&home.join("Applications")));
+
+        // Running FROM /Applications must not list it twice.
+        let apps_exe = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+        let roots = claimant_search_roots(Some(&apps_exe), Some(&home));
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|r| *r == Path::new("/Applications"))
+                .count(),
+            1,
+            "{roots:?}"
+        );
+
+        // An unbundled dev run contributes no root of its own.
+        let dev = PathBuf::from("/Users//a/aterm/target/debug/aterm");
+        let roots = claimant_search_roots(Some(&dev), Some(&home));
+        assert_eq!(roots[0], PathBuf::from("/Applications"), "{roots:?}");
+    }
+
     /// THE IMAGE ANCHOR, as a table. Every arm, and the ordering that
     /// distinguishes the two failing ones.
     ///
@@ -2248,41 +3151,67 @@ mod tests {
     /// see it, because the existing probe reads a path that follows the vnode.
     #[test]
     fn the_image_anchor_names_every_way_the_code_can_go_missing() {
-        let live = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
-        let displaced = Path::new("/Applications/aterm.app.rollback/Contents/MacOS/aterm");
+        let exec = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let rolled = Path::new("/Applications/aterm.app.rollback/Contents/MacOS/aterm");
+        let other = Path::new("/Applications/aterm-new.app/Contents/MacOS/aterm");
         let unbundled = Path::new("/Users//a/aterm/target/debug/deps/aterm_gui-abc");
+        let at = |p: &Path| SelfImage::At(p.to_path_buf());
+        // The oracle must not be consulted on any arm the kernel answers.
+        let boom = |_: &Path| panic!("the live path answered; nothing may stat");
 
-        // Present on disk.
-        let there = |_: &Path| true;
-        assert_eq!(classify_image_anchor(Some(live), there), ImageAnchor::Live);
-        // The real shape of the bug: still on disk, but not under a `.app`
-        // name any more. `app_bundle_root` answers None because the enclosing
-        // directory's extension is `rollback`, and the bundled LAYOUT is what
-        // tells that apart from an ordinary unbundled binary.
+        // Agreement is the ONLY way to read Live.
         assert_eq!(
-            classify_image_anchor(Some(displaced), there),
-            ImageAnchor::Displaced
-        );
-        assert_eq!(
-            classify_image_anchor(Some(unbundled), there),
-            ImageAnchor::NotBundled
+            classify_image_anchor(Some(exec), &at(exec), boom),
+            ImageAnchor::Live
         );
 
-        // Gone from disk. Deletion is checked FIRST and outranks everything:
-        // a deleted bundle and a renamed one both answer None from
-        // `app_bundle_root`, and reporting the recoverable state for the
-        // unrecoverable one would be the wrong way round.
-        let gone = |_: &Path| false;
-        for path in [live, displaced, unbundled] {
+        // The measured RENAME_SWAP shape, in both forms. `current_exe()` is
+        // frozen at `exec` in each of them, which is precisely why the live
+        // path has to be the one classified.
+        for live in [rolled, other] {
             assert_eq!(
-                classify_image_anchor(Some(path), gone),
-                ImageAnchor::Deleted,
-                "{path:?}"
+                classify_image_anchor(Some(exec), &at(live), boom),
+                ImageAnchor::Displaced,
+                "{live:?}"
             );
         }
 
+        // Boot-health deleted the displaced bundle: the kernel has no path.
+        assert_eq!(
+            classify_image_anchor(Some(exec), &SelfImage::NoPath, boom),
+            ImageAnchor::Deleted
+        );
+
+        // A dev run is not a fault, whatever the kernel says — judged on the
+        // exec path's layout, before anything can call it broken.
+        for live in [
+            SelfImage::At(unbundled.to_path_buf()),
+            SelfImage::NoPath,
+            SelfImage::Unsupported,
+        ] {
+            assert_eq!(
+                classify_image_anchor(Some(unbundled), &live, boom),
+                ImageAnchor::NotBundled,
+                "{live:?}"
+            );
+        }
+
+        // No vnode view (non-macOS): fall back to the exec path's existence.
+        // This arm cannot see a swap, and the doc says so.
+        assert_eq!(
+            classify_image_anchor(Some(exec), &SelfImage::Unsupported, |_: &Path| true),
+            ImageAnchor::Live
+        );
+        assert_eq!(
+            classify_image_anchor(Some(exec), &SelfImage::Unsupported, |_: &Path| false),
+            ImageAnchor::Deleted
+        );
+
         // No path to classify is not a fault.
-        assert_eq!(classify_image_anchor(None, there), ImageAnchor::Unknown);
+        assert_eq!(
+            classify_image_anchor(None, &SelfImage::Unsupported, boom),
+            ImageAnchor::Unknown
+        );
 
         // Only the two real failures claim the grant cannot be validated. A dev
         // run and a failed read must never be reported as a broken grant.
@@ -2310,7 +3239,10 @@ mod tests {
     #[test]
     fn the_image_anchor_touches_the_filesystem_only_through_its_oracle() {
         let boom = |_: &Path| panic!("the classifier must not stat anything itself");
-        assert_eq!(classify_image_anchor(None, boom), ImageAnchor::Unknown);
+        assert_eq!(
+            classify_image_anchor(None, &SelfImage::Unsupported, boom),
+            ImageAnchor::Unknown
+        );
     }
 
     #[test]

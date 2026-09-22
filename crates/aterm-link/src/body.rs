@@ -150,6 +150,17 @@ pub struct Body {
     /// The relay chain. Any `via=` at all makes the message `trust=relayed` and
     /// `kind=note demoted=<k>`, whatever the recipient's allowlist says (§6.7).
     pub via: Option<String>,
+    /// A BROADCAST's kind, carried IN THE BODY.
+    ///
+    /// A directed message puts its kind in the subject's last segment, and the
+    /// `in/` tree can afford that: one leaf per kind, per recipient. A
+    /// BROADCAST cannot — `say/<topic>/<kind>` multiplies the fleet's topics by
+    /// the kind set on a subject budget round 23 has not reclaimed (the bridge
+    /// header counts what each session already costs), and the topic is the
+    /// thing subscribers name. So `say` spends its last segment on the topic
+    /// and the kind rides here. Closed to [`crate::fabric::KINDS`] at the
+    /// decoder, like `verdict`.
+    pub kind: Option<String>,
     /// The message text, already pct-DECODED.
     pub text: String,
     /// Tokens this build does not know, kept so a round trip is lossless and a
@@ -182,6 +193,7 @@ impl Body {
             ("epoch", self.epoch.clone()),
             ("gen", self.gen.clone()),
             ("via", self.via.clone()),
+            ("kind", self.kind.clone()),
         ] {
             if let Some(v) = value {
                 line.push_str(&format!(" {key}={v}"));
@@ -244,6 +256,12 @@ impl Body {
                 "epoch" => body.epoch = Some(val.to_string()),
                 "gen" => body.gen = Some(val.to_string()),
                 "via" => body.via = Some(val.to_string()),
+                // CLOSED at the decoder, for `verdict`'s reason: a `kind=` a
+                // publisher invented is an unknown field, not a kind, so no
+                // reader downstream has to re-check it.
+                "kind" if KINDS.contains(&val) => {
+                    body.kind = Some(val.to_string());
+                }
                 "text" => body.text = crate::pct::decode(val),
                 "len" => declared_len = val.parse().ok(),
                 _ => {
@@ -264,6 +282,33 @@ impl Body {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A BROADCAST'S KIND RIDES IN THE BODY**, round-trips, and is CLOSED to
+    /// the known set — a `kind=` a publisher invented stays an unknown field,
+    /// exactly as `verdict=` does, so no reader downstream re-checks it.
+    #[test]
+    fn a_broadcast_kind_round_trips_and_is_closed() {
+        let mut b = Body::new(7);
+        b.kind = Some("task".to_string());
+        b.text = "go".to_string();
+        let wire = b.encode(None);
+        let line = String::from_utf8_lossy(&wire).into_owned();
+        assert!(line.contains(" kind=task"), "{line}");
+        let (back, _) = Body::decode(&wire);
+        assert_eq!(back.kind.as_deref(), Some("task"));
+
+        let (invented, _) = Body::decode(b"v=1 t=1 kind=shout text=hi");
+        assert_eq!(invented.kind, None, "an unknown kind is not a kind");
+        assert_eq!(
+            invented.unknown.get("kind").map(String::as_str),
+            Some("shout"),
+            "it is kept as an unknown field, losslessly"
+        );
+        // A directed message carries no body kind at all: its kind is the
+        // subject's last segment.
+        let (plain, _) = Body::decode(b"v=1 t=1 text=hi");
+        assert_eq!(plain.kind, None);
+    }
     use super::*;
 
     /// The line round-trips, and the fields the design forbids stay absent: a

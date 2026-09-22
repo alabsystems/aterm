@@ -608,6 +608,32 @@ pub(crate) fn blank_cell(theme: Theme) -> RenderCell {
     cell(' ', colors.label, colors.bar_bg, false, true)
 }
 
+/// CLOSE a band's content-facing TOP edge, in place, across the WHOLE row and in
+/// ONE tone. The top edge's counterpart to [`crate::tab_bar::seal_strip_bottom`].
+///
+/// WHY A BAND CANNOT JUST STAMP THE SEAM WHEN IT BLANKS THE ROW. It does — via
+/// [`blank_cell`] or `settings::blank_row` — and then it paints its words over it.
+/// Every writer in this crate builds the cell it writes FROM SCRATCH
+/// (`settings::write_str` calls [`cell`] with `seam: false`) and no chrome text
+/// carries an overline of its own, so the rule survives exactly where the band
+/// happens to have no words. On screen that is not a rule: a title row comes out as
+/// three disconnected stubs — the left margin, the gap before the right-aligned
+/// aside, the right margin — which reads as rendering debris rather than as the
+/// band's boundary. Drawn HERE, across the FINISHED row after every write, so no
+/// future field added to a band can chip it again.
+///
+/// `ink` is the seam's OWN tone rather than each cell's `fg`, because a title row
+/// deliberately carries more than one: a warn-coloured title beside a
+/// label-coloured aside. A rule left to the cells beneath it would run bright for
+/// the title's twenty cells and dim for the rest — a seam is a STRUCTURAL edge and
+/// must not brighten under the words it happens to pass beneath.
+pub(crate) fn seal_band_top(row: &mut [RenderCell], ink: [u8; 3]) {
+    for cell in row.iter_mut() {
+        cell.overline = true;
+        cell.overline_color = Some(ink);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod hc_fixtures {
     use super::ForcedChrome;

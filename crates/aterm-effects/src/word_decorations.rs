@@ -8942,6 +8942,10 @@ fn split_super_selection(quads: &mut Vec<GlowQuad>, n0: usize, geom: EffectGeom,
         // never a washed-over selection).
         let (hx0, hx1) = (s0 * cw, (s1 + 1) * cw);
         let (qx0, qx1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
+        // The `..q` spreads below carry the quad's colour pair across the
+        // split, which is only right for a FLAT quad (a gradient's halves
+        // would each re-span the whole ramp). Every nova quad is flat.
+        debug_assert!(q.is_flat(), "a split nova quad must be flat");
         let mut replaced = false;
         if hx0 > qx0 {
             quads[i] = GlowQuad {

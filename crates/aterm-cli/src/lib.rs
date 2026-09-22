@@ -197,6 +197,9 @@ pub enum Verb {
     Update,
     /// `aterm agents` — the coding-agent primer installer.
     Agents,
+    /// `aterm harness` — the Claude Code harness: the hook bridge and the
+    /// read verbs (docs/DESIGN-aterm-wrapper-2026-09-17.md §4.5, §5.7).
+    Harness,
     /// `aterm new-tab` — a tab, routed by `windowing_behavior` (S12 / design §5).
     NewTab,
     /// `aterm new-window` — a window, unconditionally (the `attach` escape hatch).
@@ -218,6 +221,7 @@ impl Verb {
         Verb::Ship,
         Verb::Update,
         Verb::Agents,
+        Verb::Harness,
         Verb::NewTab,
         Verb::NewWindow,
         Verb::SplitPane,
@@ -236,6 +240,7 @@ impl Verb {
             Verb::Ship => "ship",
             Verb::Update => "update",
             Verb::Agents => "agents",
+            Verb::Harness => "harness",
             // Hyphenated, exactly like Windows Terminal's — the whole value of a
             // familiar grammar is that the words are the SAME words.
             Verb::NewTab => "new-tab",
@@ -269,6 +274,7 @@ impl Verb {
             Verb::Ship
             | Verb::Update
             | Verb::Agents
+            | Verb::Harness
             | Verb::NewTab
             | Verb::NewWindow
             | Verb::SplitPane => None,
@@ -299,7 +305,8 @@ impl Verb {
             | Verb::Fabric
             | Verb::Ship
             | Verb::Update
-            | Verb::Agents => false,
+            | Verb::Agents
+            | Verb::Harness => false,
         }
     }
 
@@ -316,6 +323,7 @@ impl Verb {
             Verb::Ship => "aterm ship <args>",
             Verb::Update => "aterm update [<cmd>]",
             Verb::Agents => "aterm agents [<cmd>]",
+            Verb::Harness => "aterm harness <cmd>",
             // The synopsis column is 26 wide (VERB_BLURB_COLUMN - 4) and the
             // rendering test pins the blurb to exactly column 30, so these read
             // `[-d dir]` rather than the `[-d <dir>]` the usage lines use: the
@@ -369,6 +377,13 @@ impl Verb {
                 "it for every detected agent when it spawns a session — at",
                 "most once a minute, and only while `agents_auto_prime` is on;",
                 "a plain `aterm` shell session never does.",
+            ],
+            Verb::Harness => &[
+                "The Claude Code harness: answer the vendor's hooks, record",
+                "the statusLine, and read back what it saw (hook | statusline",
+                "| install | uninstall | status | usage | limits | ledger).",
+                "Hooks are ENRICHMENT: every read verb answers with none",
+                "installed and says so, because `--bare` removes them all.",
             ],
             Verb::NewTab => &[
                 "Open a terminal tab. Where it opens is the",

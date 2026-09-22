@@ -3327,6 +3327,8 @@ mod tests {
                 h: ch as u16,
                 color: aterm_render::premul_rgb(0x00FF_6A00, 230),
                 alpha: 0,
+                color2: aterm_render::premul_rgb(0x00FF_6A00, 230),
+                alpha2: 0,
             })
             .collect();
         input.fire_patch = vec![aterm_render::FirePatch::default()];
@@ -4283,6 +4285,8 @@ mod tests {
                     h: ch16,
                     color: premul_rgb(base, *a),
                     alpha: 0,
+                    color2: premul_rgb(base, *a),
+                    alpha2: 0,
                 });
             }
             for (i, mode) in [HaloMode::Add, HaloMode::Over].into_iter().enumerate() {
@@ -4323,6 +4327,8 @@ mod tests {
                     h: ch16,
                     color: premul_rgb(0x00ff_79c6, *a),
                     alpha: 0,
+                    color2: premul_rgb(0x00ff_79c6, *a),
+                    alpha2: 0,
                 });
             }
             fixtures.push(("nova", input, &[S::NovaAdd]));
@@ -4424,6 +4430,8 @@ mod tests {
                 h: ch16,
                 color: premul_rgb(0x00ff_6020, 140),
                 alpha: 0,
+                color2: premul_rgb(0x00ff_6020, 140),
+                alpha2: 0,
             });
             for (i, mode) in [FireMode::Add, FireMode::Over].into_iter().enumerate() {
                 input.fire_patch.push(FirePatch {
@@ -4708,6 +4716,8 @@ mod tests {
             h: ch16,
             color: premul_rgb(0x00ff_6020, 140),
             alpha: 0,
+            color2: premul_rgb(0x00ff_6020, 140),
+            alpha2: 0,
         });
         for (i, mode) in [FireMode::Add, FireMode::Over].into_iter().enumerate() {
             input.fire_patch.push(FirePatch {
@@ -4919,6 +4929,8 @@ mod tests {
                 h: 3 * ch16,
                 color: premul_rgb(0x0050_fa7b, 160),
                 alpha: 0,
+                color2: premul_rgb(0x0050_fa7b, 160),
+                alpha2: 0,
             });
             input
         };
@@ -5077,6 +5089,8 @@ mod tests {
                 h: ch16,
                 color: premul_rgb(0x00ff_8030, *a),
                 alpha: 0,
+                color2: premul_rgb(0x00ff_8030, *a),
+                alpha2: 0,
             });
         }
         // The FIRE-style marker the shimmer gate keys on (`shimmer_live`): a
@@ -5672,17 +5686,20 @@ mod tests {
             headroom: f32,
             _pad: [f32; 2],
         }
+        // Tight 16-byte `GlowInstance`s: the rect, then the colour at BOTH
+        // ends of the ramp (a flat pair — the wgpu oracle packs it the same).
         let mut stream_bytes: Vec<u8> = Vec::new();
         for (rect, colour) in INSTANCES {
             for v in rect {
                 stream_bytes.extend_from_slice(&v.to_le_bytes());
             }
             stream_bytes.extend_from_slice(&colour);
+            stream_bytes.extend_from_slice(&colour);
         }
         assert_eq!(
             stream_bytes.len() as u64,
-            crate::pipeline_table::BG_LAYOUT.stride * INSTANCES.len() as u64,
-            "the fixture packs tight 12-byte BgInstances"
+            crate::pipeline_table::GLOW_LAYOUT.stride * INSTANCES.len() as u64,
+            "the fixture packs tight 16-byte GlowInstances"
         );
         let stream = dev.new_buffer(stream_bytes.len()).expect("stream");
         // SAFETY: exactly-sized fresh shared buffer.

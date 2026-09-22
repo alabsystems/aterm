@@ -80,6 +80,7 @@ pub mod mailbox;
 pub mod mirror;
 pub mod notify;
 pub mod pct;
+pub mod permission;
 /// The presence row's meaning fields (`role= detail= phase= context= title=`).
 pub mod presence;
 pub mod render;

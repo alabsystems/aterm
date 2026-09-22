@@ -4979,6 +4979,7 @@ mod tests {
             control: None,
             frozen_path: false,
             identity: None,
+            topics: Vec::new(),
         }
     }
 

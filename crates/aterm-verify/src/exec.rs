@@ -164,11 +164,15 @@ pub struct ExecEnv<'a> {
     /// stage's own [`Cmd::envs`] — so a stage that names a variable still wins.
     ///
     /// This is where a fact the whole run must agree on lives, resolved ONCE on
-    /// the main thread instead of by each child for itself. Two of them today:
+    /// the main thread instead of by each child for itself. Three of them today:
     /// the pinned git stamp (`ATERM_BUILD_GIT_COMMIT` / `ATERM_BUILD_DEV_COMMITS`),
     /// which stops `aterm-gui`'s build script watching a path in the shared
-    /// common git dir, and `RUST_TEST_THREADS`, which the run must PIN rather
-    /// than inherit from whatever shell invoked it.
+    /// common git dir; `RUST_TEST_THREADS`, which the run must PIN rather
+    /// than inherit from whatever shell invoked it; and `CARGO_INCREMENTAL=0`
+    /// (2026-09-21), because the gate builds a commit once and the incremental
+    /// caches it never reused had grown one lane's target dir from 36 GB to
+    /// 55 GB and run the volume to `No space left on device`
+    /// ([`crate::Ctx::with_pinned_child_facts`]).
     pub add_env: &'a [(OsString, OsString)],
     /// Where per-child timing rows go when `ATERM_VERIFY_TIMINGS` names a file.
     /// `None` spawns nothing extra and writes nothing.
@@ -332,10 +336,46 @@ pub struct Run {
     pub spawn_error: Option<String>,
 }
 
+/// The OS's own sentence for ENOSPC, as cargo, rustc and a test harness print
+/// it verbatim (`… : No space left on device (os error 28)`).
+pub const ENOSPC_SENTENCE: &str = "No space left on device";
+
 impl Run {
     #[must_use]
     pub fn trimmed_output(&self) -> &str {
         self.output.trim_end_matches('\n')
+    }
+
+    /// Why this child is NOT a finding about the tree: `Some(reason)` when it
+    /// never spawned ([`Run::spawn_error`]) or when it ran out of disk — its
+    /// output carries [`ENOSPC_SENTENCE`]. `None` for a child that ran and
+    /// answered, pass or fail, including one that only PRINTED the sentence on
+    /// its way to passing.
+    ///
+    /// MEASURED 2026-09-20, the two contract runs that died on a full volume:
+    /// `aterm-verify: cannot run …/targo: No space left on device (os error 28)`
+    /// (a stage log that could not be created, so a spawn failure) and, inside
+    /// a build child, `error: failed to write …/target/debug/deps/…/lib.rmeta:
+    /// No space left on device (os error 28)`. Both were recorded as `FAIL`
+    /// rows of a FINDING's severity, so a run that had reached its verdict
+    /// would have written `verdict FAIL` into the receipt of a tree nobody
+    /// judged. [`crate::ladder::Report::fail_child`] asks this first.
+    ///
+    /// The sentence is matched anywhere in the output, so a FAILING test that
+    /// prints it for its own reasons is misread as an environment failure —
+    /// COULD NOT RUN instead of FAIL, both red, neither the merge contract; the
+    /// cost is a severity, never a green. A passing child is never asked.
+    #[must_use]
+    pub fn environment_failure(&self) -> Option<String> {
+        if self.ok {
+            return None;
+        }
+        if let Some(e) = &self.spawn_error {
+            return Some(e.clone());
+        }
+        self.output
+            .contains(ENOSPC_SENTENCE)
+            .then(|| format!("the child ran out of disk ({ENOSPC_SENTENCE})"))
     }
 }
 
@@ -808,6 +848,81 @@ mod tests {
             add_env: &[],
             timings: None,
         }
+    }
+
+    /// THE GATE'S OWN SETTING REACHES THE CHILD, over whatever the caller's
+    /// shell exported (`Command::env` after inheriting is an override), and a
+    /// stage that names the variable itself still wins — the same precedence
+    /// `remove_env` has. [`crate::Ctx::exec_env`] is what carries the run's
+    /// pinned facts here; `lib.rs` pins that `CARGO_INCREMENTAL=0` is one of
+    /// them.
+    #[test]
+    fn an_added_variable_reaches_the_child_and_a_stage_naming_it_still_wins() {
+        let tmp = crate::mktemp_dir("atv-setenv").expect("mktemp");
+        let added = [(OsString::from("CARGO_INCREMENTAL"), OsString::from("0"))];
+        let env = ExecEnv {
+            add_env: &added,
+            ..env_in(&tmp)
+        };
+        let ask = Cmd::new("/bin/sh").args(["-c", "printf %s \"${CARGO_INCREMENTAL-unset}\""]);
+        assert_eq!(run(&ask, env).trimmed_output(), "0");
+        let stage_says = ask.clone().env("CARGO_INCREMENTAL", "1");
+        assert_eq!(run(&stage_says, env).trimmed_output(), "1");
+        let plain = run(&ask, env_in(&tmp));
+        assert!(
+            plain.trimmed_output() != "0"
+                || std::env::var_os("CARGO_INCREMENTAL").is_some_and(|v| v == "0"),
+            "with nothing set the child inherits: {:?}",
+            plain.output
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A child that never spawned, and one that died of a full disk, are
+    /// environment failures; a child that ran and failed is a finding, and a
+    /// child that passed is never asked — whatever it printed.
+    #[test]
+    fn a_spawn_failure_or_an_enospc_is_the_environment_and_a_plain_failure_is_a_finding() {
+        let child = |ok: bool, output: &str, spawn_error: Option<&str>| Run {
+            ok,
+            output: output.to_string(),
+            code: if spawn_error.is_some() {
+                None
+            } else {
+                Some(i32::from(!ok))
+            },
+            spawn_error: spawn_error.map(str::to_string),
+        };
+        let never = child(
+            false,
+            "aterm-verify: cannot run /s2/targo: No space left on device (os error 28)",
+            Some("No space left on device (os error 28)"),
+        );
+        assert_eq!(
+            never.environment_failure().as_deref(),
+            Some("No space left on device (os error 28)")
+        );
+        let starved = child(
+            false,
+            "   Compiling aterm-gui v0.89.0\nerror: failed to write /s/target/debug/deps/rustccu4LYX/lib.rmeta: No space left on device (os error 28)\n\nerror: could not compile `aterm-gui` (lib) due to 1 previous error\n",
+            None,
+        );
+        assert_eq!(
+            starved.environment_failure().as_deref(),
+            Some("the child ran out of disk (No space left on device)")
+        );
+        let finding = child(false, "error[E0308]: mismatched types\n", None);
+        assert_eq!(finding.environment_failure(), None);
+        let passed = child(
+            true,
+            "test enospc_message_is_last_line ... ok (No space left on device)\n",
+            None,
+        );
+        assert_eq!(
+            passed.environment_failure(),
+            None,
+            "a passing child is never asked"
+        );
     }
 
     #[test]

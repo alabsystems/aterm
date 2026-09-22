@@ -6,7 +6,9 @@ use super::super::types::{FilterMode, StreamingMatch};
 use super::StreamingSearch;
 #[cfg(kani)]
 use crate::grapheme::map_lower_byte_to_original;
-use crate::grapheme::{ColumnMap, LowerByteMap, LowerNeed, lower_fold, lower_need};
+use crate::grapheme::{
+    ColumnMap, LowerByteMap, LowerNeed, display_columns, lower_fold, lower_need,
+};
 use std::borrow::Cow;
 
 /// Per-row coordinate scratch, populated only after the first substring hit.
@@ -151,8 +153,7 @@ impl StreamingSearch {
         // Identical single-element (or empty) result.
         let mut matches = Vec::new();
         if Self::fuzzy_match(search_text, search_pattern) {
-            let col_map = ColumnMap::new(text);
-            let end_col = col_map.byte_to_column(text.len());
+            let end_col = display_columns(text);
             matches.push(StreamingMatch::new(row, 0, end_col));
         }
         matches
@@ -560,6 +561,29 @@ mod tests {
             );
         }
         assert_eq!(find_in_row("σ", "日ΟΣ Σσς", true), vec![(6, 7)]);
+    }
+
+    #[test]
+    fn width_only_search_paths_preserve_unicode_match_columns() {
+        use super::super::super::test_content::WrappedTestContent;
+
+        let mut fuzzy = engine_literal(true);
+        fuzzy.start_search("日e", FilterMode::Fuzzy).unwrap();
+        fuzzy.scan_row(0, "\t日1\u{fe0f}\u{20e3}e\u{0301}", 1);
+        let m = &fuzzy.results()[0];
+        assert_eq!((m.row, m.start_col, m.end_col), (0, 0, 5));
+
+        let mut content = WrappedTestContent::new(
+            vec!["日e\u{0301}", "1\u{fe0f}\u{20e3}find", " tail"],
+            vec![false, true, true],
+        );
+        let mut literal = engine_literal(true);
+        literal.start_search("find", FilterMode::Literal).unwrap();
+        literal.scan_all(&mut content);
+        let m = &literal.results()[0];
+        assert_eq!((m.row, m.start_col, m.end_col), (1, 2, 6));
+        assert!(fuzzy.verify_all_invariants());
+        assert!(literal.verify_all_invariants());
     }
 
     // ====================================================================

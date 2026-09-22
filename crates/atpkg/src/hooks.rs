@@ -16,6 +16,23 @@
 //! runs ahead of a vendor's native install or a brew cask. `bin/` stays last; the deny-list
 //! keeps its meaning, because `agents/` can only ever carry those two names.
 //!
+//! AND THAT EXCEPTION IS ITSELF SCOPED: the agents dir leads **INSIDE ATERM ONLY**
+//! (owner ask 2026-09-22 — *"claude managed via aterm should be in aterm only. NOT in ALL
+//! terminals like iterm!!!"*). Until that day the move-to-front was conditional on nothing
+//! at run time, so a `claude` typed in iTerm silently ran the managed, index-pinned,
+//! `DISABLE_AUTOUPDATER=1` copy instead of the user's own install — and, because the
+//! vendor's updater is disabled in the signed manifest, there was no way to move that copy
+//! forward from outside aterm either. docs/DESIGN-which-copy-runs-2026-08-27.md had said
+//! the intended rule all along (*"the managed copy is the one that runs **inside an aterm
+//! session**"*), so the gate is the implementation catching up with its own sentence.
+//!
+//! What is NOT scoped, and must never be: `bin/`. The Trust toolchain and the verifiers —
+//! `targo`, `trustc`, `tippy`, `trustfmt`, `ty`, `ay`, `clean` — are the default compiler on
+//! this machine in ANY terminal (owner standing instruction), so the bin half stays
+//! unconditional. The two halves are written in that order, bin first, precisely so a parse
+//! error in the agents gate can never cost the toolchain: a shell abandons a sourced file at
+//! the error and runs nothing after it. See the POSIX body's comment for the measurement.
+//!
 //! MOVE-TO-FRONT, NEVER SKIP-IF-PRESENT (2026-09-10). The first cut guarded the prepend with
 //! "already on PATH?", and on a macOS login shell the answer was always yes: aterm's spawn had
 //! put the dir first, `/etc/zprofile`'s `path_helper` then rebuilt PATH with every
@@ -159,9 +176,45 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     // is rendered through its own quoter ([`fish_quote`]), never this one.
     let fish_bin = fish_quote(bin_dir);
     let fish_agents = fish_quote(agents_dir);
-    // POSIX (zsh + bash, down to macOS's bash 3.2): the agents dir is MOVED TO THE FRONT,
-    // the managed bin/ an idempotent APPEND — two elements, two variables, so neither can
-    // mask the other; quoted for a space in "Application Support". The move is the
+    // POSIX (zsh + bash, down to macOS's bash 3.2): the managed bin/ is an idempotent
+    // APPEND, and the agents dir is MOVED TO THE FRONT **ONLY INSIDE ATERM** — two
+    // elements, two variables, so neither can mask the other; quoted for a space in
+    // "Application Support".
+    //
+    // THE BIN HALF IS EMITTED FIRST, AND THAT ORDER IS LEAD-BEARING (2026-09-22). A shell
+    // abandons a sourced file at a parse error and runs nothing after it, so whichever half
+    // is last is the one a future typo costs. Measured with the same injected typo in the
+    // agents gate: agents-first left `PATH=/usr/bin:/bin` with `ATPKG_BIN` unset — the Trust
+    // toolchain gone from EVERY terminal — while bin-first kept both. The owner's standing
+    // instruction is that targo/trustc/tippy/ty/ay/clean resolve in ANY terminal, so the
+    // toolchain gets the unconditional half and the conditional one can never reach it.
+    // This matters most for the fish and PowerShell bodies, which cannot be executed on a
+    // stock macOS box at all.
+    //
+    // THE AGENTS GATE (owner ask 2026-09-22: "claude managed via aterm should be in aterm
+    // only. NOT in ALL terminals like iterm!!!"). Until today the move-to-front was
+    // conditional on NOTHING at run time, so `claude` in iTerm silently resolved to the
+    // managed, pinned, self-update-disabled copy instead of the user's own install. The
+    // written design had always said otherwise — docs/DESIGN-which-copy-runs-2026-08-27.md:
+    // "the managed copy is the one that runs **inside an aterm session**" — so this is the
+    // implementation catching up with its own sentence, not a policy reversal.
+    //
+    // The gate is a UNION of four markers, not one, because no single marker covers every
+    // lane: the GUI exports ATERM_CHILD and ATERM_SESSION_ID but NOT ATERM_AGENTS_DIR, while
+    // `aterm --session` launched from another terminal carries ATERM_AGENTS_DIR and
+    // deliberately carries neither of the other two (aterm-cli/src/lib.rs: "Deliberately NOT
+    // setting `ATERM_CHILD` here: this lane has never carried it") — so a gate on either
+    // alone switches the managed copy off in a cell the owner wants it on. TERM_PROGRAM is
+    // NOT in the union on purpose: ATERM_TERM_PROGRAM makes it user-settable, and
+    // net_listen.rs already had to stop trusting it. ATPKG_AGENTS_EVERYWHERE is the escape
+    // hatch for someone who wants the old behaviour back in every shell.
+    //
+    // The false arm DEMOTES rather than merely declining to promote: it writes PATH back
+    // without the agents element and unsets ATPKG_AGENTS, so a shell that INHERITED an
+    // agents-first PATH (an iTerm launched from an aterm tab) heals itself instead of
+    // carrying the leak down the process tree.
+    //
+    // Both arms decide on the FRAMED remainder, never the stripped one. The move is the
     // integration's reroute idiom: frame PATH as `:$PATH:` so /opt/x never matches /opt/xy,
     // remove every `:dir:` to a fixpoint by POSIX `[ = ]` (never a `[[ == ]]` pattern,
     // which `nocasematch` bends), then strip exactly one framing colon from each end so an
@@ -171,16 +224,18 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     // 2026-09-10).
     let posix = format!(
         "# Generated by atpkg -- DO NOT EDIT (rewritten on every install/update).\n\
-         __atpkg_agents=\"{agents}\"\n\
-         __atpkg_p=\":$PATH:\"\n\
-         while :; do __atpkg_q=\"${{__atpkg_p//\":$__atpkg_agents:\"/:}}\"; [ \"$__atpkg_q\" = \"$__atpkg_p\" ] && break; __atpkg_p=\"$__atpkg_q\"; done\n\
-         case \"$__atpkg_p\" in :) export PATH=\"$__atpkg_agents\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_agents:$__atpkg_p\" ;; esac\n\
-         export ATPKG_AGENTS=\"$__atpkg_agents\"\n\
-         unset __atpkg_agents __atpkg_p __atpkg_q\n\
          __atpkg_bin=\"{bin}\"\n\
          case \":$PATH:\" in *\":$__atpkg_bin:\"*) ;; *) export PATH=\"$PATH:$__atpkg_bin\" ;; esac\n\
          export ATPKG_BIN=\"$__atpkg_bin\"\n\
-         unset __atpkg_bin\n"
+         unset __atpkg_bin\n\
+         __atpkg_agents=\"{agents}\"\n\
+         __atpkg_p=\":$PATH:\"\n\
+         while :; do __atpkg_q=\"${{__atpkg_p//\":$__atpkg_agents:\"/:}}\"; [ \"$__atpkg_q\" = \"$__atpkg_p\" ] && break; __atpkg_p=\"$__atpkg_q\"; done\n\
+         case \"${{ATERM_AGENTS_DIR-}}${{ATERM_CHILD-}}${{ATERM_SESSION_ID-}}${{ATPKG_AGENTS_EVERYWHERE-}}\" in\n\
+         \"\") case \"$__atpkg_p\" in :) export PATH=\"\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_p\" ;; esac; unset ATPKG_AGENTS ;;\n\
+         *) case \"$__atpkg_p\" in :) export PATH=\"$__atpkg_agents\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_agents:$__atpkg_p\" ;; esac; export ATPKG_AGENTS=\"$__atpkg_agents\" ;;\n\
+         esac\n\
+         unset __atpkg_agents __atpkg_p __atpkg_q\n"
     );
     // fish: the agents dir moved to the front by an explicit equality loop (`string match`
     // would read the directory as a wildcard pattern; the quoted `"$__atpkg_d"` keeps an
@@ -191,14 +246,13 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     // where an old fish may run (review finding, 2026-09-10).
     let fish = format!(
         "# Generated by atpkg -- DO NOT EDIT (rewritten on every install/update).\n\
+         set -l __atpkg_bin \"{fish_bin}\"\n\
+         if not contains $__atpkg_bin $PATH; set -gx PATH $PATH $__atpkg_bin; end\n\
+         set -gx ATPKG_BIN $__atpkg_bin\n\
          set -l __atpkg_agents \"{fish_agents}\"\n\
          set -l __atpkg_rest\n\
          for __atpkg_d in $PATH; if test \"$__atpkg_d\" != \"$__atpkg_agents\"; set __atpkg_rest $__atpkg_rest \"$__atpkg_d\"; end; end\n\
-         set -gx PATH \"$__atpkg_agents\" $__atpkg_rest\n\
-         set -gx ATPKG_AGENTS $__atpkg_agents\n\
-         set -l __atpkg_bin \"{fish_bin}\"\n\
-         if not contains $__atpkg_bin $PATH; set -gx PATH $PATH $__atpkg_bin; end\n\
-         set -gx ATPKG_BIN $__atpkg_bin\n"
+         if test -n \"$ATERM_AGENTS_DIR$ATERM_CHILD$ATERM_SESSION_ID$ATPKG_AGENTS_EVERYWHERE\"; set -gx PATH \"$__atpkg_agents\" $__atpkg_rest; set -gx ATPKG_AGENTS $__atpkg_agents; else; set -gx PATH $__atpkg_rest; set -e ATPKG_AGENTS; end\n"
     );
     // PowerShell (Windows-native, and cross-platform pwsh): the aterm PowerShell integration
     // dot-sources `~/.aterm/shell.d/*.ps1`, so this is the ONLY thing that puts the managed
@@ -211,13 +265,12 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     let powershell = format!(
         "# Generated by atpkg -- DO NOT EDIT (rewritten on every install/update).\n\
          $__atpkg_sep = [System.IO.Path]::PathSeparator\n\
-         $__atpkg_agents = '{ps_agents}'\n\
-         $__atpkg_rest = @(($env:PATH -split [regex]::Escape($__atpkg_sep)) | Where-Object {{ $_ -ne $__atpkg_agents }})\n\
-         $env:PATH = (@($__atpkg_agents) + $__atpkg_rest) -join $__atpkg_sep\n\
-         $env:ATPKG_AGENTS = $__atpkg_agents\n\
          $__atpkg_bin = '{ps_bin}'\n\
          if (($env:PATH -split [regex]::Escape($__atpkg_sep)) -notcontains $__atpkg_bin) {{ $env:PATH = \"$env:PATH$__atpkg_sep$__atpkg_bin\" }}\n\
          $env:ATPKG_BIN = $__atpkg_bin\n\
+         $__atpkg_agents = '{ps_agents}'\n\
+         $__atpkg_rest = @(($env:PATH -split [regex]::Escape($__atpkg_sep)) | Where-Object {{ $_ -ne $__atpkg_agents }})\n\
+         if ($env:ATERM_AGENTS_DIR -or $env:ATERM_CHILD -or $env:ATERM_SESSION_ID -or $env:ATPKG_AGENTS_EVERYWHERE) {{ $env:PATH = (@($__atpkg_agents) + $__atpkg_rest) -join $__atpkg_sep; $env:ATPKG_AGENTS = $__atpkg_agents }} else {{ $env:PATH = $__atpkg_rest -join $__atpkg_sep; Remove-Item Env:\\ATPKG_AGENTS -ErrorAction SilentlyContinue }}\n\
          Remove-Variable __atpkg_agents, __atpkg_bin, __atpkg_sep, __atpkg_rest\n"
     );
     vec![
@@ -1002,11 +1055,109 @@ fn ensure_command_links(home: &Path) {
                 }
                 let _ = fs::remove_file(&link);
             }
-            // A real file is a hand-built binary; leave it.
-            Ok(_) => continue,
+            // A REAL FILE. Until 2026-09-21 this arm was an unconditional
+            // `continue` reading "a real file is a hand-built binary; leave
+            // it" — and the one file it was most likely to meet was aterm's
+            // OWN: every install.sh before the symlink era COPIED the binary
+            // to this path. Measured on the owner's Mac that day:
+            // `~/.local/bin/atpkg` was a fresh symlink into the 0.90.0 bundle
+            // while `~/.local/bin/aterm` was still a Jul-3 copy reporting
+            // `aterm 0.15.2607021856`, because only the second name had ever
+            // been written as a file. This pass had declined it on every run
+            // since — and the owner's agent brief points every agent at
+            // `aterm ctl privacy`, a verb that binary predates entirely.
+            //
+            // So: adopt what identifies itself as OURS, and nothing else.
+            // `tools/install.sh` already trusts exactly this probe
+            // (`"$p" --version | grep -q '^aterm-ctl '`, :3178); this is the
+            // shipped half it was missing. Anything that will not run, times
+            // out, or answers with another program's name stays untouched —
+            // fail-closed, so a developer's own build at this path survives.
+            Ok(_) => {
+                if !claims_to_be(&link, name) {
+                    continue;
+                }
+                if fs::remove_file(&link).is_err() {
+                    continue;
+                }
+            }
             Err(_) => {}
         }
         let _ = std::os::unix::fs::symlink(&target, &link);
+    }
+    retire_superseded_ctl_shim(&bin);
+}
+
+/// Whether the binary at `path` identifies itself as `name` — the ownership
+/// probe, bounded hard.
+///
+/// This is the ONE place this module executes something it did not place, so
+/// every degree of freedom is closed: no shell, no arguments but `--version`,
+/// stdin and stderr on `/dev/null` so it can neither prompt nor scribble, and
+/// the FIRST line only. A non-zero exit, an unreadable child, a name that is
+/// not ours, or output that does not begin with `<name> ` all answer `false`,
+/// which leaves the file exactly as it was.
+///
+/// The match is `"<name> "` with the trailing space on purpose: `aterm-ctl`
+/// starts with `aterm`, and adopting one under the other's name is how a shim
+/// ends up pointing at the wrong binary.
+#[cfg(unix)]
+fn claims_to_be(path: &Path, name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::{Command, Stdio};
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    // Not executable: nothing to ask, and nothing that could be shadowing us.
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return false;
+    }
+    let Ok(out) = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let Ok(text) = String::from_utf8(out.stdout) else {
+        return false;
+    };
+    text.lines()
+        .next()
+        .is_some_and(|first| first.starts_with(&format!("{name} ")))
+}
+
+/// Retire OUR OWN superseded `aterm-ctl` shim, and only ours.
+///
+/// `aterm ctl …` is the front door; `tools/install.sh`'s `retire_exposed_siblings`
+/// (:3168-3182) has removed this sibling since the one-command collapse, but no
+/// SHIPPED code ever did — so a machine that last ran the installer before that
+/// change keeps a stale `aterm-ctl` on PATH forever, and `$ATERM_CTL`-style
+/// resolution can hand a 0.15 client to a 0.90 socket. Removing it is not a
+/// loss: the bundle still ships the argv0 alias, so `aterm ctl` and an
+/// in-session `aterm-ctl` both keep working.
+///
+/// Same fail-closed rule as [`claims_to_be`]: a symlink is ours only if it
+/// points into an aterm bundle, a regular file only if it says `aterm-ctl `.
+#[cfg(unix)]
+fn retire_superseded_ctl_shim(bin: &Path) {
+    let link = bin.join("aterm-ctl");
+    let Ok(meta) = fs::symlink_metadata(&link) else {
+        return;
+    };
+    let ours = if meta.file_type().is_symlink() {
+        fs::read_link(&link)
+            .ok()
+            .is_some_and(|old| old.to_string_lossy().contains("/aterm.app/Contents/MacOS/"))
+    } else {
+        claims_to_be(&link, "aterm-ctl")
+    };
+    if ours {
+        let _ = fs::remove_file(&link);
     }
 }
 
@@ -1237,6 +1388,130 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Write a fake program that prints `line` for `--version`, and mark it
+    /// executable unless `runnable` is false.
+    #[cfg(unix)]
+    fn fake_program(path: &std::path::Path, line: &str, runnable: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::write(path, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
+        let mode = if runnable { 0o755 } else { 0o644 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// THE OWNERSHIP PROBE, as a table.
+    ///
+    /// `ensure_command_links` skipped every regular file at the link path for
+    /// "a real file is a hand-built binary" — and the file it actually met on
+    /// the owner's Mac was aterm's OWN pre-symlink install artifact, a Jul-3
+    /// copy reporting `aterm 0.15.2607021856` that shadowed the 0.90.0 bundle
+    /// on PATH and could not run `aterm ctl privacy` at all. Adoption has to
+    /// be narrow enough that a developer's build survives it, so every arm
+    /// that is NOT ours is pinned here beside the one that is.
+    #[cfg(unix)]
+    #[test]
+    fn the_ownership_probe_adopts_only_what_names_itself() {
+        let home = tmp("ownership");
+
+        let ours = home.join("aterm");
+        fake_program(&ours, "aterm 0.15.2607021856", true);
+        assert!(
+            claims_to_be(&ours, "aterm"),
+            "our own former install artifact is ours to replace"
+        );
+
+        // The prefix trap: `aterm-ctl` starts with `aterm`. Adopting one under
+        // the other's name would point the shim at the wrong binary.
+        let ctl = home.join("aterm-ctl");
+        fake_program(&ctl, "aterm-ctl 0.15.2607021856", true);
+        assert!(claims_to_be(&ctl, "aterm-ctl"));
+        assert!(
+            !claims_to_be(&ctl, "aterm"),
+            "the trailing space is load-bearing: aterm-ctl is not aterm"
+        );
+
+        // Everything else is left alone, fail-closed.
+        let foreign = home.join("foreign");
+        fake_program(&foreign, "someone-elses-tool 2.0", true);
+        assert!(!claims_to_be(&foreign, "aterm"), "another program's name");
+
+        let unreadable = home.join("not-executable");
+        fake_program(&unreadable, "aterm 0.15.0", false);
+        assert!(
+            !claims_to_be(&unreadable, "aterm"),
+            "a file we cannot run tells us nothing"
+        );
+
+        let failing = home.join("nonzero");
+        fs::write(&failing, "#!/bin/sh\necho 'aterm 0.1'\nexit 3\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            !claims_to_be(&failing, "aterm"),
+            "a non-zero exit is not an identification"
+        );
+
+        assert!(
+            !claims_to_be(&home.join("absent"), "aterm"),
+            "nothing there"
+        );
+        assert!(
+            !claims_to_be(&home, "aterm"),
+            "a directory is not a program"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// `aterm ctl …` is the front door, so OUR superseded `aterm-ctl` shim is
+    /// retired — and only ours. `tools/install.sh` has done this since the
+    /// one-command collapse; no shipped code did, which is why a Jul-3
+    /// `~/.local/bin/aterm-ctl` was still on the owner's PATH in September.
+    #[cfg(unix)]
+    #[test]
+    fn the_superseded_ctl_shim_is_retired_but_only_when_it_is_ours() {
+        let bin = tmp("ctlshim");
+
+        // Ours as a regular file: the pre-symlink install artifact.
+        let link = bin.join("aterm-ctl");
+        fake_program(&link, "aterm-ctl 0.15.2607021856", true);
+        retire_superseded_ctl_shim(&bin);
+        assert!(!link.exists(), "our own stale copy is retired");
+
+        // Ours as a symlink into a bundle.
+        let bundle = bin.join("aterm.app/Contents/MacOS");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("aterm-ctl"), "x").unwrap();
+        std::os::unix::fs::symlink(bundle.join("aterm-ctl"), &link).unwrap();
+        retire_superseded_ctl_shim(&bin);
+        assert!(!link.exists(), "our own bundle link is retired");
+
+        // NOT ours: a foreign program, and a link somewhere else. Both stay.
+        fake_program(&link, "someone-elses-ctl 9.9", true);
+        retire_superseded_ctl_shim(&bin);
+        assert!(
+            link.exists(),
+            "another program under that name is untouched"
+        );
+        fs::remove_file(&link).unwrap();
+
+        let elsewhere = bin.join("elsewhere");
+        fs::write(&elsewhere, "x").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        retire_superseded_ctl_shim(&bin);
+        assert!(
+            fs::symlink_metadata(&link).is_ok(),
+            "a link pointing outside an aterm bundle is not ours to remove"
+        );
+
+        // Nothing there at all is not an error.
+        fs::remove_file(&link).unwrap();
+        retire_superseded_ctl_shim(&bin);
+
+        let _ = fs::remove_dir_all(&bin);
     }
 
     /// The rc block goes in exactly once, sources the hook, and is removable.
@@ -2054,7 +2329,7 @@ mod tests {
     /// decision 2026-09-10 — is MOVED TO THE FRONT as its own element, with no presence
     /// guard (module doc: an order failure), exported as `ATPKG_AGENTS` beside `ATPKG_BIN`.
     #[test]
-    fn posix_dialects_append_bin_and_move_only_the_agents_dir_to_the_front() {
+    fn posix_dialects_append_bin_first_then_move_the_agents_dir_to_the_front_only_inside_aterm() {
         let files = hook_files(Path::new("/p/bin"), Path::new("/p/agents"));
         for (name, body) in &files {
             if name.ends_with(".zsh") || name.ends_with(".bash") {
@@ -2085,9 +2360,47 @@ mod tests {
                     1,
                     "one presence guard, bin/'s"
                 );
+                // THE BIN HALF GOES FIRST, and that is a firewall, not a preference: a
+                // shell abandons a sourced file at a parse error, so whichever half is
+                // LAST is the one a future typo costs. The toolchain the owner requires
+                // in every terminal gets the unconditional half; the conditional one can
+                // never reach it. Measured 2026-09-22 with an injected typo: agents-first
+                // lost `ATPKG_BIN` and every Trust shim from PATH, bin-first kept both.
                 assert!(
-                    body.find("__atpkg_agents").unwrap() < body.find("__atpkg_bin").unwrap(),
-                    "the agents element is set up first"
+                    body.find("__atpkg_bin").unwrap() < body.find("__atpkg_agents").unwrap(),
+                    "the bin element — the Trust toolchain — is set up first, out of the \
+                     agents gate's blast radius"
+                );
+                // The agents move-to-front is gated on aterm's own markers (owner ask
+                // 2026-09-22: the managed claude/codex lead INSIDE ATERM ONLY). The gate
+                // is a UNION because no single marker covers every lane — the GUI exports
+                // ATERM_CHILD/ATERM_SESSION_ID but not ATERM_AGENTS_DIR, and the
+                // `aterm --session` lane carries ATERM_AGENTS_DIR and deliberately neither
+                // of the others.
+                for marker in [
+                    "ATERM_AGENTS_DIR",
+                    "ATERM_CHILD",
+                    "ATERM_SESSION_ID",
+                    "ATPKG_AGENTS_EVERYWHERE",
+                ] {
+                    assert!(
+                        body.contains(&format!("${{{marker}-}}")),
+                        "{marker} is in the gate, and defaulted so `set -u` cannot abort \
+                         the hook"
+                    );
+                }
+                assert!(
+                    !body.contains("TERM_PROGRAM"),
+                    "TERM_PROGRAM is NOT a gate marker: ATERM_TERM_PROGRAM makes it \
+                     user-settable, so it cannot decide which binary runs"
+                );
+                // The false arm DEMOTES rather than merely declining to promote, so a
+                // shell that INHERITED an agents-first PATH (an iTerm launched from an
+                // aterm tab) heals itself instead of carrying the leak down the tree.
+                assert!(
+                    body.contains("unset ATPKG_AGENTS"),
+                    "outside aterm the agents element is actively removed and its variable \
+                     unset — inheritance is the leak this closes"
                 );
                 assert!(body.contains("\"/p/agents\"") && body.contains("\"/p/bin\""));
             }

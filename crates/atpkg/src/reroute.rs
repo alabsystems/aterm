@@ -812,7 +812,7 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
 /// carries the tag and this pass can lay it clean — the stubs' rule
 /// ([`crate::stub::identical_stub_needs_relay`]) applied to the ninth file of the directory.
 ///
-/// Doctor counts the mode-`0755` marker among the directory's executables, so laying it
+/// Doctor's scan takes every regular file in the directory, the marker included, so laying it
 /// only when absent left a tagged one tagged for ever, under a warn `aterm pkg repair`
 /// could not clear. The rewrite goes through the lane's temp-and-`rename(2)`, so a racing
 /// walk never sees the directory unmarked. Both closures are lazy: the xattr is read only

@@ -94,6 +94,8 @@ fn main() {
                     color: premul,
                     // ADDITIVE light (see `GlowQuad::alpha`).
                     alpha: 0,
+                    color2: premul,
+                    alpha2: 0,
                 });
                 yy = band_end;
             }
@@ -228,6 +230,8 @@ fn main() {
                 color: premul_rgb(lumen(pos), cov),
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: premul_rgb(lumen(pos), cov),
+                alpha2: 0,
             });
         }
         input.cursor_glow_add = q;

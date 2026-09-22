@@ -105,6 +105,7 @@
 
 pub mod changed;
 pub mod cli;
+pub mod disk;
 pub mod exec;
 pub mod glob;
 pub mod identity;
@@ -278,10 +279,17 @@ pub struct Ctx {
     /// Variables removed from every child's inherited environment
     /// ([`exec::ExecEnv::remove_env`]).
     pub child_env_remove: Vec<&'static str>,
-    /// Variables given to every child ([`exec::ExecEnv::add_env`]): the run's
-    /// pinned git stamp and its pinned test concurrency. Resolved once, here,
-    /// so every stage of one run agrees and a wrapper cannot change what the
-    /// merge contract measured without the receipt saying so.
+    /// Variables given to every child ([`exec::ExecEnv::add_env`]): the
+    /// constants in [`CHILD_ENV`], seeded here at construction, plus the run's
+    /// pinned git stamp and its pinned test concurrency, appended by
+    /// [`Ctx::with_pinned_child_facts`]. The resolved facts are resolved once,
+    /// here, so every stage of one run agrees and a wrapper cannot change what
+    /// the merge contract measured without the receipt saying so.
+    ///
+    /// BUILDERS APPEND TO THIS VECTOR. Assigning to it would silently drop the
+    /// seeded constants on every context, and `CARGO_INCREMENTAL=0` is one of
+    /// them — the 36 GB -> 55 GB lane growth would come back with nothing in
+    /// the tree saying why.
     pub child_env_add: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     /// The `ATERM_VERIFY_TIMINGS` sink, when one was opened.
     pub timings: Option<exec::Timings>,
@@ -289,12 +297,49 @@ pub struct Ctx {
     /// (and compares it with a fresh capture) rather than re-arming from
     /// whatever the root holds by the time the ladder starts.
     pub source_baseline: Option<identity::TreeState>,
+    /// The free-space floor the disk preflight refuses under ([`disk`]):
+    /// [`disk::FLOOR_BYTES`] for every real run. A test moves it — to force the
+    /// refusal, or to never refuse — on whatever volume it happens to run on.
+    pub disk_floor: u64,
 }
 
 /// The gate's own side channels, removed from every child in every mode: a
 /// child that re-invoked the gate would otherwise truncate this run's timings
 /// TSV and aim at this run's own snapshot, which this run holds locked.
 pub const GATE_CHANNELS: [&str; 2] = ["ATERM_VERIFY_TIMINGS", snapshot::SNAPSHOT_ENV];
+
+/// Variables SET in every child's environment, in every mode — after
+/// [`GATE_CHANNELS`] (and a snapshot run's `CARGO_TARGET_DIR`) are removed and
+/// before a stage's own [`exec::Cmd::envs`], so the gate's setting beats the
+/// caller's shell and a stage that names the variable itself still wins
+/// ([`exec::ExecEnv::add_env`]).
+///
+/// These seed [`Ctx::child_env_add`] at construction, so they hold on EVERY
+/// context — including one that never called
+/// [`Ctx::with_pinned_child_facts`], which appends the run's two resolved
+/// facts (the git stamp and the test concurrency) to the same vector. A pin
+/// that only a builder installs is a pin a caller can forget.
+///
+/// `CARGO_INCREMENTAL=0` (2026-09-21). The merge-contract tiers build each
+/// commit ONCE and reuse no cache afterwards, so incremental compilation buys
+/// them nothing and costs them the disk. (The reason given here until
+/// 2026-09-21 — "a snapshot nothing edits between runs" — was false for the
+/// one tier where incremental would have paid: `--changed` re-syncs the
+/// snapshot from an edited tree on every run, and gives up its incremental
+/// rebuilds to keep the lanes bounded. That is a trade, and it is stated as
+/// one.) MEASURED across incremental `--fast` runs:
+/// the snapshot's `target/` grew 36 GB -> 55 GB, `target-tippy/` held 16-18 GB
+/// and `target-drivers/` 16-20 GB, and on 2026-09-20 two contract runs died
+/// mid-ladder with `No space left on device` (`aterm-verify: cannot run
+/// …/targo: No space left on device`, then `verify: cannot write the ladder`;
+/// which stage each died on was not recorded). With those dirs deleted and
+/// `CARGO_INCREMENTAL=0` in the environment, a cold run passed the contract and
+/// left a snapshot measuring 23 GB — the incremental artifacts were most of the
+/// bloat. A
+/// caller's own `CARGO_INCREMENTAL=1` is overridden on purpose: it would
+/// re-create that growth on a run whose caches nobody reuses. The lane stamps
+/// stopped recording the variable the same day (`snapshot::LANE_ENV_VARS`).
+pub const CHILD_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
 
 impl Ctx {
     /// Build the run context. `scratch` must already exist.
@@ -332,9 +377,13 @@ impl Ctx {
             source_mode: snapshot::SourceMode::InPlace,
             notes: Vec::new(),
             child_env_remove: GATE_CHANNELS.to_vec(),
-            child_env_add: Vec::new(),
+            child_env_add: CHILD_ENV
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
             timings: None,
             source_baseline: None,
+            disk_floor: disk::FLOOR_BYTES,
         }
     }
 
@@ -458,6 +507,14 @@ impl Ctx {
         self
     }
 
+    /// Move the disk preflight's floor ([`Ctx::disk_floor`]). For tests: the
+    /// gate itself always runs at [`disk::FLOOR_BYTES`].
+    #[must_use]
+    pub fn with_disk_floor(mut self, bytes: u64) -> Self {
+        self.disk_floor = bytes;
+        self
+    }
+
     /// The command environment: cwd is the repo root (the script `cd`s there and
     /// several stages pass root-relative paths), PATH is the computed one, and
     /// every child gets the wall-clock ceiling — a hung stage has to be able to
@@ -534,9 +591,13 @@ pub fn toolchain_header(ctx: &Ctx) -> String {
 /// `out` receives, in this order: the [`toolchain_header`] line, the prelude rungs,
 /// the `hooks pinned:` note when `pin_hooks` had to set `core.hooksPath`, the
 /// `verify: source …` line (a git root only) and any `verify:` notes (the
-/// snapshot's lanes, or why the run is in place), the ladder in declared order
+/// snapshot's lanes, or why the run is in place), the `verify: disk …` line
+/// (the free space on the volume holding the run's root, against the floor),
+/// the ladder in declared order
 /// with a `  time  ` line under each stage — or, in its place, a `source
-/// identity` COULD NOT RUN row for a git checkout the gate cannot read, except
+/// identity` COULD NOT RUN row for a git checkout the gate cannot read, or a
+/// `disk preflight` COULD NOT RUN row for a volume under the floor ([`disk`]),
+/// each except
 /// under `--selftest`, which keeps its own ladder — the `source identity` row
 /// when the toolchain (or, in a git checkout, the source tree) moved mid-run,
 /// and the verdict
@@ -592,6 +653,36 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     {
         let mut r = Report::new("source identity");
         r.cannot_run(identity::unreadable_label(why));
+        out.write_all(r.render().as_bytes())?;
+        let mut reports = ctx.prelude.clone();
+        reports.push(r);
+        let verdict =
+            verdict::verdict(ctx.mode, &ctx.scope, ctx.selftest, &ladder::tally(&reports));
+        out.write_all(verdict.text.as_bytes())?;
+        out.flush()?;
+        return Ok(verdict.exit);
+    }
+
+    // THE DISK, before anything is built (2026-09-21). Two contract runs died
+    // mid-ladder on a full volume and printed FAIL rows about it; this run
+    // reads the free space first and refuses — COULD NOT RUN, never a skip —
+    // when it is under the floor, naming the amount, the floor and the
+    // regenerable dirs. It leaves no receipt: nothing was decided, so the last
+    // real judgement of the commit stands. A selftest builds nothing, so it
+    // prints the reading and refuses on nothing — the same rule as the
+    // unreadable-source arm above.
+    let reading = disk::read_free(&ctx.root);
+    out.write_all(disk::header_line(&reading, ctx.disk_floor, &ctx.root).as_bytes())?;
+    if !ctx.selftest
+        && let Err(why) = disk::decide(&reading, ctx.disk_floor, &ctx.root)
+    {
+        let mut r = Report::new("disk preflight");
+        r.cannot_run(why);
+        let caller = match &ctx.source_mode {
+            snapshot::SourceMode::Snapshot { caller } => Some(caller.as_path()),
+            snapshot::SourceMode::InPlace => None,
+        };
+        r.raw(disk::remedy(&ctx.root, ctx.disk_floor, caller));
         out.write_all(r.render().as_bytes())?;
         let mut reports = ctx.prelude.clone();
         reports.push(r);
@@ -742,6 +833,19 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
 /// checkout has no commit to key a receipt by, and a selftest decided nothing
 /// about the tree. Failures are announced on stderr and cost the next push a
 /// refusal — never this run its verdict.
+///
+/// WHAT A RECEIPT SAYS ABOUT A RUN THAT COULD NOT RUN (2026-09-21). A verdict
+/// of COULD NOT RUN is written as `verdict COULD-NOT-RUN`, `merge-contract no`
+/// — the hook refuses on it and names it, never mistaking it for a judgement.
+/// A run that never reached its verdict writes NOTHING: no snapshot, an
+/// unreadable source, a volume under the disk floor ([`disk`]), or a ladder
+/// that could not be written (`main` exits 3 on the write error before this
+/// is called), so the last real judgement of the commit stands. What used to
+/// be wrong was upstream of here: a child that never spawned, or died of `No
+/// space left on device`, was a `FAIL` row of a finding's severity, so a run
+/// that limped to its verdict would have written `verdict FAIL` about a tree
+/// nobody judged. [`ladder::Report::fail_child`] now classifies those as COULD
+/// NOT RUN.
 fn write_receipt(
     ctx: &Ctx,
     tripwire: &identity::Tripwire,
@@ -838,7 +942,9 @@ fn outcome_word(report: &Report) -> &'static str {
 pub const HOOK_CLAIM: &str = "pre-push BLOCKS a push of any commit with no passing gate receipt \
      (a tag, the release cutter's claim over origin's tip — CHANGELOG.md + RELEASES.ledger only — \
      and a clean automatic merge of a receipted commit onto origin's tip bring no ungated code and \
-     owe none of their own); ATERM_PUSH_NO_GATE=1 is the named exception";
+     owe none of their own) and REFUSES when it cannot judge — no repository, an unreadable \
+     receipts directory, a failing git — rather than admitting; ATERM_PUSH_NO_GATE=1 is the named \
+     exception";
 
 /// Where the gate keeps its own copy of each run's ladder, under
 /// [`identity::GATE_STATE_DIR`]. Named here because `main` writes it and the
@@ -1076,6 +1182,90 @@ mod tests {
             ctx(Some("off")).exec_env().child_ceiling,
             None,
             "and an operator who types `off` gets the old unbounded wait"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The wiring for [`CHILD_ENV`]: the value every stage child is launched
+    /// with carries `CARGO_INCREMENTAL=0`, in a snapshot run and in place
+    /// alike, and nothing the gate REMOVES is also something it sets. A gate
+    /// whose children quietly compiled incrementally again would refill the
+    /// 55 GB lane this exists to bound, and nothing else in the tree would
+    /// notice until the volume did.
+    #[test]
+    fn every_child_is_launched_with_incremental_compilation_off() {
+        let tmp = mktemp_dir("atv-incremental").expect("mktemp");
+        let ctx = Ctx::new(
+            tmp.clone(),
+            Mode::Fast,
+            Scope::Workspace,
+            false,
+            EnvSnapshot::default(),
+            tmp.clone(),
+        );
+        let has = |c: &Ctx, key: &str, val: &str| {
+            c.exec_env()
+                .add_env
+                .iter()
+                .any(|(k, v)| k == key && v == val)
+        };
+        assert!(
+            has(&ctx, "CARGO_INCREMENTAL", "0"),
+            "{:?}",
+            ctx.child_env_add
+        );
+        assert!(
+            CHILD_ENV.contains(&("CARGO_INCREMENTAL", "0")),
+            "{CHILD_ENV:?}"
+        );
+        let snap = Ctx::new(
+            tmp.clone(),
+            Mode::Fast,
+            Scope::Workspace,
+            false,
+            EnvSnapshot::default(),
+            tmp.clone(),
+        )
+        .in_snapshot_of(
+            tmp.clone(),
+            identity::TreeState {
+                head: "0".repeat(40),
+                dirty: std::collections::BTreeMap::new(),
+            },
+            Vec::new(),
+        );
+        assert!(
+            has(&snap, "CARGO_INCREMENTAL", "0"),
+            "{:?}",
+            snap.child_env_add
+        );
+        // And the run's OWN pinned facts join it rather than replacing it: a
+        // context that resolved the git stamp and the test concurrency still
+        // carries the incremental pin.
+        let pinned = Ctx::new(
+            tmp.clone(),
+            Mode::Fast,
+            Scope::Workspace,
+            false,
+            EnvSnapshot::default(),
+            tmp.clone(),
+        )
+        .with_pinned_child_facts();
+        assert!(
+            has(&pinned, "CARGO_INCREMENTAL", "0"),
+            "{:?}",
+            pinned.child_env_add
+        );
+        for (k, _) in CHILD_ENV {
+            assert!(
+                !snap.exec_env().remove_env.contains(&k),
+                "{k} is both set and removed"
+            );
+        }
+        assert_eq!(
+            ctx.disk_floor,
+            disk::FLOOR_BYTES,
+            "a real run keeps the real floor"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }

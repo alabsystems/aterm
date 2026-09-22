@@ -2269,9 +2269,17 @@ fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, Strin
     // the canonical key collapses them so the instance is listed exactly once.
     let mut seen: HashSet<String> = HashSet::new();
     let remember = |seen: &mut HashSet<String>, sock: &str| -> bool {
-        let key = std::fs::canonicalize(sock)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| sock.to_string());
+        // Through `socket_key` AFTER the canonicalize: on Windows the canonicalize
+        // refuses a socket file outright (a reparse point CreateFile will not
+        // open), and the two publishers spell the same socket two ways — the
+        // plan's `C:\…` and `set_self_sock`'s verbatim `\\?\C:\…` — so the raw
+        // fallback alone listed one instance twice, and every session twice
+        // under it. Measured 2026-09-22 on 0.90.0; `socket_key` says the rest.
+        let key = control_socket::socket_key(
+            &std::fs::canonicalize(sock)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| sock.to_string()),
+        );
         seen.insert(key)
     };
     // (1) Per-instance sockets directly in the default dir.
@@ -2347,7 +2355,7 @@ fn instance_socks_in(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, String)
 /// had a symlinked component. A raw match is the fast path; else compare canonical
 /// forms (best-effort — an unresolvable path is simply not self).
 fn same_socket_path(a: &str, b: &str) -> bool {
-    if a == b {
+    if a == b || control_socket::socket_key(a) == control_socket::socket_key(b) {
         return true;
     }
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -4526,6 +4534,63 @@ fn oversized_reply_error() -> io::Error {
 /// unboundedly. Bytes are accumulated raw and UTF-8-checked once at the end,
 /// so an over-long line ALWAYS reports "oversized", never a spurious UTF-8
 /// error from the cap slicing a multi-byte char in half.
+/// The most continuation lines a refusal may carry past its first.
+///
+/// A refusal is a HELP surface, so a handful of lines is the shape; the bound
+/// is here because the reply is peer-supplied and this is a terminal. Each line
+/// is already bounded by [`read_bounded_line`].
+const REFUSAL_TAIL_MAX_LINES: usize = 16;
+
+/// Print whatever a refusal wrote after its first line — verbatim and
+/// unprefixed (the continuations are already indented), bounded by
+/// [`REFUSAL_TAIL_MAX_LINES`].
+///
+/// **THIS FUNCTION ISSUES NO READ, and that is the whole of its design.** The
+/// server does NOT close the connection after a refusal — a control connection
+/// serves request after request — so "read until EOF" waits for an EOF that
+/// never comes. Written that way, it hung EVERY `aterm ctl` invocation that a
+/// live instance refused: MEASURED 2026-09-22 against `aterm ctl <unknown
+/// verb>`, which printed `ERR unknown verb (try: help)` and then blocked in
+/// `recvfrom` until the 900 s per-op deadline. `crates/aterm/tests/
+/// front_door_verbs.rs` caught it as a 60 s timeout on the routing probe, and
+/// it caught it only because a live instance was there to refuse: on a machine
+/// with nothing listening the dial fails first and the suite is green, which
+/// is why this reached `main`.
+///
+/// So the tail is taken from what the reader ALREADY HOLDS. The refusal and
+/// its continuations arrive in one write and are buffered by the same
+/// `fill_buf` that produced the status line, so the lines this exists to print
+/// — `subscribe`'s stream vocabulary is the one that prompted it — are here by
+/// the time it is called. A continuation the server chose to send in a LATER
+/// write is not waited for and is not printed: that is a deliberate trade, and
+/// the alternative is the hang above. A partial final line (no `\n` yet) is
+/// left alone for the same reason.
+fn drain_refusal_tail<R: Read>(reader: &mut BufReader<R>) -> io::Result<()> {
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    for _ in 0..REFUSAL_TAIL_MAX_LINES {
+        let buffered = reader.buffer();
+        // No complete line in hand — including none at all — ends the drain.
+        let Some(nl) = buffered.iter().position(|b| *b == b'\n') else {
+            return Ok(());
+        };
+        // Bounded like every other reply line, and by the same constant.
+        if nl >= MAX_LINE_BYTES {
+            return Ok(());
+        }
+        let line = buffered[..nl].to_vec();
+        reader.consume(nl + 1);
+        // A refusal is a help surface; non-UTF-8 in one is not worth a
+        // diagnostic of its own, and the refusal itself is already printed.
+        let Ok(text) = std::str::from_utf8(&line) else {
+            return Ok(());
+        };
+        err.write_all(text.trim_end_matches('\r').as_bytes())?;
+        err.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 fn read_bounded_line<R: BufRead>(reader: &mut R, line: &mut String) -> io::Result<usize> {
     let mut bytes = Vec::new();
     let n = reader
@@ -4874,8 +4939,11 @@ fn exchange(
     let tail = tokens.next().unwrap_or("");
 
     if status != "OK" {
-        // "ERR <msg>", "ERR", or any unexpected reply: report and fail.
+        // "ERR <msg>", "ERR", or any unexpected reply: report ALL of it and
+        // fail. `subscribe`'s refusal spells the stream vocabulary on a second
+        // line, which this client used to leave in the socket.
         stderr_line(status_line)?;
+        drain_refusal_tail(&mut reader)?;
         return Ok(ExitCode::FAILURE);
     }
 
@@ -5734,6 +5802,84 @@ mod tests {
         assert!(streams_payload("image", "@s-abc image read\n"));
         assert!(!streams_payload("image", "image shot.png\n"));
         assert!(!streams_payload("image", "@s-abc image shot.png\n"));
+    }
+
+    /// A refusal's continuation lines are consumed (and printed) and bounded.
+    ///
+    /// The reader is primed the way the real one is — `exchange` has already
+    /// read the status line through this same `BufReader`, so the tail is in
+    /// its buffer. A `BufReader` that has read NOTHING is a shape the client
+    /// never presents, and testing against it is what let the blocking version
+    /// look correct.
+    #[test]
+    fn a_multi_line_err_is_drained_to_the_end_and_bounded() {
+        let bytes = |tail: &str| {
+            let mut v = b"ERR usage: subscribe\n".to_vec();
+            v.extend_from_slice(tail.as_bytes());
+            v
+        };
+        let primed = |v: Vec<u8>| {
+            let mut r = BufReader::new(io::Cursor::new(v));
+            let mut status = String::new();
+            r.read_line(&mut status).unwrap();
+            r
+        };
+
+        let mut reader = primed(bytes(
+            "  <streams>: a subset of screen,mail and must name one\n",
+        ));
+        drain_refusal_tail(&mut reader).unwrap();
+        let mut rest = String::new();
+        reader.read_line(&mut rest).unwrap();
+        assert_eq!(rest, "", "the second line was consumed");
+
+        // A refusal with no tail at all.
+        let mut reader = primed(bytes(""));
+        drain_refusal_tail(&mut reader).unwrap();
+
+        let many: String = (0..REFUSAL_TAIL_MAX_LINES + 4)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let mut reader = primed(bytes(&many));
+        drain_refusal_tail(&mut reader).unwrap();
+        let mut rest = String::new();
+        reader.read_line(&mut rest).unwrap();
+        assert_eq!(rest, format!("line {REFUSAL_TAIL_MAX_LINES}\n"), "bounded");
+    }
+
+    /// THE REGRESSION, pinned: the drain must never touch the socket.
+    ///
+    /// A control connection stays open after a refusal, so any read the drain
+    /// issues blocks until the per-op deadline — which is what hung every
+    /// refused `aterm ctl` invocation (2026-09-22). This reader PANICS if it
+    /// is read, so a drain that reaches for more bytes fails here instead of
+    /// wedging a suite sixty seconds at a time.
+    #[test]
+    fn the_drain_never_reads_from_the_socket() {
+        struct Detonate;
+        impl Read for Detonate {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("drain_refusal_tail issued a read — that is the hang");
+            }
+        }
+
+        // Empty buffer: nothing in hand, and nothing may be fetched.
+        let mut reader = BufReader::new(Detonate);
+        drain_refusal_tail(&mut reader).unwrap();
+
+        // A buffered tail is still printed without a read, and a trailing
+        // PARTIAL line (no newline) is left alone rather than completed.
+        let mut reader = BufReader::new(io::Cursor::new(
+            b"ERR usage: subscribe\n  one\n  partial-no-newline".to_vec(),
+        ));
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        drain_refusal_tail(&mut reader).unwrap();
+        assert_eq!(
+            reader.buffer(),
+            b"  partial-no-newline",
+            "the incomplete line is left where it is"
+        );
     }
 
     #[test]

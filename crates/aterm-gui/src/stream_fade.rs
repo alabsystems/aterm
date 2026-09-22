@@ -102,12 +102,34 @@ pub(crate) fn fade_permitted(
 /// fingerprints. Skip it: an off, already-dry window does ZERO per-frame grid
 /// work (the branch's `O(damage)` idle discipline).
 ///
-/// Gated on CONFIG (`fade_on`), never on the per-frame [`fade_permitted`]
-/// bypass — gating on the bypass would drop fingerprints under `input_hot` /
-/// alt-screen / scrollback and let a resumed fade re-tint instant-shown cells.
+/// Gated on CONFIG (`fade_on`), never on the whole per-frame
+/// [`fade_permitted`] bypass — gating on all of it would drop fingerprints
+/// under `input_hot` / `motion_reduced` and let a resumed fade re-tint
+/// instant-shown cells. Those two keep the same [`ViewKey`], so the frame that
+/// resumes fading READS what they left.
+///
+/// IT IS DEAD WORK FOR THE OTHER TWO, and that is why they are arguments here.
+/// `alt_screen` and `scrolled_back` are themselves TERMS of the key
+/// ([`ViewKey`] is `(token, alt, scrolled)`), and [`fade_permitted`] is false
+/// whenever either holds — so no frame inside such a stretch can read a
+/// fingerprint, and the frame that LEAVES it re-baselines because the key
+/// changed. Every fingerprint computed from the first vim frame to the last is
+/// overwritten by the next frame's and then thrown away at the re-baseline:
+/// measured 35 µs/frame at 66x132 and 112 µs at 110x400, on every committed
+/// frame of every alt-screen session and every scrollback excursion, for a
+/// value nothing ever reads.
+///
+/// Skipping them is behaviour-preserving because the caller's skip arm calls
+/// [`StreamFade::reset`], which re-baselines exactly as the key change would:
+/// `view = None`, no births, no `active_until`, all ink dry.
 #[must_use]
-pub(crate) fn fade_update_needed(fade_on: bool, fade_shown: bool) -> bool {
-    fade_on || fade_shown
+pub(crate) fn fade_update_needed(
+    fade_on: bool,
+    fade_shown: bool,
+    alt_screen: bool,
+    scrolled_back: bool,
+) -> bool {
+    (fade_on || fade_shown) && !alt_screen && !scrolled_back
 }
 
 /// The fade ENVELOPE: the coverage (0..=255) of the final foreground at
@@ -455,31 +477,49 @@ mod tests {
         );
     }
 
-    /// IDLE GATE (perf): over ALL 2^2 inputs, `fade_update_needed` is true iff
-    /// the feature is on OR a tint from last frame still needs erasing — the
-    /// ONLY skippable point is `(off, dry)`. Non-vacuity: both the skip point
-    /// and at least one run point are reachable.
+    /// IDLE GATE (perf): over ALL 2^4 inputs, and stated as the PROPERTY
+    /// rather than the formula — NO FRAME THE GATE ADMITS CAN BE DEAD WORK.
+    /// A frame's fingerprints are readable only if [`fade_permitted`] can hold
+    /// under SOME setting of the two key-preserving bypasses (`input_hot`,
+    /// `motion_reduced`), which is exactly `!alt && !scrolled`; and the call is
+    /// worth making only when the feature is on or a tint still needs erasing.
+    /// Non-vacuity: both the skip points and the run points are reachable.
     #[test]
     fn fade_update_needed_exhaustive() {
         let mut skip_points = 0;
         let mut run_points = 0;
-        for bits in 0u8..4 {
+        for bits in 0u8..16 {
             let fade_on = bits & 1 != 0;
             let fade_shown = bits & 2 != 0;
-            let got = fade_update_needed(fade_on, fade_shown);
-            let want = fade_on || fade_shown;
-            assert_eq!(got, want, "needed({fade_on},{fade_shown}) truth table");
+            let alt = bits & 4 != 0;
+            let scrolled = bits & 8 != 0;
+            let got = fade_update_needed(fade_on, fade_shown, alt, scrolled);
+            // READABLE: some frame in this view can consume what step 1 writes.
+            let readable = !alt && !scrolled;
+            let wanted = fade_on || fade_shown;
+            assert_eq!(
+                got,
+                wanted && readable,
+                "needed({fade_on},{fade_shown},{alt},{scrolled}) truth table"
+            );
             if got {
                 run_points += 1;
+                assert!(
+                    readable,
+                    "an admitted frame must be one whose fingerprints something can read"
+                );
             } else {
                 skip_points += 1;
                 assert!(
-                    !fade_on && !fade_shown,
-                    "the only skippable frame is off-and-dry"
+                    !wanted || !readable,
+                    "a skipped frame is off-and-dry, or view-keyed out of reading"
                 );
             }
         }
-        assert_eq!(skip_points, 1, "non-vacuity: exactly one skippable point");
+        assert_eq!(
+            skip_points, 13,
+            "non-vacuity: the skip points are reachable"
+        );
         assert_eq!(run_points, 3, "non-vacuity: the run path IS reachable");
     }
 
@@ -490,7 +530,24 @@ mod tests {
     #[test]
     fn always_calling_update_is_caught() {
         let pre_fix = |_fade_on: bool, _fade_shown: bool| true;
-        assert!(!fade_update_needed(false, false), "off+dry now skips");
+        assert!(
+            !fade_update_needed(false, false, false, false),
+            "off+dry now skips"
+        );
+        // …and the view-keyed pair, which the first fix did not reach: a vim
+        // session fingerprinted the whole grid every frame for nobody.
+        assert!(
+            !fade_update_needed(true, true, true, false),
+            "an alt-screen frame now skips"
+        );
+        assert!(
+            !fade_update_needed(true, true, false, true),
+            "a scrolled-back frame now skips"
+        );
+        assert!(
+            fade_update_needed(true, false, false, false),
+            "control: an ordinary on frame still runs"
+        );
         assert!(
             pre_fix(false, false),
             "control: the old code fingerprinted the whole grid anyway"

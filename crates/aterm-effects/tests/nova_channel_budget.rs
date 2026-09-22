@@ -197,6 +197,8 @@ fn the_over_budget_channel_is_drawn_in_full_not_truncated() {
             h: ch as u16,
             color: premul_rgb(0x0040_4040, 8),
             alpha: 0,
+            color2: premul_rgb(0x0040_4040, 8),
+            alpha2: 0,
         })
         .collect();
     assert_eq!(

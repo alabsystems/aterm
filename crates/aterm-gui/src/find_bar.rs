@@ -387,11 +387,21 @@ pub(crate) fn find_bar_paint(
     }
 
     // ---- seam LAST: one unbroken rule on the content-facing edge, over text and all.
+    // ONE TONE as well as one run. The two branches used to be asymmetric — the
+    // underline named its colour, the overline did not — and an uncoloured rule falls
+    // back to each cell's own ink. At the full height that was invisible, because the
+    // top row is the blank pad and every cell of it is already `label`. It stops being
+    // invisible on the DEGRADED panel this builder deliberately supports: at 1 or 2
+    // rows the pad is the first thing dropped, so `seam_row` IS the field row, whose
+    // inks vary by construction (the bold `Find:` prompt, the well's query, `warn`
+    // across a failing one, and the reverse-video caret whose fg is the well's
+    // background). The rule would brighten under the prompt, turn red across a bad
+    // query, and go missing at the caret.
     let seam_row = if seam_at_top { 0 } else { height - 1 };
-    for cell in &mut rows[seam_row] {
-        if seam_at_top {
-            cell.overline = true;
-        } else {
+    if seam_at_top {
+        chrome_band::seal_band_top(&mut rows[seam_row], c.label);
+    } else {
+        for cell in &mut rows[seam_row] {
             cell.underline = aterm_core::terminal::UnderlineStyle::Single;
             cell.underline_color = Some(c.label);
         }
@@ -911,6 +921,31 @@ mod tests {
             top.rows.iter().flatten().all(|c| !c.overline),
             "top panel → no overline"
         );
+        // AND IT IS ONE TONE ON THE DEGRADED PANEL. At 1 or 2 rows the pad is dropped,
+        // so the seam row IS the multi-ink field row; an uncoloured overline falls back
+        // to each cell's own `fg` and the rule would brighten under the prompt, go warn
+        // across a failing query and vanish at the reverse-video caret. At the full
+        // height the pad row hid that, because every cell of it is already `label`.
+        let band = chrome_band::band_colors(Theme::default());
+        for height in [1_usize, 2] {
+            let short = find_bar_paint(&view("nomatch"), cols, height, Theme::default(), true);
+            let seam = &short.rows[0];
+            assert!(
+                seam.iter()
+                    .all(|c| c.overline && c.overline_color == Some(band.label)),
+                "{height}-row panel: the seam is one tone across the field row, breaks/tones at {:?}",
+                seam.iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.overline || c.overline_color != Some(band.label))
+                    .map(|(col, c)| (col, c.overline, c.overline_color))
+                    .collect::<Vec<_>>()
+            );
+            let inks: std::collections::BTreeSet<[u8; 3]> = seam.iter().map(|c| c.fg).collect();
+            assert!(
+                inks.len() > 1,
+                "the field row is meant to carry several inks, so this proof is not vacuous: {inks:?}"
+            );
+        }
     }
 
     /// THE QUERY FIELD ALWAYS HAS AN EDGE. The well is drawn as a FILL — the only

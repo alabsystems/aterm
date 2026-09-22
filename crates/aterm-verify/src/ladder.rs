@@ -10,6 +10,8 @@
 //! gating stage has not discharged the merge contract, so skips are counted AND
 //! NAMED here, and [`crate::verdict`] downgrades the claim accordingly.
 
+use crate::exec::Run;
+
 /// Why a stage failed — the distinction `.githooks/pre-push` already draws.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
@@ -97,6 +99,57 @@ impl Report {
             outcome: Outcome::Fail(Severity::CouldNotRun),
             label: label.into(),
         });
+    }
+
+    /// A child that did not pass, as the FAIL row of the severity its failure
+    /// HAS: COULD NOT RUN when it never spawned or died of the machine
+    /// ([`Run::environment_failure`] — a full disk, measured 2026-09-20), a
+    /// finding otherwise.
+    ///
+    /// WHAT THIS COVERS, stated narrowly because the sentence here was once
+    /// wider than the code (corrected 2026-09-21). Every stage that decides a
+    /// row from a child's EXIT STATUS comes through here or
+    /// [`Report::child_could_not_run`]: the script stages, the libc oracle,
+    /// the cells and kani gates, and the nine drive binaries, whose own exit
+    /// contracts cannot see a full disk — `libc-oracle/run.sh` maps a cargo
+    /// child that died of ENOSPC (exit 101, since targo never answers 3) onto
+    /// a plain failure, which arrived here as a FINDING about the tree until
+    /// the guard was added. So an ENOSPC on any of those is no longer counted
+    /// against the tree or written into its receipt as `verdict FAIL`.
+    ///
+    /// What does NOT come through here is a row decided from a running
+    /// process's ANSWER rather than its exit status — the smoke stages' socket
+    /// replies, metrics readings and frame checks. A child that never spawned
+    /// there was already reported by the stage that launched it, and a reply
+    /// that is wrong is a finding whatever the disk is doing.
+    pub fn fail_child(&mut self, run: &Run, label: impl Into<String>) {
+        let label = label.into();
+        if !self.child_could_not_run(run, &label) {
+            self.fail(label);
+        }
+    }
+
+    /// [`Report::decide`] from a child: `ok` on success, else [`Report::fail_child`].
+    pub fn decide_child(&mut self, run: &Run, label: impl Into<String>) {
+        if run.ok {
+            self.pass(label);
+        } else {
+            self.fail_child(run, label);
+        }
+    }
+
+    /// The environment's failure, if this child had one, recorded as a COULD
+    /// NOT RUN row under `label`: `true` when it was. The stages whose child
+    /// says MORE than pass/fail ask this before reading the output, so an
+    /// ENOSPC never reaches their own verdict logic.
+    pub fn child_could_not_run(&mut self, run: &Run, label: &str) -> bool {
+        match run.environment_failure() {
+            Some(why) => {
+                self.cannot_run(format!("{label} — could not run: {why}"));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Verbatim output (child logs, NOTICE lines). Trailing newlines are trimmed;
@@ -286,6 +339,58 @@ mod tests {
         let t = tally(&[a]);
         assert_eq!(t, Tally::default());
         assert!(!t.failed());
+        assert_eq!(t.skipped(), 0);
+    }
+
+    /// THE ROW A DYING CHILD LEAVES. A child that ran and failed is a finding
+    /// (`FAIL`, exit 1); one that never spawned or ran out of disk is COULD NOT
+    /// RUN — the same `FAIL` word on the ladder, the other severity in the
+    /// tally, and so `verdict COULD-NOT-RUN` in the receipt rather than a
+    /// judgement of the tree.
+    #[test]
+    fn a_child_that_died_of_the_machine_is_could_not_run_and_one_that_failed_is_a_finding() {
+        let run = |ok: bool, output: &str, spawn: Option<&str>| Run {
+            ok,
+            output: output.into(),
+            code: None,
+            spawn_error: spawn.map(str::to_string),
+        };
+        let mut r = Report::new("test (--workspace)");
+        r.decide_child(&run(true, "", None), "passed");
+        r.decide_child(&run(false, "error[E0308]", None), "a finding");
+        r.decide_child(
+            &run(
+                false,
+                "aterm-verify: cannot run /s2/targo: No space left on device (os error 28)",
+                Some("No space left on device (os error 28)"),
+            ),
+            "never spawned",
+        );
+        r.fail_child(
+            &run(
+                false,
+                "error: failed to write lib.rmeta: No space left on device (os error 28)",
+                None,
+            ),
+            "starved",
+        );
+        let mut asked = Report::new("cells");
+        assert!(!asked.child_could_not_run(&run(false, "no", None), "gate cells"));
+        assert!(asked.child_could_not_run(
+            &run(false, "x: No space left on device", None),
+            "gate cells"
+        ));
+
+        let t = tally(&[r, asked]);
+        assert_eq!(t.gate_failures, ["a finding"]);
+        assert_eq!(
+            t.could_not_run,
+            [
+                "never spawned — could not run: No space left on device (os error 28)",
+                "starved — could not run: the child ran out of disk (No space left on device)",
+                "gate cells — could not run: the child ran out of disk (No space left on device)",
+            ]
+        );
         assert_eq!(t.skipped(), 0);
     }
 

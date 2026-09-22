@@ -114,6 +114,7 @@ fn main() {
         duration: Duration::from_millis(260),
         length: 24,
         intensity: 0.7,
+        audible: true,
         radius: 0.6,
         ring: true,
         dark_theme: true,

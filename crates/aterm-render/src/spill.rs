@@ -583,6 +583,16 @@ fn clip_to_strip(
 /// be missing here — an alpha-blind `add_sat` replay of the bed's Over quads
 /// — so a tall ribbon poking into the head band exported a seam-discontinuous
 /// sliver on light themes (2026-09-01 audit).
+///
+/// A GRADIENT quad ([`GlowQuad::color2`], 2026-09-21) takes the frame's
+/// gradient branch: per column, colour and opacity are
+/// [`crate::glow_lerp`]'d between the quad's edges and composited
+/// source-over (which is `add_sat` wherever the opacity is 0). The column
+/// index is read against the quad's UNCLIPPED left edge, as the frame reads
+/// it, never the strip-clipped one. Until 2026-09-22 this replay read
+/// `color`/`alpha` alone: a ribbon slab poking into the head band exported
+/// its LEFT colour flat across the whole sliver, a flat-red strip over a
+/// red→blue ramp in the grid (the review measured 792 mismatching pixels).
 fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[GlowQuad]) {
     for q in quads {
         let Some((x0, y0, xe, ye)) =
@@ -590,6 +600,27 @@ fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[G
         else {
             continue;
         };
+        if !q.is_flat() {
+            let (a0, a1) = (u32::from(q.alpha), u32::from(q.alpha2));
+            let qw = u32::from(q.w);
+            for x in x0..xe {
+                // `x − q.x < q.w ≤ u16::MAX`, so the cast is exact.
+                let i = (x - q.x as usize) as u32;
+                let a = crate::glow_lerp(a0, a1, i, qw) as u8;
+                let c = crate::glow_lerp_rgb(q.color, q.color2, i, qw);
+                let ap = if a == 0 {
+                    max_channel(c)
+                } else {
+                    a.max(max_channel(c))
+                };
+                for y in y0..ye {
+                    let k = (y - s.y) * s.w + (x - s.x);
+                    color[k] = crate::over_premul(color[k], c, a);
+                    cover[k] = cover_union(cover[k], ap);
+                }
+            }
+            continue;
+        }
         // The Over case occludes by its own opacity as well as its light —
         // the solver's `a0` must reflect the paint's real coverage.
         let ap = if q.alpha == 0 {
@@ -858,6 +889,8 @@ mod tests {
                     color: 0x0020_1008,
                     // ADDITIVE light (see `GlowQuad::alpha`).
                     alpha: 0,
+                    color2: 0x0020_1008,
+                    alpha2: 0,
                 },
                 GlowQuad {
                     row: 0,
@@ -868,6 +901,8 @@ mod tests {
                     color: 0x0008_1020,
                     // ADDITIVE light (see `GlowQuad::alpha`).
                     alpha: 0,
+                    color2: 0x0008_1020,
+                    alpha2: 0,
                 },
                 GlowQuad {
                     row: 0,
@@ -881,7 +916,17 @@ mod tests {
                     // branch, not an alpha-blind add — the seam-continuity
                     // law this suite pins (2026-09-01 audit).
                     alpha: 0x16,
+                    color2: 0x0009_1216,
+                    alpha2: 0x16,
                 },
+                // GRADIENT quads (2026-09-22): the replay must ramp the
+                // colour per column from the quad's UNCLIPPED left edge, as
+                // `draw_flat_add`'s gradient branch does — an additive ramp
+                // wholly in the head band, and a source-over ramp that
+                // starts left of the pad and straddles grid_top, so the
+                // strip clip cuts both its left end and its bottom.
+                GlowQuad::gradient(0, 20, 6, 100, 8, 0x0060_0000, 0, 0x0000_0060, 0),
+                GlowQuad::gradient(0, 4, 18, 60, 14, 0x0030_0810, 0x30, 0x0008_1030, 0x50),
             ];
             // Fire field patches in the head band, Add then Over ink.
             input.fire_patch = vec![
@@ -929,6 +974,8 @@ mod tests {
                     color: 0x0018_3040,
                     // ADDITIVE light (see `GlowQuad::alpha`).
                     alpha: 0,
+                    color2: 0x0018_3040,
+                    alpha2: 0,
                 },
                 GlowQuad {
                     row: 5,
@@ -939,6 +986,8 @@ mod tests {
                     color: 0x0030_1010,
                     // ADDITIVE light (see `GlowQuad::alpha`).
                     alpha: 0,
+                    color2: 0x0030_1010,
+                    alpha2: 0,
                 },
             ];
             // Radial halos: an Add ember on the left strip + an Over veil on
@@ -1019,6 +1068,8 @@ mod tests {
             color: 0x0020_3040,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0020_3040,
+            alpha2: 0,
         }];
         let mut spill = SpillBand::new();
         spill.update(&r, &input);
@@ -1093,6 +1144,8 @@ mod tests {
             color: 0x0010_2030,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0010_2030,
+            alpha2: 0,
         }];
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 0, "grid-interior emissions must not tick");
@@ -1113,6 +1166,8 @@ mod tests {
             color: 0x0020_1008,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0020_1008,
+            alpha2: 0,
         });
         spill.update(&r, &input);
         assert_eq!(spill.rev(), 1);
@@ -1168,6 +1223,8 @@ mod tests {
             color: 0x0020_2020,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0020_2020,
+            alpha2: 0,
         }];
         let mut spill = SpillBand::new();
         spill.update(&r, &input);
@@ -1218,6 +1275,8 @@ mod tests {
             color: 0x0020_2020,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0020_2020,
+            alpha2: 0,
         }];
         let mut spill = SpillBand::new();
         spill.update(&r, &input);

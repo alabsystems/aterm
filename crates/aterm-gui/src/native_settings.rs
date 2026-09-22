@@ -14123,8 +14123,10 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             text.push_str(
                 " \u{2014} but that bundle is no longer on disk under this name, so macOS has no \
                  code to check a grant against and asks again for everything. Access granted in \
-                 Settings is not reaching this copy. A copy started fresh from Applications is \
-                 unaffected.",
+                 Settings is not reaching this copy, and the effect does not stop at this copy: \
+                 macOS keeps one record of what aterm's code should look like, and a copy it \
+                 cannot match overwrites that record and clears the access for every copy of \
+                 aterm on this Mac.",
             );
         }
         text
@@ -20324,11 +20326,13 @@ mod tests {
                 "rainbow kitty underline",
                 PreviewTrailCompanion::Pet(PetSpecies::Cat),
             ),
-            // `… tall` is the sibling spelling that still falls through to the
-            // head (`cursor_glow`'s
-            // `every_kitty_spelling_draws_the_resident_and_flying_stays_reachable`
-            // pins it out of both companion lists on purpose).
-            ("rainbow kitty tall", PreviewTrailCompanion::FlyingKitty),
+            // `… tall` is the sibling spelling, and it draws the sibling's
+            // ANIMAL: the word names the geometry the default already draws,
+            // so it can no more swap the companion than `underline` can.
+            (
+                "rainbow kitty tall",
+                PreviewTrailCompanion::Pet(PetSpecies::Cat),
+            ),
             (
                 "rainbow kitty pet",
                 PreviewTrailCompanion::Pet(PetSpecies::Cat),

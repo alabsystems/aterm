@@ -1,0 +1,26 @@
+# Captured from a live Claude Code by tools/harness-capture.sh.
+# Every file beside this one is bytes the VENDOR sent or painted.
+vendor = "claude-code"
+vendor_version = "2.1.278"
+vendor_path = "$HOME/Library/Application Support/aterm/pkg/agents/claude"
+aterm_version = "0.90.0"
+captured_utc = "2026-09-22T20:15:55Z"
+permission_mode = "default"
+
+[files]
+"PermissionRequest/0.json" = { bytes = 685, sha256 = "a1ae1f16bcfae53ad941aefcb6ceb7a2326339d37b6ac8108d88e3bec0e3affd" }
+"PermissionRequest/1.json" = { bytes = 731, sha256 = "df1378c22932582a0b3243670dc26a4131789dcfe11d364d0c17592acd1789a9" }
+"PostToolUse/0.json" = { bytes = 727, sha256 = "e68451e8157eee3a220abe6c3559519ef2234d7a44823ab2fa02f1118c03eeab" }
+"PostToolUse/1.json" = { bytes = 708, sha256 = "5aaa244187162853237a67b2c90243d28c1c51f37fe77acfc649b9dbb094d1b9" }
+"PreToolUse/0.json" = { bytes = 606, sha256 = "5dcf8b84a9a4e2758e19c3384deb8c385525a20a359745c70a8bb6d95e5ade52" }
+"PreToolUse/1.json" = { bytes = 588, sha256 = "4e117adf72a5312d72e414402a957fc96c04eb578949366985d1c25920443a25" }
+"SessionEnd/0.json" = { bytes = 423, sha256 = "fca916126b66ac5b020280f4ed3a0a1133cc21a4221b42a35cc4b1dd496db7d1" }
+"SessionStart/0.json" = { bytes = 392, sha256 = "03de6533e9bb93e26207d35a29eda4322339830287c15ea62e3e37e1f787bb5c" }
+"StatusLine/0.json" = { bytes = 942, sha256 = "31fa65ad601d6cf6826dda4b3e7f171653dab6eca4004b04405482f4b88cad17" }
+"StatusLine/1.json" = { bytes = 1274, sha256 = "eea5371076a5f461c0b5ea2b8b09b435290a77dda16d9f5723dc2685e174db34" }
+"StatusLine/2.json" = { bytes = 1597, sha256 = "092dbacc9073a72ac4eb023f76cf21a144fe59f262673341e398a6f7e49fea40" }
+"StatusLine/3.json" = { bytes = 1592, sha256 = "5599867db1905abe7c2f55dd461a5a89109bbdcbbf3414a8aee6ef60544c1cf1" }
+"StatusLine/4.json" = { bytes = 1596, sha256 = "3b652d78dc444d0e364f8c6ea740cd05fe0ebdd9992e1abc369046326197ced5" }
+"StatusLine/5.json" = { bytes = 1593, sha256 = "247a31d06d45796296b7907adc0364241dab0a6ebcfd05ccc73b8225e88837f7" }
+"screen/usage.status" = { bytes = 390, sha256 = "ef3cef5632da2a450a81c9ed46ed77ae344d4c0583d2ae387c958f545ed5505e" }
+"screen/usage.txt" = { bytes = 1586, sha256 = "0daf023b71e32f48ced1c875e3a7e8f559d9bcbfd7dc5fa0e38e91274bcebe4a" }

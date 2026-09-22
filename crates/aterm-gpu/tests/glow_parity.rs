@@ -51,6 +51,8 @@ fn glow_additive_is_byte_exact_over_background() {
             color: premul_rgb(base, *a),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(base, *a),
+            alpha2: 0,
         });
     }
 
@@ -120,6 +122,8 @@ fn glow_over_text_matches_within_tolerance() {
             color: premul_rgb(base, a),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(base, a),
+            alpha2: 0,
         });
     }
     // A crown straddling rows 0,1,2 at column 12 (each as its own single-row quad).
@@ -133,6 +137,8 @@ fn glow_over_text_matches_within_tolerance() {
             color: premul_rgb(base, 80),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(base, 80),
+            alpha2: 0,
         });
     }
 
@@ -191,6 +197,8 @@ fn empty_glow_is_byte_identical_to_no_glow() {
         color: premul_rgb(0x0050_FA7B, 255),
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: premul_rgb(0x0050_FA7B, 255),
+        alpha2: 0,
     };
 
     // CPU: baseline (empty) -> painted -> drained. The painted frame must differ
@@ -290,6 +298,8 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
         color,
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: color,
+        alpha2: 0,
     };
 
     // Frame 0: the BARE frame (no glow at all), through the cached path on a
@@ -471,6 +481,8 @@ fn bloom_adds_light_over_the_base() {
             color: premul_rgb(base, 220),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(base, 220),
+            alpha2: 0,
         });
     }
 
@@ -619,6 +631,8 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         color: premul_rgb(0x00FF_8844, 160),
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: premul_rgb(0x00FF_8844, 160),
+        alpha2: 0,
     });
     // ... and one GRID-space nova quad: pins the `pad`/`grid_top` offset the
     // grid streams add on both backends (`grid_top16 = pad + head`).
@@ -631,6 +645,8 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         color: premul_rgb(0x0050_FA7B, 180),
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: premul_rgb(0x0050_FA7B, 180),
+        alpha2: 0,
     });
 
     let cpu_f = cpu.render_input(&input);
@@ -687,4 +703,106 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         gpu_c, gpu_f.pixels,
         "GPU cached head-band glow frame must equal the fresh full render"
     );
+}
+
+/// **THE BLOOM EXTRACT RAMPS A GRADIENT QUAD ACROSS ITS OWN WIDTH**
+/// (2026-09-22 review). The extract draws the `cursor_glow_add` stream
+/// through `vs_glow`/`fs_glow` into the HALF-RES bloom target, with the
+/// FULL-RES frame's uniforms: the fragment's `pos.x` is a half-res pixel,
+/// while the quad's left edge is in full-res pixels. The column the ramp is
+/// read at therefore has to be measured in the quad's own space, or every
+/// fragment left of `x/2 + w/2` clamps toward the LEFT colour and the halo
+/// over a red→blue ramp stays red to its blue end.
+///
+/// One additive `GlowQuad::gradient` red → blue across 30 cells, bloom on
+/// minus bloom off, sampled 3 px above the quad: the halo over the left end
+/// must be red-dominant and over the right end blue-dominant — as it is for
+/// the CONTROL, the same ramp built from 30 flat one-cell quads. Both arms:
+/// the first-party Metal renderer and (macOS) the wgpu oracle, whose WGSL
+/// twin carries the same extract. RED before the fix at `col 32`: red 35
+/// against blue 24 (the control: red 3, blue 55).
+#[test]
+fn bloom_halo_follows_a_gradient_quad_s_ramp() {
+    let theme = Theme::default();
+    let (rows, cols) = (8usize, 40usize);
+    let (c0, c1) = (0x00E0_0000u32, 0x0000_00E0u32);
+    for oracle in [false, true] {
+        if oracle && !cfg!(target_os = "macos") {
+            continue;
+        }
+        let Some((cpu, mut gpu)) = backends(18.0, theme) else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        if oracle {
+            gpu.disarm_metal_for_oracle();
+        }
+        let (cw, ch) = cpu.cell_size();
+        let mut win = aterm_gpu::WindowGpu::new();
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let (x0, n) = (4usize, 30usize);
+        let gradient = vec![GlowQuad::gradient(
+            3,
+            (x0 * cw) as u16,
+            (3 * ch) as u16,
+            (n * cw) as u16,
+            ch as u16,
+            c0,
+            0,
+            c1,
+            0,
+        )];
+        let w = (n * cw) as u32;
+        let cells: Vec<GlowQuad> = (0..n)
+            .map(|k| {
+                // The column-centre colour of cell k's middle pixel.
+                let i = (k * cw + cw / 2) as u32;
+                let c = aterm_render::glow_lerp_rgb(c0, c1, i, w);
+                GlowQuad::flat(
+                    3,
+                    ((x0 + k) * cw) as u16,
+                    (3 * ch) as u16,
+                    cw as u16,
+                    ch as u16,
+                    c,
+                    0,
+                )
+            })
+            .collect();
+        let mut gains = Vec::new();
+        for quads in [gradient, cells] {
+            let mut input = term.cell_frame(rows, cols);
+            input.cursor_visible = false;
+            input.cursor_glow_add = quads;
+            gpu.set_bloom(true);
+            let on = gpu.render_input(&mut win, &input, None);
+            gpu.set_bloom(false);
+            let off = gpu.render_input(&mut win, &input, None);
+            let gain = |col: usize| {
+                let p = (3 * ch - 3) * on.width + col * cw + cw / 2;
+                let ch_of = |v: u32, sh: u32| ((v >> sh) & 0xff) as i32;
+                (
+                    ch_of(on.pixels[p], 16) - ch_of(off.pixels[p], 16),
+                    ch_of(on.pixels[p], 0) - ch_of(off.pixels[p], 0),
+                )
+            };
+            gains.push([gain(6), gain(18), gain(32)]);
+        }
+        eprintln!(
+            "oracle={oracle}: (red, blue) halo gain at cols 6/18/32 — gradient {:?}, \
+             flat cells {:?}",
+            gains[0], gains[1]
+        );
+        for (name, g) in [("gradient", gains[0]), ("flat cells", gains[1])] {
+            let ([r6, b6], [r32, b32]) = ([g[0].0, g[0].1], [g[2].0, g[2].1]);
+            assert!(
+                r6 > b6 && r6 > 0,
+                "oracle={oracle} {name}: the halo over the red end is red: {g:?}"
+            );
+            assert!(
+                b32 > r32 && b32 > 0,
+                "oracle={oracle} {name}: the halo over the BLUE end is blue: {g:?}"
+            );
+        }
+    }
 }

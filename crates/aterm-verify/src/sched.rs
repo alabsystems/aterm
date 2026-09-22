@@ -14,8 +14,10 @@
 //!   (cargo takes a file lock), they just queue — so "running them concurrently"
 //!   would buy nothing and cost the ability to reason about the run. Stages in a
 //!   lane run in declared order, one at a time. Tippy has its own target dir
-//!   (`target-tippy`), the L0 gate has its own workspace, and the libc oracle
-//!   owns its nested workspace's two target dirs, so all are real lanes that
+//!   (`target-tippy`), the L0 gate has its own workspace, the libc oracle owns
+//!   its nested workspace's two target dirs, and the conformance suites' RELEASE
+//!   artifact has `target/conformance-release` — a directory under `target/`
+//!   whose cargo lock is nevertheless its own — so all are real lanes that
 //!   genuinely overlap the main build.
 //!
 //! * An EXCLUSIVE stage runs with nothing else in flight. The two smokes MEASURE:
@@ -64,9 +66,16 @@ struct State {
 }
 
 /// Can stage `i` start right now? Pure, so the rule above is testable without
-/// threads.
+/// threads — `pub(crate)` since 2026-09-22 so `plan`'s tests can ask THIS
+/// function whether a row really starts at t0, rather than re-deriving the rule.
 #[must_use]
-fn ready(specs: &[StageSpec], started: &[bool], done: &[bool], running: usize, i: usize) -> bool {
+pub(crate) fn ready(
+    specs: &[StageSpec],
+    started: &[bool],
+    done: &[bool],
+    running: usize,
+    i: usize,
+) -> bool {
     if started[i] {
         return false;
     }
@@ -215,6 +224,7 @@ pub fn lane_name(lane: Lane) -> &'static str {
         Lane::RegexTarget => "target-regex/",
         Lane::XtaskTarget => "target-xtask/",
         Lane::DriverTarget => "target-drivers/",
+        Lane::ConformanceRelease => "target/conformance-release/",
     }
 }
 

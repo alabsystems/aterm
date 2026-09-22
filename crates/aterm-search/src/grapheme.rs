@@ -124,7 +124,24 @@ pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
 /// the engine's counter, not beside it.
 #[must_use]
 pub fn display_columns(text: &str) -> usize {
-    ColumnMap::new(text).total_columns()
+    // Match ColumnMap's ASCII-only Kani abstraction without bringing the
+    // Unicode segmenter's property-table searches into bounded proofs.
+    #[cfg(kani)]
+    {
+        text.len()
+    }
+    #[cfg(not(kani))]
+    {
+        if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
+            return text.len();
+        }
+        // Width-only callers need no byte-offset lookups. Count with the
+        // map's same grid-width rule and saturation, without allocating a
+        // coordinate entry for every grapheme only to discard the map.
+        text.graphemes().fold(0usize, |col, grapheme| {
+            col.saturating_add(grapheme_grid_columns(grapheme))
+        })
+    }
 }
 
 /// Map a byte offset in lowercased text back to the corresponding byte offset
@@ -226,15 +243,6 @@ impl ColumnMap {
         }
     }
 
-    /// Return the total display column count of the source text.
-    ///
-    /// Equivalent to `byte_to_column(text.len())`.
-    #[must_use]
-    #[inline]
-    pub fn total_columns(&self) -> usize {
-        self.byte_to_column(self.text_len)
-    }
-
     /// Look up the display column for a byte offset.
     ///
     /// O(1) for ASCII text (identity mapping), O(log G) for non-ASCII.
@@ -318,7 +326,48 @@ impl LowerByteMap {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnMap, LowerByteMap, byte_to_column, map_lower_byte_to_original};
+    use super::{
+        ColumnMap, LowerByteMap, byte_to_column, display_columns, map_lower_byte_to_original,
+    };
+
+    #[test]
+    fn width_only_matches_coordinate_map_for_unicode_and_controls() {
+        let pieces = [
+            "",
+            "plain ASCII ~",
+            "\0\t\r\n\u{7f}",
+            "日本語",
+            "e\u{0301}",
+            "\u{0301}\u{0308}",
+            "\u{fe0f}",
+            "न्दी",
+            "1\u{fe0f}\u{20e3}",
+            "👩🏽‍💻",
+            "🇦",
+            "🇧",
+            "♥\u{fe0e}",
+            "♥\u{fe0f}",
+        ];
+        // Pairing includes boundaries where a combining mark, variation
+        // selector or regional indicator joins the preceding piece.
+        for left in pieces {
+            for right in pieces {
+                let text = format!("{left}{right}");
+                assert_eq!(
+                    display_columns(&text),
+                    ColumnMap::new(&text).byte_to_column(text.len()),
+                    "text={text:?}"
+                );
+            }
+        }
+        // These widths distinguish terminal cells from byte, scalar and
+        // grapheme counts; controls must not enter the ASCII identity path.
+        assert_eq!(display_columns("\0\t\r\n\u{7f}"), 0);
+        assert_eq!(display_columns("日"), 2);
+        assert_eq!(display_columns("न्दी"), 3);
+        assert_eq!(display_columns("1\u{fe0f}\u{20e3}"), 2);
+        assert_eq!(display_columns("👩🏽‍💻"), 2);
+    }
 
     /// ColumnMap produces identical results to byte_to_column for ASCII text.
     #[test]

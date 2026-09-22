@@ -603,12 +603,13 @@ impl CursorStateHandler<'_> {
             self.modes.cursor_blink = style.blinks();
             if changed {
                 // A cursor-shape change repaints the cursor cell without changing any
-                // cell's content; mark grid damage so `damage_epoch` advances and the
-                // new shape isn't swallowed by the frontend's redraw early-out (cf.
-                // DECTCEM `show_cursor`). The blink-class transition (steady<->blinking)
-                // already self-heals via the frontend blink timer; this covers a
-                // within-class change (e.g. steady block -> steady bar) with no grid write.
-                self.grid.damage_mut().mark_full();
+                // cell's content; mark that CELL's damage so `damage_epoch` advances
+                // and the new shape isn't swallowed by the frontend's redraw early-out
+                // (cf. DECTCEM `show_cursor`, which carries the audit note). The
+                // blink-class transition (steady<->blinking) already self-heals via the
+                // frontend blink timer; this covers a within-class change (e.g. steady
+                // block -> steady bar) with no grid write.
+                self.grid.mark_cursor_damage();
                 if let Some(callback) = self.cursor_style_callback {
                     callback(style);
                 }

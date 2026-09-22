@@ -213,6 +213,19 @@ impl GlowStyle {
             // the A/B twin of the default body, so it must differ from the
             // default in the BODY and in nothing else — the same resident.
             || Self::style_names_flat_ribbon(s)
+            // …and the TALL spellings, third time, same reason — and this one
+            // was the sharpest, because `… tall` names the geometry the
+            // DEFAULT ALREADY DRAWS. `ribbon_tall` is
+            // `!style_names_underline_ribbon`, so `rainbow kitty tall` and
+            // `rainbow kitty pet` resolve to the SAME geometry; the word
+            // changed nothing it names and swapped the ANIMAL instead,
+            // because this list is a whole-string equality that never learned
+            // the spelling. Both places a user reads call it "an explicit
+            // spelling of the DEFAULT" (the config doc and the starter
+            // aterm.toml), and the default is the resident — so an explicit
+            // spelling of the default that drew a different animal was the
+            // naming trap this list exists to close, for the third time.
+            || Self::style_names_tall_ribbon(s)
     }
 
     /// Whether this style string explicitly asks for the OLD FLYING KITTY HEAD
@@ -511,7 +524,11 @@ impl GlowStyle {
 /// `PartialEq` (structural; never `Eq` — f32 fields) backs the `last_cfg`
 /// compare-on-write in [`CursorGlow::tick`]: two configs that compare equal
 /// hold the same field values, so they must — and do — produce the identical
-/// frame.
+/// frame. The converse does NOT hold, and has not since [`Self::audible`]
+/// joined the struct: that field is AUDIO-only, so two configs differing in
+/// it alone are unequal and still draw a byte-identical frame. Nothing needs
+/// a fade or a reset on a focus flip; the cost is one short-circuiting
+/// re-store of `last_cfg`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlowConfig {
     pub enabled: bool,
@@ -525,7 +542,31 @@ pub struct GlowConfig {
     /// Max comet length in cells.
     pub length: usize,
     /// Additive brightness scale 0.0..=1.0 (0 ⇒ effectively off).
+    ///
+    /// THE VISUAL HALF of what used to be one scalar with three folded
+    /// meanings: the user's brightness knob, the accessibility policy
+    /// (`Reduce Motion`), and the host's performance headroom (the load-shed
+    /// envelope). All three still land here, and all three still dim the
+    /// light exactly as before — see [`Self::audible`] for the half that
+    /// stopped riding along.
     pub intensity: f32,
+    /// THE AUDIO HALF, carrying ONE fact: should a key pressed on this tick's
+    /// window be HEARD, stated independently of how bright the trail is.
+    ///
+    /// Two rulings live in this split. A key-time click costs no GPU, so a
+    /// frame the host sheds for performance is still a heard key; and
+    /// `Reduce Motion` is a MOTION setting, not an audio setting, so it dims
+    /// the light without closing the key seam. Both used to mute every
+    /// keystroke because the engine read `intensity <= 0` as "silent".
+    ///
+    /// What still decides audibility elsewhere, and is deliberately NOT here:
+    /// the master switch and serious mode arrive as [`Self::enabled`], and
+    /// the sound knobs (`trail_sounds`, `trail_sound_volume`, the resize
+    /// quiet window, a dead audio worker) gate host-side in
+    /// `keystroke_click_audible` before a cue is ever minted. What the host
+    /// must put here is the one term the engine cannot see: whether the key
+    /// landed in THIS window.
+    pub audible: bool,
     /// Bloom-crown radius in cells (0 ⇒ no crown, comet only).
     pub radius: f32,
     /// Landing-ring "ping" on a jump.
@@ -3461,10 +3502,17 @@ impl InsertSeam {
         }
     }
 
-    /// The armed licence while it is fresh ([`CursorGlow::INSERT_HINT_FRESH`]).
+    /// The armed licence while it is fresh — [`CursorGlow::INSERT_HINT_FRESH`]
+    /// for a PRICED insert, the much shorter
+    /// [`CursorGlow::INSERT_GESTURE_HINT_FRESH`] for the unknown-width class.
     fn fresh(&self, now: Instant) -> Option<InsertLicence> {
         self.armed.filter(|i| {
-            now.saturating_duration_since(i.at).as_secs_f32() <= CursorGlow::INSERT_HINT_FRESH
+            let window = if i.known {
+                CursorGlow::INSERT_HINT_FRESH
+            } else {
+                CursorGlow::INSERT_GESTURE_HINT_FRESH
+            };
+            now.saturating_duration_since(i.at).as_secs_f32() <= window
         })
     }
 
@@ -3801,6 +3849,10 @@ struct WitnessRowBuf {
     row: u16,
     cols: Vec<char>,
 }
+
+/// The two ping-pong buffers [`CursorGlow::spawn_bolt`]'s midpoint-displacement
+/// jag swaps between: the polyline so far, and the one being built from it.
+type BoltJag = (Vec<(f32, f32)>, Vec<(f32, f32)>);
 
 /// Per-window aurora animation state.
 #[derive(Default)]
@@ -4284,23 +4336,44 @@ pub struct CursorGlow {
     /// widens the measured gap, and a wide gap earns exactly zero cadence
     /// credit, which is the right answer for the first key of a new burst.
     key_cue_at: Option<Instant>,
-    /// The live style/pack's per-keystroke heat GAIN and cooling τ, snapshotted
-    /// by the last DRAWING [`Self::tick`]. [`Self::cue_keystroke`] runs from the
+    /// The live style/pack's per-keystroke heat GAIN and cooling τ,
+    /// snapshotted by every [`Self::tick`] that gets past the MASTER SWITCH
+    /// and is not handled by the classic engine (which returns above the
+    /// store, writing neither these nor [`Self::sound_live`]) — not only by a
+    /// drawing one. Both are pure functions of the config
+    /// (neither reads `intensity`), so the dark-but-audible path computes
+    /// bit-identical values, and a click minted during a load-shed frame
+    /// reads THIS tick's timbre rather than the last lit tick's. [`Self::cue_keystroke`] runs from the
     /// host's key handler, which holds no [`GlowConfig`] — without these it
     /// could not reconstruct the heat the echo is about to reach, and the
     /// key-time click would carry the PRE-keystroke timbre (one keystroke of
     /// lag in the sound, the exact "feels behind" the seam exists to remove).
-    /// Read only behind [`Self::sound_live`], and no tick sets that without
-    /// writing these, so the zeroed `Default` is unreachable in the cue path.
+    /// Read only behind [`Self::sound_live`], and no tick opens that seam
+    /// without writing these first (they are stored at the end of the lazy
+    /// thermal decay, ABOVE both the zero-amplitude return and the live
+    /// path), so the zeroed `Default` is unreachable in the cue path.
     heat_gain_live: f32,
     heat_tau_live: f32,
-    /// Whether the LAST [`Self::tick`] ran the LIVE path (master on, real
-    /// geometry, nonzero amplitude). [`Self::cue_keystroke`] records nothing
-    /// unless this is set, which is what keeps the "sound is silenced by
-    /// exactly the gates that silence the light" law true for a cue born at
-    /// the KEY instead of at a spawn: the spawn edge is unreachable while
-    /// dark, but the key seam is not. Also false before the first tick, so a
-    /// host that never ticks (headless, tests) is byte-identical.
+    /// Whether the LAST [`Self::tick`] left the key seam OPEN — it ran the
+    /// live path (master on, real geometry, nonzero amplitude), OR it went
+    /// dark only for a MOTION or PERFORMANCE reason while
+    /// [`GlowConfig::audible`] said the key still belongs to this window.
+    /// [`Self::cue_keystroke`] records nothing unless this is set.
+    ///
+    /// THE LAW IT CARRIES, restated: sound is silenced by exactly the gates
+    /// that are ABOUT SOUND. It used to be "the gates that silence the
+    /// light", which handed a load-shed latch and macOS `Reduce Motion` a
+    /// mute switch over a click that costs no GPU. The master switch and
+    /// serious mode still close it (they arrive as [`GlowConfig::enabled`]),
+    /// unfocus still closes it (it arrives as `audible = false`), and the
+    /// host's own sound knobs never reach here at all — they gate before a
+    /// cue is minted. Also false before the first tick, so a host that never
+    /// ticks (headless, tests) is byte-identical.
+    ///
+    /// It has an OUT-OF-BAND READER: [`Self::sound_seam_open`], which
+    /// `aterm ctl tone` prints as `engine_sound=` and `aterm ctl trail
+    /// status` as `sound_seam=`. A future edit to either dark return is
+    /// changing a user-visible answer, not only a private gate.
     sound_live: bool,
     /// THIS frame's cursor-row content probe ([`Self::observe_row`]) — the
     /// newer half of the poof detector's double buffer. Per-COLUMN chars
@@ -4387,6 +4460,14 @@ pub struct CursorGlow {
     /// Reused by [`Self::emit_bolts`] (Laser strikes) for the per-bolt polyline,
     /// so a strike frame allocates nothing after the first growth.
     bolt_verts: Vec<BeamVertex>,
+    /// Ping-pong scratch for [`Self::spawn_bolt`]'s midpoint-displacement
+    /// rounds. The jag used to build a FRESH `Vec` per round — `vec![from, to]`
+    /// plus one `Vec::with_capacity` per round, two rounds for a crackle and
+    /// four for a jump — so every strike cost three heap buffers to describe a
+    /// polyline five points long, and hot typing crackles several a second.
+    /// Taken out of `self` around the jag because the loop calls
+    /// [`Self::frand`], and handed straight back.
+    bolt_jag: BoltJag,
     /// Reused by [`Self::emit_comet`]'s Laser arm for the per-layer filament
     /// polyline, so a laser frame allocates nothing after the first growth.
     comet_verts: Vec<BeamVertex>,
@@ -4418,7 +4499,10 @@ pub struct CursorGlow {
     /// state TOWARD the wiped fixpoint (`clear_blink`, `clear_typed`,
     /// `drop_row_probe`, the drains/takes/swaps) keep it, as do the two that
     /// are structurally inert while dark: `cue_keystroke` no-ops once the
-    /// dark tick forces `sound_live` false, and `observe_neighbor_rows`
+    /// MASTER-OFF tick forces `sound_live` false — this latch is set by that
+    /// branch and by no other, so the argument does not rest on the
+    /// zero-amplitude return, which now leaves the seam open for a shed or
+    /// motion-reduced frame — and `observe_neighbor_rows`
     /// no-ops until an `observe_row` — which unsettles — lands first.
     /// `#[derive(Default)]` starts it false, so the first dark tick still
     /// runs one (no-op) wipe before latching.
@@ -4935,6 +5019,16 @@ pub struct TrailStatus<'a> {
     /// envelope reported a bright `intensity` for frames that were never drawn.
     /// Fillers must fold it; `effective == false` ⇒ `intensity == 0.0`.
     pub intensity: f32,
+    /// Whether the KEY SEAM is open — [`CursorGlow::sound_seam_open`], read
+    /// off the engine rather than re-derived from the config, so this row and
+    /// the gate `cue_keystroke_shifted` tests cannot drift.
+    ///
+    /// It sits beside `shed` and `intensity` on purpose: `shed=0.00
+    /// intensity=0.00 sound_seam=true` is a shed or motion-reduced window
+    /// whose typing is STILL HEARD (a key-time click costs no GPU), and
+    /// `sound_seam=false` beside `focused=false` is the one dark case that is
+    /// supposed to be silent.
+    pub sound_seam: bool,
     /// The ribbon's dark-theme PRESENTATION as the raw spelling resolves it:
     /// `"underline"` (the explicit post-v0.43 highlighter-plus-strip hybrid) or
     /// `"tall"` (the default smooth v0.43-shaped body, selected by ordinary
@@ -5084,7 +5178,7 @@ impl TrailStatus<'_> {
         );
         format!(
             "trail style={:?} resolved={} config_enabled={} effective={} focused={} \
-             motion={} motion_stage={} shed={:.2} intensity={:.2} \
+             motion={} motion_stage={} shed={:.2} intensity={:.2} sound_seam={} \
              licensed={} declined={} last_decline_reason={} spawns={} \
              ribbon_active={} ribbon_look={} ribbon_segments={} ribbon_hue_bands={} \
              ribbon_drawn={} ribbon_curtain_ms={} \
@@ -5107,6 +5201,7 @@ impl TrailStatus<'_> {
             self.motion_stage,
             self.shed,
             self.intensity,
+            self.sound_seam,
             self.tally.licensed,
             self.tally.declined,
             self.tally.last_decline_reason.unwrap_or("none"),
@@ -5189,6 +5284,11 @@ impl TrailStatus<'_> {
     /// ([`rk::Status::retired`]: the witness saw the glyph under them
     /// replaced, or go) — the number that says a
     /// band went out because its text moved or went, as against expiring.
+    /// `ribbon_followed=` (2026-09-21) is its twin: the cells the follow
+    /// pass carried to another row WITH their text ([`rk::Status::followed`]
+    /// — a bottom-anchored composer growing a row without a scroll), so
+    /// "the band went with its text" reads apart from "its text moved out
+    /// from under it".
     #[must_use]
     pub fn line_v2(&self, v2: Option<rk::Status>) -> String {
         let mut line = self.line();
@@ -5198,8 +5298,8 @@ impl TrailStatus<'_> {
             // formality.
             let _ = write!(
                 line,
-                " v2_quads={} v2_halos={} v2_stars={} v2_meteors={} v2_bridged={} ribbon_retired={}",
-                s.quads, s.halos, s.stars, s.meteors, s.bridged, s.retired
+                " v2_quads={} v2_halos={} v2_stars={} v2_meteors={} v2_bridged={} ribbon_retired={} ribbon_followed={}",
+                s.quads, s.halos, s.stars, s.meteors, s.bridged, s.retired, s.followed
             );
         }
         line
@@ -5579,6 +5679,48 @@ impl CursorGlow {
     /// the unpaid typed credits behind it, on a row that is not a program
     /// row, once.
     pub const INSERT_HINT_FRESH: f32 = 2.0;
+    /// The same window for the UNKNOWN-WIDTH class — a bare Tab or ⌃V,
+    /// whose echo is the local program's and whose bytes were one keystroke
+    /// already on the wire.
+    ///
+    /// **WHY IT IS NOT [`Self::INSERT_HINT_FRESH`]** (2026-09-21). Two
+    /// seconds is a PASTE's number: the host's write of a large body can
+    /// land slowly, and the width check bounds what the licence can buy
+    /// anyway. The unknown class has no width to check — its admission is
+    /// the row witness and the 32-cell bound — so for the whole two seconds
+    /// the FIRST same-row forward advance on the hand's row was taken as
+    /// the gesture's echo, and 1.75 s of that is past every other licence's
+    /// freshness. A background job printing on the prompt row was lit as a
+    /// 32-cell sweep: ink over bytes no key asked for.
+    ///
+    /// **THE NUMBER, AND WHAT SET IT.** A local bash completion's echo was
+    /// measured on glass at `<= 115 ms` — the recorder's own sampling
+    /// floor, which is to say the instrument could not resolve it
+    /// (`index.json`'s `analysis` reads `AT CAPTURE FLOOR`), so that is a
+    /// bound and not a reading. The FLOOR on this constant is not that
+    /// measurement but this crate's own standing law
+    /// (`a_spinner_row_advancing_after_a_tab_stays_dark`), which requires a
+    /// Tab's completion to still be the Tab's **800 ms** later; 0.75 broke
+    /// it, and weakening a shipped law to fit a guessed constant is not a
+    /// trade this lane gets to make. One second keeps every existing law
+    /// with 200 ms to spare and halves the window a program hop can walk
+    /// into.
+    ///
+    /// It is a POLICY, not a bound — a completion that shells out over a
+    /// slow network can take longer, and past this its echo goes unlit
+    /// rather than the window staying open for program output. That is the
+    /// trade the owner's report picks: an unexpected rainbow is the defect;
+    /// a completion that paints no trail is not.
+    ///
+    /// **WHAT WAS TRIED INSTEAD AND DOES NOT WORK:** a COLUMN witness
+    /// beside the row one, refusing a hop that does not BEGIN where the
+    /// hand stood when the gesture was armed. It cannot bind. The caret can
+    /// only reach another column by a move, and the first same-row forward
+    /// move after the Tab therefore always starts at the hand's own column
+    /// — it is admitted, and the licence is spent, before any later hop can
+    /// be tested. Measured: both arms of the twin scored 1. Time is the
+    /// only discriminator this seam has.
+    pub const INSERT_GESTURE_HINT_FRESH: f32 = 1.0;
     /// How long after a delivered insert was laid a keyless same-row retreat
     /// landing inside its span is read as the program's REWRITE of that
     /// insert (Claude Code swaps a dropped path for `[Image #1] ` 300-400 ms
@@ -5897,8 +6039,9 @@ impl CursorGlow {
     ///
     /// SILENCE LAW: a cue born at the key cannot inherit the spawn edge's
     /// "unreachable while dark" proof, so it is gated on [`Self::sound_live`] —
-    /// the master switch, real geometry, and nonzero amplitude (unfocus /
-    /// reduced motion) as of the last tick. A host that never ticks records
+    /// the master switch, real geometry, and the host's `audible` verdict
+    /// (unfocus only — reduced motion and load shed dim the light without
+    /// closing the seam) as of the last tick. A host that never ticks records
     /// nothing at all. Everything downstream (focus, the sound knob, volume,
     /// the resize quiet window) is host policy applied at the drain, exactly as
     /// for an echo cue.
@@ -6699,6 +6842,28 @@ impl CursorGlow {
         own_row || (ins.known && hop >= usize::from(ins.cells))
     }
 
+    /// THE INSERT'S ECHO ON THE VISIBLE LANE — the one predicate
+    /// `spawn_judged`'s insert arm lays by on [`SpawnLane::Visible`] and the
+    /// hide bridge admits a hidden→visible reappearance by
+    /// ([`Self::hidden_bridge_source`], 2026-09-22), so the two can never
+    /// disagree about one move: the echo shape ([`Self::insert_echo`]), on
+    /// the insert's own row ([`Self::insert_row_identity`]), with no fresher
+    /// press class owning the hop ([`Self::fresher_class_owns_hop`]).
+    fn visible_insert_echo(
+        &self,
+        pr: u16,
+        pc: u16,
+        cr: u16,
+        cc: u16,
+        now: Instant,
+        cfg: &GlowConfig,
+    ) -> Option<InsertLicence> {
+        let ins = self.insert_echo(pr, pc, cr, cc, now, cfg)?;
+        let hop = usize::from(cc - pc);
+        (Self::insert_row_identity(cr, hop, ins) && !self.fresher_class_owns_hop(hop, ins, now))
+            .then_some(ins)
+    }
+
     /// Whether a FRESHER press class owns this same-row forward hop, so the
     /// insert must wait for its own echo: a navigation press (an arrow's own
     /// hop), a reflow, a scripted gesture stamped at another instant, or
@@ -7382,6 +7547,17 @@ impl CursorGlow {
     /// Stamp the focused pane's exact columns in the coordinate space handed
     /// to [`Self::tick`]. This is morphology only: [`Self::move_licensed`]
     /// remains the sole authority to mint light.
+    pub fn note_pane_rows(&mut self, first_row: u16, rows: usize) {
+        let pane_rows = u16::try_from(rows)
+            .ok()
+            .filter(|rows| *rows > 0)
+            .map(|rows| (first_row, rows));
+        self.v2.set_pane_rows(pane_rows);
+    }
+
+    /// Stamp the focused pane's exact columns in the coordinate space handed
+    /// to [`Self::tick`]. This is morphology only: [`Self::move_licensed`]
+    /// remains the sole authority to mint light.
     pub fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
         self.pane_columns = u16::try_from(cols)
             .ok()
@@ -7641,6 +7817,25 @@ impl CursorGlow {
     /// that row. `Flow::default()` — `flow=0.00 combo=0 combo_best=0` — for
     /// every style but Rainbow Kitty v2, whose spine is the one that prices
     /// it.
+    /// Whether the KEY SEAM is open: would a keypress landing on this
+    /// engine's window right now record a click cue?
+    ///
+    /// The first reader of `sound_live` outside the engine, minted because
+    /// `aterm ctl tone` must be able to refute "sound is broken" on its own
+    /// and `aterm ctl trail status` must be able to say "the light is off AND
+    /// the keys are heard" in one row. Both read THIS value rather than
+    /// re-deriving it from the config, so the two verbs cannot drift from
+    /// each other or from the gate `cue_keystroke_shifted` actually tests on
+    /// its first line.
+    ///
+    /// It answers for the ENGINE only: the host's own sound gates
+    /// (`trail_sounds`, `trail_sound_volume`, the resize-quiet window, a dead
+    /// audio worker) sit downstream and are reported separately.
+    #[must_use]
+    pub const fn sound_seam_open(&self) -> bool {
+        self.sound_live
+    }
+
     #[must_use]
     pub fn flow_status(&self) -> rk::Flow {
         if self.v2.engaged() {
@@ -8448,13 +8643,16 @@ impl CursorGlow {
 
     /// **THE ROWS THE CONTENT WITNESS WANTS** (2026-09-12, the abandoned
     /// band; `rk::witness`): the distinct grid rows Rainbow Kitty's resident
-    /// ribbon occupies, written into `out` (at most `out.len()` — size it
-    /// [`rk::witness::WITNESS_ROWS`]); returns how many. The host captures
-    /// exactly these rows under its terminal lock, beside the row probe,
-    /// and hands each to [`Self::observe_ribbon_row`] before the tick; the
-    /// caret's own row rides the row probe the host already holds, so it
-    /// costs no second grid read. `0` for every style but rainbow kitty —
-    /// the other nine sample nothing and pay nothing.
+    /// ribbon occupies — and, since 2026-09-21 (the band follows its text),
+    /// the row above and below each, so the follow pass can see where a
+    /// run's text went when a bottom-anchored box grew a row
+    /// ([`rk::Engine::ribbon_rows`]) — written into `out` (at most
+    /// `out.len()` — size it [`rk::witness::WITNESS_ROWS`]); returns how
+    /// many. The host captures exactly these rows under its terminal lock,
+    /// beside the row probe, and hands each to [`Self::observe_ribbon_row`]
+    /// before the tick; the caret's own row rides the row probe the host
+    /// already holds, so it costs no second grid read. `0` for every style
+    /// but rainbow kitty — the other nine sample nothing and pay nothing.
     pub fn ribbon_rows(&self, out: &mut [u16]) -> usize {
         let mut n = self.v2.ribbon_rows(out);
         if !self.v2.engaged() || out.is_empty() {
@@ -9167,17 +9365,21 @@ impl CursorGlow {
 
     /// Wipe every piece of TRANSIENT state: the in-flight light (sparks,
     /// particles, streaks, bursts, the whole glide-star family, meteors,
-    /// vapor, bolts, ring, crossfades), the pending sound + keyed-click
-    /// credits, ALL input hints, the row probes, and the rainbow kitty
+    /// vapor, bolts, ring, crossfades), ALL input hints, the row probes, and
+    /// the rainbow kitty
     /// tail/pop/wake machinery. The ONE teardown all three dark/reset paths
     /// compose from — never hand-maintained lists at the call sites, which drift
     /// and leave a disabled engine reporting live light or a stale hint alive to
     /// fire on refocus. Everything transient clears here, unconditionally:
     /// nothing presents while dark, a stale hint must not outlive the wipe,
     /// and a wiped engine must report idle-zero so the host's frame train
-    /// disarms. `sound_live`, the cursor-position tracking (`last` /
+    /// disarms. `sound_live`, the SOUND LEDGER
+    /// ([`Self::clear_sound_ledger`]), the cursor-position tracking (`last` /
     /// `last_visible` / `last_move`), and `ctx_alt` stay with the callers —
-    /// the three paths deliberately differ there.
+    /// the four things the three paths deliberately differ on. The sound
+    /// ledger is the newest of them: a load-shed frame is dark but still
+    /// HEARD, so it must KEEP the credits an in-flight echo is about to
+    /// spend, while a master-off, reset or unfocused tick must not.
     fn clear_transient_state(&mut self) {
         self.park_source_intact = None;
         // A held park is judged before the teardown takes its stamp and
@@ -9187,8 +9389,6 @@ impl CursorGlow {
         self.type_press_ring.forget();
         self.insert.orphans = None;
         self.last_committed_type = None;
-        self.sound_cues.clear();
-        self.clear_keyed_clicks();
         // EVERY LICENSE TERM GOES. A teardown means the engine is dark or
         // reset; a hint that survived it would license the first program move
         // after the lights come back on.
@@ -9260,6 +9460,29 @@ impl CursorGlow {
         // the elapsed gap, which the lazy decay already does.
         self.erase_mom.reset();
         self.last_type = None;
+    }
+
+    /// Drop the SOUND ledger: the pending cues and the keyed-click credits
+    /// that account for them. Split out of [`Self::clear_transient_state`]
+    /// for the same reason [`Self::clear_thermals`] is a sibling rather than
+    /// a body — the callers genuinely differ, so the difference is stated
+    /// ONCE at each call site instead of hidden inside a shared teardown.
+    ///
+    /// WHO CALLS IT: [`Self::reset`] and the master-off dark return, both
+    /// unconditionally (a credit banked before the switch, or in a coordinate
+    /// space that just died, must not mute the first click of the next one);
+    /// and the zero-amplitude return ONLY when the tick is inaudible. A shed
+    /// or motion-reduced frame is dark but still heard, so its banked credits
+    /// must survive — the in-flight echoes of keys typed during the shed
+    /// arrive after the latch flaps back to lit, find their credits, and stay
+    /// silent. Wiping them per dark frame would double-click the whole burst.
+    ///
+    /// NOTHING VISUAL BELONGS HERE. The audio half must never resurrect
+    /// visual state: geometry, the candidate cohort, the held park, the erase
+    /// licences and the type-press ring all still clear on every dark tick.
+    fn clear_sound_ledger(&mut self) {
+        self.sound_cues.clear();
+        self.clear_keyed_clicks();
     }
 
     /// UN-LATCH the dark-settled fast path (see [`Self::dark_settled`]): the
@@ -9345,6 +9568,7 @@ impl CursorGlow {
         // coordinate-space event, not a darkness one.
         self.unsettle();
         self.clear_transient_state();
+        self.clear_sound_ledger();
         self.clear_thermals();
         // The salvaged engine holds its OWN cursor memory and its own in-flight
         // light, both in the coordinate space that just died — so it takes the
@@ -9416,8 +9640,11 @@ impl CursorGlow {
     /// or the in-flight echo (a same-row forward reappearance the unpaid
     /// presses pay for, whatever the hide's age: keys were typed since the
     /// caret was last seen, and `spawn` judges the hop under the full share
-    /// rule). `None`: a declined relocation. Selects geometry only — the
-    /// licence gate still decides admission.
+    /// rule), or the delivered insert's echo (a same-row forward
+    /// reappearance a fresh Tab or paste licence lays, whatever the hide's
+    /// age: [`Self::visible_insert_echo`], 2026-09-22). `None`: a declined
+    /// relocation. Selects geometry only — the licence gate still decides
+    /// admission.
     fn hidden_bridge_source(
         &self,
         cur: Option<(u16, u16)>,
@@ -9520,11 +9747,32 @@ impl CursorGlow {
         // and `spawn` judges the hop under the full share rule.
         let in_flight_echo =
             cur.is_some_and(|(cr, cc)| self.unpaid_typed_echo(r, c, cr, cc, now, cfg, geom));
+        // THE LICENSED INSERT'S REAPPEARANCE (2026-09-22, Rainbow Kitty
+        // only — the one style with a delivered-insert class). A Tab
+        // completion or a paste whose echo frame the host presented TORN —
+        // the caret hidden and nothing yet written (a 1024-byte PTY read
+        // ending at `?25l`, the `?2026` hold capped) — reappears the insert's
+        // width on with no print the anchored lane could have judged under
+        // the hidden caret: it was refused here as a `hidden-relocation`
+        // (the Tab) or silently (the paste, whose gesture the enqueue
+        // revoked), the licence lapsed unspent, the three cells of `INTO `'s
+        // `TO ` were laid by nobody, and the hand's next key past them
+        // minted a second band with the dark gap between
+        // (`tests/licensed_insert_band.rs`). The insert's own witness is its
+        // delivery, not the hide window, so the reach is the licence's: a
+        // same-row forward reappearance `spawn` would lay as that insert on
+        // the visible lane — exactly the predicate it judges with
+        // ([`Self::visible_insert_echo`]), so the bridge admits nothing the
+        // insert arm then refuses. An insert already laid under the hidden
+        // caret (its print on the torn present) was spent there and admits
+        // nothing more.
+        let insert_echo =
+            cur.is_some_and(|(cr, cc)| self.visible_insert_echo(r, c, cr, cc, now, cfg).is_some());
         // The NAV witness is an alternative to `fresh` (a stamp the key
         // just laid), not to `plausible` (the reach the same nav witness
-        // already widened above); the in-flight echo remains its own,
-        // reach-free lane.
-        (((fresh || nav_bridge) && plausible) || in_flight_echo).then_some((r, c))
+        // already widened above); the in-flight echo and the insert's echo
+        // remain their own, reach-free lanes.
+        (((fresh || nav_bridge) && plausible) || in_flight_echo || insert_echo).then_some((r, c))
     }
 
     /// JUDGE THE OBSERVED CARET against its source: a real move between two
@@ -9757,6 +10005,7 @@ impl CursorGlow {
             // spurious comet (the cursor_trail.rs disabled-branch rationale).
             if !self.dark_settled {
                 self.clear_transient_state();
+                self.clear_sound_ledger();
                 self.clear_thermals();
                 self.dark_settled = true;
             }
@@ -9949,6 +10198,25 @@ impl CursorGlow {
             }
         }
         self.heat_at = Some(now);
+        // THE KEY-TIME CLICK'S TIMBRE INPUTS, written by every tick that gets
+        // past the master switch AND is not handled by the classic engine
+        // (which returns ~150 lines above, writing neither these nor
+        // `sound_live`) — including one that is about to return dark for a
+        // motion or performance reason, which now still sounds its keys.
+        // THE INVARIANT THIS SITE EXISTS FOR, stated exactly: both writers of
+        // `sound_live` sit BELOW these two stores, so the seam can never open
+        // on a stale thermal snapshot.
+        // Both are pure functions of `cfg`: `heat_gain` reads fire-ness and
+        // `pack.heat.gain`, `heat_tau` reads the style and `pack.heat.tau`,
+        // and NEITHER reads `intensity` — so the ramp shadow above (which
+        // scales `intensity` alone) cannot move them, and the value computed
+        // here is bit-identical to the one the lit path used to compute ~40
+        // lines further down. Sited directly under the lazy decay that just
+        // aged the integrators they pair with, so a cue minted after any
+        // non-master-off tick reads a COHERENT thermal snapshot rather than a
+        // `Default` zero.
+        self.heat_gain_live = Self::heat_gain(cfg, matches!(cfg.style, GlowStyle::Fire));
+        self.heat_tau_live = Self::heat_tau(cfg);
 
         // ZERO AMPLITUDE (unfocused / motion-reduced / a genuine 0 intensity):
         // emit NO light and spawn nothing, but KEEP the long-lived thermal
@@ -9968,29 +10236,43 @@ impl CursorGlow {
             // reduced-motion blip mid-switch drops them rather than resuming
             // them stale later. (The ramp-IN floor keeps a genuine switch off
             // this path: a live positive intensity is never scaled to 0 by the
-            // ramp.) Zero amplitude is dark, and dark is silent — the key seam
-            // closes with it (see `sound_live`), so an unfocused /
-            // motion-reduced window records no key-time click and banks no
-            // credit for one. NOTE: no `clear_thermals` here — the lazy decay
-            // above already cooled the long-lived integrators by the elapsed
-            // gap, which is the whole focus-blip contract this branch guards.
-            self.sound_live = false;
+            // ramp.)
+            //
+            // THE KEY SEAM DOES NOT CLOSE WITH THE LIGHT. Zero amplitude is
+            // dark, and dark used to mean silent — which made a load-shed
+            // frame and a `Reduce Motion` session mute every keystroke, a
+            // MOTION/PERFORMANCE policy deleting an AUDIO feature for a click
+            // that costs no GPU. So the seam now asks [`GlowConfig::audible`]
+            // instead: dark for a motion or performance reason is still
+            // HEARD, dark because the key belongs to another window is not.
+            // The light's behaviour on this path is unchanged in every other
+            // respect. NOTE: no `clear_thermals` here — the lazy decay above
+            // already cooled the long-lived integrators by the elapsed gap,
+            // which is the whole focus-blip contract this branch guards.
+            self.sound_live = cfg.audible;
             self.clear_transient_state();
+            // The SOUND ledger is transient state the audio half owns, so it
+            // goes only when the seam goes: wiping the banked key credits on
+            // every shed frame would double-click the whole burst the moment
+            // the latch flapped back to lit (the in-flight echoes would find
+            // no credit to spend). An unfocused tick keeps today's wipe.
+            if !cfg.audible {
+                self.clear_sound_ledger();
+            }
             self.track_shown_caret(cur, now);
             return 0;
         }
-        // Past both dark returns: this tick DRAWS, so the key seam is open
-        // until a later tick closes it (see `sound_live`). Deliberately here
-        // and not at entry — a tick that took either dark path must leave the
-        // seam shut, so keys pressed while the aurora is off/unfocused stay
-        // silent instead of banking cues for the frame that turns it back on.
+        // Past both dark returns: this tick DRAWS, so the key seam is open.
+        // The two dark paths above no longer agree about it: the MASTER-OFF
+        // return still shuts it (it runs a full `clear_thermals` teardown, so
+        // a click minted after it would read a genuinely dead thermal state,
+        // and it is also the `cursor_trail = false` / serious-mode case the
+        // user asked for), while the zero-amplitude return asks
+        // `cfg.audible` — a shed or motion-reduced frame is dark but heard.
+        // The thermal constants this click reads are written above, at the
+        // end of the lazy decay, so every tick past the master switch leaves
+        // them fresh.
         self.sound_live = true;
-        // …and with it the thermal constants the key-time click needs to
-        // predict its own timbre. Written HERE, in lockstep with `sound_live`,
-        // so the invariant "`cue_keystroke` never reads a `Default` zero" is
-        // one line to check rather than a search of every early return.
-        self.heat_gain_live = Self::heat_gain(cfg, matches!(cfg.style, GlowStyle::Fire));
-        self.heat_tau_live = Self::heat_tau(cfg);
 
         self.expire_seam_holds(now);
         // Spawn on a real move between two visible positions — where "visible"
@@ -10214,6 +10496,28 @@ impl CursorGlow {
                     self.v2_cues.reserve(Self::V2_CUE_SCRATCH);
                 }
                 let v2_cfg = rk::Config::from_glow(cfg, self.reduced_motion);
+                // THE FOLLOW PASS (2026-09-21, the band follows its text):
+                // BEFORE the tick replays this frame's events, the engine
+                // reads the rows the host sampled under its lock and carries
+                // every run whose text moved a row up or down — a
+                // bottom-anchored composer growing without a scroll — to
+                // the row its glyphs now stand on, with every clock intact
+                // (`rk::Engine::follow_rows`). The same samples feed the
+                // witness after the tick, below.
+                if witness_n > 0 {
+                    let mut samples = [rk::witness::RowSample {
+                        row: u16::MAX,
+                        cols: &[],
+                    }; rk::witness::WITNESS_ROWS];
+                    let n = witness_n.min(samples.len()).min(self.witness_rows.len());
+                    for (sample, slot) in samples.iter_mut().zip(&self.witness_rows[..n]) {
+                        *sample = rk::witness::RowSample {
+                            row: slot.row,
+                            cols: &slot.cols,
+                        };
+                    }
+                    self.v2.follow_rows(&samples[..n], now);
+                }
                 let mut frame = rk::Frame {
                     under: &mut under,
                     out: &mut *out,
@@ -11200,6 +11504,25 @@ impl CursorGlow {
         // the head and every taken index are unchanged, and a refusal's
         // forget drops only the presses in flight at the park.
         let later_stamps = self.type_hint.split_off_after(p.at);
+        // …and the events the judgment mints — the landing sweep, the
+        // `Move` — are the park's own, ordered before the keys pressed
+        // since (`rk::Engine::set_flush_clock`).
+        // ONLY FOR A PARK THE RIBBON WILL READ AS A RE-ANCHOR (2026-09-22,
+        // the merge with main's `RE_ANCHOR_MIN_CELLS`). The ordering exists
+        // for the composer's box-growth wrap, where the park's own landing
+        // sweep and `Move` must be replayed before the keys pressed since,
+        // so the relaid word takes the walk it had. Under the ribbon's own
+        // floor the move is not a re-anchor at all — a one- or two-cell
+        // backward park flush is the mirror moving — and reordering there
+        // HELD the key that followed it instead of laying its cell: the
+        // witness then saw the row's last glyph blank under an armed cell,
+        // released it, and `wrapped_composer_band`'s `c2_bs` carried 218
+        // row-frames with interior dark runs (measured 2026-09-22; 0 with
+        // this scope, and the same 0 main has).
+        let reanchor = p.landing_row == p.row
+            && p.origin > p.landing
+            && p.origin - p.landing >= rk::ribbon::RE_ANCHOR_MIN_CELLS;
+        self.v2.set_flush_clock(reanchor.then_some(p.at));
         let _ = self.with_presses_banked_through(p.at, |glow| {
             glow.spawn_judged(
                 p.row,
@@ -11215,6 +11538,7 @@ impl CursorGlow {
                 },
             )
         });
+        self.v2.set_flush_clock(None);
         self.type_hint.merge(later_stamps);
     }
 
@@ -11742,16 +12066,17 @@ impl CursorGlow {
         // licence gate because the gate's classes cannot describe it, and
         // before `classify_move` because a typed stamp beside a 63-cell hop
         // would read it as a re-anchor and lay only the landing.
-        if let Some(ins) = self.insert_echo(pr, pc, cr, cc, now, cfg) {
-            let hop = usize::from(cc - pc);
-            let identity = match lane {
-                SpawnLane::Visible => Self::insert_row_identity(cr, hop, ins),
-                SpawnLane::Anchored { insert_ok } => insert_ok,
-            };
-            if identity && !self.fresher_class_owns_hop(hop, ins, now) {
-                self.lay_insert(pr, pc, cr, cc, ins, now);
-                return true;
+        let insert = match lane {
+            SpawnLane::Visible => self.visible_insert_echo(pr, pc, cr, cc, now, cfg),
+            SpawnLane::Anchored { insert_ok } => {
+                self.insert_echo(pr, pc, cr, cc, now, cfg).filter(|ins| {
+                    insert_ok && !self.fresher_class_owns_hop(usize::from(cc - pc), *ins, now)
+                })
             }
+        };
+        if let Some(ins) = insert {
+            self.lay_insert(pr, pc, cr, cc, ins, now);
+            return true;
         }
         // THE INSERT'S REWRITE: the program pulled the caret BACK inside the
         // span a delivered insert laid (Claude Code swapping the dropped path
@@ -14035,10 +14360,16 @@ impl CursorGlow {
             return;
         }
         let rounds = if big { 4 } else { 2 };
-        let mut pts = vec![from, to];
+        // The two reusable jag buffers, taken out of `self` because the loop
+        // below calls `self.frand()`; both are handed back before returning.
+        let (mut pts, mut next) = std::mem::take(&mut self.bolt_jag);
+        pts.clear();
+        pts.push(from);
+        pts.push(to);
         let mut amp = (len * 0.16).clamp(cell * 0.35, cell * 2.6);
         for _ in 0..rounds {
-            let mut next = Vec::with_capacity(pts.len() * 2 - 1);
+            next.clear();
+            next.reserve(pts.len() * 2 - 1);
             for w in pts.windows(2) {
                 let (a, b) = (w[0], w[1]);
                 let (sx, sy) = (b.0 - a.0, b.1 - a.1);
@@ -14052,7 +14383,7 @@ impl CursorGlow {
                 ));
             }
             next.push(*pts.last().expect("bolt polyline is never empty"));
-            pts = next;
+            std::mem::swap(&mut pts, &mut next);
             amp *= 0.5;
         }
         if big {
@@ -14094,13 +14425,18 @@ impl CursorGlow {
         };
         let seed = self.frand();
         self.push_bolt(Bolt {
-            pts,
+            // The ONE buffer a `Bolt` owns for its life. The jag's two
+            // scratches go back to the pool on the next line, so a crackle
+            // costs one allocation where it used to cost three, and a jump one
+            // where it used to cost five.
+            pts: pts.clone(),
             born: now,
             life,
             seed,
             // Crackle arcs (small strikes off the typing head) render thin.
             branch: !big,
         });
+        self.bolt_jag = (pts, next);
     }
 
     /// Append a bolt, evicting the oldest once [`Self::MAX_BOLTS`] are live.
@@ -18165,6 +18501,7 @@ mod tests {
             duration: Duration::from_millis(240),
             length: 18,
             intensity: 0.7,
+            audible: true,
             radius: 0.6,
             ring: true,
             // Water and rainbow kitty are beam-less (WATER-1 / the kitty draws its
@@ -19283,13 +19620,17 @@ mod tests {
         assert_eq!(glow.keyed_clicks, 0, "stale credits are dropped wholesale");
     }
 
-    /// DARK ⇒ SILENT for the key seam too. The spawn edge gets this for free
-    /// (it is unreachable while dark); a cue born at the KEY does not, so the
-    /// seam is gated on the last tick's liveness — master off, degenerate
-    /// geometry, and zero amplitude (unfocus / reduced motion) all close it,
-    /// as does never having ticked at all.
+    /// DARK ⇒ SILENT for the key seam, for the gates that are ABOUT SOUND.
+    /// The spawn edge gets its silence for free (it is unreachable while
+    /// dark); a cue born at the KEY does not, so the seam is gated on the
+    /// last tick's verdict — master off, degenerate geometry, and a dark tick
+    /// the host marked INAUDIBLE (unfocus) all close it, as does never having
+    /// ticked at all. A dark tick the host marked audible — a load-shed frame
+    /// or a `Reduce Motion` session — does NOT: that case is pinned by
+    /// `a_shed_frame_keeps_the_key_seam_open` in
+    /// `tests/shed_frame_is_still_a_heard_key.rs`.
     #[test]
-    fn key_time_click_is_silent_wherever_the_light_is() {
+    fn key_time_click_is_silent_wherever_the_sound_gates_close() {
         let mut glow = CursorGlow::default();
         let g = geom();
         let live = cfg(GlowStyle::RainbowKitty, true);
@@ -19316,11 +19657,13 @@ mod tests {
         assert!(glow.cue_keystroke(t0));
         assert_eq!(glow.drain_sound_cues().count(), 1);
 
-        // Zero amplitude (unfocused / motion-reduced) closes it again, and
-        // drops the credit banked while it was open.
+        // Zero amplitude WITH the host's inaudible verdict (an unfocused
+        // window) closes it again, and drops the credit banked while it was
+        // open.
         let dark = GlowConfig {
             classic_mono: false,
             intensity: 0.0,
+            audible: false,
             ..live
         };
         assert!(glow.cue_keystroke(t0));
@@ -21990,6 +22333,8 @@ mod tests {
             h: 5,
             color: 0x12_3456,
             alpha: 7,
+            color2: 0x12_3456,
+            alpha2: 7,
         };
         let glow_base = glow_hash(FrameFingerprint::GLOW_OUT, glow);
         assert_ne!(
@@ -24707,6 +25052,62 @@ mod tests {
     /// RED-PROOF: the any-row `cells == INSERT_GESTURE_CELLS`
     /// term admitted the spinner's first advance as the Tab's echo —
     /// `spawns == 2` at the spinner, the one-shot spent on it.
+    /// **A BARE TAB'S LICENCE IS A GESTURE'S, NOT A PASTE'S** (2026-09-21).
+    /// The unknown-width class has no width to check — its admission is the
+    /// row witness and the 32-cell bound — so for the whole two seconds of
+    /// [`CursorGlow::INSERT_HINT_FRESH`] the FIRST same-row forward advance
+    /// on the hand's row was taken as the Tab's echo, 1.75 s of it past
+    /// every other licence's freshness. A background job printing on the
+    /// prompt row was lit as a 32-cell sweep: ink over bytes no key asked
+    /// for. It now expires at [`CursorGlow::INSERT_GESTURE_HINT_FRESH`].
+    ///
+    /// The control is the SAME hop inside the window, which must still
+    /// light — `a_spinner_row_advancing_after_a_tab_stays_dark` holds the
+    /// 800 ms end of that, and this holds the far end.
+    #[test]
+    fn a_program_hop_after_a_tab_s_gesture_window_stays_dark() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        // AN ABSOLUTE instant, not one derived from the constant under
+        // test: the first spelling computed `FRESH * 1000 + 200` and so
+        // moved with whatever it was given, passing with the 2.0 s paste
+        // window restored — a pin that cannot fail. 1400 ms is past the
+        // gesture window and comfortably INSIDE the paste one, so it reads
+        // the difference between them and nothing else.
+        let stale = 1400u64;
+        assert!(
+            f64::from(CursorGlow::INSERT_GESTURE_HINT_FRESH) < 1.4
+                && f64::from(CursorGlow::INSERT_HINT_FRESH) > 1.4,
+            "this pin only means something while 1400 ms separates the two \
+             windows"
+        );
+        let run = |gap_ms: u64| -> u64 {
+            let t0 = Instant::now();
+            let at = |ms: u64| t0 + Duration::from_millis(ms);
+            let mut glow = CursorGlow::default();
+            let mut out = Vec::new();
+            established_input_row_beside_a_spinner(&mut glow, t0);
+            let before = glow.spawns();
+            glow.note_user_gesture(at(600));
+            glow.note_insert_delivered(at(600), InsertWidth::Unknown);
+            // The hand's own row advances ten cells with no key behind it.
+            glow.observe_print_anchor(Some((12, 13, 7)));
+            glow.tick(None, at(600 + gap_ms), &c, g, &mut out);
+            glow.spawns() - before
+        };
+        assert_eq!(
+            run(300),
+            1,
+            "fixture: inside the window the gesture still licenses its echo"
+        );
+        assert_eq!(
+            run(stale),
+            0,
+            "{stale} ms after a bare Tab the same keyless hop is program \
+             output and must stay dark"
+        );
+    }
+
     #[test]
     fn a_spinner_row_advancing_after_a_tab_stays_dark() {
         let g = geom();
@@ -25453,6 +25854,67 @@ mod tests {
                 "the completion is the insert's: {:?}",
                 ring_rows(&glow)
             );
+        }
+    }
+
+    /// THE LICENSED INSERT'S REAPPEARANCE IS BRIDGED (2026-09-22). A Tab's
+    /// completion or a paste whose echo frame reached the glass torn before
+    /// its glyphs (a 1024-byte read ending at the hide) shows the caret
+    /// HIDDEN, then visible the insert's width on, with no print the
+    /// anchored lane could judge under the hide. The hide bridge admits the
+    /// reappearance on the insert's own reach and the insert arm lays it
+    /// `licence=insert`. The same reappearance with no licence is a declined
+    /// relocation, and so is one wider than a priced paste: the bridge
+    /// admits exactly what the insert arm lays (`visible_insert_echo`).
+    ///
+    /// RED before the fix: the Tab read `declined hidden-relocation`, the
+    /// paste declined silently (no gesture fresh to log it), and
+    /// `insert_tally().lit == 0` for both.
+    #[test]
+    fn a_licensed_insert_s_hidden_to_visible_reappearance_is_laid_as_the_insert() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut out = Vec::new();
+        for (what, arm, landing, lit) in [
+            ("a Tab", Some(InsertWidth::Unknown), 12u16, 1u64),
+            ("a 3-cell paste", Some(InsertWidth::Cells(3)), 12, 1),
+            (
+                "a hop wider than the paste",
+                Some(InsertWidth::Cells(3)),
+                20,
+                0,
+            ),
+            ("program output", None, 12, 0),
+        ] {
+            let mut glow = CursorGlow::default();
+            glow.tick(Some((2, 9)), t0, &c, g, &mut out);
+            match arm {
+                Some(InsertWidth::Unknown) => {
+                    glow.note_user_gesture(at(100));
+                    glow.note_insert_armed(at(100), InsertWidth::Unknown);
+                }
+                Some(width) => glow.note_insert_delivered_from(at(100), at(100), width),
+                None => {}
+            }
+            glow.tick(None, at(120), &c, g, &mut out);
+            glow.tick(Some((2, landing)), at(150), &c, g, &mut out);
+            assert_eq!(
+                glow.insert_tally().lit,
+                lit,
+                "{what}: {:?}",
+                ring_rows(&glow)
+            );
+            assert_eq!(glow.spawns(), lit, "{what}: {:?}", ring_rows(&glow));
+            if lit == 1 {
+                assert_eq!(
+                    glow.admission_log().last().map(|r| (r.licence, r.reason)),
+                    Some(("insert", "licensed")),
+                    "{what}: {:?}",
+                    ring_rows(&glow)
+                );
+            }
         }
     }
 
@@ -26966,6 +27428,55 @@ mod tests {
     /// "beam" is a first-class style now (the steady power-down TUBE), no longer
     /// an alias folded into `Lumen` — while `comet`/`lumen` keep parsing to the
     /// default and `laser` stays its own style.
+    /// **THE JAG'S REUSED BUFFERS CARRY NOTHING BETWEEN STRIKES.**
+    ///
+    /// `spawn_bolt` used to build a fresh `Vec` per midpoint-displacement round
+    /// — `vec![from, to]` plus one `Vec::with_capacity` per round, two rounds
+    /// for a crackle and four for a jump — so every strike cost three or five
+    /// heap buffers to describe a polyline five points long, and hot typing
+    /// crackles several a second. They are pooled on the engine now, which
+    /// introduces exactly one hazard worth a test: a reused buffer that is not
+    /// cleared carries the PREVIOUS strike's points into this one.
+    ///
+    /// So: the same seed must produce the same polyline, strike after strike.
+    /// Laser has no other behavioural coverage in this crate — the only other
+    /// mention is the style-name parse below — so this is also the only thing
+    /// standing between the pooling and a silent shape regression.
+    #[test]
+    fn a_pooled_bolt_jag_is_deterministic_across_strikes() {
+        let mut g = CursorGlow::default();
+        let now = Instant::now();
+        let strike = |g: &mut CursorGlow, seed: u32, big: bool| -> Vec<(f32, f32)> {
+            g.rng = seed;
+            g.bolts.clear();
+            g.spawn_bolt((10.0, 10.0), (90.0, 46.0), 16.0, big, now);
+            g.bolts
+                .last()
+                .expect("a strike longer than one pixel pushes a bolt")
+                .pts
+                .clone()
+        };
+        for big in [false, true] {
+            let first = strike(&mut g, 0x1234_5678, big);
+            assert!(
+                first.len() >= 5,
+                "fixture: a {} strike is a real polyline ({} points)",
+                if big { "jump" } else { "crackle" },
+                first.len()
+            );
+            // Intervening strikes with OTHER seeds, so the pooled buffers hold
+            // someone else's points when the repeat runs.
+            for seed in [0xAAAA_5555, 0x0F0F_F0F0] {
+                strike(&mut g, seed, !big);
+            }
+            let again = strike(&mut g, 0x1234_5678, big);
+            assert_eq!(
+                first, again,
+                "the reused jag buffer carried a previous strike's points in"
+            );
+        }
+    }
+
     #[test]
     fn beam_parses_to_its_own_style() {
         assert_eq!(GlowStyle::parse("beam"), GlowStyle::Beam);
@@ -28293,6 +28804,16 @@ mod tests {
             "underline rainbow",
             "nyan underline",
             "  Rainbow Kitty Underline  ",
+            // THE GEOMETRY IS NOT AN ANIMAL, third instance — and the plainest
+            // of the three, because `… tall` names the geometry the DEFAULT
+            // already draws (`ribbon_tall` is true for both), so appending the
+            // word changed nothing it named and swapped the companion instead.
+            // Both docs a user reads call it "an explicit spelling of the
+            // default". All four spellings, for the alias reason above.
+            "rainbow kitty tall",
+            "rainbow tall",
+            "tall rainbow",
+            "nyan tall",
         ] {
             assert_eq!(GlowStyle::parse(s), GlowStyle::RainbowKitty, "{s}");
             assert!(
@@ -28367,9 +28888,10 @@ mod tests {
         for cat in ["rainbow kitty", "kitty", "rainbow kitty pet"] {
             assert!(!GlowStyle::style_names_dog_pet(cat), "{cat}");
         }
-        // Neither widening reaches the tall-ribbon presentation, and no
-        // non-kitty style acquired a companion.
-        for s in ["comet", "phaser", "lumen", "off", "rainbow kitty tall"] {
+        // No NON-kitty style acquired a companion. `rainbow kitty tall` is
+        // NOT in this list any more: it is a kitty-named GEOMETRY spelling and
+        // draws the resident, exactly as `… underline` and `… flat` do.
+        for s in ["comet", "phaser", "lumen", "off"] {
             assert!(!GlowStyle::style_names_kitty_pet(s), "{s}");
             assert!(!GlowStyle::style_names_flying_kitty(s), "{s}");
         }
@@ -32363,6 +32885,7 @@ halo = "add"
             motion_mode: "auto",
             shed: 1.0,
             intensity: 0.7,
+            sound_seam: true,
             tally: AdmissionTally {
                 licensed: 8,
                 declined: 1,
@@ -32568,6 +33091,7 @@ halo = "add"
             motion_mode: "auto",
             shed: 1.0,
             intensity: 0.7,
+            sound_seam: true,
             tally: AdmissionTally::default(),
             spawns: 0,
             ribbon_look: "underline",
@@ -32763,6 +33287,7 @@ halo = "add"
             motion_mode: "auto",
             shed: 1.0,
             intensity: 0.7,
+            sound_seam: true,
             tally: AdmissionTally::default(),
             spawns: 0,
             ribbon_look: "underline",
@@ -33193,19 +33718,32 @@ halo = "add"
     /// a sub-cell twitch behind the just-echoed glyph. Each was decomposed
     /// by switching it off and reading the previous number. The eight
     /// non-kitty rows never moved. See `FLAT_GOLDENS` for the same bakes.
+    /// **RE-BAKED 2026-09-21: ribbon quads carry a per-column gradient**
+    /// (`GlowQuad::color2` — `ribbon_beam` samples the colour at each slab's
+    /// two edges and the quad ramps between them, so a whole-cell slab is no
+    /// longer a flat block; the coverage is still the slab's centre sample).
+    /// A gradient quad folds a THIRD damage word carrying its right edge, so
+    /// all four kitty rows move (dark `13_957_692_697_408_025_534` →
+    /// `383_721_728_202_092_274`, light `16_474_978_137_331_214_836` →
+    /// `5_202_336_454_404_496_754`, underline `11_627_668_675_227_657_479`
+    /// → `544_488_007_139_041_733`, reduced `11_365_708_919_978_438_696` →
+    /// `13_592_174_565_784_071_210`); the eight non-kitty rows fold flat
+    /// quads whose two words are the pre-gradient pair bit for bit, and
+    /// `the_other_nine_styles_are_byte_identical_with_v2_unconditional` held
+    /// them unchanged on the same run.
     const DELETION_GOLDENS: [(&str, u64); 12] = [
         ("Lumen dark", 1_264_411_311_373_267_895),
         ("Phaser dark", 2_726_566_909_586_900_035),
-        ("RainbowKitty dark", 13_957_692_697_408_025_534),
+        ("RainbowKitty dark", 383_721_728_202_092_274),
         ("Sparkle dark", 14_969_905_489_495_276_903),
         ("Fire dark", 12_618_090_056_209_866_428),
         ("Laser dark", 1_955_324_598_530_313_952),
         ("Beam dark", 15_086_158_732_367_022_435),
         ("Water dark", 482_165_703_607_766_578),
         ("Comet dark", 14_523_124_226_784_523_753),
-        ("RainbowKitty light", 16_474_978_137_331_214_836),
-        ("RainbowKitty underline", 11_627_668_675_227_657_479),
-        ("RainbowKitty reduced", 11_365_708_919_978_438_696),
+        ("RainbowKitty light", 5_202_336_454_404_496_754),
+        ("RainbowKitty underline", 544_488_007_139_041_733),
+        ("RainbowKitty reduced", 13_592_174_565_784_071_210),
     ];
 
     /// THE FLAT SPELLING'S GOLDENS: the four RainbowKitty rows of
@@ -33279,11 +33817,19 @@ halo = "add"
     /// green over every bake: the comet body still folds all four rows
     /// somewhere else, so the collapse is a measurement and not a vacuous
     /// pin.
+    /// **RE-BAKED 2026-09-21: ribbon quads carry a per-column gradient** (the
+    /// same cause as [`DELETION_GOLDENS`]'s bake of that date — the flat
+    /// spelling collapses the comet BODY, not the colour walk, so its slabs
+    /// ramp too): dark `14_766_156_058_099_546_727` →
+    /// `17_890_278_511_770_188_755`, light `15_009_626_345_715_177_661` →
+    /// `6_430_388_712_169_283_571`, underline `18_121_524_929_398_043_921` →
+    /// `15_379_506_098_573_732_577`, reduced `9_256_275_961_493_287_119` →
+    /// `3_073_631_414_449_164_399`. The `assert_ne!` control still holds.
     const FLAT_GOLDENS: [(&str, u64); 4] = [
-        ("RainbowKitty dark", 14_766_156_058_099_546_727),
-        ("RainbowKitty light", 15_009_626_345_715_177_661),
-        ("RainbowKitty underline", 18_121_524_929_398_043_921),
-        ("RainbowKitty reduced", 9_256_275_961_493_287_119),
+        ("RainbowKitty dark", 17_890_278_511_770_188_755),
+        ("RainbowKitty light", 6_430_388_712_169_283_571),
+        ("RainbowKitty underline", 15_379_506_098_573_732_577),
+        ("RainbowKitty reduced", 3_073_631_414_449_164_399),
     ];
 
     /// The four kitty rows of the deletion script — dark, light, underline,
@@ -35221,6 +35767,84 @@ halo = "add"
             "…and the pool forgotten"
         );
         assert_eq!(stalled.in_flight_tally().park_flushed, 1);
+    }
+
+    /// **A ONE-CELL PARK'S FLUSH DRAINS NOTHING** (2026-09-21): parity
+    /// between the two floors. A key typed, the caret observed ONE column
+    /// left of where it stood (a repaint parking on the trailing space it
+    /// has just drawn), held as a park, and flushed after the window: the
+    /// flush judges it `typing` for one cell and hands v2 a same-row
+    /// backward `Typed` move with no erase behind it. To the host that is
+    /// plain typing (`classify_move` admits a re-anchor only past two
+    /// cells, its `raw_dist > 2`), and it must not be a re-anchor to the
+    /// ribbon either: before `ribbon::RE_ANCHOR_MIN_CELLS` the ribbon
+    /// `retract_suffix`-ed exactly the last laid cell on it. The band's
+    /// cells all stand, none leaving,
+    /// the mirror at the landing; the control at three cells is the
+    /// re-anchor as before. This trigger — the flushed one-cell park — is
+    /// pinned HERE, at unit level; it was not measured at the host seam,
+    /// and no host-seam take of the owner's gesture reproduced the dark
+    /// boundary space through it.
+    ///
+    /// RED before the floor: `leaving=[4]`.
+    #[test]
+    fn a_one_cell_park_flushed_as_typing_drains_no_cell_of_the_band() {
+        let g = wide_geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let ms = Duration::from_millis;
+        let leaving = |glow: &CursorGlow| {
+            glow.v2
+                .ribbon()
+                .cells()
+                .iter()
+                .filter(|l| l.row == 11 && l.leaving())
+                .map(|l| l.col)
+                .collect::<Vec<_>>()
+        };
+        for (back, drains) in [(1u16, false), (2, false), (3, true)] {
+            let mut out = Vec::new();
+            let mut glow = CursorGlow::default();
+            let t0 = Instant::now();
+            let pre = pre_roll(&mut glow, 11, t0, &c, g);
+            assert_eq!(
+                v2_cols(&glow, 11).into_iter().collect::<Vec<_>>(),
+                vec![2, 3, 4],
+                "{back} back: the pre-roll's band"
+            );
+            let k = pre + ms(85);
+            glow.note_typed(k);
+            let park_at = k + ms(10);
+            let landing = 5 - back;
+            glow.tick(Some((11, landing)), park_at, &c, g, &mut out);
+            assert!(glow.held_park.is_some(), "{back} back: held");
+            assert!(leaving(&glow).is_empty(), "{back} back: nothing while held");
+            // Silence past the window: the flush, today's verdict.
+            let quiet = park_at + past_park_window();
+            glow.tick(Some((11, landing)), quiet, &c, g, &mut out);
+            assert_eq!(glow.in_flight_tally().park_flushed, 1, "{back} back");
+            assert_eq!(
+                glow.v2.caret_mirror(),
+                (11, landing),
+                "{back} back: the mirror follows the flush"
+            );
+            if drains {
+                assert!(
+                    !leaving(&glow).is_empty(),
+                    "at the host's re-anchor floor the flush still drains the row"
+                );
+            } else {
+                assert!(
+                    leaving(&glow).is_empty(),
+                    "a {back}-cell park's flush drained the band: leaving={:?}",
+                    leaving(&glow)
+                );
+                assert_eq!(
+                    v2_cols(&glow, 11).into_iter().collect::<Vec<_>>(),
+                    vec![2, 3, 4],
+                    "{back} back: every cell of the band stands"
+                );
+            }
+        }
     }
 
     /// A park followed by a Backspace flushes BEFORE the erase: the park's

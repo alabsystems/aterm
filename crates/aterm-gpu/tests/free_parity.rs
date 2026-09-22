@@ -236,6 +236,8 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
         color: aterm_render::premul_rgb(0x0040_80FF, 200),
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: aterm_render::premul_rgb(0x0040_80FF, 200),
+        alpha2: 0,
     });
     input.nova_add.push(GlowQuad {
         row: 0,
@@ -246,6 +248,8 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
         color: aterm_render::premul_rgb(0x00FF_C040, 200),
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: aterm_render::premul_rgb(0x00FF_C040, 200),
+        alpha2: 0,
     });
 
     // Non-vacuous premise: without the sprite the stamp + light paint.

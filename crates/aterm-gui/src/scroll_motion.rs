@@ -56,6 +56,19 @@ use std::time::{Duration, Instant};
 /// Wheel-glide duration: ~180 ms ease-out (the M1 brief's cadence).
 pub(crate) const GLIDE_MS: u64 = 180;
 
+/// DIRECT MANIPULATION (precise / trackpad deltas, 2026-09-22): how long the
+/// band HOLDS the finger's last sub-row position after the last delta before
+/// the rest-settle begins (ms). A trackpad delivers ~120 deltas/s while the
+/// finger moves; a gap this long is the finger having stopped, not a hiccup
+/// in the stream, so the settle never fights a live gesture.
+pub(crate) const TRACK_REST_MS: u64 = 100;
+
+/// DIRECT MANIPULATION: the rest-settle's ease-out from the tracked sub-row
+/// position to the NEAREST whole row (ms). The engine is whole-row at rest
+/// (selection and mouse mapping stay exact), and the ease is short because
+/// the distance is at most half a cell.
+pub(crate) const TRACK_SETTLE_MS: u64 = 120;
+
 /// How long the pill stays fully opaque after the last scroll activity.
 pub(crate) const PILL_HOLD_MS: u64 = 900;
 
@@ -93,6 +106,18 @@ pub(crate) fn decompose(scroll_px: i64, cell_h: i64) -> (i64, i64) {
     (scroll_px.div_euclid(cell_h), scroll_px.rem_euclid(cell_h))
 }
 
+/// The whole-row position (a `cell_h` multiple) NEAREST to `scroll_px` — the
+/// rest-settle target of a tracked glide. Half a cell rounds AWAY from the
+/// live bottom (toward history), the direction the finger was travelling for
+/// the common case; for `scroll_px >= 0` the result is `>= 0`, and for a
+/// position at or below a whole row `r` it never exceeds `r`, so a target
+/// clamped into `[0, max_rows * cell_h]` stays clamped.
+#[must_use]
+pub(crate) fn nearest_row_px(scroll_px: i64, cell_h: i64) -> i64 {
+    debug_assert!(cell_h >= 1, "cell height must be positive");
+    (scroll_px + cell_h / 2).div_euclid(cell_h) * cell_h
+}
+
 /// The eased glide position at `elapsed_ms` of a `dur_ms` ease-out-cubic from
 /// `start_px` to `target_px`.
 ///
@@ -120,15 +145,25 @@ pub(crate) fn glide_position(start_px: i64, target_px: i64, elapsed_ms: u64, dur
 }
 
 /// A self-disarming wheel glide: an ease-out from `start_px` to `target_px`
-/// over [`GLIDE_MS`]. The host samples it on frame-paced wakes and DROPS it
-/// the moment `sample` reports done — after which no deadline is armed (the
-/// 0%-idle discipline; the abstract twin is `scroll_glide_model`).
+/// over [`GLIDE_MS`] — or, for a PRECISE gesture, a band PARKED at the finger's
+/// sub-row position (`t0` in the future, `sample` = `start_px`) whose ease is
+/// the rest-settle to the nearest whole row ([`Self::tracked`], [`Self::track`]).
+/// The host samples it on frame-paced wakes and DROPS it the moment `sample`
+/// reports done — after which no deadline is armed (the 0%-idle discipline;
+/// the abstract twin is `scroll_glide_model`).
 #[derive(Debug)]
 pub(crate) struct Glide {
     start_px: i64,
     target_px: i64,
     t0: Instant,
     dur: Duration,
+    /// DIRECT MANIPULATION: the sub-PIXEL remainder of the tracked position.
+    /// A trackpad at 0.5 rows / 100 ms is 1.42 px per 120 Hz delta; rounding
+    /// each delta to an integer pixel would move 1 px per delta — 30 % slower
+    /// than the finger — so the fraction is carried, exactly as
+    /// `on_mouse_wheel` carries the sub-ROW fraction for the seam. Zero for a
+    /// notch glide (its positions are whole rows).
+    carry_px: f64,
 }
 
 impl Glide {
@@ -140,7 +175,120 @@ impl Glide {
             target_px,
             t0: now,
             dur: Duration::from_millis(GLIDE_MS),
+            carry_px: 0.0,
         }
+    }
+
+    /// DIRECT MANIPULATION (2026-09-22): a glide PARKED at `pos_px` with no
+    /// ease — the band sits exactly where the finger put it — that will, unless
+    /// [`Self::track`] moves it again first, settle to the nearest whole row
+    /// ([`nearest_row_px`]) starting [`TRACK_REST_MS`] after `now` and lasting
+    /// [`TRACK_SETTLE_MS`]. Representation: the settle IS the glide (`start_px`
+    /// = the tracked position, `target_px` = the nearest row, `t0` = the rest
+    /// boundary), so [`Self::sample`] before `t0` returns the tracked position
+    /// (elapsed saturates to zero: `u = 0`, `e = 0`), the host's ceil pairing
+    /// and its settle/cancel paths need no new state, and the bounded-wakes /
+    /// disarm-only-at-target invariants of `scroll_glide_model` hold unchanged
+    /// (`end()` is `t0 + dur`, the target is always a whole row).
+    #[must_use]
+    pub(crate) fn tracked(pos_px: i64, cell_h: i64, now: Instant) -> Self {
+        let mut g = Self::new(pos_px, pos_px, now);
+        g.park(pos_px, cell_h, now);
+        g
+    }
+
+    /// Park the band at `pos_px` and (re)arm the rest-settle from `now`.
+    fn park(&mut self, pos_px: i64, cell_h: i64, now: Instant) {
+        self.start_px = pos_px;
+        self.target_px = nearest_row_px(pos_px, cell_h);
+        self.t0 = now + Duration::from_millis(TRACK_REST_MS);
+        self.dur = Duration::from_millis(TRACK_SETTLE_MS);
+    }
+
+    /// Move the tracked position by `delta_px` (signed, fractional: + = into
+    /// history) from the CURRENT sample — continuous whether the band was
+    /// parked, settling, or mid-way through a notch ease — clamped into
+    /// `[0, max_px]`, and re-arm the rest-settle from `now`. Returns the
+    /// clamped-away excess (signed px, 0 when the whole delta fit), which the
+    /// host hands to the elastic-overscroll bounce exactly as a notch's clamp
+    /// excess. The sub-pixel remainder is carried (`carry_px`) while the delta
+    /// fits and forfeited at an edge, so a finger held past the top never
+    /// banks a phantom return.
+    ///
+    /// WHY NO EASE (the law this replaces was `extend_target`): a precise
+    /// delta IS a position, not an intent. Any ease over whole-row banked
+    /// targets renders a constant finger speed as a sawtooth — the band
+    /// idles until a row banks, then covers it; measured at 120 Hz with a 34
+    /// px cell the per-frame velocity of the extending chain ran
+    /// `0,0,5,4,3,9,…,27,12,4,34` at 4 rows/100 ms and `…,1,1,0,0,0,0,5,4,…`
+    /// at 1 row/100 ms (the `a_precise_stream_tracks_one_to_one…` control
+    /// below), which is the "blocky" scrolling reported on 2026-09-22.
+    pub(crate) fn track(&mut self, delta_px: f64, cell_h: i64, max_px: i64, now: Instant) -> i64 {
+        let (pos, _) = self.sample(now);
+        let want = pos as f64 + self.carry_px + delta_px;
+        let whole = want.round();
+        let want_px = whole as i64;
+        let clamped = want_px.clamp(0, max_px.max(0));
+        self.carry_px = if clamped == want_px {
+            want - whole
+        } else {
+            0.0
+        };
+        self.park(clamped, cell_h, now);
+        want_px - clamped
+    }
+
+    /// GESTURE END (the trackpad's `TouchPhase::Ended`, or the seam reporting a
+    /// precise delta to an app that took the mouse mid-gesture): begin the
+    /// rest-settle NOW instead of at the rest boundary. A no-op for a glide
+    /// already easing (a notch glide, or a settle in flight), so the ordinary
+    /// `t0 <= now` glides are untouched.
+    pub(crate) fn release(&mut self, now: Instant) {
+        if now < self.t0 {
+            self.t0 = now;
+        }
+    }
+
+    /// The next wake the host must arm for this glide at `now`: while a
+    /// tracked glide is PARKED (`now < t0`) its position is constant, so ONE
+    /// wake at the rest boundary (the pill's hold-boundary discipline — no
+    /// frame-paced churn presenting an unchanged frame); otherwise the frame
+    /// cadence capped at [`Self::end`], exactly the formula the host used
+    /// before tracked glides existed (`t0 <= now` for every notch glide).
+    ///
+    /// TEST-ONLY since the anchored tick: production reads
+    /// `ScrollGlideState::wake_deadline` (the stored anchor, re-anchored to
+    /// [`Self::settle_start`] while parked), so a park never re-derives a wake
+    /// from the clock; this is the pure statement of the same law.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn next_wake(&self, now: Instant, frame_iv: Duration) -> Instant {
+        if now < self.t0 {
+            self.t0
+        } else {
+            self.end().min(now + frame_iv)
+        }
+    }
+
+    /// When this glide's EASE begins: `t0`. For a notch glide that is its arm
+    /// time (already past); for a tracked band it is the rest boundary the
+    /// finger's last delta armed — the ONE wake the host owes while the band is
+    /// parked (`ScrollGlideState::next_tick` is anchored to it).
+    #[must_use]
+    pub(crate) fn settle_start(&self) -> Instant {
+        self.t0
+    }
+
+    /// Shift the whole glide (start AND target) by `delta_px` without
+    /// touching its clock: the frame moved under it. The host calls this when
+    /// the engine's `display_offset` is not the row the glide last set — SCR-1's
+    /// re-pin after an output batch (`Grid` scroll.rs, "Re-pin the viewport
+    /// after a batch of output": `prev_offset + lines_added`) — so the ease
+    /// continues relative to the content the reader is looking at instead of
+    /// scrolling it back toward live by `lines_added` on every wake.
+    pub(crate) fn shift(&mut self, delta_px: i64) {
+        self.start_px += delta_px;
+        self.target_px += delta_px;
     }
 
     /// The eased position at `now`, and whether the glide is DONE (position
@@ -166,8 +314,21 @@ impl Glide {
         self.start_px = pos;
         self.target_px = target_px;
         self.t0 = now;
+        // A notch chained onto a TRACKED glide (a wheel click mid-trackpad
+        // gesture, a Magic Mouse) earns the full M1 ease, not the settle's
+        // 120 ms, and its positions are whole rows (no sub-pixel carry).
+        self.dur = Duration::from_millis(GLIDE_MS);
+        self.carry_px = 0.0;
     }
 
+    /// RETIRED FROM PRODUCTION (2026-09-22) — kept under `cfg(test)` as the
+    /// NEGATIVE CONTROL of `a_precise_stream_tracks_one_to_one…`: this was the
+    /// 2026-09-06 chain for precise deltas, and over whole-row banked targets
+    /// its remaining duration shrinks toward zero at the deadline, so the ease
+    /// velocity (`3·Δ/dur` at `u = 0`) spikes and the last delta before the
+    /// deadline snaps a whole row in one frame — the sawtooth the control
+    /// measures. Precise deltas now [`Self::track`] with no ease.
+    ///
     /// Move the target WITHOUT pushing the deadline out — the chained form for
     /// a stream of precise (trackpad) deltas within one glide. The chosen form,
     /// named as docs/DESIGN-selection-custody §5.6 asks: [`Self::end`] is kept
@@ -187,6 +348,7 @@ impl Glide {
     /// The bounded-wakes / disarm-only-at-target invariants of the abstract
     /// `scroll_glide_model` are untouched: the deadline is the ORIGINAL end, so
     /// a chain of extensions arms no more wakes than the glide they extend.
+    #[cfg(test)]
     pub(crate) fn extend_target(&mut self, target_px: i64, now: Instant) {
         let end = self.end();
         let (pos, _) = self.sample(now);
@@ -260,6 +422,12 @@ pub(crate) struct OverscrollSpring {
     x0_px: f64,
     t0: Instant,
     dur: Duration,
+    /// The bounce's next frame-paced tick — an ANCHOR the host sets one panel
+    /// period out at release and advances phase-locked in `tick_overscroll`
+    /// (the glide's `ScrollGlideState::next_tick` twin). `new` seeds it at
+    /// `now` (due at once) so a host that forgets to anchor it ticks on the
+    /// next wake rather than never; the host's `release_overscroll` anchors it.
+    next_tick: Instant,
 }
 
 impl OverscrollSpring {
@@ -270,7 +438,26 @@ impl OverscrollSpring {
             x0_px,
             t0: now,
             dur: Duration::from_millis(SPRING_SETTLE_MS),
+            next_tick: now,
         }
+    }
+
+    /// The one wake this bounce owes `about_to_wait`: its anchored next tick,
+    /// capped at the settle bound. Stored state only — a park cannot move it.
+    #[must_use]
+    pub(crate) fn wake_deadline(&self) -> Instant {
+        self.end().min(self.next_tick)
+    }
+
+    /// The anchored next tick (see [`Self::wake_deadline`]).
+    #[must_use]
+    pub(crate) fn next_tick(&self) -> Instant {
+        self.next_tick
+    }
+
+    /// Re-anchor the next tick (the host's release and its phase-locked tick).
+    pub(crate) fn set_next_tick(&mut self, next: Instant) {
+        self.next_tick = next;
     }
 
     /// The signed displacement at `now` and whether the bounce is DONE — settled
@@ -674,6 +861,152 @@ mod tests {
             extend_lag < 0.6 * retarget_lag,
             "the extending chain trails by about half ({extend_lag:.1} vs {retarget_lag:.1} px)"
         );
+    }
+
+    /// DIRECT MANIPULATION (2026-09-22) — a 120 Hz precise stream at constant
+    /// finger speed through the TRACK law moves the band 1:1 (within a pixel of
+    /// the finger at every frame, sub-pixel carry included) and EVENLY (per-frame
+    /// velocity `max <= 2 * min`, no zero-motion frame) at 0.5, 1, 2 and 4 rows
+    /// per 100 ms; after the last delta the band HOLDS for `TRACK_REST_MS` with
+    /// one armed wake, then settles to the nearest whole row and is done at
+    /// `end()`; `release` starts that settle at once.
+    ///
+    /// NEGATIVE CONTROL: the same streams through the law this replaces —
+    /// whole-row banking (`bank_scroll_lines` truncation) feeding
+    /// `extend_target` on an in-flight glide, else a fresh 180 ms glide, sampled
+    /// on the same frame ticks — produce zero-motion frames AND a frame faster
+    /// than twice the average at EVERY speed. The assertion has teeth against
+    /// the shipping 2026-09-06 code, not against a strawman.
+    #[test]
+    fn a_precise_stream_tracks_one_to_one_and_the_extend_chain_it_replaces_stutters() {
+        let t0 = Instant::now();
+        let cell = 34i64; // Retina 2x, 15 px face
+        let tick = Duration::from_micros(8_333); // 120 Hz
+        let max_px = 1_000 * cell;
+        for rows_per_100ms in [0.5f64, 1.0, 2.0, 4.0] {
+            let px_per_tick = rows_per_100ms * cell as f64 * 8.333 / 100.0;
+
+            // ---- the TRACK law ------------------------------------------------
+            let mut g = Glide::tracked(0, cell, t0);
+            let mut now = t0;
+            let mut finger = 0.0f64;
+            let mut prev = 0i64;
+            let mut vels: Vec<i64> = Vec::new();
+            for i in 1..=120u32 {
+                now += tick;
+                finger += px_per_tick;
+                assert_eq!(
+                    g.track(px_per_tick, cell, max_px, now),
+                    0,
+                    "nothing clamped away far from the edges"
+                );
+                let (pos, done) = g.sample(now);
+                assert!(!done, "a tracked glide is never done while deltas arrive");
+                assert!(
+                    (pos as f64 - finger).abs() <= 1.0,
+                    "1:1 — the band is within a pixel of the finger ({pos} vs {finger:.2} at tick {i}, {rows_per_100ms} rows/100 ms)"
+                );
+                if i > 12 {
+                    vels.push(pos - prev);
+                }
+                prev = pos;
+            }
+            let (mx, mn) = (*vels.iter().max().unwrap(), *vels.iter().min().unwrap());
+            assert!(
+                mn >= 1 && mx <= 2 * mn,
+                "even motion at {rows_per_100ms} rows/100 ms: max {mx} px/frame, min {mn}"
+            );
+            // Rest: one wake at the boundary, the position held, then the settle.
+            let rest_end = now + Duration::from_millis(TRACK_REST_MS);
+            assert_eq!(
+                g.next_wake(now, tick),
+                rest_end,
+                "parked: ONE wake at the rest boundary, not a frame cadence"
+            );
+            assert_eq!(
+                g.sample(rest_end - Duration::from_millis(1)).0,
+                prev,
+                "the band holds the finger's position through the rest window"
+            );
+            let end = g.end();
+            assert_eq!(end, rest_end + Duration::from_millis(TRACK_SETTLE_MS));
+            assert_eq!(
+                g.next_wake(rest_end, tick),
+                rest_end + tick,
+                "settling: frame-paced wakes"
+            );
+            let (landed, done) = g.sample(end);
+            assert!(done, "done at end()");
+            assert_eq!(landed % cell, 0, "…on a whole row");
+            assert!(
+                (landed - prev).abs() <= cell / 2,
+                "…the NEAREST one ({landed} from {prev})"
+            );
+            // Release: a gesture end starts the settle at once.
+            let mut r = Glide::tracked(7, cell, t0);
+            r.release(t0 + Duration::from_millis(3));
+            assert_eq!(
+                r.end(),
+                t0 + Duration::from_millis(3 + TRACK_SETTLE_MS),
+                "release moves the settle to now"
+            );
+            let mut e = Glide::new(0, cell, t0);
+            e.release(t0 + Duration::from_millis(3));
+            assert_eq!(
+                e.end(),
+                t0 + Duration::from_millis(GLIDE_MS),
+                "a notch glide ignores release"
+            );
+
+            // ---- CONTROL: the retired extend_target chain over whole rows -------
+            let mut now = t0;
+            let mut residual = 0.0f64;
+            let mut glide: Option<Glide> = None;
+            let mut landed = 0i64;
+            let mut pos = 0i64;
+            let mut prev = 0i64;
+            let mut vels: Vec<i64> = Vec::new();
+            for i in 1..=120u32 {
+                now += tick;
+                if let Some(g) = glide.as_ref() {
+                    let (p, done) = g.sample(now);
+                    pos = p;
+                    if done {
+                        landed = g.target_px();
+                        glide = None;
+                    }
+                }
+                // `bank_scroll_lines`: truncate to whole rows, carry the rest.
+                residual += px_per_tick / cell as f64;
+                let whole = residual.trunc();
+                residual -= whole;
+                if whole != 0.0 {
+                    let rows = whole as i64;
+                    match glide.as_mut() {
+                        Some(g) => {
+                            let target = g.target_px() + rows * cell;
+                            g.extend_target(target, now);
+                        }
+                        None => glide = Some(Glide::new(landed, landed + rows * cell, now)),
+                    }
+                    pos = glide.as_ref().map_or(pos, |g| g.sample(now).0);
+                }
+                if i > 12 {
+                    vels.push(pos - prev);
+                }
+                prev = pos;
+            }
+            let zeros = vels.iter().filter(|v| **v == 0).count();
+            let mx = *vels.iter().max().unwrap();
+            let avg = vels.iter().sum::<i64>() as f64 / vels.len() as f64;
+            eprintln!(
+                "control @{rows_per_100ms} rows/100 ms: {zeros} zero-motion frames, max {mx} px/frame vs avg {avg:.2}"
+            );
+            assert!(
+                zeros > 0 && mx as f64 > 2.0 * avg,
+                "control: the extend chain idles then jumps at {rows_per_100ms} rows/100 ms"
+            );
+        }
     }
 
     /// PROVE (3) — spring overshoot-freedom + decay: over an amplitude ×

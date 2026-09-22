@@ -256,6 +256,8 @@ impl QuadSink<'_> {
                 // ADDITIVE light — this emitter has no other mode (see
                 // [`GlowQuad::alpha`]).
                 alpha: 0,
+                color2: premul,
+                alpha2: 0,
             });
             self.budget -= 1;
             yy = band_end;

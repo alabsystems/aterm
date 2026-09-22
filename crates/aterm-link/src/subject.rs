@@ -43,6 +43,25 @@ const CLASS_PREFIX_LEN: usize = 2;
 /// The longest name a principal may carry after its class prefix (§3.2).
 const NAME_MAX: usize = 32;
 
+/// The longest a topic name may be (the same bound a principal's name gets:
+/// short enough that a subject segment cannot carry a sentence).
+const TOPIC_MAX: usize = 32;
+
+/// Whether `t` is a well-formed BROADCAST TOPIC: `[a-z0-9][a-z0-9._-]{0,31}`.
+///
+/// It is ONE subject segment, so it may not hold a `/`, and it must open with
+/// an alphanumeric so a topic can never be read as a flag or a relative path.
+/// `.` and `-` and `_` are allowed inside because a topic is a name people
+/// choose (`build.failed`, `sat-comp`), not an identifier this crate mints.
+#[must_use]
+pub fn is_topic(t: &str) -> bool {
+    let mut cs = t.chars();
+    cs.next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && t.len() <= TOPIC_MAX
+        && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
 /// Whether `p` is a well-formed principal: a class prefix and `[a-z0-9-]{1,32}`
 /// (§3.2 — "too short to carry a sentence into an agent's context").
 #[must_use]
@@ -227,6 +246,58 @@ pub fn fleet_filter(fleet: &str) -> String {
     format!("/f/{fleet}/fleet/>")
 }
 
+/// EVERY BROADCAST FACE IN THE FLEET, as one filter.
+///
+/// One subscription, not one per topic: the receiver-side opt-in is a LOCAL
+/// decision (`topic add`), so subscribing per topic would put every session's
+/// topic set on the bus as subscription churn and would re-attach the face
+/// every time an agent changed its mind. The bridge reads the whole `say`
+/// subtree and fans in to the sessions that asked — which is also what makes
+/// "one record per broadcast, however many subscribers" true on the log.
+#[must_use]
+pub fn say_filter(fleet: &str) -> String {
+    format!("/f/{fleet}/pub/*/*/say/>")
+}
+
+/// A parsed `/f/<F>/pub/<node>/<sid>/say/<topic>` BROADCAST subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SayAddr {
+    /// The publishing node.
+    pub node: String,
+    /// The publishing session.
+    pub sid: String,
+    /// The topic the record was published on.
+    pub topic: String,
+}
+
+/// Parse a broadcast subject, LEFT-ANCHORED AND BY POSITION — seven segments,
+/// `f`/`<F>`/`pub`/`<node>`/`<sid>`/`say`/`<topic>` — exactly like
+/// [`parse_in`], and for the same reason: a filter is a wildcard match, so the
+/// only thing that makes an eight-segment forgery detectable is a parse that
+/// counts.
+///
+/// `None` for anything else, including a `pub` face that is not `say` — the
+/// filter cannot express "the sixth segment is `say`" on its own.
+#[must_use]
+pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
+    let segs: Vec<&str> = subject.split('/').collect();
+    if segs.len() != 8 || !segs[0].is_empty() {
+        return None;
+    }
+    if segs[1] != "f" || segs[2] != fleet || segs[3] != "pub" || segs[6] != "say" {
+        return None;
+    }
+    let (node, sid, topic) = (segs[4], segs[5], segs[7]);
+    if !is_principal(node) || !is_principal(sid) || !sid.starts_with("s-") || !is_topic(topic) {
+        return None;
+    }
+    Some(SayAddr {
+        node: node.to_string(),
+        sid: sid.to_string(),
+        topic: topic.to_string(),
+    })
+}
+
 /// The node's own `term` subtree: the drive face for the sessions it hosts.
 #[must_use]
 pub fn term_filter(fleet: &str, node: &str) -> String {
@@ -235,6 +306,41 @@ pub fn term_filter(fleet: &str, node: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A TOPIC IS ONE SUBJECT SEGMENT.** `[a-z0-9][a-z0-9._-]{0,31}`: it must
+    /// open alphanumeric so it can never read as a flag or a relative path, it
+    /// may not hold a `/` because it IS a segment, and it is bounded for the
+    /// reason a principal's name is — a subject segment must not be able to
+    /// carry a sentence into an agent's context.
+    #[test]
+    fn a_topic_is_one_bounded_lowercase_segment() {
+        for good in [
+            "say",
+            "build",
+            "build.failed",
+            "sat-comp",
+            "a",
+            "x_1",
+            "0",
+            &"a".repeat(32),
+        ] {
+            assert!(is_topic(good), "{good} must be a topic");
+        }
+        for bad in [
+            "",      // empty
+            "Build", // uppercase
+            ".dot",  // must open alphanumeric
+            "-dash",
+            "_under",
+            "a/b",           // two segments
+            "a b",           // whitespace
+            "a:b",           // the separator itself
+            "a*",            // a filter wildcard
+            &"a".repeat(33), // over the bound
+        ] {
+            assert!(!is_topic(bad), "{bad:?} must not be a topic");
+        }
+    }
     use super::*;
 
     /// [`PRINCIPAL_MAX`] IS THE GRAMMAR'S OWN CEILING, not a second number

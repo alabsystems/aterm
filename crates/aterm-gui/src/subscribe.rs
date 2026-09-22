@@ -112,6 +112,21 @@ pub struct TargetStreams {
     /// gate already authorized. Inert without `screen` (as `every-frame` is without
     /// `cells`); alone it names no source, so a `trim`-only list fails closed.
     pub trim: bool,
+    /// Emit `MAIL <local> id=<n> off=<n> from=<p> kind=<k> [re=<n>]`, one line
+    /// per row DELIVERED into the watched session's inbox, and a `GAP` when the
+    /// ring evicted rows this subscriber had not been shown.
+    ///
+    /// METADATA ONLY — no body, no `text=`, by the shape of
+    /// [`crate::fabric::MailLine`] rather than by a filter someone could
+    /// forget. A manager watches WHO wrote and WHAT KIND it was and reads the
+    /// words with its own `inbox get`; nothing a peer wrote is pushed at an
+    /// agent that did not ask for it.
+    ///
+    /// AUTHORITY: none beyond the subscribe gate this target already passed.
+    /// `inbox` and `subscribe` are both `OpClass::Read` -> `Op::ReadScreen`
+    /// (`control::required_op`), so a subscriber allowed to watch this session
+    /// may already list its inbox — this is a push face on a read it can make.
+    pub mail: bool,
 }
 
 impl TargetStreams {
@@ -126,7 +141,7 @@ impl TargetStreams {
     /// "names at least one source" check and ack a stream that never emits.
     #[must_use]
     fn any_frame_source(self) -> bool {
-        self.screen || self.cursor || self.events || self.cells || self.bytes
+        self.screen || self.cursor || self.events || self.cells || self.bytes || self.mail
     }
 }
 
@@ -205,10 +220,13 @@ impl InstanceStreams {
 /// [`RequestedInstance`] and not an [`InstanceStreams`] because parsing sees no
 /// [`Scope`]: the two halves are authorized by different checks (per resolved target
 /// vs. once for the connection), and the type says so at the boundary.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Requested {
     /// The per-target frame sources, gated once per resolved selector.
     pub targets: TargetStreams,
+    /// `mail`'s `kinds=`/`from=` filter. Inert unless `targets.mail` is set; it
+    /// carries NO authority — it only narrows rows the gate already allowed.
+    pub mail: crate::fabric::MailFilter,
     /// The instance-wide frame sources, gated once for the connection.
     pub instance: RequestedInstance,
     /// A MODIFIER (not a frame source): when set, the frames a wake emits are prefixed
@@ -236,6 +254,105 @@ pub struct Requested {
     pub timestamps: bool,
 }
 
+/// Split a stream list into tokens, KEEPING a `mail:` token's own comma list
+/// together.
+///
+/// The list is comma-or-whitespace separated and `kinds=<k,..>` is itself comma
+/// separated, so `mail:kinds=task,ask` arrives as two pieces. The rule that
+/// puts it back: a piece that names NO stream continues the `mail` token. It is
+/// unambiguous because the stream names are a closed set and so are the kinds
+/// ([`crate::fabric::KINDS`]), and it fails CLOSED either way — a continuation
+/// that is not a kind is rejected by [`parse_mail_params`], and a mistyped
+/// stream name outside a `mail:` token still reaches the `_ => return None`
+/// arm.
+fn fold_mail_params(s: &str) -> Vec<String> {
+    // THE ONE VOCABULARY, plus the `ts` alias the catalog spells inside
+    // `timestamps`. A fourth hand-written copy is how `mail` came to be missing
+    // from the refusal for a whole round.
+    let is_stream =
+        |t: &str| t == "ts" || aterm_types::control_verbs::SUBSCRIBE_STREAMS.contains(&t);
+    let mut out: Vec<String> = Vec::new();
+    for tok in s.split([',', ' ', '\t']).filter(|t| !t.is_empty()) {
+        let continues_mail = out
+            .last()
+            .is_some_and(|last| last.starts_with("mail:") && !is_stream(tok));
+        if continues_mail {
+            let last = out.last_mut().expect("checked above");
+            last.push(',');
+            last.push_str(tok);
+        } else {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// ONE sender class or ONE principal — never a list.
+///
+/// `from=` is singular by grammar and by meaning, and the fold that reassembles
+/// `kinds=`'s comma list will happily hand this a second piece: `mail:from=h-a,h-b`
+/// arrived as `from=h-a,h-b`, was taken verbatim, and matched NOTHING — the
+/// live-looking subscription that says nothing, which the fail-closed rule
+/// exists to prevent. A comma is therefore refused here, and so is anything
+/// that is neither a class nor a principal-shaped token.
+fn is_sender_selector(v: &str) -> bool {
+    if matches!(v, "human" | "agent" | "service" | "other") {
+        return true;
+    }
+    // A principal: `<class>-<name>`, optionally `@<node>` for a peer session.
+    let shaped = v
+        .strip_prefix("h-")
+        .or_else(|| v.strip_prefix("s-"))
+        .or_else(|| v.strip_prefix("a-"));
+    shaped.is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+    })
+}
+
+/// `` | `:kinds=<k,..>` | `:from=<class|principal>` | `:topic=<t>` | any
+/// combination, in any order.
+///
+/// FAIL-CLOSED on anything else: an unknown key, a repeated one, an empty
+/// value, or a kind that is not one of [`crate::fabric::KINDS`]. A filter that
+/// silently matched nothing would be a subscription that looks alive and says
+/// nothing — the same failure `parse`'s no-source rule exists to prevent.
+fn parse_mail_params(spec: &str) -> Option<crate::fabric::MailFilter> {
+    let mut want = crate::fabric::MailFilter::default();
+    if spec.is_empty() {
+        return Some(want);
+    }
+    for part in spec.strip_prefix(':')?.split(':') {
+        if let Some(v) = part.strip_prefix("kinds=") {
+            if !want.kinds.is_empty() || v.is_empty() {
+                return None;
+            }
+            for k in v.split(',') {
+                if !crate::fabric::KINDS.contains(&k) {
+                    return None;
+                }
+                want.kinds.push(k.to_string());
+            }
+        } else if let Some(v) = part.strip_prefix("topic=") {
+            if want.topic.is_some() || !crate::fabric::is_topic(v) {
+                return None;
+            }
+            want.topic = Some(v.to_string());
+        } else {
+            // Not `kinds=` and not `topic=`, so it must be `from=` — an unknown
+            // key is the `None` this `?` produces.
+            let v = part.strip_prefix("from=")?;
+            if want.from.is_some() || !is_sender_selector(v) {
+                return None;
+            }
+            want.from = Some(v.to_string());
+        }
+    }
+    Some(want)
+}
+
 impl Requested {
     /// Parse a whitespace-or-comma separated stream list (`screen,cursor,events`).
     /// FAIL-CLOSED twice over: `None` on any unknown token, so a typo cannot silently
@@ -246,7 +363,13 @@ impl Requested {
     #[must_use]
     pub fn parse(s: &str) -> Option<Requested> {
         let mut out = Requested::default();
-        for tok in s.split([',', ' ', '\t']).filter(|t| !t.is_empty()) {
+        for tok in fold_mail_params(s) {
+            let tok = tok.as_str();
+            if let Some(spec) = tok.strip_prefix("mail") {
+                out.targets.mail = true;
+                out.mail = parse_mail_params(spec)?;
+                continue;
+            }
             match tok {
                 "screen" => out.targets.screen = true,
                 "cursor" => out.targets.cursor = true,
@@ -271,7 +394,7 @@ impl Requested {
 /// which is exactly how the instance-scoped `sessions` flag came to travel with five
 /// per-target flags in the first place. (It also keeps the signature inside clippy's
 /// argument budget without a stylistic `allow`.)
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct PushOptions {
     /// `since=<seq>`: the client's last-seen `content_seq`. Seeds each watch's
     /// `last_sent_seq` so the immediate catch-up fires exactly when content moved
@@ -286,6 +409,11 @@ pub struct PushOptions {
     pub non_coalesced: bool,
     /// The `timestamps`/`ts` modifier — see [`Requested::timestamps`].
     pub timestamps: bool,
+    /// `mail`'s row filter ([`Requested::mail`]). It carries no authority, so
+    /// it rides here with the other knobs rather than beside the two
+    /// authority-bearing arguments — the reason this struct exists. Its
+    /// `String`s are why `PushOptions` is `Clone` and no longer `Copy`.
+    pub mail: crate::fabric::MailFilter,
 }
 
 /// One subscriber's wake handle: a single-slot notify the producer `try_send`s into.
@@ -600,6 +728,14 @@ struct Watch {
     /// `every-frame` mode: re-emit the `cells` frame on EVERY wake even when
     /// `content_seq` is unchanged (animation fidelity), instead of only on advance.
     non_coalesced: bool,
+    /// The session's inbox, for the `mail` stream.
+    fabric: Arc<crate::fabric::SessionFabric>,
+    /// The highest inbox row id already pushed (or stepped over), seeded to the
+    /// ring's high at subscription: `mail` is a LIVE stream like turns and
+    /// blocks, not a replay of the backlog. `await inbox` is what reads history.
+    last_mail_id: u64,
+    /// Which rows this subscriber asked for.
+    mail: crate::fabric::MailFilter,
 }
 
 /// AUTHORITY for the `@*` LIVE TARGET SET: whether this subscription may adopt
@@ -943,7 +1079,7 @@ fn frame_block_complete(sid: &str, id: u64, exit: Option<i32>) -> String {
 /// a fleet-supervision signal on the `events` stream. Returns the new watermark.
 /// The title is pct-encoded so a title with spaces/newlines stays one line.
 ///
-/// PURE (takes the already-sampled `title`, not the engine handle): the digest
+/// PURE (takes the already-sampled title change, not the engine handle): the digest
 /// samples the title, the bell total and the new completed blocks in ONE
 /// [`sample_engine_events`] lock hold, because an events-only subscription used
 /// to take `term_lock` three separate times per target per 250 ms tick purely to
@@ -951,17 +1087,19 @@ fn frame_block_complete(sid: &str, id: u64, exit: Option<i32>) -> String {
 /// the keystroke-encode path contend for.
 fn drain_title_event(
     sid: &str,
-    title: &str,
+    title: Option<String>,
     last_title: Option<String>,
     out: &mut String,
 ) -> Option<String> {
-    if last_title.as_deref() != Some(title) {
+    if let Some(title) = title {
         out.push_str(&format!(
             "EVENT {sid} title {}\n",
-            crate::control::pct_encode(title)
+            crate::control::pct_encode(&title)
         ));
+        Some(title)
+    } else {
+        last_title
     }
-    Some(title.to_string())
 }
 
 /// Scan the target's EVENT TIMELINE and push the record kinds the wire carries,
@@ -1252,6 +1390,53 @@ fn frame_gap(sid: &str, seq: u64) -> String {
 /// Returns a [`Frame`], not a `String`, because unlike its sibling formatters this
 /// one is emitted STANDALONE rather than appended to a target's wake body — and a
 /// standalone write is exactly what has to go through the egress to be stamped.
+/// The `mail` stream: one `MAIL` line per newly delivered row the filter wants,
+/// oldest first, preceded by a `GAP` when the ring evicted rows this subscriber
+/// was never shown. Appended to the wake's buffer like every other digest line,
+/// so a wake is still ONE frame.
+///
+/// The cursor advances to the ring's HIGH, not to the last row emitted, so a
+/// row the filter rejected is stepped over once and never reconsidered — the
+/// same monotone rule the `Stop` hook's wait uses, and what stops a
+/// `kinds=`-filtered subscription re-walking the ring on every wake.
+///
+/// NO BODY REACHES HERE: [`crate::fabric::MailLine`] has no field for one.
+///
+/// LATENCY is the loop's 250 ms liveness tick, not a delivery-side wake:
+/// `cmd_deliver` signals the session's own condvar (what `await inbox` parks
+/// on) and has no `Subscribers` handle in scope. A quarter second is the
+/// resolution a mailbox watcher needs; tightening it means plumbing the
+/// registry into the deliver dispatch, which is a change to that seam and not
+/// to this one.
+fn drain_mail_events(watch: &mut Watch, sid: &str, out: &mut String) {
+    let since = watch.fabric.mail_since(watch.last_mail_id, &watch.mail);
+    // WHAT WAS ISSUED ABOVE THE CURSOR, LESS WHAT THE RING STILL HOLDS. Not
+    // "everything below the oldest row": eviction is BY CLASS, so a human row
+    // pinned at the front leaves `oldest` where it was while agent rows behind
+    // it go, and a front-anchored gap would report none of them.
+    let issued = since.high.saturating_sub(watch.last_mail_id);
+    let missed = issued.saturating_sub(since.present);
+    if missed > 0 {
+        out.push_str(&format!("GAP {sid} mail-dropped={missed}\n"));
+    }
+    for row in &since.rows {
+        let re = row.re.map_or_else(String::new, |off| format!(" re={off}"));
+        // `topic=` rides the push line for the reason it rides the `msg` row:
+        // it is the row's answer to "why is this in my mailbox?", and a watcher
+        // that had to run a drain to find out would be reading the body it
+        // deliberately never receives here.
+        let topic = row
+            .topic
+            .as_ref()
+            .map_or_else(String::new, |t| format!(" topic={t}"));
+        out.push_str(&format!(
+            "MAIL {sid} id={} off={} from={} kind={}{re}{topic}\n",
+            row.id, row.off, row.from, row.kind
+        ));
+    }
+    watch.last_mail_id = watch.last_mail_id.max(since.high);
+}
+
 fn frame_gap_events(tag: Tag, floor: u64) -> Frame {
     Frame::text(tag, format!("GAP {tag} events-resync={floor}\n"))
 }
@@ -1312,13 +1497,18 @@ struct EngineSample {
     /// Blocks that COMPLETED past the watermark, oldest-first — empty on an idle
     /// wake, which is the point.
     blocks: Vec<(u64, Option<i32>)>,
-    /// The live window title (`OSC 0/2`).
-    title: String,
+    /// The live window title (`OSC 0/2`), owned only when it differs from the
+    /// watermark. `None` means unchanged; `Some("")` is a change to an empty title.
+    title: Option<String>,
     /// The monotonic fired-bell count.
     bell: u64,
 }
 
-fn sample_engine_events(term: &Arc<Mutex<Terminal>>, last_block_id: Option<u64>) -> EngineSample {
+fn sample_engine_events(
+    term: &Arc<Mutex<Terminal>>,
+    last_block_id: Option<u64>,
+    last_title: Option<&str>,
+) -> EngineSample {
     let t = crate::term_lock(term);
     let blocks = match t.newest_completed_block().map(|b| b.id) {
         // Nothing has ever completed, or nothing completed past the watermark:
@@ -1344,7 +1534,7 @@ fn sample_engine_events(term: &Arc<Mutex<Terminal>>, last_block_id: Option<u64>)
     // across a socket write (the caller writes; we only fill a String).
     EngineSample {
         blocks,
-        title: t.title().to_string(),
+        title: (last_title != Some(t.title())).then(|| t.title().to_string()),
         bell: t.bell_total(),
     }
 }
@@ -1521,15 +1711,22 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
         // the pass lands on — the same one-tick skew the old order had in the
         // opposite direction, and a skew every watermark-driven stream here
         // already tolerates by construction.
-        let engine = sample_engine_events(&watch.term, watch.last_block_id);
+        let engine = sample_engine_events(
+            &watch.term,
+            watch.last_block_id,
+            watch.last_title.as_deref(),
+        );
         watch.last_block_id =
             drain_block_events(&sid, &engine.blocks, watch.last_block_id, &mut out);
         watch.last_turn_id = drain_turn_events(&watch.turns, &sid, watch.last_turn_id, &mut out);
         watch.last_timeline_id =
             drain_timeline_events(&watch.timeline, &sid, watch.last_timeline_id, &mut out);
-        watch.last_title =
-            drain_title_event(&sid, &engine.title, watch.last_title.take(), &mut out);
+        watch.last_title = drain_title_event(&sid, engine.title, watch.last_title.take(), &mut out);
         watch.last_bell = drain_bell_event(&sid, engine.bell, watch.last_bell, &mut out);
+    }
+
+    if streams.mail {
+        drain_mail_events(watch, &sid, &mut out);
     }
 
     if out.is_empty() {
@@ -1548,6 +1745,7 @@ pub type ResolvedTarget = (
     Arc<ByteFanout>,
     Arc<Mutex<TurnLedger>>,
     Arc<Mutex<crate::session_timeline::SessionTimeline>>,
+    Arc<crate::fabric::SessionFabric>,
 );
 
 /// Build one target's send cursors — the per-`Watch` seeding, in ONE place.
@@ -1562,9 +1760,20 @@ pub type ResolvedTarget = (
 /// multi-target subscription (and for `@*` outright), so in adopt mode they are
 /// always `None` here and this function behaves identically for both callers.
 fn new_watch(target: &ResolvedTarget, streams: TargetStreams, opts: &PushOptions) -> Watch {
-    let (id, term, fanout, turns, timeline) = target;
+    let (id, term, fanout, turns, timeline, fabric) = target;
     Watch {
         local_id: *id,
+        fabric: fabric.clone(),
+        // Seeded to the ring's high so only mail DELIVERED after subscription
+        // pushes — the same live-stream rule as turns, blocks, title and bell.
+        last_mail_id: if streams.mail {
+            fabric
+                .mail_since(0, &crate::fabric::MailFilter::default())
+                .high
+        } else {
+            0
+        },
+        mail: opts.mail.clone(),
         term: term.clone(),
         turns: turns.clone(),
         // `since-turn=<id>` resumes the turn stream from that id (push turns
@@ -1713,8 +1922,7 @@ pub fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
     let PushScopes {
         streams, instance, ..
     } = scopes;
-    let local_ids: Vec<u64> = targets.iter().map(|(id, _, _, _, _)| *id).collect();
-    let mut sub = SubscriberSet::register(registry, &local_ids);
+    let local_ids: Vec<u64> = targets.iter().map(|(id, _, _, _, _, _)| *id).collect();
 
     // INSTANCE lifecycle watermark: seed to the CURRENT journal high (and the
     // current live set, for the recovery path) so only spawns/exits AFTER
@@ -1745,6 +1953,15 @@ pub fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
         .iter()
         .map(|t| new_watch(t, streams, &opts))
         .collect();
+
+    // REGISTER AFTER THE WATCHES ARE SEEDED, never before. Every live stream's
+    // watermark — mail's cursor, the turn/block/timeline ids, title, bell — is
+    // taken inside `new_watch`, and a row that lands between a register and
+    // that read is folded into the SEED and pushed to nobody: registered means
+    // "wakes reach me", and a wake that finds its own arrival already counted
+    // as backlog is a wake wasted. Seeding first makes the registration the
+    // real barrier it is documented to be.
+    let mut sub = SubscriberSet::register(registry, &local_ids);
 
     let mut egress = Egress::new(writer, opts.timestamps);
     // `Gone` is not a failure to report: the client hanging up IS how a push-only
@@ -2031,6 +2248,7 @@ fn adopt_new_targets(
                     h.ctx.byte_fanout.clone(),
                     h.ctx.turns.clone(),
                     h.ctx.timeline.clone(),
+                    h.ctx.fabric.clone(),
                 ),
                 h.sid.as_str().to_string(),
             )
@@ -2353,6 +2571,9 @@ pub(crate) mod bench_seam {
         };
         Watch {
             local_id,
+            fabric: std::sync::Arc::default(),
+            last_mail_id: 0,
+            mail: crate::fabric::MailFilter::default(),
             term: term.clone(),
             last_sent_seq: 0,
             last_alt: false,
@@ -2471,6 +2692,9 @@ mod tests {
     fn test_watch(term: Arc<Mutex<Terminal>>) -> Watch {
         Watch {
             local_id: 1,
+            fabric: std::sync::Arc::default(),
+            last_mail_id: 0,
+            mail: crate::fabric::MailFilter::default(),
             term,
             last_sent_seq: 0,
             last_alt: false,
@@ -2716,6 +2940,9 @@ mod tests {
     fn watch_on(local_id: u64, term: &Arc<Mutex<Terminal>>) -> Watch {
         Watch {
             local_id,
+            fabric: std::sync::Arc::default(),
+            last_mail_id: 0,
+            mail: crate::fabric::MailFilter::default(),
             term: term.clone(),
             last_sent_seq: 0,
             last_alt: false,
@@ -2774,6 +3001,171 @@ mod tests {
             cursor,
             events,
             ..Default::default()
+        }
+    }
+
+    /// **THE `mail` GRAMMAR, COMMAS AND ALL.** The stream list is comma
+    /// separated and `kinds=<k,..>` is itself comma separated, so
+    /// `mail:kinds=task,ask` arrives split; [`fold_mail_params`] puts it back
+    /// by the rule "a piece that names no stream continues the mail token", and
+    /// a stream name after it ends the fold. Everything the grammar does not
+    /// name fails CLOSED — an unknown kind, an unknown key, a repeat, an empty
+    /// value — because a filter that matched nothing would look like a live
+    /// subscription that has gone quiet.
+    #[test]
+    fn the_mail_streams_filter_parses_and_fails_closed() {
+        let mail = |kinds: &[&str], from: Option<&str>| crate::fabric::MailFilter {
+            kinds: kinds.iter().map(|k| (*k).to_string()).collect(),
+            from: from.map(str::to_string),
+            topic: None,
+        };
+        let topic = |t: &str| crate::fabric::MailFilter {
+            topic: Some(t.to_string()),
+            ..crate::fabric::MailFilter::default()
+        };
+        let got = |s: &str| Requested::parse(s).expect(s);
+
+        assert!(got("mail").targets.mail);
+        assert_eq!(got("mail").mail, mail(&[], None));
+        assert_eq!(
+            got("mail:kinds=task,ask").mail,
+            mail(&["task", "ask"], None)
+        );
+        assert_eq!(got("mail:from=h-andrew").mail, mail(&[], Some("h-andrew")));
+        assert_eq!(got("mail:from=human").mail, mail(&[], Some("human")));
+        assert_eq!(
+            got("mail:kinds=task,ask:from=agent").mail,
+            mail(&["task", "ask"], Some("agent"))
+        );
+
+        // The fold ends at the next stream name, and the streams around it still
+        // parse — the case the comma ambiguity would have broken.
+        let both = got("screen,mail:kinds=task,ask,cursor");
+        assert_eq!(both.mail, mail(&["task", "ask"], None));
+        assert!(both.targets.screen && both.targets.cursor && both.targets.mail);
+
+        // `mail:topic=` narrows to one BROADCAST face, and composes with the
+        // other two in any order.
+        assert_eq!(got("mail:topic=build.failed").mail, topic("build.failed"));
+        assert_eq!(
+            got("mail:topic=build.failed:kinds=note").mail,
+            crate::fabric::MailFilter {
+                kinds: vec!["note".to_string()],
+                from: None,
+                topic: Some("build.failed".to_string()),
+            }
+        );
+
+        // `mail` alone IS a frame source, so it satisfies the no-source rule.
+        assert!(Requested::parse("mail").is_some());
+
+        for bad in [
+            "mail:kinds=nope",           // not one of KINDS
+            "mail:kinds=",               // empty value
+            "mail:from=",                // empty value
+            "mail:bogus=1",              // unknown key
+            "mail:kinds=task:kinds=ask", // repeated
+            "mail:from=a:from=b",        // repeated
+            "mail:topic=",               // empty value
+            "mail:topic=Build",          // not the topic grammar
+            "mail:topic=a/b",            // nor is this
+            "mail:topic=a:topic=b",      // repeated
+            "mailish",                   // not this stream, not any stream
+        ] {
+            assert_eq!(Requested::parse(bad), None, "{bad} must fail closed");
+        }
+    }
+
+    /// **THE GAP FRAME, LITERALLY.** A client parses the wire text, so the
+    /// token is asserted as text: `GAP <local> mail-dropped=<n>`, one line,
+    /// before the MAIL lines of the same wake. The count is what the ring
+    /// lost, which with class eviction is not "everything below the front
+    /// row" — see `mail_since_reports_what_was_evicted…`.
+    #[test]
+    fn the_gap_frame_names_what_the_ring_dropped() {
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(7);
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(h.clone());
+        let deliver = |off: u64, from: &str| {
+            let reply = crate::fabric::cmd_deliver(
+                &store,
+                &format!(
+                    "{} off={off} from={from} kind=note trust=agent text=x",
+                    h.sid.as_str()
+                ),
+            );
+            assert!(reply.starts_with("OK"), "{reply}");
+        };
+        let over = crate::fabric::RING_CAP + 40;
+        for n in 1..=over {
+            deliver(1000 + n as u64, &format!("s-p{n}"));
+        }
+        let mut w = new_watch(
+            &(
+                7,
+                h.term.clone(),
+                h.ctx.byte_fanout.clone(),
+                h.ctx.turns.clone(),
+                h.ctx.timeline.clone(),
+                h.ctx.fabric.clone(),
+            ),
+            TargetStreams {
+                mail: true,
+                ..TargetStreams::default()
+            },
+            &PushOptions::default(),
+        );
+        // A subscriber that joined before any of it.
+        w.last_mail_id = 0;
+        let mut out = String::new();
+        drain_mail_events(&mut w, "7", &mut out);
+        let first = out.lines().next().expect("a frame");
+        assert_eq!(
+            first,
+            &format!("GAP 7 mail-dropped={}", over - crate::fabric::RING_CAP),
+            "the literal gap frame: {out}"
+        );
+        assert!(
+            out.lines()
+                .nth(1)
+                .is_some_and(|l| l.starts_with("MAIL 7 id=")),
+            "the MAIL lines follow it: {out}"
+        );
+    }
+
+    /// **`from=` IS SINGULAR.** The fold that reassembles `kinds=`'s comma list
+    /// will hand `from=` a second piece, and `mail:from=h-a,h-b` was taken
+    /// verbatim and matched NOTHING — a live-looking subscription that says
+    /// nothing, the exact failure the fail-closed rule exists to prevent.
+    #[test]
+    fn a_from_selector_is_one_class_or_one_principal() {
+        let from = |s: &str| Requested::parse(s).map(|r| r.mail.from);
+        for good in [
+            "human",
+            "agent",
+            "service",
+            "other",
+            "h-andrew",
+            "s-w1@n-lab",
+            "a-svc",
+        ] {
+            assert_eq!(
+                from(&format!("mail:from={good}")),
+                Some(Some(good.to_string())),
+                "{good}"
+            );
+        }
+        for bad in [
+            "mail:from=h-andrew,h-bob", // a list: the defect
+            "mail:from=human,agent",
+            "mail:from=andrew", // no class prefix, not a class
+            "mail:from=h-",     // a prefix and nothing else
+            "mail:from=h-a b",
+        ] {
+            assert_eq!(Requested::parse(bad), None, "{bad} must fail closed");
         }
     }
 
@@ -3623,6 +4015,7 @@ mod tests {
             h.ctx.byte_fanout.clone(),
             h.ctx.turns.clone(),
             h.ctx.timeline.clone(),
+            h.ctx.fabric.clone(),
         );
         store.write().unwrap_or_else(|p| p.into_inner()).register(h);
         let streams = TargetStreams {
@@ -3685,6 +4078,7 @@ mod tests {
             h.ctx.byte_fanout.clone(),
             h.ctx.turns.clone(),
             h.ctx.timeline.clone(),
+            h.ctx.fabric.clone(),
         );
         store.write().unwrap_or_else(|p| p.into_inner()).register(h);
         let streams = TargetStreams {
@@ -3785,24 +4179,55 @@ mod tests {
         let mut out = String::new();
         // Sampled through the SHIPPING sampler, so this test now covers the one
         // lock hold as well as the formatter it feeds.
-        let title = |t: &Arc<Mutex<Terminal>>| sample_engine_events(t, None).title;
+        let title = |last: Option<&str>| sample_engine_events(&term, None, last).title;
         // First drain with no watermark emits the current title.
-        let wm = drain_title_event("3", &title(&term), None, &mut out);
+        let sampled = title(None).expect("no watermark must sample a title");
+        let allocation = sampled.as_ptr();
+        let wm = drain_title_event("3", Some(sampled), None, &mut out);
         assert!(
             out.contains("EVENT 3 title my%20dir\n"),
             "title emitted + pct-encoded: {out:?}"
         );
+        assert_eq!(
+            wm.as_ref().unwrap().as_ptr(),
+            allocation,
+            "reuse the sample"
+        );
         // A re-scan with the same title emits nothing.
         out.clear();
-        let wm = drain_title_event("3", &title(&term), wm, &mut out);
+        let sampled = title(wm.as_deref());
+        assert!(sampled.is_none(), "an idle sample owns no title allocation");
+        let wm = drain_title_event("3", sampled, wm, &mut out);
         assert!(out.is_empty(), "unchanged title emits nothing: {out:?}");
+        assert_eq!(
+            wm.as_ref().unwrap().as_ptr(),
+            allocation,
+            "keep the watermark"
+        );
         // A new title emits again.
         crate::term_lock(&term).process(b"\x1b]2;other\x07");
         out.clear();
-        let _ = drain_title_event("3", &title(&term), wm, &mut out);
+        let sampled = title(wm.as_deref());
+        let wm = drain_title_event("3", sampled, wm, &mut out);
         assert!(
             out.contains("EVENT 3 title other\n"),
             "change re-emits: {out:?}"
+        );
+        assert_eq!(wm.as_deref(), Some("other"));
+
+        // Clearing a title is a real change, distinct from an unchanged sample.
+        crate::term_lock(&term).process(b"\x1b]2;\x07");
+        out.clear();
+        let sampled = title(wm.as_deref());
+        assert_eq!(sampled.as_deref(), Some(""));
+        let wm = drain_title_event("3", sampled, wm, &mut out);
+        assert_eq!(out, "EVENT 3 title \n");
+        assert_eq!(wm.as_deref(), Some(""));
+        assert!(title(wm.as_deref()).is_none());
+        assert_eq!(
+            title(None).as_deref(),
+            Some(""),
+            "initial empty title still emits"
         );
     }
 
@@ -3855,7 +4280,7 @@ mod tests {
         }
         for wm in probes {
             assert_eq!(
-                sample_engine_events(&term, wm).blocks,
+                sample_engine_events(&term, wm, None).blocks,
                 reference(wm),
                 "watermark {wm:?} diverged from the forward filter"
             );
@@ -3863,11 +4288,13 @@ mod tests {
 
         // The two arms the digest stands on, named explicitly.
         assert!(
-            sample_engine_events(&term, Some(ceiling)).blocks.is_empty(),
+            sample_engine_events(&term, Some(ceiling), None)
+                .blocks
+                .is_empty(),
             "at the high-water an idle wake must produce nothing"
         );
         assert_eq!(
-            sample_engine_events(&term, None).blocks,
+            sample_engine_events(&term, None, None).blocks,
             all,
             "no watermark = every completed block, oldest-first"
         );
@@ -4021,7 +4448,7 @@ mod tests {
     fn drain_bell_event_emits_on_new_bells() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let mut out = String::new();
-        let bell = |t: &Arc<Mutex<Terminal>>| sample_engine_events(t, None).bell;
+        let bell = |t: &Arc<Mutex<Terminal>>| sample_engine_events(t, None, None).bell;
         // No bells yet: baseline 0, nothing emitted.
         let wm = drain_bell_event("4", bell(&term), 0, &mut out);
         assert!(out.is_empty() && wm == 0, "no bell yet: {out:?}");
@@ -4155,6 +4582,7 @@ mod tests {
             Arc::new(Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            Arc::default(),
         );
         (crate::session_store::new_store(), vec![target])
     }

@@ -485,7 +485,9 @@ pub(crate) enum AttrFormat {
     /// every packed RGBA colour.
     Unorm8x4,
     /// `wgpu::VertexFormat::Uint8x4` / `MTLVertexFormatUChar4` — the fire `tsl`
-    /// bytes, read as raw integers.
+    /// bytes and the glow colour PAIR (`GlowInstance::color`/`color2`), read as
+    /// raw integers: the glow fragment ramps the two ends in INTEGER arithmetic
+    /// per column, so it needs the exact bytes, not a normalized float.
     Uint8x4,
     /// `wgpu::VertexFormat::Float32x4` / `MTLVertexFormatFloat4` — glyph rect
     /// and UV.
@@ -553,6 +555,12 @@ pub(crate) enum VertexLayout {
     None,
     /// `renderer.rs::BgInstance` — 12 bytes.
     Bg,
+    /// `renderer.rs::GlowInstance` — 16 bytes: the bg rect plus a colour PAIR,
+    /// the two ends of a per-column gradient ([`aterm_render::GlowQuad::color2`],
+    /// 2026-09-21). Every consumer of a `GlowQuad` stream reads this layout —
+    /// the glow additive pipeline and both crown pipelines — so a gradient
+    /// quad ramps on every path that draws it.
+    Glow,
     /// `renderer.rs::GlyphInstance` — 40 bytes.
     Glyph,
     /// `renderer.rs::RainGlowInstance` — 20 bytes.
@@ -575,6 +583,33 @@ pub(crate) const BG_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
             location: 1,
             format: AttrFormat::Unorm8x4,
             offset: 8,
+        },
+    ],
+};
+
+/// `GlowInstance`: `[u16;4]` rect + `[u8;4]` LEFT-edge colour + `[u8;4]`
+/// RIGHT-edge colour. Both colours are `Uint8x4`, NOT `Unorm8x4`: the fragment
+/// computes `aterm_render::glow_lerp`'s integer law per column and divides by
+/// 255 itself, which is what keeps it byte-exact with the CPU rasterizer (the
+/// rasterizer's float interpolant would not be).
+pub(crate) const GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
+    name: "GlowInstance",
+    stride: 16,
+    attrs: &[
+        VertexAttr {
+            location: 0,
+            format: AttrFormat::Uint16x4,
+            offset: 0,
+        },
+        VertexAttr {
+            location: 1,
+            format: AttrFormat::Uint8x4,
+            offset: 8,
+        },
+        VertexAttr {
+            location: 2,
+            format: AttrFormat::Uint8x4,
+            offset: 12,
         },
     ],
 };
@@ -665,6 +700,7 @@ impl VertexLayout {
         match self {
             Self::None => None,
             Self::Bg => Some(BG_LAYOUT),
+            Self::Glow => Some(GLOW_LAYOUT),
             Self::Glyph => Some(GLYPH_LAYOUT),
             Self::RainGlow => Some(RAIN_GLOW_LAYOUT),
             Self::Fire => Some(FIRE_LAYOUT),
@@ -700,6 +736,13 @@ const fn wgpu_attr(a: VertexAttr) -> wgpu::VertexAttribute {
 #[cfg(wgpu_arm)]
 static BG_ATTRS: [wgpu::VertexAttribute; 2] =
     [wgpu_attr(BG_LAYOUT.attrs[0]), wgpu_attr(BG_LAYOUT.attrs[1])];
+/// The `wgpu` attribute array for [`GLOW_LAYOUT`].
+#[cfg(wgpu_arm)]
+static GLOW_ATTRS: [wgpu::VertexAttribute; 3] = [
+    wgpu_attr(GLOW_LAYOUT.attrs[0]),
+    wgpu_attr(GLOW_LAYOUT.attrs[1]),
+    wgpu_attr(GLOW_LAYOUT.attrs[2]),
+];
 /// The `wgpu` attribute array for [`GLYPH_LAYOUT`].
 #[cfg(wgpu_arm)]
 static GLYPH_ATTRS: [wgpu::VertexAttribute; 4] = [
@@ -730,6 +773,13 @@ static BG_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferL
     array_stride: BG_LAYOUT.stride,
     step_mode: wgpu::VertexStepMode::Instance,
     attributes: &BG_ATTRS,
+}];
+/// The `wgpu` per-instance buffer layout for [`VertexLayout::Glow`].
+#[cfg(wgpu_arm)]
+static GLOW_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBufferLayout {
+    array_stride: GLOW_LAYOUT.stride,
+    step_mode: wgpu::VertexStepMode::Instance,
+    attributes: &GLOW_ATTRS,
 }];
 /// The `wgpu` per-instance buffer layout for [`VertexLayout::Glyph`].
 #[cfg(wgpu_arm)]
@@ -992,6 +1042,7 @@ impl PipelineSpec {
         match self.vertex {
             VertexLayout::None => &[],
             VertexLayout::Bg => &BG_BUFFERS,
+            VertexLayout::Glow => &GLOW_BUFFERS,
             VertexLayout::Glyph => &GLYPH_BUFFERS,
             VertexLayout::RainGlow => &RAIN_GLOW_BUFFERS,
             VertexLayout::Fire => &FIRE_BUFFERS,
@@ -1107,14 +1158,16 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
     PipelineSpec {
         label: "aterm-gpu glow additive pipeline",
         library: ShaderLibrary::Cell,
-        vs: "vs_bg",
+        // `vs_glow` carries the instance's colour PAIR and rect span FLAT to
+        // the fragment, which ramps them per column (`GlowInstance`).
+        vs: "vs_glow",
         // Glow is RAW (no sRGB decode): the Unorm view keeps One/One byte-exact
         // against the CPU `add_sat`.
         fs: "fs_glow",
         target: TargetRole::OffscreenUnorm,
         blend: Some(Blend::GLOW_OVER),
         write_mask: WriteMask::Color,
-        vertex: VertexLayout::Bg,
+        vertex: VertexLayout::Glow,
         topology: Topology::TriangleList,
         binds: BindSpec::CELL_FLAT,
         pass_load: PassLoad::Dynamic,
@@ -1258,7 +1311,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         // 1.0, so there is no `1 - dst` headroom to divide up.
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
-        vertex: VertexLayout::Bg,
+        // The crown reads the SAME `GlowInstance` stream the bloom extract
+        // does, so a gradient quad ramps in the crown as it does on the glass.
+        vertex: VertexLayout::Glow,
         topology: Topology::TriangleList,
         binds: BindSpec::CROWN,
         pass_load: PassLoad::Dynamic,
@@ -1272,7 +1327,7 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         // THE CROWN IS INSIDE THE BUDGET — see `BoostComposite::Screen`.
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
-        vertex: VertexLayout::Bg,
+        vertex: VertexLayout::Glow,
         topology: Topology::TriangleList,
         binds: BindSpec::CROWN,
         pass_load: PassLoad::Dynamic,
@@ -1766,13 +1821,14 @@ mod tests {
             seen, PIPELINE_COUNT,
             "every row belongs to exactly one library"
         );
-        // 26 entry-point slots over 24 DISTINCT names: `vs_fs` is exported by
+        // 27 entry-point slots over 25 DISTINCT names: `vs_fs` is exported by
         // two different libraries, so it is one name in each roster and two in
-        // the union count.
+        // the union count. (26 until 2026-09-21: `vs_glow` joined the cell
+        // roster when the glow row left `vs_bg` for the `GlowInstance` layout.)
         let total: usize = ShaderLibrary::ALL
             .into_iter()
             .map(|l| entry_points(l).len())
             .sum();
-        assert_eq!(total, 26);
+        assert_eq!(total, 27);
     }
 }

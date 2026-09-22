@@ -1359,7 +1359,7 @@ impl App {
         self.typing_sound_auditioned = voice;
         let volume = self.config.trail_sound_volume();
         let audible = crate::app_input::keystroke_click_audible(
-            self.trail_audio.is_live(),
+            self.trail_audio.host_state(),
             self.config.trail_sounds_or_default(),
             volume,
             self.serious_mode_policy()
@@ -2354,7 +2354,14 @@ impl App {
             let panel_rows = notice.wanted_rows().min(ws.input_scratch.cells.len());
             let band =
                 crate::config_notice::band_text(&notice.lines, usize::from(ws.cols), panel_rows);
-            let mut rows = band.warnings.iter().chain(band.more.iter());
+            // The SAME rows the band paints, in the same order — a notice that spans
+            // several lines reaches here already split, so the reader hears the caret
+            // diagram as the rows it is drawn as rather than as one run-on sentence.
+            let mut rows = band
+                .warnings
+                .iter()
+                .map(|warning| warning.text.as_str())
+                .chain(band.more.as_deref());
             // The title plus the FIRST warning as painted: one sentence, the length of
             // one row. Everything else the band shows is there to be read on demand.
             if panel_rows > 0 {
@@ -2362,7 +2369,7 @@ impl App {
                     Some(first) => format!("{} \u{00b7} {first}", band.title),
                     None => band.title.clone(),
                 };
-                let rest: Vec<&str> = rows.map(String::as_str).collect();
+                let rest: Vec<&str> = rows.collect();
                 out.push(GridMessage {
                     message: ChromeMessage::ConfigWarning,
                     text: spoken,

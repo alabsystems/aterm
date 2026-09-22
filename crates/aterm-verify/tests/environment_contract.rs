@@ -1249,14 +1249,17 @@ fn a_snapshot_path_naming_the_main_checkout_is_refused_and_untouched() {
     assert!(!c.root.join(identity::GATE_STATE_DIR).exists());
 }
 
-/// `  time  …` lines carry measurements, so they are masked; everything else
-/// must be identical.
+/// `  time  …` lines and the `verify: disk …` line carry measurements (the
+/// free space moves under any other writer on the volume), so they are masked;
+/// everything else must be identical.
 fn masked(ladder: &str) -> String {
     ladder
         .lines()
         .map(|l| {
             if l.starts_with("  time  ") {
                 "  time  <masked>"
+            } else if l.starts_with("verify: disk ") {
+                "verify: disk <masked>"
             } else {
                 l
             }
@@ -1618,4 +1621,110 @@ fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
         "the receipt entered the source identity: {:?}",
         tree.dirty.keys().collect::<Vec<_>>()
     );
+}
+
+/// THE DISK PREFLIGHT, WIRED (2026-09-21). Two contract runs died mid-ladder on
+/// a full volume and the rows they managed to print were FAIL rows. A run that starts under the floor now refuses
+/// before a stage is planned — COULD NOT RUN, exit 3, with the amount, the
+/// floor, the run's own regenerable dirs and the remedy on the ladder — and
+/// writes no receipt, so the last real judgement of the commit stands. The
+/// floor is moved to `u64::MAX` to force the refusal on whatever volume this
+/// runs on; the gate's own floor is `aterm_verify::disk::FLOOR_BYTES`.
+#[test]
+fn a_volume_under_the_floor_is_could_not_run_before_any_stage_and_leaves_no_receipt() {
+    let repo = Fixture::new("atv-env-disk-floor");
+    repo.git_init().with_targo("true");
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    // A receipt from an earlier, real judgement of this commit.
+    let prior = aterm_verify::receipt::Receipt {
+        head: head.clone(),
+        dirty: None,
+        mode: "fast".into(),
+        scope: "workspace".into(),
+        verdict: "PASS".into(),
+        merge_contract: true,
+        skipped: "none".into(),
+        when: 1,
+    };
+    aterm_verify::receipt::write(&repo.root, &prior).expect("the prior receipt is written");
+
+    let ctx = repo.ctx().with_disk_floor(u64::MAX);
+    let (ladder, code) = repo.run(&ctx);
+    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
+    let line = ladder
+        .lines()
+        .find(|l| l.starts_with("verify: disk "))
+        .unwrap_or_else(|| panic!("no disk line: {ladder}"));
+    assert!(
+        line.contains(" free on the volume holding ") && line.contains("(floor "),
+        "{line}"
+    );
+    assert!(
+        ladder.contains("\n=== disk preflight ===\n  FAIL  disk: "),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains("under the ") && ladder.contains(" floor"),
+        "the row names the floor: {ladder}"
+    );
+    assert!(ladder.contains("regenerable"), "{ladder}");
+    assert!(
+        ladder.contains("  target-drivers/\n"),
+        "the run's own lane dir is named in the remedy: {ladder}"
+    );
+    assert!(ladder.contains("VERIFY: COULD NOT RUN"), "{ladder}");
+    assert!(
+        !ladder.contains("=== build"),
+        "no stage was planned: {ladder}"
+    );
+    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
+    // No receipt was written: the earlier judgement stands, byte for byte.
+    let text = fs::read_to_string(aterm_verify::receipt::dir(&repo.root).join(&head))
+        .expect("the prior receipt is still there");
+    assert_eq!(aterm_verify::receipt::Receipt::parse(&text), Some(prior));
+}
+
+/// …and the same floor under `--selftest` prints the reading and refuses on
+/// nothing: a selftest builds nothing, so there is nothing a full volume could
+/// stop, and SELFTEST FAIL over it would be a finding about the driver that is
+/// not true — the rule the unreadable-source arm already follows.
+#[test]
+fn a_selftest_prints_the_disk_reading_and_never_refuses_on_it() {
+    let repo = Fixture::new("atv-env-disk-selftest");
+    repo.git_init().with_targo("true");
+    let plain = repo.ctx();
+    let ctx = Ctx::new(
+        plain.root.clone(),
+        Mode::Fast,
+        Scope::workspace(),
+        true,
+        plain.env.clone(),
+        repo.scratch.clone(),
+    )
+    .with_disk_floor(u64::MAX);
+    let (ladder, code) = repo.run(&ctx);
+    assert_eq!(code, exit::PASS, "{ladder}");
+    assert!(ladder.contains("verify: disk "), "{ladder}");
+    assert!(!ladder.contains("disk preflight"), "{ladder}");
+    assert!(ladder.contains("SELFTEST OK"), "{ladder}");
+}
+
+/// A volume at or over the floor changes nothing but the line that records
+/// the reading: the preflight costs one `df` and one header line.
+#[test]
+fn a_volume_at_or_over_the_floor_runs_the_ladder_with_the_reading_on_record() {
+    let repo = Fixture::new("atv-env-disk-ok");
+    repo.git_init().with_targo("true");
+    let (ladder, code) = repo.run(&repo.ctx().with_disk_floor(0));
+    assert_ne!(code, exit::COULD_NOT_RUN, "{ladder}");
+    let line = ladder
+        .lines()
+        .find(|l| l.starts_with("verify: disk "))
+        .unwrap_or_else(|| panic!("no disk line: {ladder}"));
+    assert!(
+        line.contains(" free on the volume holding ") && line.ends_with("(floor 0.0 GiB)"),
+        "{line}"
+    );
+    assert!(!ladder.contains("disk preflight"), "{ladder}");
+    assert!(ladder.contains("=== build"), "{ladder}");
 }

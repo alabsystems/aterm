@@ -233,6 +233,51 @@ impl_pod_zeroable!(BgInstance {
     color: [u8; 4]
 });
 
+/// One GLOW quad: a pixel-space rect carrying a colour PAIR — the two ends of
+/// a horizontal gradient ([`aterm_render::GlowQuad::color2`], 2026-09-21).
+///
+/// PACKED LAYOUT (16 B): the bg rect (`[u16;4]`, 8 B) then TWO `[u8;4]`
+/// colours, `color` at the quad's LEFT edge and `color2` at its RIGHT, each
+/// the host's PREMULTIPLIED `r, g, b` with the quad's OWN alpha byte in the
+/// fourth slot (`glow8`). Both colour attributes are fetched as `Uint8x4` —
+/// exact integers, NOT `Unorm8x4` floats — because the fragment ramps between
+/// the two ends per column with `aterm_render::glow_lerp`'s INTEGER law and
+/// only then divides by 255, which is what keeps the GPU byte-exact with the
+/// CPU rasterizer; the rasterizer's float interpolant would not be. A flat
+/// quad (`color2 == color`) reaches the identical bytes the 12-byte
+/// `BgInstance` path reached. `#[repr(C)]`, 2-byte align, no padding:
+/// `size_of` == 16 == `GLOW_LAYOUT.stride`. Every `GlowQuad` stream — the
+/// aurora, `glow_under`, the nova, the bloom extract and both crowns — is
+/// this instance, so a gradient ramps on every path that draws it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GlowInstance {
+    /// x, y, w, h in pixels (top-left origin, y down) — non-negative integers.
+    rect: [u16; 4],
+    /// The LEFT edge: premultiplied r, g, b and the quad's alpha (the mode).
+    color: [u8; 4],
+    /// The RIGHT edge, same packing.
+    color2: [u8; 4],
+}
+impl_pod_zeroable!(GlowInstance {
+    rect: [u16; 4],
+    color: [u8; 4],
+    color2: [u8; 4]
+});
+
+impl GlowInstance {
+    /// The instance for one [`aterm_render::GlowQuad`] at `rect` (the quad's
+    /// own rect, or the grid-offset one for a grid-relative stream).
+    fn of(rect: [u16; 4], q: &aterm_render::GlowQuad) -> Self {
+        let [r, g, b, a, r2, g2, b2, a2] = glow8(q);
+        Self {
+            rect,
+            color: [r, g, b, a],
+            color2: [r2, g2, b2, a2],
+        }
+    }
+}
+
 /// One background RUN under construction by a row's emission walk: `(x, w,
 /// colour)` in framebuffer pixels. The row band (`y`, `h`) is the same for every
 /// quad in a run, so it is supplied at flush time rather than carried here.
@@ -348,6 +393,7 @@ impl_pod_zeroable!(GlyphInstance {
 // mis-striding a draw on one backend only.
 const _: () = {
     assert!(std::mem::size_of::<BgInstance>() as u64 == pipeline_table::BG_LAYOUT.stride);
+    assert!(std::mem::size_of::<GlowInstance>() as u64 == pipeline_table::GLOW_LAYOUT.stride);
     assert!(std::mem::size_of::<GlyphInstance>() as u64 == pipeline_table::GLYPH_LAYOUT.stride);
 };
 
@@ -476,13 +522,77 @@ fn fs_bg(in: BgVsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(s2l(in.color.rgb), in.color.a);
 }
 
-// Glow (LUMEN aurora, One/One additive) emits its premultiplied colour RAW (no sRGB
-// decode): over the offscreen's default view the add is byte-exact == the CPU `add_sat`
-// on native, and lands in linear on downlevel (the accepted approximation — see the
-// header DOWNLEVEL FALLBACK). Same vertex path as `fs_bg`, different fragment.
+// GLOW (the LUMEN aurora and every other `GlowQuad` stream): a `GlowInstance` —
+// the bg rect plus a colour PAIR, the quad's LEFT and RIGHT edges (2026-09-21).
+// The vertex stage hands the fragment the pair and the rect's x-span FLAT, and
+// the fragment ramps between the two ends PER COLUMN with the SAME integer law
+// the CPU rasterizer uses (`aterm_render::glow_lerp`), for alpha alike:
+//
+//     c(i) = (c0·(2w − m) + c1·m + w) / (2w),   m = 2i + 1
+//
+// A flat pair (c0 == c1) is the identity for every i, so every historical
+// stream reaches the bytes it always did; a gradient is continuous inside the
+// quad. The rasterizer's float colour interpolant is deliberately NOT used —
+// its rounding is not the CPU's, and byte parity is the contract. The fragment
+// emits `c / 255.0` RAW (no sRGB decode; the same division the Unorm8x4 decode
+// performed for the flat path) into the glow blend `src + dst·(1 − src_a)`,
+// which rounds ONCE on store: over the offscreen's default view that is
+// byte-exact == the CPU `add_sat` / `over_premul` on native, and lands in
+// linear on downlevel (the accepted approximation — see the header DOWNLEVEL
+// FALLBACK).
+struct GlowVsOut {
+    @builtin(position) pos: vec4<f32>,
+    // The quad's left edge and width in device px, as whole numbers.
+    @location(0) @interpolate(flat) span: vec2<f32>,
+    // The colour pair as exact bytes (r, g, b, a): premultiplied, `a` the mode.
+    @location(1) @interpolate(flat) c0: vec4<u32>,
+    @location(2) @interpolate(flat) c1: vec4<u32>,
+    // The fragment's x INSIDE THE QUAD, in the quad's own px (0 at its left
+    // edge, its width at its right), interpolated linearly: the same pipeline
+    // draws the bloom EXTRACT into the HALF-RES bloom target under the
+    // full-res uniforms, where `pos.x - span.x` mixed a half-res pixel with a
+    // full-res edge and read the quad's left half at its LEFT colour (the
+    // 2026-09-22 review). cell.metal's `vs_glow` is the twin.
+    @location(3) @interpolate(linear, center) lx: f32,
+};
+
+@vertex
+fn vs_glow(@builtin(vertex_index) vi: u32,
+           @location(0) rect_u: vec4<u32>,
+           @location(1) c0: vec4<u32>,
+           @location(2) c1: vec4<u32>) -> GlowVsOut {
+    let rect = vec4<f32>(rect_u);
+    let k = corner(vi);
+    let px = rect.xy + k * rect.zw;
+    var o: GlowVsOut;
+    o.pos = vec4<f32>(to_ndc(px), 0.0, 1.0);
+    o.span = rect.xz;
+    o.lx = k.x * rect.z;
+    o.c0 = c0;
+    o.c1 = c1;
+    return o;
+}
+
+// The fragment's 0-based column inside its quad, from its x in the quad's own
+// px. At full res the pixel CENTRE interpolates to i + 0.5, so the floor is i
+// with half a pixel of margin either side; at half res each fragment reads the
+// quad's own column under its centre. The clamp only guards the edges.
+fn glow_column(lx: f32, w: f32) -> u32 {
+    return u32(clamp(floor(lx), 0.0, max(w - 1.0, 0.0)));
+}
+
+// `aterm_render::glow_lerp`, per channel and for alpha alike, at column `i` of
+// a `w`-wide quad (`w >= 1`: a zero-width quad rasterizes no fragment).
+fn glow_lerp4(c0: vec4<u32>, c1: vec4<u32>, i: u32, w: u32) -> vec4<u32> {
+    let m = 2u * min(i, w - 1u) + 1u;
+    return (c0 * (2u * w - m) + c1 * m + vec4<u32>(w)) / (2u * w);
+}
+
 @fragment
-fn fs_glow(in: BgVsOut) -> @location(0) vec4<f32> {
-    return in.color;
+fn fs_glow(in: GlowVsOut) -> @location(0) vec4<f32> {
+    let w = max(u32(in.span.y), 1u);
+    let c = glow_lerp4(in.c0, in.c1, glow_column(in.lx, in.span.y), w);
+    return vec4<f32>(c) / 255.0;
 }
 
 // PHOSPHOR rain bright-head halo (One/One additive, RAW like fs_glow) with an
@@ -1079,10 +1189,35 @@ struct HdrU {
 };
 @group(0) @binding(0) var<uniform> hu: HdrU;
 
+// The crown reads the SAME `GlowInstance` stream the bloom extract does — a
+// rect plus a colour PAIR (`aterm_render::GlowQuad::color2`) — and ramps it
+// per column with the identical integer law `fs_glow` uses, BEFORE its boost,
+// so a gradient quad is the same gradient in the crown as on the glass and a
+// flat pair is the identity (the bytes the Unorm8x4 decode used to deliver).
 struct HdrVsOut {
     @builtin(position) pos: vec4<f32>,
-    @location(0) color: vec4<f32>,
+    // The quad's left edge in SWAPCHAIN px (the rect's x plus the W1 band
+    // offset, both whole pixels) and its width.
+    @location(0) @interpolate(flat) span: vec2<f32>,
+    @location(1) @interpolate(flat) c0: vec4<u32>,
+    @location(2) @interpolate(flat) c1: vec4<u32>,
 };
+
+fn glow_column(pos_x: f32, span: vec2<f32>) -> u32 {
+    return u32(clamp(floor(pos_x - span.x), 0.0, max(span.y - 1.0, 0.0)));
+}
+
+fn glow_lerp4(c0: vec4<u32>, c1: vec4<u32>, i: u32, w: u32) -> vec4<u32> {
+    let m = 2u * min(i, w - 1u) + 1u;
+    return (c0 * (2u * w - m) + c1 * m + vec4<u32>(w)) / (2u * w);
+}
+
+// The fragment's premultiplied sRGB-space colour, ramped, as 0..1 floats.
+fn crown_color(in: HdrVsOut) -> vec3<f32> {
+    let w = max(u32(in.span.y), 1u);
+    let c = glow_lerp4(in.c0, in.c1, glow_column(in.pos.x, in.span), w);
+    return vec3<f32>(c.rgb) / 255.0;
+}
 
 fn hdr_corner(vi: u32) -> vec2<f32> {
     var c = array<vec2<f32>, 6>(
@@ -1095,14 +1230,17 @@ fn hdr_corner(vi: u32) -> vec2<f32> {
 @vertex
 fn vs_hdr_glow(@builtin(vertex_index) vi: u32,
                @location(0) rect_u: vec4<u32>,
-               @location(1) color: vec4<f32>) -> HdrVsOut {
+               @location(1) c0: vec4<u32>,
+               @location(2) c1: vec4<u32>) -> HdrVsOut {
     let rect = vec4<f32>(rect_u);
     let k = hdr_corner(vi);
     // Offscreen px -> swapchain px (the W1 band placement) -> NDC.
     let px = rect.xy + k * rect.zw + hu.content_off;
     var o: HdrVsOut;
     o.pos = vec4<f32>(2.0 * px.x / hu.screen.x - 1.0, 1.0 - 2.0 * px.y / hu.screen.y, 0.0, 1.0);
-    o.color = color;
+    o.span = vec2<f32>(rect.x + hu.content_off.x, rect.z);
+    o.c0 = c0;
+    o.c1 = c1;
     return o;
 }
 
@@ -1132,7 +1270,7 @@ fn white_part(c: vec3<f32>) -> f32 {
 // glass — which is what makes the hierarchy read as light instead of as gain.
 @fragment
 fn fs_hdr_glow(in: HdrVsOut) -> @location(0) vec4<f32> {
-    let c = clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let c = clamp(crown_color(in), vec3<f32>(0.0), vec3<f32>(1.0));
     let lo = c / 12.92;
     let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
     let lin = select(lo, hi, c > vec3<f32>(0.04045));
@@ -1153,7 +1291,7 @@ fn fs_hdr_glow(in: HdrVsOut) -> @location(0) vec4<f32> {
 // colour, no plateau. COLOR write-mask: the blit's alpha stays 1.0.
 @fragment
 fn fs_sdr_glow(in: HdrVsOut) -> @location(0) vec4<f32> {
-    let c = clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let c = clamp(crown_color(in), vec3<f32>(0.0), vec3<f32>(1.0));
     let bound = max(hu.headroom, 0.0);
     return vec4<f32>(c * bound * max(hu.boost, 0.0), 0.0);
 }
@@ -4026,12 +4164,6 @@ pub struct WindowGpu {
     // copies run through `FrameEncoder::copy_texture_rect` (the Metal arm of
     // which REFUSES the overlapping self-copy this scratch exists to avoid).
     pub(crate) shift_scratch: Option<crate::device_layer::LayerTexture>,
-    // M1b: the `scroll_frac_px` PRESENTED last frame. A fractional frame mutates
-    // the offscreen (the band shift), so the scissored dirty-row diff must not
-    // compare against it: a nonzero frac THIS frame OR last frame forces a full
-    // repaint (fresh untranslated offscreen) before the shift. `0` on every
-    // whole-row frame ⇒ the scissored present path is byte-identical to pre-M1b.
-    pub(crate) prev_frac: i32,
     // SDR-bloom PRESENT compositing target. The GPU comet bloom is a soft additive
     // HALO; compositing it into `offscreen` would force every scissored aurora tick
     // to REBUILD the whole halo band (the halo re-adds over any Load-preserved row),
@@ -4095,6 +4227,14 @@ pub struct WindowGpu {
     // the offscreen's dims, recreated on resize.
     #[cfg(target_os = "macos")]
     pub(crate) metal_present_off: Option<crate::metal::resources::SealedTexture>,
+    // The ARMED arm's resident band-shift scratch (the `shift_scratch` twin):
+    // the Submit B sub-row translate and the E7 whole-row rescue both stage
+    // through it. Reused at the offscreen's dims, recreated on resize. It used
+    // to be MINTED PER CALL — a full-frame MTLTexture allocation on every
+    // glide frame and every rescued scroll frame (`metal_ensure_shift_scratch`
+    // is the one mint now).
+    #[cfg(target_os = "macos")]
+    pub(crate) metal_shift_scratch: Option<crate::metal::resources::SealedTexture>,
     // W6b — the ARMED arm's resident settings card (see [`MetalTrayCard`]):
     // the wgpu `tray_overlay` twin, cleared wherever that one is cleared so
     // a reopened card re-uploads on both arms alike.
@@ -5008,9 +5148,9 @@ pub struct GpuRenderer {
     // halo's extract source). Taken out of `self` (mem::take) and cleared per call,
     // like the other scratch streams above, so the default-on glow path — non-empty
     // on essentially every present while typing/fading — no longer heap-allocates a
-    // fresh Vec<BgInstance> every frame. Byte-identical: the same instances are built
+    // fresh Vec<GlowInstance> every frame. Byte-identical: the same instances are built
     // and uploaded; only the backing allocation is reused.
-    bloom_glow_scratch: Vec<BgInstance>,
+    bloom_glow_scratch: Vec<GlowInstance>,
     // Persistent per-cell resolved-glyph-key scratch for `encode_frame` (mem::take,
     // like `row_plans`). The atlas-key prepass and the glyph-emission loop ran the
     // IDENTICAL per-cell derivation — `drawable` + `image_hides_glyph_at`, the
@@ -5431,9 +5571,10 @@ struct Instances {
     trail: Vec<BgInstance>,
     /// LUMEN aurora: PREMULTIPLIED ADDITIVE light quads (comet/bloom/ring/sparks),
     /// drawn through `glow_add_pipeline` (One/One) AFTER the glyphs/deco and UNDER
-    /// the cursor. The colour is premultiplied, so the alpha lane is irrelevant.
-    /// Empty when no aurora is live.
-    glow_add: Vec<BgInstance>,
+    /// the cursor. The colour is premultiplied; the alpha lane is the quad's
+    /// MODE (`glow8`), and the instance carries a colour PAIR so a gradient
+    /// quad ramps per column. Empty when no aurora is live.
+    glow_add: Vec<GlowInstance>,
     /// GLOW-HALO cursor-effect radial light (`glow_halo`: EMBERFORGE round
     /// embers / crown): a [`RainGlowInstance`] One/One stream through the SAME
     /// `rain_glow_pipeline` as `rain_add`, drawn right AFTER the aurora and
@@ -5460,7 +5601,7 @@ struct Instances {
     /// stays `glow_add`-only). Empty for every glow_under-free frame — and
     /// then NO extra pass opens (the fused base pass is byte-identical to
     /// before).
-    glow_under: Vec<BgInstance>,
+    glow_under: Vec<GlowInstance>,
     /// EMBERFORGE per-pixel FIRE FIELD patches (`fire_patch`): the flame BODY
     /// at full art scale, drawn in the SAME A2 Unorm interpose pass right
     /// AFTER `glow_under` (== the CPU phase-B3b `draw_fire_patch` after
@@ -5476,7 +5617,7 @@ struct Instances {
     /// SAME `glow_add_pipeline` right after the aurora on the Unorm view (== CPU
     /// `add_sat`, byte-exact over background — `draw_nova` runs right after
     /// `draw_glow`). Empty for every nova-free frame.
-    nova_add: Vec<BgInstance>,
+    nova_add: Vec<GlowInstance>,
     /// PHOSPHOR rain bright-head halos (`rain_add`): the third glow-shaped
     /// One/One stream, drawn through the SAME `glow_add_pipeline` right after
     /// the nova on the Unorm view (== CPU `add_sat`; the host premultiplies the
@@ -6547,10 +6688,12 @@ fn build_effect_pipeline(
         // LUMEN aurora pipeline: PREMULTIPLIED light, additive or source-over per
         // INSTANCE (the instance alpha byte is [`GlowQuad::alpha`]; `0` is the
         // additive mode and the row's `Blend::GLOW_OVER` collapses to One/One there).
-        // Reuses the bg layout + `vs_bg` + the `BgInstance` vertex layout verbatim;
-        // the differences from `Pipeline::Bg` are the blend state, the RAW `fs_glow`
-        // fragment, the Unorm (additive) target, and the COLOR write-mask — RGB
-        // only, so the offscreen alpha the blit relies on is never perturbed.
+        // Reuses the bg BIND layout; the vertex layout is `GlowInstance` (the bg
+        // rect plus a colour PAIR, ramped per column by `vs_glow`/`fs_glow`), and
+        // the other differences from `Pipeline::Bg` are the blend state, the RAW
+        // `fs_glow` fragment, the Unorm (additive) target, and the COLOR
+        // write-mask — RGB only, so the offscreen alpha the blit relies on is
+        // never perturbed.
         EffectPipeline::GlowAdd => (Pipeline::GlowAdd, &layouts.bg),
         // PHOSPHOR rain halo pipeline: the glow-add twin with the radial falloff
         // shaders + `RainGlowInstance` layout. Same `bg` layout, One/One blend, and
@@ -9705,9 +9848,9 @@ impl GpuRenderer {
             unsafe { mtl::buffer_write(&buf, bytes) };
             Ok(buf)
         };
-        let insts: &[BgInstance] = &self.bloom_glow_scratch;
+        let insts: &[GlowInstance] = &self.bloom_glow_scratch;
         let stream = mint_bytes(live, aterm_bits::cast_slice(insts))?;
-        let extract_offset = extract_first as usize * std::mem::size_of::<BgInstance>();
+        let extract_offset = extract_first as usize * std::mem::size_of::<GlowInstance>();
         let cell_u = mint_bytes(
             live,
             aterm_bits::bytes_of(&Uniforms {
@@ -10033,6 +10176,38 @@ impl GpuRenderer {
     /// A failure takes one named note and leaves the band unshifted (the
     /// frame is then the untranslated armed frame — visible, not corrupt).
     #[cfg(target_os = "macos")]
+    /// The ARMED arm's resident band-shift scratch at `(w, h)` — minted on the
+    /// first shift at these dims, reused after. Returns an OWNED handle (same
+    /// loss domain), so the caller keeps borrowing `win` freely.
+    #[cfg(target_os = "macos")]
+    fn metal_ensure_shift_scratch(
+        &mut self,
+        win: &mut WindowGpu,
+        w: u32,
+        h: u32,
+    ) -> Result<crate::metal::resources::SealedTexture, String> {
+        let resident = win
+            .metal_shift_scratch
+            .as_ref()
+            .is_some_and(|t| (t.width(), t.height()) == (w as usize, h as usize));
+        if !resident {
+            let _pool = crate::metal::ffi::AutoreleasePool::new();
+            let cell = self.metal_arm.as_mut().ok_or("the Metal arm is not live")?;
+            let live = cell.live_mut();
+            win.metal_shift_scratch = Some(live.mint.texture_2d(
+                crate::metal::ffi::PixelFormat::Rgba8Unorm,
+                w as usize,
+                h as usize,
+                0,
+            )?);
+        }
+        Ok(win
+            .metal_shift_scratch
+            .as_ref()
+            .expect("ensured above")
+            .clone_handle())
+    }
+
     fn metal_shift_offscreen_band_px(
         &mut self,
         win: &mut WindowGpu,
@@ -10044,22 +10219,28 @@ impl GpuRenderer {
         let Some(shift) = band_shift_ops(y0, y1, delta) else {
             return;
         };
+        let Some((w, h)) = win.metal_offscreen.as_ref().map(|o| (o.w, o.h)) else {
+            return;
+        };
+        // The resident scratch (was a per-call full-frame mint).
+        let scratch = match self.metal_ensure_shift_scratch(win, w, h) {
+            Ok(s) => s,
+            Err(e) => {
+                metal_arm_note(&format!(
+                    "armed scroll shift: no scratch ({e}); band unshifted"
+                ));
+                return;
+            }
+        };
         let Some(off) = win.metal_offscreen.as_ref() else {
             return;
         };
-        let (w, h) = (off.w, off.h);
         let Some(cell) = self.metal_arm.as_mut() else {
             return;
         };
         let live = cell.live_mut();
         let _pool = crate::metal::ffi::AutoreleasePool::new();
         let staged = (|| -> Result<(), String> {
-            let scratch = live.mint.texture_2d(
-                crate::metal::ffi::PixelFormat::Rgba8Unorm,
-                w as usize,
-                h as usize,
-                0,
-            )?;
             let mut enc = FrameEncoder::metal(&live.session)?;
             enc.copy_texture_rect(
                 FrameCopyTexture::Metal(&off.tex),
@@ -10376,13 +10557,6 @@ impl GpuRenderer {
         };
         let work_started = aterm_time::Instant::now();
 
-        // W6b — the M1b frac shift MUTATES the metal offscreen after this
-        // encode (the wgpu path's `shift_full` law, mirrored): force Full
-        // whenever the shift runs this frame OR ran last frame, so the
-        // scissored diff never compares against a translated base.
-        if input.scroll_frac_px != 0 || win.prev_frac != 0 {
-            win.present_prev = None;
-        }
         // The armed frame encode (scissored dirty-row scope live since W6b;
         // the armed tail runs inside encode_frame). A mid-frame degrade
         // leaves the pixels on the WGPU offscreen — refuse THIS present
@@ -10401,9 +10575,10 @@ impl GpuRenderer {
             return Err(SurfacePresentFailure::Validation);
         }
         win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
-        // The armed M1b scroll shift (in place on the Metal offscreen).
-        self.shift_offscreen_band(win, input);
-        win.prev_frac = input.scroll_frac_px;
+        // The M1b sub-row shift runs INSIDE Submit B, over the throwaway
+        // present copy (`metal_encode_submit_b` → `BandShiftPass`): the
+        // offscreen stays the untranslated scissor base through a glide, so
+        // neither this frame nor the next owes a Full repaint for it.
         if tray.is_none() {
             #[cfg(wgpu_arm)]
             {
@@ -10580,10 +10755,6 @@ impl GpuRenderer {
             win.virtual_target = Some(self.make_virtual_target(w, h));
         }
         let work_started = aterm_time::Instant::now();
-        // W6b — the `shift_full` law, as on the on-glass arm above.
-        if input.scroll_frac_px != 0 || win.prev_frac != 0 {
-            win.present_prev = None;
-        }
         // The armed frame encode (scissored dirty-row scope live since W6b;
         // the armed tail runs inside `encode_frame`). A mid-frame degrade
         // leaves the pixels on the WGPU offscreen — refuse THIS present
@@ -10594,9 +10765,7 @@ impl GpuRenderer {
             return Err("the frame encode degraded to wgpu mid-frame".to_owned());
         }
         win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
-        // The armed M1b scroll shift (in place on the Metal offscreen).
-        self.shift_offscreen_band(win, input);
-        win.prev_frac = input.scroll_frac_px;
+        // The sub-row shift is a Submit B step over the copy (see the on-glass arm).
         if tray.is_none() {
             #[cfg(wgpu_arm)]
             {
@@ -10775,8 +10944,8 @@ impl GpuRenderer {
             TEXTURE_USAGE_SHADER_READ,
         };
         use crate::metal::present::{
-            BloomPasses, CrownPass, PostPass, PresentSequence, ShimmerPass, TrayPass,
-            encode_present_sequence,
+            BandShiftPass, BloomPasses, CrownPass, PostPass, PresentSequence, ShimmerPass,
+            TrayPass, encode_present_sequence,
         };
 
         // ---- Phase A: derivations off `self`/`win` (no arm borrow) -------
@@ -10849,6 +11018,29 @@ impl GpuRenderer {
         };
         let shimmer_phase = self.shimmer_phase();
         let (cell_w, cell_h) = self.cpu.cell_size();
+        // M1b sub-row scroll, ON THE COPY. The band shift is a Submit B step
+        // over the throwaway present copy (after the halo/haze, under the
+        // tray) — never a mutation of the offscreen — so the scissored
+        // dirty-row diff keeps its untranslated base through a whole glide
+        // (the CPU `render_input_cached` → `present_view` precedent). SIGNED:
+        // positive shifts the band up (glide), negative down (overscroll).
+        let band_shift = {
+            let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
+                self.cpu.grid_top(),
+                cell_h,
+                input.grid_top_row,
+                input.grid_bot_row,
+                fh as usize,
+            );
+            band_shift_ops(y0, y1, i64::from(input.scroll_frac_px))
+        };
+        // The staged move's scratch, resident per window (an owned handle so
+        // the arm borrow below is undisturbed). Ensured HERE, before Phase B
+        // takes the arm.
+        let shift_scratch = match band_shift {
+            Some(_) => Some(self.metal_ensure_shift_scratch(win, fw, fh)?),
+            None => None,
+        };
 
         // ---- Phase B: the arm mints + encodes ----------------------------
         // An OWNED +1 handle (not a borrow): the resident tray card ensure
@@ -10860,12 +11052,44 @@ impl GpuRenderer {
             .ok_or("the armed frame's offscreen is absent")?
             .tex
             .clone_handle();
+        // WHETHER ANY PASS THIS FRAME CAN WRITE THE PRESENT COPY, resolved HERE
+        // — before the mint that exists to serve them — rather than 224 lines
+        // below, where `use_present_off` used to be computed for the first time.
+        //
+        // The three terms are exactly the three the later gate uses: `bloom_parts`
+        // is `Some` iff `bloom_state` is (:10903), and `shimmer_parts` / `tray_parts`
+        // are `.map()`s of `shimmer_region` / `tray` (:10979, :11031), so this
+        // cannot disagree with it. Resolving it once and reading it twice is what
+        // makes that structural rather than a coincidence the next edit can break.
+        //
+        // WHY (2026-09-22 efficiency audit): the mint below was unconditional, so
+        // EVERY window paid a full-size Rgba8Unorm texture — 2028x1928x4 padded to
+        // 16,384,000 B = 15.6 MB on the owner's machine — for a copy that only a
+        // bloom, shimmer or tray pass ever writes. A window with no effects on
+        // screen carried it for its whole life, and every window carried it from
+        // cold start until the first frame that could use it. The wgpu twin
+        // already had this right: `ensure_present_offscreen` has exactly one
+        // caller, under `if use_present_off`.
+        //
+        // The mint is gated; the RELEASE of an already-minted surface deliberately
+        // is not. Re-minting a 16 MB Metal texture inside Submit B's encode on the
+        // first glow frame after an idle stretch is a latency risk on exactly the
+        // frame an effect starts, which is the frame a user is looking at.
+        // The fourth writer is the M1b sub-row band shift (`band_shift`, resolved
+        // in Phase A above): a sub-row frame composes the copy even with every
+        // effect off, because the translate lands on the copy, never on the
+        // scissor base.
+        let use_present_off = bloom_state.is_some()
+            || shimmer_region.is_some()
+            || tray.is_some()
+            || band_shift.is_some();
         // The throwaway present copy, resident per window at the offscreen's
         // dims (the `present_offscreen` twin).
-        let needs_off = win
-            .metal_present_off
-            .as_ref()
-            .is_none_or(|t| (t.width(), t.height()) != (fw as usize, fh as usize));
+        let needs_off = use_present_off
+            && win
+                .metal_present_off
+                .as_ref()
+                .is_none_or(|t| (t.width(), t.height()) != (fw as usize, fh as usize));
         let cell = self.metal_arm.as_mut().ok_or("the Metal arm is not live")?;
         let live = cell.live_mut();
         let usage = TEXTURE_USAGE_RENDER_TARGET | TEXTURE_USAGE_SHADER_READ;
@@ -10876,12 +11100,14 @@ impl GpuRenderer {
                         .texture_2d(MPix::Rgba8Unorm, fw as usize, fh as usize, usage)?,
                 );
         }
-        // Owned +1 for the same reason as `off_tex` above.
-        let present_off = win
-            .metal_present_off
-            .as_ref()
-            .expect("ensured above")
-            .clone_handle();
+        // Owned +1 for the same reason as `off_tex` above — and `Some` exactly
+        // when a pass can write it, which `needs_off` above guarantees.
+        let present_off = use_present_off.then(|| {
+            win.metal_present_off
+                .as_ref()
+                .expect("ensured above when `use_present_off`")
+                .clone_handle()
+        });
         let dest_mpix = dest_format.metal();
         let linear = live.mint.sampler(SamplerDesc::LINEAR_CLAMP)?;
         let nearest = live.nearest.clone_retained();
@@ -10905,9 +11131,9 @@ impl GpuRenderer {
             // ONE upload of the whole ungated stream; the extract binds it at
             // the `extract_first` BYTE offset (the W1 offset verb — the W5
             // deferral's production spelling, no sub-stream copy).
-            let insts: &[BgInstance] = &self.bloom_glow_scratch;
+            let insts: &[GlowInstance] = &self.bloom_glow_scratch;
             let stream = mint_bytes(live, aterm_bits::cast_slice(insts))?;
-            let extract_offset = extract_first as usize * std::mem::size_of::<BgInstance>();
+            let extract_offset = extract_first as usize * std::mem::size_of::<GlowInstance>();
             let cell_u = mint_bytes(
                 live,
                 aterm_bits::bytes_of(&Uniforms {
@@ -11072,7 +11298,7 @@ impl GpuRenderer {
                     }
                 };
                 let ubuf = mint_bytes(live, aterm_bits::bytes_of(&hu))?;
-                let insts: &[BgInstance] = &self.bloom_glow_scratch;
+                let insts: &[GlowInstance] = &self.bloom_glow_scratch;
                 let stream =
                     mint_bytes(live, aterm_bits::cast_slice(&insts[..crown_count as usize]))?;
                 let pso = live.present_pso(row, dest_mpix)?;
@@ -11085,11 +11311,21 @@ impl GpuRenderer {
             None
         };
 
-        let use_present_off =
-            bloom_parts.is_some() || shimmer_parts.is_some() || tray_parts.is_some();
+        // Resolved before the mint (see `use_present_off` there); these three
+        // `_parts` are `Some` exactly when the three values it read were, and the
+        // band shift is the same value both read, so the assert is a structural
+        // check, not a runtime cost worth avoiding.
+        debug_assert_eq!(
+            use_present_off,
+            bloom_parts.is_some()
+                || shimmer_parts.is_some()
+                || tray_parts.is_some()
+                || band_shift.is_some(),
+            "the present-copy gate and the passes that write it must agree"
+        );
         let seq = PresentSequence {
             offscreen: &off_tex,
-            present_off: use_present_off.then_some(&present_off),
+            present_off: present_off.as_ref(),
             // Full-frame compose this wave (the armed present is always a
             // full repaint, so the dirty-rect narrowing has no baseline).
             copy_rect: [0, 0, fw, fh],
@@ -11146,6 +11382,9 @@ impl GpuRenderer {
                     },
                     region: *region,
                 }),
+            band_shift: band_shift
+                .zip(shift_scratch.as_ref())
+                .map(|(shift, scratch)| BandShiftPass { shift, scratch }),
             tray: tray_parts.as_ref().map(|(tu, pso, binds)| TrayPass {
                 pso,
                 card_tex: win
@@ -11162,10 +11401,12 @@ impl GpuRenderer {
             }),
             blit: PostPass {
                 pso: &blit_pso,
-                tex: if use_present_off {
-                    present_off.obj()
-                } else {
-                    off_tex.obj()
+                // The present copy when a pass wrote one, the offscreen
+                // otherwise — and `present_off` is `Some` exactly in the first
+                // case, so this reads the gate off the handle itself.
+                tex: match present_off.as_ref() {
+                    Some(copy) => copy.obj(),
+                    None => off_tex.obj(),
                 },
                 tex_slot: Pipeline::Blit.spec().binds.fragment_textures[0] as usize,
                 sampler: &nearest,
@@ -11272,7 +11513,8 @@ impl GpuRenderer {
         if !self.last_frame_arm_metal {
             return Err("the armed encode degraded to wgpu".to_owned());
         }
-        self.shift_offscreen_band(win, input);
+        // (The sub-row shift is Submit B's own step now — over the copy, so
+        // this hook presents exactly what the on-glass arm presents.)
         let (device, latch) = {
             let live = self
                 .metal_arm
@@ -11427,6 +11669,11 @@ impl GpuRenderer {
     /// scratch texture stages the move (band → scratch, scratch → band shifted); no
     /// shader, no readback, no encode of cells. `frac == 0`, an empty band, or a
     /// fully-exposed band (`moved == 0`) is a literal no-op.
+    ///
+    /// THE ORACLE'S shift only (`render_input_target`, always a Full frame).
+    /// The PRESENT paths translate the throwaway present copy instead
+    /// (`shift_present_copy_band` / `BandShiftPass`), so the offscreen they
+    /// scissor against never holds a translated frame.
     fn shift_offscreen_band(&mut self, win: &mut WindowGpu, input: &RenderInput) {
         // SIGNED: positive shifts the band UP (glide), negative shifts it DOWN (the
         // elastic-overscroll bounce). The magnitude drives the copy; the sign picks
@@ -11534,10 +11781,12 @@ impl GpuRenderer {
         let off_tex = off.tex.clone();
         // This MUTATES the offscreen outside any encode scissor, so the throwaway
         // present copy can no longer be trusted anywhere: force a full re-copy on
-        // the next `compose_present_offscreen`. (A sub-row-scroll frame also forces
-        // a full repaint and the in-place bake, so this is belt-and-braces — but
-        // the tracker's whole safety argument is that EVERY offscreen writer says
-        // so, not that the callers happen to be arranged safely.)
+        // the next `compose_present_offscreen`. (The sub-row glide no longer touches
+        // the offscreen — it translates the present copy, `shift_present_copy_band`
+        // — so the E7 rescue is this scratch's only present-path caller and the
+        // oracle the other; the tracker's whole safety argument is that EVERY
+        // offscreen writer says so, not that the callers happen to be arranged
+        // safely.)
         note_offscreen_written(win, None, (w, h));
         // Reuse the resident scratch when its dims already match; (re)create on the
         // first fractional frame or after a resize — through the W3/W4 DEVICE
@@ -13104,33 +13353,17 @@ impl GpuRenderer {
         // byte-identical underlying pixels (a same-format `copy_texture_to_texture`
         // of the offscreen).
         //
-        // The one frame class that KEEPS the in-offscreen composite is the sub-row
-        // scroll (`shift_full` below): it mutates the offscreen in place anyway, has
-        // already invalidated `present_prev`, and its baked halo must stay under the
-        // chrome and ride the band shift. `tray_over_copy` is exactly its complement.
+        // The sub-row scroll frame used to be the one class that kept the in-place
+        // composite (`shift_full`: the band shift mutated the offscreen, which then
+        // forced a Full repaint this frame AND next). It now translates the COPY
+        // (`shift_present_copy_band`, after the halo/haze so they still ride the
+        // glide, before the card so chrome stays pinned), so every frame class
+        // routes the card over the copy and the offscreen is always the clean base.
         let tray_resident = tray.is_some() || win.tray_overlay.is_some();
-        // M1b sub-row scroll: a fractional frame MUTATES the offscreen (the grid-band
-        // shift below), so the scissored dirty-row diff must never compare against
-        // it. Force a full clean repaint (fresh UNtranslated offscreen) whenever the
-        // shift runs this frame OR ran last frame (so the frame returning to frac 0
-        // also re-renders clean). SIGNED: a negative frac (overscroll bounce) mutates
-        // the offscreen just like a positive one, so the gate keys on `!= 0` for
-        // EITHER sign — otherwise successive down-shifts would compound on a stale
-        // offscreen. `0` on every whole-row frame ⇒ byte-identical to the pre-M1b
-        // scissored path.
         let frac = input.scroll_frac_px;
-        let shift_full = frac != 0 || win.prev_frac != 0;
-        if shift_full {
-            win.present_prev = None;
-        }
-        // Which route this frame's card takes — decided BEFORE the encode because
-        // the encode's scissor decision depends on it (`tray_over_copy` is the frame
-        // class where `present_prev` survives a resident card). `tray_in_place` is
-        // its complement RESTRICTED to a card actually being drawn this frame: only
-        // a real composite dirties the offscreen, and only that owes the
-        // end-of-present invalidation below.
-        let tray_over_copy = tray_resident && !shift_full;
-        let tray_in_place = tray.is_some() && !tray_over_copy;
+        // A resident card ALWAYS rides the copy route now (no in-place class is
+        // left), so `present_prev` survives it on every frame.
+        let tray_over_copy = tray_resident;
         let (fw, fh) = self.encode_present_frame(win, input);
         win.resident_input_effects_transport_shift_y = effects_transport_shift_y;
 
@@ -13143,60 +13376,28 @@ impl GpuRenderer {
         // AFTER the halo so it refracts the finished frame.
         let shimmer_present = self.shimmer_live(input);
         let fx_present = bloom_glow_present || shimmer_present;
-        // The tray / sub-row-scroll frames MUTATE the offscreen in place (grid-band
-        // shift, then card composite) and are already forced to a Full repaint, so
-        // the offscreen is not reused as a scissor base. On those frames composite
-        // the comet halo IN PLACE into the offscreen — BEFORE the tray/shift, so the
-        // halo sits under the chrome and rides the scroll exactly as the pre-change
-        // in-encode bloom did — then invalidate `present_prev` at the end so the
-        // haloed offscreen is never diffed against. The hot typing path (no tray, no
-        // shift) keeps the offscreen a CLEAN halo-free scissor base and composites
-        // the halo over a throwaway `present_offscreen` below.
-        // Only the sub-row-scroll frame bakes in place now: the tray term moved to
-        // the `present_offscreen` route above, and `tray_in_place` (a card on a
-        // shift frame) is a SUBSET of `shift_full`, so dropping it from this
-        // disjunction changes no frame's routing.
-        let bake_in_place = fx_present && shift_full;
+        // Every effect composites over the throwaway `present_offscreen` copy —
+        // the in-place bake (the sub-row-scroll frame's route) is gone with the
+        // in-place shift: the halo/haze go over the copy, THEN the copy's band is
+        // translated, so they ride the glide exactly as the oracle's bake-under-
+        // shift does (`render_input_target`), and the offscreen is never diffed
+        // against a haloed or translated frame.
         // When a bloom composite below builds + uploads the UNGATED glow
         // instances (`vbufs.bloom_glow`), remember the count — the EDR/SDR
         // crown passes read the same buffer and must not build it twice.
         let mut ungated_built: Option<u32> = None;
-        if bake_in_place {
-            if bloom_glow_present {
-                ungated_built = Some(self.composite_bloom_in_place(win, input));
-            }
-            if shimmer_present {
-                self.shimmer_offscreen_in_place(win, input);
-            }
-        }
 
-        // M1b sub-row scroll: shift the terminal-content grid band by the SIGNED
-        // `frac` (up for a glide residual, down for an overscroll bounce) on the
-        // terminal-only offscreen BEFORE frontend chrome is composited. The CPU
-        // path translates its renderer frame before `composite_tray_at`; matching
-        // that order keeps Settings, native surfaces, notices, and badges pinned.
-        // `prev_frac` is stamped so next frame's full-repaint gate fires once.
-        self.shift_offscreen_band(win, input);
-        win.prev_frac = frac;
-
-        // Composite frontend chrome. On the copy route the card is DEFERRED to
-        // `draw_tray_over_present_copy` below (after the halo/haze, so the z-order is
-        // the one `bake_in_place` produced); the in-place sub-row-scroll frame still
-        // bakes it INTO the already-translated offscreen, the single source of truth
-        // for that frame. A `None` tray drops any resident overlay on either route —
-        // and on the copy route the drop owes NO repaint at all, because the
-        // offscreen never held the card: the next `compose_present_offscreen`
-        // re-copies the footprint this card recorded last frame, and a later present
-        // that composes nothing blits the (always card-free) offscreen directly.
-        match tray {
-            Some(t) if tray_in_place => self.draw_tray_into_offscreen(win, t),
-            Some(_) => {}
-            None => {
-                win.tray_overlay = None;
-                #[cfg(target_os = "macos")]
-                {
-                    win.metal_tray_card = None;
-                }
+        // Frontend chrome is DEFERRED to `draw_tray_over_present_copy` below (after
+        // the halo/haze and the band translate). A `None` tray drops any resident
+        // overlay, and the drop owes NO repaint: the offscreen never held the card;
+        // the next `compose_present_offscreen` re-copies the footprint this card
+        // recorded last frame, and a later present that composes nothing blits the
+        // (always card-free) offscreen directly.
+        if tray.is_none() {
+            win.tray_overlay = None;
+            #[cfg(target_os = "macos")]
+            {
+                win.metal_tray_card = None;
             }
         }
 
@@ -13222,7 +13423,9 @@ impl GpuRenderer {
         // and the sync copies the encode's own scissor rect — i.e. a one-row band on
         // a typing frame — which is the trade this whole change is: a bounded
         // per-frame band copy in place of an unbounded full grid re-encode.
-        let use_present_off = (fx_present && !bake_in_place) || tray_over_copy;
+        // A sub-row frame composes the copy even with every effect off: the
+        // translate lands on the copy, never on the scissor base.
+        let use_present_off = fx_present || tray_over_copy || frac != 0;
         // ONE command buffer for the rest of the present. The composite below and
         // the letterbox blit further down used to commit SEPARATE Metal command
         // buffers, and each commit is real driver work on the frame that carries
@@ -13244,6 +13447,12 @@ impl GpuRenderer {
         if use_present_off && let Some(n) = self.compose_present_offscreen(win, input, &mut enc) {
             ungated_built = Some(n);
         }
+        // The M1b sub-row translate, over the composed copy: after the halo and
+        // the haze (they ride), before the card (it stays pinned). Same encoder
+        // ⇒ record order ⇒ execution order.
+        if frac != 0 {
+            self.shift_present_copy_band(win, input, &mut enc);
+        }
         // The card, over the finished copy — AFTER the halo and the haze, so the
         // chrome sits on top exactly as it did when both were baked into the
         // offscreen. Same encoder ⇒ record order ⇒ execution order.
@@ -13252,10 +13461,11 @@ impl GpuRenderer {
         }
 
         // 2. Ensure a blit pipeline for this destination format exists. The tray is
-        //    already composited (into the offscreen on the in-place route, over the
-        //    `present_offscreen` copy on the copy route — and the blit binds whichever
-        //    of the two this frame composited into, see `use_present_off`), so the
-        //    blit just blits the frame-with-card — no swapchain-side tray pass.
+        //    already composited over the `present_offscreen` copy (the copy route is
+        //    the only route now; the blit binds the copy when this frame composed
+        //    one, else the offscreen itself — never haloed, never translated — see
+        //    `use_present_off`), so the blit just blits the frame-with-card — no
+        //    swapchain-side tray pass.
         let format = dest.format;
         self.ensure_blit_pipeline(format);
         // M3 phase B: the PROVEN present gate (HdrPresentGate.Present — see
@@ -13613,23 +13823,99 @@ impl GpuRenderer {
             );
         }
         self.ctx.queue.submit([enc.finish()]);
+    }
 
-        // A scroll frame composited the halo IN PLACE into the offscreen, and an
-        // in-place card baked itself there too, so the offscreen is no longer the
-        // clean base+aurora frame `encode_present_frame` just stamped `present_prev`
-        // for: the NEXT present must not scissor against it (the halo would be
-        // Load-preserved and re-added; the card would compound and strand). Force a
-        // clean FULL repaint next present.
-        //
-        // `tray_in_place` is load-bearing, not belt-and-braces: it is the seam where
-        // a card LEAVES the in-place route. A frame that ends a sub-row glide bakes
-        // the card into the offscreen and stamps `present_prev`; without this the
-        // NEXT frame (frac back to 0 ⇒ `tray_over_copy`) would trust that stamp,
-        // scissor against an offscreen carrying a baked card, and then draw the card
-        // AGAIN over the copy — a doubled, and on a moved card a stranded, pill.
-        if bake_in_place || tray_in_place {
-            win.present_prev = None;
+    /// M1b SUB-ROW SCROLL, ON THE COPY (the wgpu present arm): translate the
+    /// terminal-content grid band `[grid_top_row, grid_bot_row)` of this window's
+    /// `present_offscreen` by the SIGNED `input.scroll_frac_px` device px — the
+    /// SAME staged two-copy `band_shift_ops` plan as `shift_offscreen_band`, the
+    /// same resident `shift_scratch`, recorded into the CALLER's encoder (the one
+    /// that carries the compose, the halo and the blit: one commit, and record
+    /// order puts it after the halo/haze and before the card).
+    ///
+    /// WHY THE COPY: the offscreen is the scissor base. Translating it in place
+    /// (the retired design) forced `RepaintScope::Full` on every glide frame and
+    /// on the frame after, so a glide — the one interaction that is ALL frames —
+    /// ran on the most expensive frame class the renderer has, and a dense
+    /// window could not tell a glide from a flood. The copy is throwaway by
+    /// contract, so translating it costs two band copies and NO repaint.
+    ///
+    /// BOOKKEEPING: the band of the copy no longer matches the offscreen, so it
+    /// is unioned into `present_offscreen_fx` — the next
+    /// `compose_present_offscreen` re-copies exactly that band from the clean
+    /// offscreen (translated again on the next glide frame, or restored on the
+    /// frame the glide lands). `union_rect_opt`'s `None` stays absorbing, so a
+    /// tracker already at "everything" can only stay there. Chrome rows outside
+    /// the band are never named by either copy — the chrome-invariance theorem.
+    #[cfg(wgpu_arm)]
+    fn shift_present_copy_band(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        enc: &mut wgpu::CommandEncoder,
+    ) {
+        let Some((w, h)) = win.present_offscreen.as_ref().map(|p| (p.w, p.h)) else {
+            return;
+        };
+        let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
+            self.cpu.grid_top(),
+            self.cell_size().1,
+            input.grid_top_row,
+            input.grid_bot_row,
+            h as usize,
+        );
+        let Some(shift) = band_shift_ops(y0, y1, i64::from(input.scroll_frac_px)) else {
+            return;
+        };
+        // The resident scratch, exactly as `shift_offscreen_band_px` ensures it.
+        let scratch_ok = win
+            .shift_scratch
+            .as_ref()
+            .is_some_and(|t| t.width() == w && t.height() == h);
+        if !scratch_ok {
+            let format = crate::device_layer::TexelFormat::from_wgpu(self.ctx.offscreen_format())
+                .expect("the offscreen format is inside the map's closed set of six");
+            win.shift_scratch = Some(self.ctx.device_layer().create_texture_2d(
+                "aterm-gpu m1b scroll shift scratch",
+                format,
+                w,
+                h,
+                crate::device_layer::TexUsage {
+                    sampled: false,
+                    render: false,
+                    copy_src: true,
+                    copy_dst: true,
+                },
+                None,
+            ));
         }
+        // The band of the copy diverges from the offscreen from here on.
+        win.present_offscreen_fx = union_rect_opt(
+            win.present_offscreen_fx,
+            Some([0, y0 as u32, w, y1 as u32]),
+            (w, h),
+        );
+        let po = win.present_offscreen.as_ref().expect("dims read above");
+        let scratch = win.shift_scratch.as_ref().expect("just ensured").wgpu();
+        fn rect(tex: &wgpu::Texture, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            }
+        }
+        let extent = wgpu::Extent3d {
+            width: w,
+            height: shift.moved,
+            depth_or_array_layers: 1,
+        };
+        // 1. Stage the moved rows into the scratch (distinct texture ⇒ no
+        //    overlap UB).
+        enc.copy_texture_to_texture(rect(&po.tex, shift.src_y), rect(scratch, 0), extent);
+        // 2. Lay them back shifted; the exposed strip keeps the copy's own
+        //    pixels — the documented-deferred placeholder, byte for byte.
+        enc.copy_texture_to_texture(rect(scratch, 0), rect(&po.tex, shift.dst_y), extent);
     }
 
     /// HEADLESS PRESENT-REAL: present `input` into this window's persistent
@@ -14346,10 +14632,7 @@ impl GpuRenderer {
             by0 = by0.min(ry);
             bx1 = bx1.max(rx.saturating_add(ew));
             by1 = by1.max(ry.saturating_add(eh));
-            v.push(BgInstance {
-                rect: [rx, ry, q.w, q.h],
-                color: glow4(q),
-            });
+            v.push(GlowInstance::of([rx, ry, q.w, q.h], q));
         }
         let n = v.len();
         let any_thin = v
@@ -14371,7 +14654,12 @@ impl GpuRenderer {
                 };
                 let (num, den) = (num_w * num_h, den_w * den_h);
                 if den > 1 {
-                    for c in &mut inst.color[..3] {
+                    // BOTH ends of the ramp scale by the same area ratio, so
+                    // the widened quad's gradient is the thin quad's, dimmed.
+                    for c in inst.color[..3]
+                        .iter_mut()
+                        .chain(inst.color2[..3].iter_mut())
+                    {
                         *c = ((u32::from(*c) * num + den / 2) / den) as u8;
                     }
                 }
@@ -19000,7 +19288,19 @@ impl GpuRenderer {
                 aterm_render::CharFgWalk::new(u16::try_from(r).map_or(&[][..], |row| {
                     aterm_render::char_fg_row_slice(&input.char_fg, row)
                 }));
-            for (c, cell) in cells.iter().take(cols).enumerate() {
+            // The sparse lane is already sorted by column. Visit only cells
+            // carrying marks instead of doing geometry and sparse lookups for
+            // every unaccented cell on the row. Group equal columns so even a
+            // host-built duplicate is painted once, using the same entry the
+            // existing `combining_at` binary search selects below.
+            for entries in input.combining[r].chunk_by(|a, b| a.0 == b.0) {
+                let c = entries[0].0;
+                if c >= cols {
+                    break;
+                }
+                let Some(cell) = cells.get(c) else {
+                    break;
+                };
                 let (cx, ccw, run) = if row_uniform {
                     (c * rcw, rcw, None)
                 } else {
@@ -19657,10 +19957,9 @@ impl GpuRenderer {
                 if (q.row as usize) >= rows || !row_active(q.row as usize) {
                     continue;
                 }
-                self.inst.glow_under.push(BgInstance {
-                    rect: [q.x, q.y, q.w, q.h],
-                    color: glow4(q),
-                });
+                self.inst
+                    .glow_under
+                    .push(GlowInstance::of([q.x, q.y, q.w, q.h], q));
             }
         }
 
@@ -19698,7 +19997,7 @@ impl GpuRenderer {
 
         // LUMEN aurora: PREMULTIPLIED ADDITIVE light quads (comet/bloom/ring/sparks).
         // The host already premultiplied `q.color`, so we emit it straight through
-        // `glow4` — which carries the quad's own `alpha` byte, `0` for every quad
+        // `glow8` — which carries the quad's own `alpha` byte, `0` for every quad
         // this stream emits, so the glow pipeline's `src + dst·(1 − src_a)` blend
         // is One/One here and the result is byte-identical to the CPU `add_sat`. Quads
         // are WINDOW-ABSOLUTE pixels (converted at the producer) tagged with a
@@ -19709,10 +20008,9 @@ impl GpuRenderer {
                 if (q.row as usize) >= rows || !row_active(q.row as usize) {
                     continue;
                 }
-                self.inst.glow_add.push(BgInstance {
-                    rect: [q.x, q.y, q.w, q.h],
-                    color: glow4(q),
-                });
+                self.inst
+                    .glow_add
+                    .push(GlowInstance::of([q.x, q.y, q.w, q.h], q));
             }
         }
 
@@ -19767,15 +20065,15 @@ impl GpuRenderer {
                 if (q.row as usize) >= rows || !row_active(q.row as usize) {
                     continue;
                 }
-                self.inst.nova_add.push(BgInstance {
-                    rect: [
+                self.inst.nova_add.push(GlowInstance::of(
+                    [
                         pad16.saturating_add(q.x),
                         grid_top16.saturating_add(q.y),
                         q.w,
                         q.h,
                     ],
-                    color: glow4(q),
-                });
+                    q,
+                ));
             }
         }
 
@@ -19897,7 +20195,7 @@ impl GpuRenderer {
 
         // Underline/bar/hollow cursors paint OVER the glyph (the CPU fills
         // them after its glyph blits), so their quads form a third pass that
-        // runs after the glyph pass. Same rects as the CPU: `cursor_rects`.
+        // runs after the glyph pass. Same rects as the CPU: `for_each_cursor_rect`.
         // (Extends the cleared persistent `cursor` stream — identical contents
         // in identical order to the old `.collect()`.)
         if cursor_drawn && !block_cursor && row_active(cr) {
@@ -19913,19 +20211,24 @@ impl GpuRenderer {
             // hollow block's right rail is the one that would otherwise land in the
             // neighbouring pane); uniform rows keep every rect as-is, since
             // `cur_run` is None and the map is the identity it always was.
-            self.inst.cursor.extend(
-                aterm_render::cursor_rects(style, pad + cur_x, grid_top + cr * ch, cur_cw, ch)
-                    .into_iter()
-                    .filter_map(|[x, y, rw, rh]| {
-                        let (x, rw) = match cur_run {
-                            None => (x, rw),
-                            Some((rx0, rx1)) => clip_x_span(x, rw, rx0, rx1)?,
-                        };
-                        Some(BgInstance {
+            aterm_render::for_each_cursor_rect(
+                style,
+                pad + cur_x,
+                grid_top + cr * ch,
+                cur_cw,
+                ch,
+                |[x, y, rw, rh]| {
+                    let clipped = match cur_run {
+                        None => Some((x, rw)),
+                        Some((rx0, rx1)) => clip_x_span(x, rw, rx0, rx1),
+                    };
+                    if let Some((x, rw)) = clipped {
+                        self.inst.cursor.push(BgInstance {
                             rect: [sat_pos_u16(x), sat_pos_u16(y), rw as u16, rh as u16],
                             color: cursor_color,
-                        })
-                    }),
+                        });
+                    }
+                },
             );
         }
 
@@ -21170,8 +21473,11 @@ fn rgb4_u32(c: u32) -> [u8; 4] {
     rgb4([(c >> 16) as u8, (c >> 8) as u8, c as u8])
 }
 
-/// A flat [`GlowQuad`] as a `BgInstance` colour: the host's PREMULTIPLIED bytes
-/// with the quad's own [`GlowQuad::alpha`] in the alpha slot.
+/// A [`GlowQuad`] as a [`GlowInstance`]'s colour PAIR — `[r, g, b, a, r2, g2,
+/// b2, a2]`: the host's PREMULTIPLIED bytes at the quad's LEFT edge with the
+/// quad's own [`GlowQuad::alpha`] in the alpha slot, then the RIGHT edge
+/// ([`GlowQuad::color2`] / [`GlowQuad::alpha2`]) packed the same way. A flat
+/// quad packs its one colour twice.
 ///
 /// **THE ALPHA BYTE IS THE MODE**, and it is the reason this is not
 /// [`rgb4_u32`]. The glow pipeline's blend is `src + dst·(1 − src_a)`, which is
@@ -21181,12 +21487,16 @@ fn rgb4_u32(c: u32) -> [u8; 4] {
 /// paint. Handing this pipeline `rgb4_u32`'s `a == 255` would ask for
 /// `src + dst·0` — a REPLACE — so the two must not be confused, and there is
 /// one function so they cannot be.
-fn glow4(q: &aterm_render::GlowQuad) -> [u8; 4] {
+fn glow8(q: &aterm_render::GlowQuad) -> [u8; 8] {
     [
         (q.color >> 16) as u8,
         (q.color >> 8) as u8,
         q.color as u8,
         q.alpha,
+        (q.color2 >> 16) as u8,
+        (q.color2 >> 8) as u8,
+        q.color2 as u8,
+        q.alpha2,
     ]
 }
 
@@ -21978,12 +22288,12 @@ impl GpuRenderer {
             // W6a: the WHOLE ungated stream, bound at the `extract_first`
             // BYTE offset — the W1 offset verb the production Submit B uses,
             // armed here so the pinned W5 differential covers the spelling.
-            let insts: &[BgInstance] = &self.bloom_glow_scratch;
+            let insts: &[GlowInstance] = &self.bloom_glow_scratch;
             let bytes: &[u8] = aterm_bits::cast_slice(insts);
             let stream = mint.buffer(bytes.len())?;
             // SAFETY: fresh exactly-sized shared buffer; no GPU work on it.
             unsafe { mtl::buffer_write(&stream, bytes) };
-            let extract_offset = extract_first as usize * std::mem::size_of::<BgInstance>();
+            let extract_offset = extract_first as usize * std::mem::size_of::<GlowInstance>();
             let (uw, uh, tb) = self.uniform_written.unwrap_or((fw, fh, 0));
             assert_eq!((uw, uh), (fw, fh), "the encode wrote this frame's uniforms");
             let cell = mint.buffer(std::mem::size_of::<Uniforms>())?;
@@ -22195,6 +22505,7 @@ impl GpuRenderer {
             offscreen: &offscreen,
             present_off: use_present_off.then_some(&present_off),
             copy_rect: [0, 0, fw, fh],
+            band_shift: None,
             bloom: bloom_parts.as_ref().map(
                 |(half, extract_pso, cell, extract_binds, stream, count, pso, ubuf, binds, sc)| {
                     BloomPasses {
@@ -22652,8 +22963,9 @@ impl GpuRenderer {
     /// TEST HELPER (W5, rows 14/15 — the crown pair, ONE construction site):
     /// the boost pass through the REAL machinery — `ensure_hdr_glow_pipeline`
     /// / `ensure_sdr_glow_pipeline` (each built by its table row), the REAL
-    /// shared `glow_boost` uniform buffer + bind group, a `BgInstance`-layout
-    /// stream at slot 0 — onto a seeded Load target of the row's own resolved
+    /// shared `glow_boost` uniform buffer + bind group, a `GlowInstance`-layout
+    /// stream at slot 0 (each `(rect, colour)` fixture packed FLAT, the colour
+    /// at both ends) — onto a seeded Load target of the row's own resolved
     /// format (Rgba16Float for the EDR crown, the caller's present format for
     /// the SDR twin), crown-scissored, instanced. Readback texel size follows
     /// the format (8 for f16).
@@ -22694,9 +23006,13 @@ impl GpuRenderer {
                 _pad: [0.0, 0.0],
             }),
         );
-        let insts: Vec<BgInstance> = instances
+        let insts: Vec<GlowInstance> = instances
             .iter()
-            .map(|&(rect, color)| BgInstance { rect, color })
+            .map(|&(rect, color)| GlowInstance {
+                rect,
+                color,
+                color2: color,
+            })
             .collect();
         let stream = self.stream_buffer_for_test(aterm_bits::cast_slice(&insts));
         let mut enc = self
@@ -23457,6 +23773,9 @@ mod tests {
         fn bg(v: &mut Vec<super::BgInstance>) {
             v.push(aterm_bits::Zeroable::zeroed());
         }
+        fn gw(v: &mut Vec<super::GlowInstance>) {
+            v.push(aterm_bits::Zeroable::zeroed());
+        }
         fn gl(v: &mut Vec<super::GlyphInstance>) {
             v.push(aterm_bits::Zeroable::zeroed());
         }
@@ -23480,17 +23799,17 @@ mod tests {
             StreamCase {
                 stream: "glow_under",
                 want: EffectPipeline::GlowAdd,
-                fill: |i| bg(&mut i.glow_under),
+                fill: |i| gw(&mut i.glow_under),
             },
             StreamCase {
                 stream: "glow_add",
                 want: EffectPipeline::GlowAdd,
-                fill: |i| bg(&mut i.glow_add),
+                fill: |i| gw(&mut i.glow_add),
             },
             StreamCase {
                 stream: "nova_add",
                 want: EffectPipeline::GlowAdd,
-                fill: |i| bg(&mut i.nova_add),
+                fill: |i| gw(&mut i.nova_add),
             },
             StreamCase {
                 stream: "glow_halo",
@@ -23692,6 +24011,8 @@ mod tests {
             color: 0x0020_2020,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0020_2020,
+            alpha2: 0,
         });
         let want = frame_effect_pipelines(&inst, &input, true);
         let mut expected = [false; EFFECT_PIPELINE_COUNT];
@@ -25810,6 +26131,8 @@ ab\r\n",
             color: 0x0030_50A0, // premultiplied light,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0030_50A0,
+            alpha2: 0,
         };
 
         let run = |gpu: &mut GpuRenderer, label: &str| {
@@ -25906,6 +26229,8 @@ ab\r\n",
             color: 0x0030_50A0,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0030_50A0,
+            alpha2: 0,
         };
         let mut glow_a = frame(b"AAAA\r\nbbbb");
         glow_a.cursor_glow_add = vec![quad(4, 0)];
@@ -25984,6 +26309,8 @@ ab\r\n",
             color: 0x0030_50A0,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0030_50A0,
+            alpha2: 0,
         }];
         let seq = [frame(b"AAAA"), with_edge_glow, frame(b"AAAA\r\nbbbb")];
         let mut win = WindowGpu::new();
@@ -26129,6 +26456,152 @@ ab\r\n",
         assert_ne!(
             shifted.pixels, zero.pixels,
             "negative control: terminal pixels outside the pinned tray must move"
+        );
+    }
+
+    /// THE GLIDE STAYS ON THE SCISSOR. A sub-row scroll frame over UNCHANGED
+    /// content must take the gate / scissor path, and so must the frame that
+    /// lands the glide (frac back to 0): the translate lives on the throwaway
+    /// present copy, never on the offscreen the diff compares against. Against
+    /// the retired `shift_full` law both presents counted as `full_repaints`
+    /// (a frac this frame OR last frame cleared `present_prev`), so this test
+    /// FAILS on that code at the first assertion. Drives the SHIPPED
+    /// `present_to_view` through the swapchain stand-in (which, unlike the
+    /// readback helpers, does not reset `present_prev`).
+    #[test]
+    fn fractional_scroll_frames_keep_the_scissor_path() {
+        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
+                return;
+            }
+        };
+        #[cfg(target_os = "macos")]
+        gpu.disarm_metal_for_test();
+        let (rows, cols) = (6usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
+        let mut input = term.cell_frame(rows, cols);
+        input.grid_top_row = 1;
+        input.grid_bot_row = rows - 1;
+        let (fw, fh) = gpu.frame_size(rows, cols);
+        let dest = (fw as u32 + 9, fh as u32 + 7);
+        let mut win = WindowGpu::new();
+
+        // Prime: the first present is Full by definition (no prior frame).
+        input.scroll_frac_px = 0;
+        gpu.present_swapchain_standin_for_test(&mut win, &input, false, None, None, dest);
+        let full_after_prime = gpu.full_repaints();
+        let scissor_after_prime = gpu.scissor_taken();
+
+        // A glide frame: same content, frac 3 ⇒ the gate path (no dirty rows).
+        input.scroll_frac_px = 3;
+        gpu.present_swapchain_standin_for_test(&mut win, &input, false, None, None, dest);
+        assert_eq!(
+            gpu.full_repaints(),
+            full_after_prime,
+            "a sub-row scroll frame over unchanged content must not force a Full repaint"
+        );
+        assert!(
+            gpu.scissor_taken() > scissor_after_prime,
+            "the frac frame must take the scissor/gate path (scissor_taken={}, full_repaints={})",
+            gpu.scissor_taken(),
+            gpu.full_repaints()
+        );
+
+        // A second glide frame at a different frac, then the landing frame
+        // (frac 0): neither owes a Full repaint either — the retired law forced
+        // one on "the frame after" as well.
+        for frac in [7, 0] {
+            input.scroll_frac_px = frac;
+            let before = gpu.scissor_taken();
+            gpu.present_swapchain_standin_for_test(&mut win, &input, false, None, None, dest);
+            assert_eq!(
+                gpu.full_repaints(),
+                full_after_prime,
+                "frac {frac}: no Full repaint"
+            );
+            assert!(gpu.scissor_taken() > before, "frac {frac}: scissor path");
+        }
+
+        // THE INVARIANT UNDER IT: the offscreen never held a translated frame.
+        // `present_input_readback` reads the offscreen (no shift of its own), so
+        // after the glide it must equal a fresh untranslated oracle render.
+        input.scroll_frac_px = 0;
+        let resident = gpu.present_input_readback(&mut win, &input);
+        let mut fresh = WindowGpu::new();
+        let oracle = gpu.render_input(&mut fresh, &input, None);
+        assert_eq!(
+            resident.pixels, oracle.pixels,
+            "the scissor base must stay untranslated through a glide"
+        );
+        // Negative control for the assertion above: a translated oracle differs.
+        input.scroll_frac_px = 3;
+        let translated = gpu.render_input(&mut fresh, &input, None);
+        assert_ne!(
+            translated.pixels, oracle.pixels,
+            "frac 3 must move terminal pixels"
+        );
+    }
+
+    /// THE ARMED ARM'S TWIN: after an armed present with a nonzero frac, the
+    /// Metal offscreen holds the UNTRANSLATED frame (the translate happened on
+    /// `metal_present_off` inside Submit B), and the presented bytes still move
+    /// the band while leaving chrome rows pinned. Against the retired design
+    /// `shift_offscreen_band` translated the offscreen in place, so the first
+    /// byte assertion FAILS there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn armed_fractional_scroll_keeps_the_offscreen_untranslated() {
+        if crate::metal::ffi::Device::preferred().is_none() {
+            crate::stderr_line!("SKIP: no Metal device");
+            return;
+        }
+        let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
+                return;
+            }
+        };
+        gpu.arm_metal_for_test();
+        let (rows, cols) = (6usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\x1b[?25lrow zero\r\nrow one\r\nrow two\r\nrow three");
+        let mut input = term.cell_frame(rows, cols);
+        input.grid_top_row = 1;
+        input.grid_bot_row = rows - 1;
+        let mut win = WindowGpu::new();
+        let untranslated = gpu.render_input(&mut win, &input, None);
+        assert!(
+            gpu.metal_render_armed(),
+            "the first frame must mint the arm"
+        );
+        let (w, h) = (untranslated.width as u32, untranslated.height as u32);
+        let dest = (w + 9, h + 7);
+
+        input.scroll_frac_px = 0;
+        let flat = gpu
+            .metal_present_bytes_for_test(&mut win, &input, dest, false)
+            .expect("armed present");
+        input.scroll_frac_px = 3;
+        let glided = gpu
+            .metal_present_bytes_for_test(&mut win, &input, dest, false)
+            .expect("armed present");
+        // (1) The offscreen is still the untranslated frame.
+        let resident = gpu
+            .metal_read_back_offscreen(&win, w, h)
+            .expect("armed offscreen readback");
+        assert_eq!(
+            resident.pixels, untranslated.pixels,
+            "the armed scissor base must stay untranslated through a glide"
+        );
+        // (2) The glass moved: the presented bytes differ from the frac-0 present
+        //     (non-vacuity — the translate really landed on the copy).
+        assert_ne!(
+            glided, flat,
+            "a frac 3 present must move terminal pixels on glass"
         );
     }
 

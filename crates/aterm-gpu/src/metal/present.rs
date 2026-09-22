@@ -602,6 +602,26 @@ pub(crate) struct ShimmerPass<'a> {
     pub(crate) region: [u32; 4],
 }
 
+/// The M1b sub-row band shift (§2: two staged whole-width copies OVER THE
+/// PRESENT COPY, between the shimmer and the tray). The SAME pure
+/// `BandShift` plan the wgpu arm records into its present encoder
+/// (`shift_present_copy_band`), run through the overlap-refusing W1 copy
+/// verb via a resident scratch. It lives HERE, in Submit B, and never on
+/// the offscreen: a glide frame used to translate the scissor base in place
+/// and then had to force `RepaintScope::Full` on itself AND the frame after
+/// (the retired `shift_full` law), which made every glide frame the most
+/// expensive frame class the renderer has. Over the copy the offscreen stays
+/// untranslated for the whole glide — the CPU `render_input_cached` →
+/// `present_view` precedent — and the gate / scissor / E7 rescue keep
+/// working underneath it.
+pub(crate) struct BandShiftPass<'a> {
+    pub(crate) shift: crate::renderer::BandShift,
+    /// Frame-sized resident scratch (`WindowGpu::metal_shift_scratch`): a
+    /// same-texture overlapping copy is undefined in Metal, so the moved rows
+    /// stage through it.
+    pub(crate) scratch: &'a SealedTexture,
+}
+
 /// The tray pass (§2: row 17, 4-vertex strip, straight-alpha src-over).
 pub(crate) struct TrayPass<'a> {
     pub(crate) pso: &'a Obj,
@@ -645,6 +665,9 @@ pub(crate) struct PresentSequence<'a> {
     pub(crate) copy_rect: [u32; 4],
     pub(crate) bloom: Option<BloomPasses<'a>>,
     pub(crate) shimmer: Option<ShimmerPass<'a>>,
+    /// The sub-row scroll translate, over the copy (requires `present_off`;
+    /// the sequence REFUSES it against the bare offscreen).
+    pub(crate) band_shift: Option<BandShiftPass<'a>>,
     pub(crate) tray: Option<TrayPass<'a>>,
     /// The letterbox blit (row 16) onto the drawable: POST_FS binds; the
     /// clear is the live terminal background.
@@ -759,6 +782,35 @@ pub(crate) fn encode_present_sequence(
         pass.set_fragment_sampler(r.sampler, r.sampler_slot);
         pass.set_fragment_buffer(r.uniform, r.uniform_slot);
         pass.draw_fullscreen_triangle()?;
+    }
+
+    // 3b. The M1b sub-row band shift, over the COPY — AFTER the halo and the
+    //     haze (so they ride the glide exactly as the oracle's in-place bake
+    //     under `shift_offscreen_band` does) and BEFORE the tray (chrome stays
+    //     pinned — the chrome-invariance theorem: rows outside the band are
+    //     never named by either copy). Refused without a present copy: the
+    //     shift must never land on the scissor base again.
+    if let Some(bs) = &seq.band_shift {
+        if seq.present_off.is_none() {
+            return Err(
+                "the band shift needs the present copy, never the offscreen (the \
+                 scissor base stays untranslated)"
+                    .to_owned(),
+            );
+        }
+        let w = composed.width();
+        let (src_y, dst_y, moved) = (
+            bs.shift.src_y as usize,
+            bs.shift.dst_y as usize,
+            bs.shift.moved as usize,
+        );
+        // 1. Stage the moved rows `[src_y, src_y+moved)` into the scratch.
+        cb.copy_texture_sub_rect(composed, (0, src_y), bs.scratch, (0, 0), w, moved)?;
+        // 2. Lay them back at `[dst_y, dst_y+moved)`. The `|frac|`-px strip at
+        //    the opposite edge keeps the copy's own (compose-copied) pixels —
+        //    the documented-deferred placeholder, byte for byte what the
+        //    in-place shift left.
+        cb.copy_texture_sub_rect(bs.scratch, (0, 0), composed, (0, dst_y), w, moved)?;
     }
 
     // 4. Tray: the card over the finished copy (straight-alpha src-over,
@@ -1300,6 +1352,7 @@ mod tests {
                 copy_rect: [0, 0, 0, 0],
                 bloom: None,
                 shimmer: None,
+                band_shift: None,
                 tray: None,
                 blit: PostPass {
                     pso: if is_hdr { &blit_edr } else { &blit_sdr },

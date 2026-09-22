@@ -379,7 +379,11 @@ fn pre_tool_use_blocks_the_tool_call_exactly_while_the_session_is_held() {
     w.wait_ready();
     let (a, _b) = w.two_sessions();
 
-    let before = hook(&w, "{}", &["run", "pre-tool-use", "--session", &a]);
+    let before = hook(
+        &w,
+        "{}",
+        &["run", "pre-tool-use", "--gate-tools", "--session", &a],
+    );
     assert_eq!(code(&before), 0, "an un-halted session gates nothing");
 
     let mut god = w.god();
@@ -393,7 +397,11 @@ fn pre_tool_use_blocks_the_tool_call_exactly_while_the_session_is_held() {
             .then_some(())
     });
 
-    let held = hook(&w, "{}", &["run", "pre-tool-use", "--session", &a]);
+    let held = hook(
+        &w,
+        "{}",
+        &["run", "pre-tool-use", "--gate-tools", "--session", &a],
+    );
     assert_eq!(code(&held), 2, "a held session must block the tool call");
     let stderr = String::from_utf8(held.stderr).expect("utf-8 stderr");
     // THE HUMAN'S OWN REASON, end to end. §5.3 has the bridge apply `hold <sid>
@@ -424,8 +432,361 @@ fn pre_tool_use_blocks_the_tool_call_exactly_while_the_session_is_held() {
             .contains("hold=0")
             .then_some(())
     });
-    let after = hook(&w, "{}", &["run", "pre-tool-use", "--session", &a]);
+    let after = hook(
+        &w,
+        "{}",
+        &["run", "pre-tool-use", "--gate-tools", "--session", &a],
+    );
     assert_eq!(code(&after), 0, "the gate lifts with the halt");
+}
+
+// ---------------------------------------------------------------------------
+// PermissionRequest / Notification — answer what can be made safe, escalate
+// the rest (2026-09-21)
+// ---------------------------------------------------------------------------
+
+/// The permission-request hook's stdin for a Bash command, in the vendor's
+/// shape (2.1.278).
+fn permission_input(mode: &str, tool: &str, command: &str, cwd: &str) -> String {
+    format!(
+        r#"{{"session_id":"x","transcript_path":"/nowhere","cwd":"{cwd}","permission_mode":"{mode}","hook_event_name":"PermissionRequest","tool_name":"{tool}","tool_input":{{"command":"{command}","description":"d"}},"permission_suggestions":[]}}"#
+    )
+}
+
+fn attention_of(w: &World, sid: &str) -> String {
+    let meta = w.verb(&format!("@{sid} meta"));
+    meta.header()
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix("attention="))
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// **A bypass-permissions removal on a shell variable is answered — guarded.**
+/// The decision on stdout carries the rewritten command; the window is told
+/// `story approved`; nothing is escalated. A literal critical path is NOT
+/// decided and NOT escalated by the request: no stdout, no attention — the
+/// box is the human's, and another hook may yet answer it. The vendor's own
+/// `permission_prompt` notification is what escalates, and the next tool call
+/// (where `--gate-tools` installed it) or prompt clears it — and an attention
+/// a human wrote is never touched.
+#[test]
+fn a_guardable_removal_is_answered_and_the_rest_is_escalated_then_cleared() {
+    let w = World::boot("permreq", &[]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let state = ledger_dir(&w, "permreq");
+    let dir = state.display().to_string();
+
+    let guarded = hook(
+        &w,
+        &permission_input(
+            "bypassPermissions",
+            "Bash",
+            "S=/tmp/z; rm -rf $S/x",
+            "/tmp/z",
+        ),
+        &[
+            "run",
+            "permission-request",
+            "--session",
+            &a,
+            "--state",
+            &dir,
+        ],
+    );
+    assert_eq!(code(&guarded), 0);
+    let out = String::from_utf8(guarded.stdout).expect("utf-8 stdout");
+    assert!(out.contains(r#""behavior": "allow""#), "{out}");
+    assert!(
+        out.contains("rm -rf ${S:?}/x"),
+        "the guarded command is the updatedInput: {out}"
+    );
+    assert!(
+        out.contains(r#""hookEventName": "PermissionRequest""#),
+        "{out}"
+    );
+    // Attributed, and pointing at its audit row: `aterm harness` is the
+    // harness's `mark::STEM`, `link rm-guard` this decider, `id=1` the row.
+    assert!(
+        out.contains("aterm harness link rm-guard id=1: "),
+        "the systemMessage names the decider and the row: {out}"
+    );
+    assert_eq!(
+        attention_of(&w, &a),
+        "-",
+        "a decided request escalates nothing"
+    );
+    let status = w.verb(&format!("@{a} status"));
+    assert!(
+        status.header().contains("story=1"),
+        "the window was told `story approved`: {}",
+        status.header()
+    );
+    let log = std::fs::read_to_string(state.join("decisions").join(format!("{a}.log")))
+        .expect("the decision log");
+    assert!(log.contains("allow guarded $S -> ${S:?}"), "{log}");
+    assert!(
+        log.lines()
+            .next()
+            .is_some_and(|l| l.contains(" id=1 allow ")),
+        "the row carries the id the systemMessage quotes: {log}"
+    );
+
+    // A literal critical path: no decision, and no attention from the request.
+    let undecided = hook(
+        &w,
+        &permission_input("bypassPermissions", "Bash", "rm -rf /usr", "/tmp/z"),
+        &[
+            "run",
+            "permission-request",
+            "--session",
+            &a,
+            "--state",
+            &dir,
+        ],
+    );
+    assert_eq!(code(&undecided), 0);
+    assert!(
+        undecided.stdout.is_empty(),
+        "an undecided request prints nothing"
+    );
+    assert_eq!(
+        attention_of(&w, &a),
+        "-",
+        "the request never escalates: another hook may answer the box"
+    );
+    let log = std::fs::read_to_string(state.join("decisions").join(format!("{a}.log")))
+        .expect("the decision log");
+    assert!(log.contains("undecided a top-level directory"), "{log}");
+    assert!(
+        log.lines()
+            .nth(1)
+            .is_some_and(|l| l.contains(" id=2 undecided ")),
+        "each row its own id: {log}"
+    );
+
+    // The vendor's "needs you": the escalation.
+    let waiting = hook(
+        &w,
+        r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}"#,
+        &["run", "notification", "--session", &a, "--state", &dir],
+    );
+    assert_eq!(code(&waiting), 0);
+    assert!(attention_of(&w, &a).starts_with("claude%20needs%20approval"));
+    assert!(state.join("attention").join(&a).exists(), "the marker");
+
+    // The next tool call clears it (where --gate-tools installed the hook).
+    let cleared = hook(
+        &w,
+        "{}",
+        &[
+            "run",
+            "pre-tool-use",
+            "--gate-tools",
+            "--session",
+            &a,
+            "--state",
+            &dir,
+        ],
+    );
+    assert_eq!(code(&cleared), 0);
+    assert_eq!(attention_of(&w, &a), "-", "cleared at the next tool call");
+    assert!(
+        !state.join("attention").join(&a).exists(),
+        "the marker is gone"
+    );
+
+    // And a default install's Stop, which opens nothing else, clears it too.
+    let _ = hook(
+        &w,
+        r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"again"}"#,
+        &["run", "notification", "--session", &a, "--state", &dir],
+    );
+    assert!(attention_of(&w, &a).starts_with("claude%20needs%20approval"));
+    let stopped = hook(&w, "{}", &["run", "stop", "--session", &a, "--state", &dir]);
+    assert_eq!(code(&stopped), 0);
+    assert_eq!(attention_of(&w, &a), "-", "cleared when the turn ends");
+
+    // A human's attention stands: the escalation goes around it, and a clear
+    // never removes it.
+    assert!(w
+        .verb(&format!("@{a} meta set attention human wrote this"))
+        .ok());
+    let around = hook(
+        &w,
+        r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"x"}"#,
+        &["run", "notification", "--session", &a, "--state", &dir],
+    );
+    assert_eq!(code(&around), 0);
+    assert_eq!(attention_of(&w, &a), "human%20wrote%20this");
+    let _ = hook(&w, "{}", &["run", "stop", "--session", &a, "--state", &dir]);
+    assert_eq!(
+        attention_of(&w, &a),
+        "human%20wrote%20this",
+        "a clear never removes a human's"
+    );
+    assert!(w.verb(&format!("@{a} meta unset attention")).ok());
+}
+
+/// **`$ATERM_NO_HARNESS` switches the approval-box hooks off** — read the one
+/// way every harness surface reads it (unset, empty and `"0"` are "on"). With
+/// it set, a guardable removal is NOT answered (nothing on stdout: the box is
+/// the human's), nothing is logged as decided, and a waiting notification
+/// raises no attention; with it `"0"`, the same removal is answered.
+#[test]
+fn no_harness_leaves_a_guardable_box_and_its_notification_alone() {
+    let w = World::boot("noharn", &[]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let state = ledger_dir(&w, "noharn");
+    let dir = state.display().to_string();
+    let input = permission_input(
+        "bypassPermissions",
+        "Bash",
+        "S=/tmp/z; rm -rf $S/x",
+        "/tmp/z",
+    );
+    let args = [
+        "run",
+        "permission-request",
+        "--session",
+        &a,
+        "--state",
+        &dir,
+    ];
+    let env = |off: &'static str| {
+        [
+            ("ATERM_CONTROL_SOCK", w.ctl_sock.clone()),
+            ("ATERM_CONTROL_TOKEN", w.token.clone()),
+            ("ATERM_NO_HARNESS", off.to_string()),
+        ]
+    };
+    let run = |off: &'static str, stdin: &str, args: &[&str]| {
+        let env = env(off);
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        hook_in(&w.tmp, &env, stdin.as_bytes(), args)
+    };
+
+    let off = run("1", &input, &args);
+    assert_eq!(code(&off), 0);
+    assert!(
+        off.stdout.is_empty(),
+        "no decision under ATERM_NO_HARNESS=1: {}",
+        String::from_utf8_lossy(&off.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&off.stderr);
+    assert!(stderr.contains("ATERM_NO_HARNESS"), "said once: {stderr}");
+    assert!(
+        !state.join("decisions").join(format!("{a}.log")).exists(),
+        "nothing was decided, so nothing is logged"
+    );
+
+    let waiting = run(
+        "1",
+        r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"x"}"#,
+        &["run", "notification", "--session", &a, "--state", &dir],
+    );
+    assert_eq!(code(&waiting), 0);
+    assert_eq!(attention_of(&w, &a), "-", "no escalation when switched off");
+
+    // "0" is not engaged: the same removal is answered.
+    let on = run("0", &input, &args);
+    assert_eq!(code(&on), 0);
+    let out = String::from_utf8_lossy(&on.stdout);
+    assert!(out.contains(r#""behavior": "allow""#), "{out}");
+}
+
+/// **An escalation reaches the manager even when the attention is taken.**
+/// A human's own attention is never written over — and that must not also
+/// swallow the `kind=ask` a worker installed with `--report-to` owes its
+/// manager: the box still needs a decision, and the ask is how the manager
+/// learns of it.
+#[test]
+fn an_escalation_asks_the_manager_even_beside_a_humans_attention() {
+    let w = World::boot("permask", &[]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let dir = ledger_dir(&w, "permask").display().to_string();
+    assert!(w
+        .verb(&format!("@{a} meta set attention human wrote this"))
+        .ok());
+    let out = hook(
+        &w,
+        r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}"#,
+        &[
+            "run",
+            "notification",
+            "--session",
+            &a,
+            "--state",
+            &dir,
+            "--report-to",
+            &format!("@{b}"),
+        ],
+    );
+    assert_eq!(code(&out), 0);
+    assert!(out.stdout.is_empty(), "a Notification hook prints nothing");
+    assert_eq!(
+        attention_of(&w, &a),
+        "human%20wrote%20this",
+        "the human's attention stands"
+    );
+    let asks = until("the ask to land in the manager's inbox", || {
+        let asks: Vec<String> = rows(&w, &b)
+            .into_iter()
+            .filter(|r| r.contains("kind=ask"))
+            .collect();
+        (!asks.is_empty()).then_some(asks)
+    });
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert!(w.verb(&format!("@{a} meta unset attention")).ok());
+}
+
+/// **The vendor's own "needs you" is escalated the same way** — and only its
+/// waiting kinds; `auth_success` is nothing to the hook.
+#[test]
+fn a_permission_prompt_notification_sets_the_attention_and_other_kinds_do_not() {
+    let w = World::boot("notify", &[]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let dir = ledger_dir(&w, "notify").display().to_string();
+    let other = hook(
+        &w,
+        r#"{"hook_event_name":"Notification","notification_type":"auth_success","message":"Logged in"}"#,
+        &["run", "notification", "--session", &a, "--state", &dir],
+    );
+    assert_eq!(code(&other), 0);
+    assert_eq!(attention_of(&w, &a), "-");
+    let waiting = hook(
+        &w,
+        r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash","title":"Permission needed"}"#,
+        &["run", "notification", "--session", &a, "--state", &dir],
+    );
+    assert_eq!(code(&waiting), 0);
+    assert!(
+        waiting.stdout.is_empty(),
+        "a Notification hook prints nothing"
+    );
+    let attention = attention_of(&w, &a);
+    assert!(
+        attention.starts_with("claude%20needs%20approval:%20Claude%20needs%20your%20permission"),
+        "{attention}"
+    );
+    assert!(attention.ends_with("permission_prompt"), "{attention}");
+    let _ = hook(
+        &w,
+        "{}",
+        &[
+            "run",
+            "user-prompt-submit",
+            "--session",
+            &a,
+            "--state",
+            &dir,
+        ],
+    );
+    assert_eq!(attention_of(&w, &a), "-", "the human typing clears it");
 }
 
 // ---------------------------------------------------------------------------
@@ -443,12 +804,66 @@ fn stop_exits_zero_on_an_empty_inbox() {
     let out = hook(
         &w,
         "{}",
-        &["run", "stop", "--session", &a, "--timeout", "0.4"],
+        &[
+            "run",
+            "stop",
+            "--keep-alive",
+            "--session",
+            &a,
+            "--timeout",
+            "0.4",
+        ],
     );
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert!(
         out.stderr.is_empty(),
         "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// **THE DEFAULT IS REPORT AND RETURN.** Without `--keep-alive` a `stop` never
+/// parks on `await inbox`: an accepted `task` sitting unread — the row that
+/// exits 2 and keeps the turn alive when the flag IS given
+/// ([`a_newer_row_from_an_accepted_principal_wakes_a_stopped_agent`]) — leaves
+/// this hook at exit 0, at once, having said nothing. A turn a hook holds open
+/// is a turn a human watching the terminal did not see end.
+#[test]
+fn stop_reports_and_returns_when_keep_alive_is_off() {
+    let w = World::boot("stopnowait", &["h-andrew"]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    send(
+        &w,
+        &a,
+        "h-andrew",
+        "task",
+        1,
+        "a%20row%20that%20would%20wake",
+    );
+    until("the task to land", || {
+        (!rows(&w, &a).is_empty()).then_some(())
+    });
+    let began = std::time::Instant::now();
+    let out = hook(
+        &w,
+        &stop_input(false),
+        &["run", "stop", "--session", &a, "--timeout", "20"],
+    );
+    assert_eq!(
+        code(&out),
+        0,
+        "no wait, no wake: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(5),
+        "it must not have waited out the 20 s timeout: {:?}",
+        began.elapsed()
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "and it says nothing: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -474,7 +889,15 @@ fn the_vendors_loop_breaker_returns_at_once() {
     let out = hook(
         &w,
         r#"{"session_id":"x","stop_hook_active":true}"#,
-        &["run", "stop", "--session", &a, "--timeout", "15"],
+        &[
+            "run",
+            "stop",
+            "--keep-alive",
+            "--session",
+            &a,
+            "--timeout",
+            "15",
+        ],
     );
     let took = started.elapsed();
     assert_eq!(
@@ -508,6 +931,7 @@ fn a_newer_row_from_an_accepted_principal_wakes_a_stopped_agent() {
             "hook",
             "run",
             "stop",
+            "--keep-alive",
             "--session",
             &a,
             "--state",
@@ -572,6 +996,7 @@ fn a_deferred_row_can_never_re_fire_the_stop_hook() {
     let args: Vec<&str> = vec![
         "run",
         "stop",
+        "--keep-alive",
         "--session",
         &a,
         "--state",
@@ -651,6 +1076,7 @@ fn an_unlisted_principal_never_wakes_a_stopped_agent() {
         &[
             "run",
             "stop",
+            "--keep-alive",
             "--session",
             &a,
             "--state",
@@ -723,6 +1149,7 @@ fn the_wake_budget_bounds_a_hundred_rows_to_the_budget() {
             &[
                 "run",
                 "stop",
+                "--keep-alive",
                 "--session",
                 &a,
                 "--state",
@@ -797,6 +1224,8 @@ fn a_real_claude_continues_instead_of_stopping_and_rewakes() {
             "h-andrew".into(),
             "--timeout".into(),
             "20".into(),
+            // The wake is what this pin measures, and round 22 made it opt-in.
+            "--keep-alive".into(),
         ];
         install.extend(extra.into_iter().map(str::to_string));
         let wrote = Command::new(env!("CARGO_BIN_EXE_aterm-link"))
@@ -969,7 +1398,7 @@ fn files_named(dir: &std::path::Path, prefix: &str) -> Vec<String> {
 /// **THE INSTALLER WRITES THE COMMAND THAT RUNS, UNDER BOTH SPELLINGS, AND
 /// PROVES IT FIRST.** Invoked as `aterm-link` the hooks are `<exe> hook run`;
 /// pointed (`--exe`) at the multiplexed front door they are `<exe> link hook
-/// run` — the spelling the 2026-09-14 install got wrong. Each install's four
+/// run` — the spelling the 2026-09-14 install got wrong. Each install's six
 /// self-tests answer `ok` against the live instance, the file is written, and
 /// every command in it parses back to the spelling its executable accepts.
 #[test]
@@ -1031,7 +1460,7 @@ fn the_installer_writes_the_command_that_runs_under_both_spellings() {
         let out = hook_in(&w.tmp, &env, b"", &args);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(code(&out), 0, "{tag}: {stderr}");
-        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
+        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
             let line = stderr
                 .lines()
                 .find(|l| l.contains(&format!("self-test {event}:")))
@@ -1042,7 +1471,11 @@ fn the_installer_writes_the_command_that_runs_under_both_spellings() {
             );
         }
         let cmds = commands_in(&settings);
-        assert_eq!(cmds.len(), 4, "{tag}: {cmds:?}");
+        assert_eq!(
+            cmds.len(),
+            aterm_link::hook::DEFAULT_EVENTS.len(),
+            "the default hooks: {tag}: {cmds:?}"
+        );
         for (event, cmd) in &cmds {
             assert!(cmd.starts_with(&want), "{tag}: {event}: {cmd}");
             assert!(
@@ -1282,9 +1715,12 @@ fn merge_keeps_permissions_and_foreign_hooks_and_replaces_old_aterm_hooks_with_a
             .collect()
     };
     let exe = env!("CARGO_BIN_EXE_aterm-link");
-    assert_eq!(of("PreToolUse").len(), 2, "{cmds:?}");
-    assert_eq!(of("PreToolUse")[0], "/usr/local/bin/lint-it");
-    assert!(of("PreToolUse")[1].starts_with(&format!("{exe} hook run pre-tool-use ")));
+    // The FOREIGN tool hook stays; aterm's own, which the merged-into file
+    // still carried from round 21, goes — this installer writes no PreToolUse
+    // unless `--gate-tools` asks, and the merge strips every `OWN_MARK` command
+    // before adding its own. An upgrade must not leave a worker gated by a hook
+    // its settings no longer claim.
+    assert_eq!(of("PreToolUse"), ["/usr/local/bin/lint-it"], "{cmds:?}");
     assert_eq!(of("PostToolUse"), ["/usr/local/bin/format-it".to_string()]);
     assert_eq!(of("Stop").len(), 1, "{cmds:?}");
     assert!(of("Stop")[0].starts_with(&format!("{exe} hook run stop ")));
@@ -1319,6 +1755,109 @@ fn merge_keeps_permissions_and_foreign_hooks_and_replaces_old_aterm_hooks_with_a
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(commands_in(&settings).len(), cmds.len());
     assert_eq!(files_named(&dir, "settings.local.json.bak-").len(), 2);
+}
+
+/// **`--merge --keep-flags` DROPS A ROUND-21 TOOL GATE.** Round 21 wrote a
+/// PreToolUse entry of ours on every install, with no `--gate-tools` word
+/// (it gated unconditionally). The automatic re-install (`--keep-flags`)
+/// keeps a gate an operator asked for BY NAME, and must not read that
+/// unflagged entry as one: after the run, PreToolUse holds only the foreign
+/// hook. Then `remove` takes the block out and says, on stderr, which switch
+/// keeps it out — the primer pass installs it again otherwise.
+#[test]
+fn merge_keep_flags_drops_a_round_21_gate_and_keeps_the_foreign_tool_hook() {
+    let w = World::boot("keep21", &["h-andrew"]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let env = [
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+        ("ATERM_CONTROL_TOKEN", w.token.as_str()),
+    ];
+    let dir = w.tmp.join("claude21");
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings = dir.join("settings.json");
+    let settings_s = settings.display().to_string();
+    let ledger = ledger_dir(&w, "keep21");
+    let ledger_s = ledger.display().to_string();
+    std::fs::write(
+        &settings,
+        format!(
+            r#"{{
+  "hooks": {{
+    "PreToolUse": [
+      {{"matcher": "Bash", "hooks": [{{"type": "command", "command": "/usr/local/bin/lint-it"}}]}},
+      {{"matcher": "*", "hooks": [{{"type": "command", "command": "/old/aterm hook run pre-tool-use --state {ledger_s}"}}]}}
+    ],
+    "Stop": [
+      {{"hooks": [{{"type": "command", "command": "/old/aterm hook run stop --state {ledger_s} --wake-budget 6/1 --timeout 15", "timeout": 600}}]}}
+    ]
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let out = hook_in(
+        &w.tmp,
+        &env,
+        b"",
+        &[
+            "install",
+            "claude",
+            "--merge",
+            "--keep-flags",
+            "--settings",
+            &settings_s,
+            "--session",
+            &a,
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let cmds = commands_in(&settings);
+    let pre: Vec<&str> = cmds
+        .iter()
+        .filter(|(e, _)| e == "PreToolUse")
+        .map(|(_, c)| c.as_str())
+        .collect();
+    assert_eq!(pre, ["/usr/local/bin/lint-it"], "{cmds:?}");
+    assert!(
+        cmds.iter()
+            .all(|(_, c)| !c.contains("--gate-tools") && !c.contains("/old/aterm")),
+        "{cmds:?}"
+    );
+    assert!(
+        cmds.iter().any(|(e, _)| e == "PermissionRequest"),
+        "the re-install writes today's default events: {cmds:?}"
+    );
+
+    let out = hook_in(
+        &w.tmp,
+        &env,
+        b"",
+        &["remove", "claude", "--settings", &settings_s],
+    );
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .is_some_and(|l| l.starts_with("removed ")),
+        "the answer is the last stdout line (aterm-primer reads it): {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agents_auto_prime = false") && stderr.contains("enabled = false"),
+        "the removal names the switch that keeps it off: {stderr}"
+    );
+    assert_eq!(
+        commands_in(&settings)
+            .iter()
+            .map(|(_, c)| c.as_str())
+            .collect::<Vec<_>>(),
+        ["/usr/local/bin/lint-it"],
+        "only the foreign hook is left"
+    );
 }
 
 /// **`--check` FINDS ATERM THROUGH THE RENDEZVOUS DIR WITH NOTHING BUT THE
@@ -1423,6 +1962,15 @@ type Broken<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<&'a str>, &'a [u8]);
 /// Every way an environment can be broken short of a live aterm answering,
 /// for one event: the hook exits 0 and says why on stderr, and `--check` says
 /// `not ok` and exits 0 too.
+/// The flag an event needs before it does anything at all (round 22).
+fn opt_in(event: &str) -> Vec<&'static str> {
+    match event {
+        "pre-tool-use" => vec!["--gate-tools"],
+        "stop" => vec!["--keep-alive"],
+        _ => vec![],
+    }
+}
+
 fn fails_open_in_every_broken_environment(event: &str) {
     let dir = scratch(&format!("open-{event}"));
     // A socket FILE nobody listens on — a crashed instance's leftover.
@@ -1483,6 +2031,13 @@ fn fails_open_in_every_broken_environment(event: &str) {
     ];
     for (what, env, extra, stdin) in cases {
         let mut args = vec!["run", event];
+        // THE OPT-IN IS PART OF THE PATH. Without `--gate-tools` a
+        // `pre-tool-use` returns before it opens anything, and without
+        // `--keep-alive` so does a `stop` with nothing to report: there is no
+        // broken environment left for them to fail OPEN in, and nothing to say
+        // about one. Fail-open is asserted for the work these events do when
+        // they are asked to do it.
+        args.extend(opt_in(event));
         args.extend(extra.iter().copied());
         let out = hook_in(&dir, &env, stdin, &args);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1561,12 +2116,10 @@ fn a_refused_token_and_an_unwritable_state_dir_fail_open_for_every_event() {
         "pre-tool-use",
         "stop",
     ] {
-        let out = hook_in(
-            &w.tmp,
-            &refused,
-            b"{}",
-            &["run", event, "--session", &a, "--timeout", "0.3"],
-        );
+        let mut args = vec!["run", event];
+        args.extend(opt_in(event));
+        args.extend(["--session", &a, "--timeout", "0.3"]);
+        let out = hook_in(&w.tmp, &refused, b"{}", &args);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(code(&out), 0, "{event} under a refused token: {stderr}");
         assert!(
@@ -1666,7 +2219,9 @@ fn a_live_but_silent_aterm_cannot_stall_a_hook_past_its_deadline() {
         "stop",
     ] {
         for check in [false, true] {
-            let mut args = vec!["run", event, "--session", "s-abc", "--timeout", "0.5"];
+            let mut args = vec!["run", event];
+            args.extend(opt_in(event));
+            args.extend(["--session", "s-abc", "--timeout", "0.5"]);
             if check {
                 args.push("--check");
             }
@@ -1750,7 +2305,15 @@ fn a_stop_whose_await_is_never_answered_names_the_deadline_and_carries_on() {
         &dir,
         &env,
         b"{}",
-        &["run", "stop", "--session", "s-abc", "--timeout", "0.5"],
+        &[
+            "run",
+            "stop",
+            "--keep-alive",
+            "--session",
+            "s-abc",
+            "--timeout",
+            "0.5",
+        ],
     );
     let took = started.elapsed();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1840,8 +2403,8 @@ fn merge_writes_through_a_symlink_and_keeps_the_targets_mode() {
     let cmds = commands_in(&target);
     assert_eq!(
         cmds.len(),
-        4,
-        "the link's target received the hooks: {cmds:?}"
+        aterm_link::hook::DEFAULT_EVENTS.len(),
+        "the link's target received the default hooks: {cmds:?}"
     );
     let merged = std::fs::read_to_string(&target).unwrap();
     assert!(
@@ -2003,7 +2566,11 @@ fn a_relative_exe_is_made_absolute_before_it_is_tested_or_written() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(code(&out), 0, "{tag}: {stderr}");
         let cmds = commands_in(&settings);
-        assert_eq!(cmds.len(), 4, "{tag}: {cmds:?}");
+        assert_eq!(
+            cmds.len(),
+            aterm_link::hook::DEFAULT_EVENTS.len(),
+            "the default hooks: {tag}: {cmds:?}"
+        );
         for (event, cmd) in &cmds {
             assert!(
                 cmd.starts_with(&want),
@@ -2070,34 +2637,249 @@ fn a_relative_exe_is_made_absolute_before_it_is_tested_or_written() {
 // Round 14 — the end-of-turn report is structural: `--report-to`
 // ---------------------------------------------------------------------------
 
-/// A SYNTHETIC transcript in the vendor's JSONL shape (one object per line;
-/// a turn's text, `tool_use` and `thinking` blocks on lines of their own; a
-/// tool result quoting the assistant marker as a string value), ending in
-/// `last` as the final assistant text. Never a real one.
-fn transcript(dir: &std::path::Path, name: &str, last: &str) -> String {
-    let path = dir.join(name);
-    let text = aterm_link::json::string(last);
-    let lines = [
-        r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"run the suite"}}"#.to_string(),
-        r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"On it."}]}}"#.to_string(),
-        r#"{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"targo test"}}]}}"#.to_string(),
-        r#"{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"QUOTED\"}]}} 3 passed"}]}}"#.to_string(),
-        r#"{"type":"assistant","uuid":"a3","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private"}]}}"#.to_string(),
-        format!(
-            r#"{{"type":"assistant","uuid":"{name}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"text","text":{text}}}]}}}}"#
-        ),
-        r#"{"type":"system","subtype":"turn_duration","uuid":"s1","durationMs":1200}"#.to_string(),
-    ];
-    std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
-    path.display().to_string()
+/// A SCRIPTED ATERM: a Unix socket that speaks the control protocol from a
+/// table, so a `Stop` hook can be driven through a state a real instance will
+/// not hold still in — here, a `status` whose FIRST answer is the contended
+/// `seq=- hash=-`.
+///
+/// The protocol it needs is small: the client sends `AUTH <token>` and then one
+/// request per line; a reply is one `OK …` line, optionally followed by the
+/// rows its header counted.
+fn scripted_aterm(
+    dir: &std::path::Path,
+    tag: &str,
+    rows: Vec<String>,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let sock = dir.join(format!("scripted-{tag}.sock"));
+    let _ = std::fs::remove_file(&sock);
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the scripted aterm");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let screen = rows.join("\n") + "\n";
+    let hash = format!("{:016x}", fnv1a_64(screen.as_bytes()));
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { break };
+            let mut w = conn.try_clone().expect("clone");
+            let reader = std::io::BufReader::new(conn);
+            let mut statuses = 0usize;
+            for line in std::io::BufRead::lines(reader) {
+                let Ok(line) = line else { break };
+                if line.starts_with("AUTH ") {
+                    continue;
+                }
+                log.lock().unwrap().push(line.clone());
+                let reply = if line.ends_with(" status") {
+                    statuses += 1;
+                    if statuses == 1 {
+                        "OK schema=1 sid=1 phase=idle seq=- hash=-\n".to_string()
+                    } else {
+                        format!("OK schema=1 sid=1 phase=idle seq=7 hash={hash}\n")
+                    }
+                } else if line.ends_with(" text") {
+                    let mut out = format!("OK {}\n", rows.len());
+                    for r in &rows {
+                        out.push_str(r);
+                        out.push('\n');
+                    }
+                    out
+                } else if line.contains(" inbox ") {
+                    "OK 0 seen=0 pending=0\n".to_string()
+                } else if line.contains(" post ") {
+                    "OK 1 off=91\n".to_string()
+                } else {
+                    "OK\n".to_string()
+                };
+                use std::io::Write as _;
+                if w.write_all(reply.as_bytes()).is_err() {
+                    break;
+                }
+                let _ = w.flush();
+            }
+        }
+    });
+    (sock.display().to_string(), seen)
 }
 
-/// The vendor's `Stop` input naming `path` as the transcript.
-fn stop_input(path: &str, active: bool) -> String {
-    format!(
-        "{{\"session_id\":\"x\",\"transcript_path\":{},\"hook_event_name\":\"Stop\",\"stop_hook_active\":{active}}}",
-        aterm_link::json::string(path)
-    )
+/// **A CONTENDED `status` COSTS A RETRY, NOT THE REPORT.** `seq=-`/`hash=-` is
+/// what a real instance answers while the PTY reader holds the terminal — the
+/// state a `Stop` racing Claude Code's repaint of the done row lands in — and
+/// returning an error for it threw the turn's only report away. Driven through
+/// a scripted aterm because a live one will not hold that state on demand.
+#[test]
+fn a_contended_first_status_still_posts_the_report() {
+    let dir = scratch("contended");
+    let rule = "\u{2500}".repeat(40);
+    let rows = vec![
+        "\u{23fa} Done: the suite is green.".to_string(),
+        "  Next: the e2e.".to_string(),
+        String::new(),
+        rule.clone(),
+        "\u{276f}".to_string(),
+        rule,
+        "  ? for shortcuts".to_string(),
+    ];
+    let (sock, seen) = scripted_aterm(&dir, "stop", rows);
+    let state = dir.join("state").display().to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aterm-link"))
+        .args([
+            "hook",
+            "run",
+            "stop",
+            "--session",
+            "s-worker",
+            "--report-to",
+            "@s-mgr",
+            "--state",
+            &state,
+        ])
+        .env("ATERM_CONTROL_SOCK", &sock)
+        .env("ATERM_CONTROL_TOKEN", "t")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the hook");
+    {
+        use std::io::Write as _;
+        let _ = child.stdin.take().expect("stdin").write_all(b"{}");
+    }
+    let out = child.wait_with_output().expect("wait");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    let lines = seen.lock().unwrap().clone();
+    let statuses = lines.iter().filter(|l| l.ends_with(" status")).count();
+    let posts = lines.iter().filter(|l| l.contains(" post ")).count();
+    assert!(
+        statuses >= 2,
+        "the contended answer must be retried, not fatal: {lines:?} / {err}"
+    );
+    assert_eq!(posts, 1, "the report must still go out: {err} / {lines:?}");
+    let post = lines.iter().find(|l| l.contains(" post ")).expect("a post");
+    assert!(post.contains("kind=report"), "{post}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The vendor's `Stop` input. Round 22 reads nothing out of it but
+/// `stop_hook_active`: the report comes from the SCREEN, through the control
+/// socket, not from a transcript on disk.
+fn stop_input(active: bool) -> String {
+    format!("{{\"session_id\":\"x\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":{active}}}")
+}
+
+/// THE FAKE CLAUDE: a Claude Code live zone painted by `printf`, advanced by
+/// Enter, each press a DIFFERENT screen — the shape `aterm-phase` reads and the
+/// report is built from. 120 columns, the harness's `ATERM_COLUMNS`, so the
+/// rules are full-width. Modelled on `r13_presence`'s, which measured the
+/// presence face against the same paint.
+fn write_fake_claude(dir: &std::path::Path) -> std::path::PathBuf {
+    let rule = "\u{2500}".repeat(120);
+    let screen = |said: &str, second: &str| {
+        format!(
+            "printf '\\033[2J\\033[H'\n\
+             printf '%s\\n' '\u{23fa} {said}' '{second}' '' \
+             '{rule}' '\u{276f} ' '{rule}' '  ? for shortcuts'\n\
+             read _\n"
+        )
+    };
+    let script = format!(
+        "#!/bin/sh\n{}{}{}",
+        screen(
+            "All 248 tests pass; the branch is ready.",
+            "  Next: the e2e suite."
+        ),
+        screen("Second task done.", "  Nothing else on my desk."),
+        screen("Another done.", "  Idle now."),
+    );
+    let path = dir.join("fake-claude.sh");
+    std::fs::write(&path, script).expect("write the fake");
+    path
+}
+
+/// Start the fake Claude in `sid` and wait for its first screen.
+fn paint(w: &World, sid: &str, fake: &std::path::Path) {
+    let sent = w.verb(&format!("@{sid} send sh {}", fake.display()));
+    assert!(sent.ok(), "send: {}", sent.header());
+    assert!(w.verb(&format!("@{sid} key enter")).ok());
+    until("the fake Claude's first screen", || {
+        screen_rows(w, sid)
+            .iter()
+            .any(|r| r.starts_with("\u{23fa} All 248 tests pass"))
+            .then_some(())
+    });
+}
+
+/// Advance the fake Claude to its next screen, whose first row starts `said`.
+fn advance(w: &World, sid: &str, said: &str) {
+    assert!(w.verb(&format!("@{sid} key enter")).ok());
+    until("the next screen", || {
+        screen_rows(w, sid)
+            .iter()
+            .any(|r| r.starts_with(said))
+            .then_some(())
+    });
+}
+
+/// The session's screen, as `text` serves it.
+fn screen_rows(w: &World, sid: &str) -> Vec<String> {
+    let reply = w.verb(&format!("@{sid} text"));
+    assert!(reply.ok(), "text: {}", reply.header());
+    reply.rows().to_vec()
+}
+
+/// `status`'s stamp for `sid`: the `seq=` and `hash=` of the live screen.
+fn stamp(w: &World, sid: &str) -> (String, String) {
+    let reply = w.verb(&format!("@{sid} status"));
+    assert!(reply.ok(), "status: {}", reply.header());
+    let head = reply.header().to_string();
+    let get = |key: &str| {
+        head.split_whitespace()
+            .find_map(|t| t.strip_prefix(key))
+            .unwrap_or_else(|| panic!("{key} in {head}"))
+            .to_string()
+    };
+    (get("seq="), get("hash="))
+}
+
+/// FNV-1a-64, the hash `status` stamps a screen with — spelled out here rather
+/// than reached for across a crate boundary, so the test checks the WIRE and not
+/// a shared helper.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// **THE STAMP A REPORT CARRIES MUST DESCRIBE THE ROWS IT CARRIES.** The hook
+/// reads `status` for `seq=`/`hash=` and `text` for the rows, hashes the rows
+/// itself, and posts NOTHING when the two disagree — so if they can disagree on
+/// a quiet screen, `--report-to` never reports at all. Measured here across the
+/// real wire, which is where a trailing space or a dropped row would show up
+/// and where the in-crate `screen_stamp_matches_the_text_verbs_rows` cannot see.
+#[test]
+fn the_status_stamp_hashes_the_rows_the_text_verb_serves() {
+    let w = World::boot("stamprows", &[]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let fake = write_fake_claude(&w.tmp);
+    paint(&w, &a, &fake);
+    let (seq, hash) = stamp(&w, &a);
+    let rows = screen_rows(&w, &a);
+    let mut screen = String::new();
+    for r in &rows {
+        screen.push_str(r);
+        screen.push('\n');
+    }
+    let ours = format!("{:016x}", fnv1a_64(screen.as_bytes()));
+    assert_eq!(
+        ours,
+        hash,
+        "seq={seq}, {} rows, {} bytes:\n{rows:#?}",
+        rows.len(),
+        screen.len()
+    );
 }
 
 /// The `msg` rows of `sid`'s inbox that are reports.
@@ -2114,6 +2896,11 @@ fn row_id(row: &str) -> u64 {
         .nth(1)
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("a row id: {row}"))
+}
+
+/// The rows of a report body, without its `seq=`/`hash=` stamp line.
+fn said_of(body: &str) -> &str {
+    body.split_once('\n').map_or(body, |(_, rest)| rest)
 }
 
 /// The whole body of `sid`'s row `id`, through `inbox get`.
@@ -2137,12 +2924,13 @@ fn the_stop_hook_posts_the_workers_last_message_as_a_report() {
     let dir = ledger_dir(&w, "report14");
     let state = dir.display().to_string();
     let to = format!("@{b}");
-    let said = "All 248 tests pass; the branch is ready.\nNext: the e2e suite.";
-    let path = transcript(&w.tmp, "t1.jsonl", said);
+    let fake = write_fake_claude(&w.tmp);
+    paint(&w, &a, &fake);
+    let (seq, hash) = stamp(&w, &a);
 
     let out = hook(
         &w,
-        &stop_input(&path, false),
+        &stop_input(false),
         &[
             "run",
             "stop",
@@ -2168,7 +2956,23 @@ fn the_stop_hook_posts_the_workers_last_message_as_a_report() {
     assert!(row.contains(&format!("from={a}@{}", w.node)), "{row}");
     assert!(row.contains("trust=agent"), "{row}");
     assert!(!row.contains(" re="), "no unhandled task, no re=: {row}");
-    assert_eq!(body_of(&w, &b, row_id(&row)), said);
+    // THE BODY IS THE SCREEN. Its first line is `status`'s own stamp, and its
+    // rows are rows `text` serves for that session — the ones from the last
+    // `⏺` row down to where the live zone begins, trailing spaces off.
+    let body = body_of(&w, &b, row_id(&row));
+    let (stamp_line, rest) = body.split_once('\n').expect("the stamp, then the rows");
+    assert_eq!(stamp_line, format!("seq={seq} hash={hash}"), "{body}");
+    assert_eq!(
+        rest, "\u{23fa} All 248 tests pass; the branch is ready.\n  Next: the e2e suite.",
+        "{body}"
+    );
+    let screen = screen_rows(&w, &a);
+    for line in rest.lines() {
+        assert!(
+            screen.iter().any(|r| r.trim_end() == line),
+            "every reported row is a row of the screen: {line:?} not in {screen:?}"
+        );
+    }
     assert_eq!(reports(&w, &b).len(), 1);
     assert!(
         dir.join("report").join(&a).exists(),
@@ -2213,6 +3017,9 @@ fn a_report_answers_the_newest_unhandled_task_and_a_re_fired_stop_posts_nothing_
     let (a, b) = w.two_sessions();
     let state = ledger_dir(&w, "report14re").display().to_string();
     let to = format!("@{b}");
+    // `--keep-alive` because this test is about the WAKE as well as the
+    // report: without it (the round-22 default) `stop` reports and returns 0,
+    // which `stop_exits_zero_without_keep_alive` is the test for.
     let args = |input: &str| -> Output {
         hook(
             &w,
@@ -2226,11 +3033,14 @@ fn a_report_answers_the_newest_unhandled_task_and_a_re_fired_stop_posts_nothing_
                 &state,
                 "--report-to",
                 &to,
+                "--keep-alive",
                 "--timeout",
                 "0.2",
             ],
         )
     };
+    let fake = write_fake_claude(&w.tmp);
+    paint(&w, &a, &fake);
 
     send(&w, &a, "h-andrew", "task", 1, "the%20first%20task");
     let newest = send(&w, &a, "h-andrew", "task", 2, "the%20second%20task");
@@ -2238,8 +3048,7 @@ fn a_report_answers_the_newest_unhandled_task_and_a_re_fired_stop_posts_nothing_
         (rows(&w, &a).len() >= 2).then_some(())
     });
 
-    let path = transcript(&w.tmp, "t2.jsonl", "Second task done.");
-    let out = args(&stop_input(&path, false));
+    let out = args(&stop_input(false));
     assert_eq!(
         code(&out),
         2,
@@ -2248,17 +3057,20 @@ fn a_report_answers_the_newest_unhandled_task_and_a_re_fired_stop_posts_nothing_
     );
     let row = until("the report to land", || reports(&w, &b).into_iter().next());
     assert!(row.contains(&format!(" re={newest} ")), "{row}");
-    assert_eq!(body_of(&w, &b, row_id(&row)), "Second task done.");
+    assert_eq!(
+        said_of(&body_of(&w, &b, row_id(&row))),
+        "\u{23fa} All 248 tests pass; the branch is ready.\n  Next: the e2e suite."
+    );
 
-    // The re-fire: the same line, the vendor's flag — nothing posted, and the
+    // The re-fire: the SAME SCREEN, the vendor's flag — nothing posted, and the
     // loop breaker still honoured (no wake, exit 0).
-    let out = args(&stop_input(&path, true));
+    let out = args(&stop_input(true));
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("already reported"), "{stderr}");
     assert!(stderr.contains("nothing posted"), "{stderr}");
-    // And without the flag: the same message is still not a second report.
-    let out = args(&stop_input(&path, false));
+    // And without the flag: the same screen is still not a second report.
+    let out = args(&stop_input(false));
     assert_eq!(code(&out), 2);
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("already reported"),
@@ -2267,11 +3079,11 @@ fn a_report_answers_the_newest_unhandled_task_and_a_re_fired_stop_posts_nothing_
     );
     assert_eq!(reports(&w, &b).len(), 1, "{:?}", reports(&w, &b));
 
-    // The tasks handled, a new message: a new report, no `re=`, exit 0.
+    // The tasks handled and the SCREEN MOVED: a new report, no `re=`, exit 0.
+    advance(&w, &a, "\u{23fa} Second task done.");
     let last_id = rows(&w, &a).iter().map(|r| row_id(r)).max().unwrap();
     assert!(w.verb(&format!("@{a} inbox seen {last_id} handled")).ok());
-    let path = transcript(&w.tmp, "t3.jsonl", "Nothing else on my desk.");
-    let out = args(&stop_input(&path, false));
+    let out = args(&stop_input(false));
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     let two = until("the second report", || {
         let r = reports(&w, &b);
@@ -2280,77 +3092,8 @@ fn a_report_answers_the_newest_unhandled_task_and_a_re_fired_stop_posts_nothing_
     let newest_row = two.iter().max_by_key(|r| row_id(r)).unwrap();
     assert!(!newest_row.contains(" re="), "{newest_row}");
     assert_eq!(
-        body_of(&w, &b, row_id(newest_row)),
-        "Nothing else on my desk."
-    );
-}
-
-/// **FAIL-OPEN.** No `transcript_path`, a path nobody wrote, a file that is
-/// not a transcript, a JSONL with no assistant line, a stdin that is not JSON:
-/// exit 0, the reason on stderr, nothing posted — and the wait that follows
-/// is the round-12 one (an empty inbox, nothing to wake for).
-#[test]
-fn a_missing_or_malformed_transcript_posts_nothing_and_exits_zero() {
-    let w = World::boot("report14nil", &[]);
-    w.wait_ready();
-    let (a, b) = w.two_sessions();
-    let state = ledger_dir(&w, "report14nil").display().to_string();
-    let to = format!("@{b}");
-
-    let prose = w.tmp.join("prose.txt");
-    std::fs::write(&prose, "the assistant said hello\n").unwrap();
-    let no_assistant = w.tmp.join("noassist.jsonl");
-    std::fs::write(
-        &no_assistant,
-        "{\"type\":\"user\",\"message\":{\"content\":\"assistant?\"}}\n",
-    )
-    .unwrap();
-    let missing = w.tmp.join("missing.jsonl");
-    let cases: Vec<(&str, String)> = vec![
-        ("no transcript_path", "{}".to_string()),
-        (
-            "a missing file",
-            stop_input(&missing.display().to_string(), false),
-        ),
-        ("prose", stop_input(&prose.display().to_string(), false)),
-        (
-            "no assistant line",
-            stop_input(&no_assistant.display().to_string(), false),
-        ),
-        (
-            "malformed stdin",
-            "{{{{\"transcript_path\": nonsense".to_string(),
-        ),
-    ];
-    for (what, input) in cases {
-        let out = hook(
-            &w,
-            &input,
-            &[
-                "run",
-                "stop",
-                "--session",
-                &a,
-                "--state",
-                &state,
-                "--report-to",
-                &to,
-                "--timeout",
-                "0.2",
-            ],
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(code(&out), 0, "{what}: {stderr}");
-        assert!(
-            stderr.contains("nothing posted"),
-            "{what}: the reason must be on stderr: {stderr}"
-        );
-        assert!(out.stdout.is_empty(), "{what}");
-    }
-    assert!(reports(&w, &b).is_empty(), "{:?}", reports(&w, &b));
-    assert!(
-        !std::path::Path::new(&state).join("wake").join(&a).exists(),
-        "nothing was charged"
+        said_of(&body_of(&w, &b, row_id(newest_row))),
+        "\u{23fa} Second task done.\n  Nothing else on my desk."
     );
 }
 
@@ -2364,15 +3107,22 @@ fn a_report_is_charged_to_the_wake_budget() {
     let dir = ledger_dir(&w, "report14budget");
     let state = dir.display().to_string();
     let to = format!("@{b}");
+    // THREE DIFFERENT SCREENS, because a report is once per screen: the same
+    // screen twice is one report and would never reach the budget.
+    let fake = write_fake_claude(&w.tmp);
+    paint(&w, &a, &fake);
     let mut spent = 0;
-    for (n, said) in ["first turn", "second turn", "third turn"]
-        .iter()
-        .enumerate()
-    {
-        let path = transcript(&w.tmp, &format!("b{n}.jsonl"), said);
+    for next in [
+        None,
+        Some("\u{23fa} Second task done."),
+        Some("\u{23fa} Another done."),
+    ] {
+        if let Some(said) = next {
+            advance(&w, &a, said);
+        }
         let out = hook(
             &w,
-            &stop_input(&path, false),
+            &stop_input(false),
             &[
                 "run",
                 "stop",
@@ -2406,391 +3156,10 @@ fn a_report_is_charged_to_the_wake_budget() {
 // Round 16 addendum — the report is what the worker DISPLAYED
 // ---------------------------------------------------------------------------
 
-/// Standard padded base64 — the test side of the hook's decoder.
-fn b64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// One length-delimited protobuf field.
-fn proto(number: u8, value: &[u8]) -> Vec<u8> {
-    let mut out = vec![(number << 3) | 2];
-    let mut len = value.len();
-    loop {
-        let byte = (len & 0x7f) as u8;
-        len >>= 7;
-        if len == 0 {
-            out.push(byte);
-            break;
-        }
-        out.push(byte | 0x80);
-    }
-    out.extend_from_slice(value);
-    out
-}
-
-/// A SYNTHETIC `thinking` signature in the shape measured on Claude Code
-/// 2.1.267 — field numbers and wire types only, every byte made up here: the
-/// payload's header carries the block's kind at its field 8.
-fn signature(kind: &str) -> String {
-    let mut header = vec![0x08, 0x01, 0x18, 0x02, 0x38, 0x01];
-    header.extend(proto(8, kind.as_bytes()));
-    let mut payload = proto(1, &header);
-    payload.extend(proto(2, &[0xa5; 12]));
-    payload.extend(proto(3, &[0x5a; 12]));
-    payload.extend(proto(4, &[0x3c; 48]));
-    let opaque: Vec<u8> = (0..96u8).map(|i| i.wrapping_mul(37)).collect();
-    payload.extend(proto(5, &opaque));
-    let mut top = vec![0x08, 0x02];
-    top.extend(proto(2, &payload));
-    top.extend([0x18, 0x01]);
-    b64(&top)
-}
-
-/// One assistant line of a SYNTHETIC transcript in this build's shape: one
-/// content block, the message's id shared by its lines.
-fn block_line(uuid: &str, id: &str, block: &str) -> String {
-    format!(
-        r#"{{"type":"assistant","uuid":"{uuid}","isSidechain":false,"message":{{"id":"{id}","role":"assistant","content":[{block}]}}}}"#
-    )
-}
-
-fn thinking_block(text: &str, signature: &str) -> String {
-    format!(
-        r#"{{"type":"thinking","thinking":{},"signature":{}}}"#,
-        aterm_link::json::string(text),
-        aterm_link::json::string(signature)
-    )
-}
-
-fn text_block(text: &str) -> String {
-    format!(
-        r#"{{"type":"text","text":{}}}"#,
-        aterm_link::json::string(text)
-    )
-}
-
-/// The head of a turn — a prompt, a message with hidden reasoning (with
-/// text, so a leak would show), a text line and a tool call, then narration
-/// and another tool call — each line's uuid and id led by `tag`.
-fn turn_head(tag: &str, secret: &str) -> Vec<String> {
-    let narr = signature("narration");
-    let hid = signature("thinking");
-    let tool = r#"{"type":"tool_use","id":"t","name":"Bash","input":{"command":"true"}}"#;
-    let result = |n: u8| {
-        format!(
-            r#"{{"type":"user","uuid":"{tag}-r{n}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"ok"}}]}}}}"#
-        )
-    };
-    vec![
-        format!(
-            r#"{{"type":"user","uuid":"{tag}-u","message":{{"role":"user","content":"run the rehearsal"}}}}"#
-        ),
-        block_line(
-            &format!("{tag}-a1"),
-            &format!("{tag}-m1"),
-            &thinking_block(secret, &hid),
-        ),
-        block_line(
-            &format!("{tag}-a2"),
-            &format!("{tag}-m1"),
-            &text_block("Starting the rehearsal."),
-        ),
-        block_line(&format!("{tag}-a3"), &format!("{tag}-m1"), tool),
-        result(1),
-        block_line(
-            &format!("{tag}-a4"),
-            &format!("{tag}-m2"),
-            &thinking_block("", &hid),
-        ),
-        block_line(
-            &format!("{tag}-a5"),
-            &format!("{tag}-m2"),
-            &thinking_block("The rehearsal finished; checking its outcome:", &narr),
-        ),
-        block_line(&format!("{tag}-a6"), &format!("{tag}-m2"), tool),
-        result(2),
-    ]
-}
-
-/// The vendor's `Stop` input with its own `last_assistant_message`.
-fn stop_input_saying(path: &str, last: &str) -> String {
-    format!(
-        "{{\"session_id\":\"x\",\"transcript_path\":{},\"hook_event_name\":\"Stop\",\"stop_hook_active\":false,\"last_assistant_message\":{}}}",
-        aterm_link::json::string(path),
-        aterm_link::json::string(last)
-    )
-}
-
-/// **THE REPORT IS WHAT THE WORKER DISPLAYED, NEVER ITS HIDDEN REASONING**
-/// (round 16 addendum), through the shipped binary against a live instance:
-///
-/// 1. a turn that ends in narration (a `thinking` block with Claude Code's
-///    narration mark) posts the narration — not the earlier text line the
-///    round-14 reader took — and not the hidden block beside it;
-/// 2. a turn whose last message is hidden reasoning alone posts nothing and
-///    says why, never the text and never an older message;
-/// 3. a transcript that LAGS the turn — the vendor's `last_assistant_message`
-///    in the input, the final lines landing 300 ms after the hook started —
-///    posts the final message, not the stale narration the file held when
-///    `Stop` fired (what the live worker's report posted on 2026-09-15);
-/// 4. final lines that never land: after the 2 s catch-up the vendor's text
-///    is posted, and stderr says so.
-///
-/// No report body anywhere carries the hidden block's text.
-#[test]
-fn the_report_posts_what_the_worker_displayed_and_never_its_hidden_reasoning() {
-    const SECRET: &str = "HIDDENREASONINGSENTINEL";
-    let w = World::boot("report16", &["h-andrew"]);
-    w.wait_ready();
-    let (a, b) = w.two_sessions();
-    let state = ledger_dir(&w, "report16").display().to_string();
-    let to = format!("@{b}");
-    let run = |input: &str| -> Output {
-        hook(
-            &w,
-            input,
-            &[
-                "run",
-                "stop",
-                "--session",
-                &a,
-                "--state",
-                &state,
-                "--report-to",
-                &to,
-                "--timeout",
-                "0.2",
-            ],
-        )
-    };
-    let write = |name: &str, lines: &[String]| -> String {
-        let path = w.tmp.join(name);
-        std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
-        path.display().to_string()
-    };
-    let newest_body = |n: usize| -> String {
-        let got = until("the report to land", || {
-            let r = reports(&w, &b);
-            (r.len() >= n).then_some(r)
-        });
-        let newest = got.iter().max_by_key(|r| row_id(r)).expect("a report");
-        body_of(&w, &b, row_id(newest))
-    };
-    let narr = signature("narration");
-    let hid = signature("thinking");
-
-    // 1. Narration ends the turn.
-    let mut lines = turn_head("n", SECRET);
-    lines.push(block_line("n-a7", "n-m3", &thinking_block(SECRET, &hid)));
-    lines.push(block_line(
-        "n-a8",
-        "n-m3",
-        &thinking_block("All 12 cases pass; the branch is merged.", &narr),
-    ));
-    let path = write("r16-narration.jsonl", &lines);
-    let out = run(&stop_input(&path, false));
-    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(newest_body(1), "All 12 cases pass; the branch is merged.");
-
-    // 2. Hidden reasoning alone ends the turn.
-    let mut lines = turn_head("h", SECRET);
-    lines.push(block_line("h-a7", "h-m3", &thinking_block(SECRET, &hid)));
-    let path = write("r16-hidden.jsonl", &lines);
-    let out = run(&stop_input(&path, false));
-    assert_eq!(code(&out), 0);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("cannot be told from hidden reasoning")
-            && stderr.contains("nothing posted"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains(SECRET), "{stderr}");
-
-    // 3. The transcript lags the turn.
-    let fin = "Done: 12 of 12 cases pass; merged.";
-    let path = write("r16-lagging.jsonl", &turn_head("l", SECRET));
-    let tail = [
-        block_line("l-a7", "l-m3", &thinking_block("", &hid)),
-        block_line("l-a8", "l-m3", &text_block(fin)),
-    ];
-    let writer = {
-        let path = path.clone();
-        let tail = tail.join("\n") + "\n";
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("open to append");
-            f.write_all(tail.as_bytes())
-                .expect("append the final lines");
-        })
-    };
-    let out = run(&stop_input_saying(&path, fin));
-    writer.join().expect("the writer");
-    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(newest_body(2), fin);
-
-    // 4. The final lines never land.
-    let said = "Done; said in memory only.";
-    let path = write("r16-never.jsonl", &turn_head("v", SECRET));
-    let out = run(&stop_input_saying(&path, said));
-    assert_eq!(code(&out), 0);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("did not show the turn's last message within 2000 ms")
-            && stderr.contains("posting the vendor's last_assistant_message"),
-        "{stderr}"
-    );
-    assert_eq!(newest_body(3), said);
-
-    let all = reports(&w, &b);
-    assert_eq!(all.len(), 3, "{all:?}");
-    for row in &all {
-        assert!(!body_of(&w, &b, row_id(row)).contains(SECRET), "{row}");
-    }
-}
-
-/// The vendor's `Stop` input for a stop the WAKE caused (`stop_hook_active`),
-/// with its own `last_assistant_message`.
-fn refired_stop_saying(path: &str, last: &str) -> String {
-    format!(
-        "{{\"session_id\":\"x\",\"transcript_path\":{},\"hook_event_name\":\"Stop\",\"stop_hook_active\":true,\"last_assistant_message\":{}}}",
-        aterm_link::json::string(path),
-        aterm_link::json::string(last)
-    )
-}
-
-/// **A REPLY AFTER A WAKE IS REPORTED, EVEN IN THE SAME WORDS** (review
-/// defect A, through the shipped binary against a live instance). Stop #1
-/// reports the worker's message; the hook's wake keeps the turn alive, so
-/// the vendor writes its `Stop hook feedback:` line (`isMeta`), an attachment
-/// and the `stop_hook_summary`, and the worker replies — in the same words —
-/// and Stop #2 fires (`stop_hook_active: true`) before that reply is on
-/// disk. The round-16 reader took the pre-wake line as "caught up", keyed it
-/// the same, and dropped the reply as a re-fire ("this message was already
-/// reported"): one report where there were two. Then a re-fire of Stop #2
-/// posts nothing, as it must.
-#[test]
-fn a_reply_after_a_wake_is_reported_even_in_the_same_words() {
-    let w = World::boot("wake16", &["h-andrew"]);
-    w.wait_ready();
-    let (a, b) = w.two_sessions();
-    let state = ledger_dir(&w, "wake16").display().to_string();
-    let to = format!("@{b}");
-    let run = |input: &str| -> Output {
-        hook(
-            &w,
-            input,
-            &[
-                "run",
-                "stop",
-                "--session",
-                &a,
-                "--state",
-                &state,
-                "--report-to",
-                &to,
-                "--timeout",
-                "0.2",
-            ],
-        )
-    };
-    let said = "Idle; waiting for the next task.";
-    let path = w.tmp.join("r16-wake.jsonl");
-    let mut lines = vec![
-        r#"{"type":"user","uuid":"k-u1","message":{"role":"user","content":"take the next task"}}"#
-            .to_string(),
-        block_line("k-a2", "k-m2", &text_block(said)),
-    ];
-    std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
-    let path = path.display().to_string();
-
-    // Stop #1: the message is reported.
-    let out = run(&stop_input_saying(&path, said));
-    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
-    let first = until("the first report", || {
-        let r = reports(&w, &b);
-        (!r.is_empty()).then_some(r)
-    });
-    assert_eq!(first.len(), 1, "{first:?}");
-
-    // The wake, as the vendor writes it; then Stop #2, the reply not on disk.
-    lines.push(format!(
-        r#"{{"type":"user","uuid":"k-u3","isMeta":true,"message":{{"role":"user","content":{}}}}}"#,
-        aterm_link::json::string("Stop hook feedback:\n[aterm fabric] 1 new message for s-x.")
-    ));
-    lines.push(r#"{"type":"attachment","uuid":"k-at"}"#.to_string());
-    lines.push(r#"{"type":"system","subtype":"stop_hook_summary","uuid":"k-ss"}"#.to_string());
-    std::fs::write(&path, lines.join("\n") + "\n").expect("write the wake");
-    let writer = {
-        let path = path.clone();
-        let reply = block_line("k-a4", "k-m4", &text_block(said)) + "\n";
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("open to append");
-            f.write_all(reply.as_bytes()).expect("append the reply");
-        })
-    };
-    let started = std::time::Instant::now();
-    let out = run(&refired_stop_saying(&path, said));
-    let took = started.elapsed();
-    writer.join().expect("the writer");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(code(&out), 0, "{stderr}");
-    assert!(
-        !stderr.contains("already reported"),
-        "the reply after the wake was dropped as a re-fire (in {took:?}): {stderr}"
-    );
-    let both = until("the reply's report", || {
-        let r = reports(&w, &b);
-        (r.len() >= 2).then_some(r)
-    });
-    assert_eq!(both.len(), 2, "{both:?}");
-    let newest = both.iter().max_by_key(|r| row_id(r)).expect("a report");
-    assert_eq!(body_of(&w, &b, row_id(newest)), said);
-
-    // A re-fire of Stop #2, the reply now on disk: nothing more.
-    let out = run(&refired_stop_saying(&path, said));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("already reported"), "{stderr}");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert_eq!(reports(&w, &b).len(), 2);
-}
-
 /// **THE INSTALLER WRITES THE FLAG ON THE STOP COMMAND, PROVES IT, AND
 /// REFUSES A RECIPIENT THE INSTANCE DOES NOT HOST.** The self-test line for
-/// `Stop` ends `report-to=<sid>`; the other three commands do not carry the
+/// `Stop` and for `Notification` (the escalation's `kind=ask` goes to the same
+/// recipient) ends `report-to=<sid>`; the other commands do not carry the
 /// flag; the written `Stop` command answers `ok … report-to=<sid>` through the
 /// shell; and `--report-to` naming nobody is exit 2 with nothing written.
 #[test]
@@ -2825,23 +3194,27 @@ fn the_installer_writes_report_to_and_refuses_a_recipient_that_does_not_exist() 
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(code(&out), 0, "{stderr}");
-    for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
+    for (_, event) in aterm_link::hook::DEFAULT_EVENTS {
         let line = stderr
             .lines()
             .find(|l| l.contains(&format!("self-test {event}:")))
             .unwrap_or_else(|| panic!("no self-test line for {event}: {stderr}"));
         assert_eq!(
             line.contains(&format!("report-to={b}")),
-            event == "Stop",
+            event == "Stop" || event == "Notification",
             "{line}"
         );
     }
     let cmds = commands_in(&settings);
-    assert_eq!(cmds.len(), 4);
+    assert_eq!(
+        cmds.len(),
+        aterm_link::hook::DEFAULT_EVENTS.len(),
+        "the default hooks"
+    );
     for (event, cmd) in &cmds {
         assert_eq!(
             cmd.contains(&format!("--report-to @{b}")),
-            event == "Stop",
+            event == "Stop" || event == "Notification",
             "{event}: {cmd}"
         );
     }
@@ -2912,10 +3285,12 @@ fn a_report_answers_the_task_the_worker_just_marked_handled() {
     let (a, b) = w.two_sessions();
     let state = ledger_dir(&w, "r14handled").display().to_string();
     let to = format!("@{b}");
-    let stop = |path: &str| -> Output {
+    let fake = write_fake_claude(&w.tmp);
+    paint(&w, &a, &fake);
+    let stop = || -> Output {
         hook(
             &w,
-            &stop_input(path, false),
+            &stop_input(false),
             &[
                 "run",
                 "stop",
@@ -2936,8 +3311,7 @@ fn a_report_answers_the_task_the_worker_just_marked_handled() {
     });
     let id = rows(&w, &a).iter().map(|r| row_id(r)).max().unwrap();
     assert!(w.verb(&format!("@{a} inbox seen {id} handled")).ok());
-    let path = transcript(&w.tmp, "handled.jsonl", "The thing is done.");
-    let out = stop(&path);
+    let out = stop();
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     let row = until("the report", || reports(&w, &b).into_iter().next());
     assert!(
@@ -2950,9 +3324,10 @@ fn a_report_answers_the_task_the_worker_just_marked_handled() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // The next report, nothing new in the inbox: answers nothing.
-    let path = transcript(&w.tmp, "handled2.jsonl", "Idle now.");
-    let out = stop(&path);
+    // The next report, nothing new in the inbox: answers nothing. The screen
+    // moves first, because a report is once per screen.
+    advance(&w, &a, "\u{23fa} Second task done.");
+    let out = stop();
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     let two = until("the second report", || {
         let r = reports(&w, &b);
@@ -2968,8 +3343,8 @@ fn a_report_answers_the_task_the_worker_just_marked_handled() {
     });
     let id = rows(&w, &a).iter().map(|r| row_id(r)).max().unwrap();
     assert!(w.verb(&format!("@{a} inbox seen {id} handled")).ok());
-    let path = transcript(&w.tmp, "handled3.jsonl", "Another done.");
-    let out = stop(&path);
+    advance(&w, &a, "\u{23fa} Another done.");
+    let out = stop();
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     let three = until("the third report", || {
         let r = reports(&w, &b);
@@ -3014,11 +3389,10 @@ fn a_recipient_that_vanished_after_install_is_named_not_silently_charged() {
     until("the session to leave the registry", || {
         (w.sessions().len() < 2).then_some(())
     });
-    let path = transcript(&w.tmp, "gone.jsonl", "Said into the void.");
     let started = std::time::Instant::now();
     let out = hook(
         &w,
-        &stop_input(&path, false),
+        &stop_input(false),
         &[
             "run",
             "stop",
@@ -3065,11 +3439,10 @@ fn no_broker_the_stop_hook_says_the_report_is_queued() {
     let dir = ledger_dir(&w, "r14nobroker");
     let state = dir.display().to_string();
     let to = format!("@{b}");
-    let path = transcript(&w.tmp, "nobroker.jsonl", "Nobody will carry this yet.");
     let started = std::time::Instant::now();
     let out = hook(
         &w,
-        &stop_input(&path, false),
+        &stop_input(false),
         &[
             "run",
             "stop",
@@ -3099,7 +3472,7 @@ fn no_broker_the_stop_hook_says_the_report_is_queued() {
     // The re-fire: nothing posted twice into the outbox.
     let out = hook(
         &w,
-        &stop_input(&path, true),
+        &stop_input(true),
         &[
             "run",
             "stop",
@@ -3126,71 +3499,4 @@ fn no_broker_the_stop_hook_says_the_report_is_queued() {
         .cloned()
         .collect();
     assert_eq!(posts.len(), 1, "{posts:?}");
-}
-
-/// **A FIFO AT transcript_path DOES NOT PARK THE STOP HOOK.** The real binary,
-/// a FIFO nobody writes: the hook must exit (0, the reason on stderr) at once,
-/// not sit in `open(2)` until the vendor's 600 s Stop timeout.
-#[test]
-fn a_fifo_transcript_does_not_park_the_stop_hook() {
-    let w = World::boot("r14fifo", &[]);
-    w.wait_ready();
-    let (a, b) = w.two_sessions();
-    let state = ledger_dir(&w, "r14fifo").display().to_string();
-    let to = format!("@{b}");
-    let fifo = w.tmp.join("fifo.jsonl");
-    assert!(Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .unwrap()
-        .success());
-    let p = fifo.display().to_string();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm-link"));
-    cmd.args([
-        "hook",
-        "run",
-        "stop",
-        "--session",
-        &a,
-        "--state",
-        &state,
-        "--report-to",
-        &to,
-        "--timeout",
-        "0.2",
-    ])
-    .env("ATERM_CONTROL_SOCK", &w.ctl_sock)
-    .env("ATERM_CONTROL_TOKEN", &w.token)
-    .env_remove("ATERM_PARENT_SESSION_ID")
-    .env_remove("ATERM_SESSION_ID")
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stop_input(&p, false).as_bytes())
-        .unwrap();
-    let started = std::time::Instant::now();
-    let deadline = std::time::Duration::from_secs(8);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert_eq!(status.code(), Some(0), "{status}");
-            break;
-        }
-        if started.elapsed() > deadline {
-            let _ = child.kill();
-            panic!("the Stop hook was still parked on the FIFO at {p} after {deadline:?}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let out = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("not a regular file") && stderr.contains("nothing posted"),
-        "{stderr}"
-    );
-    assert!(reports(&w, &b).is_empty());
 }

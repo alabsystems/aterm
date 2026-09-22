@@ -127,17 +127,171 @@ pub struct GlowQuad {
     /// ground and CAN darken a ground brighter than itself. A stream that must
     /// not darken anything stays at `0`.
     pub alpha: u8,
+    /// PREMULTIPLIED light colour `0x00RRGGBB` at the quad's RIGHT edge — the
+    /// second end of a HORIZONTAL GRADIENT across the quad's `w` columns
+    /// (2026-09-21). [`color`](GlowQuad::color) is the LEFT edge. A quad whose
+    /// `color2 == color` and `alpha2 == alpha` is FLAT, and every flat quad
+    /// composites bit for bit as it did before this field existed: column `i`
+    /// (0-based) of a `w`-wide quad carries, per channel and for the opacity
+    /// alike,
+    ///
+    /// ```text
+    /// c(i) = (c0·(2w − m) + c1·m + w) / (2w),   m = 2i + 1
+    /// ```
+    ///
+    /// in unsigned integer arithmetic (round half up) — the value of the
+    /// straight line from `c0` at the left EDGE to `c1` at the right EDGE
+    /// sampled at the column's CENTRE. `c0 == c1` gives `c(i) == c0` for every
+    /// `i` (the identity that keeps every flat emitter and every parity pin
+    /// byte-unchanged); `c(0)`/`c(w−1)` sit within half a step of the ends;
+    /// the ramp is monotone; `w == 1` is `(c0 + c1 + 1) / 2`. The CPU
+    /// rasterizer and both GPU fragment shaders compute this SAME integer
+    /// formula per column, never the rasterizer's float interpolant, which is
+    /// what keeps the two backends byte-exact.
+    ///
+    /// WHY: the rainbow ribbon paints one slab per vertex pair, and under the
+    /// frame budget a slab is a whole cell (15 px at Retina) painted FLAT — a
+    /// 37–95-level step per slab on the blue legs, the owner's "blocky
+    /// gradient" (2026-09-21). The ramp makes colour continuous INSIDE a quad
+    /// without adding quads.
+    pub color2: u32,
+    /// THE SOURCE-OVER OPACITY at the quad's RIGHT edge, the second end of the
+    /// same ramp [`color2`](GlowQuad::color2) describes; [`alpha`](GlowQuad::alpha)
+    /// is the left end. **THE MODE IS PER QUAD, NOT PER END**: `alpha == 0 ⇔
+    /// alpha2 == 0` (debug-asserted by [`GlowQuad::flat`] and
+    /// [`GlowQuad::gradient`]) — a quad is additive at both ends or source-over
+    /// at both ends. Under that invariant the per-column `a(i)` is `0`
+    /// everywhere, or `> 0` everywhere except where a ramp reaches `0` at one
+    /// end — and since the colour is premultiplied by the same coverage,
+    /// `c(i) → 0` as `a(i) → 0`, so `over_premul(dst, c, 0) == add_sat(dst, c)
+    /// == dst` there: the composite is continuous across the mode's own seam.
+    pub alpha2: u8,
 }
 
 impl GlowQuad {
+    /// A FLAT quad — the historical shape: one colour and one opacity across
+    /// its whole width (`color2 == color`, `alpha2 == alpha`). Composites bit
+    /// for bit as the pre-gradient quad did.
+    #[must_use]
+    pub const fn flat(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32, alpha: u8) -> Self {
+        Self {
+            row,
+            x,
+            y,
+            w,
+            h,
+            color,
+            alpha,
+            color2: color,
+            alpha2: alpha,
+        }
+    }
+
+    /// A GRADIENT quad: `(color, alpha)` at the left edge ramping to
+    /// `(color2, alpha2)` at the right edge (see [`GlowQuad::color2`]).
+    ///
+    /// # Panics (debug)
+    /// When exactly one of `alpha`/`alpha2` is `0`: a quad is additive at both
+    /// ends or source-over at both ends (see [`GlowQuad::alpha2`]).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gradient(
+        row: u16,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        color: u32,
+        alpha: u8,
+        color2: u32,
+        alpha2: u8,
+    ) -> Self {
+        debug_assert_eq!(
+            alpha == 0,
+            alpha2 == 0,
+            "a GlowQuad is additive at both ends or source-over at both ends"
+        );
+        Self {
+            row,
+            x,
+            y,
+            w,
+            h,
+            color,
+            alpha,
+            color2,
+            alpha2,
+        }
+    }
+
+    /// Whether the quad is FLAT (`color2 == color && alpha2 == alpha`).
+    #[must_use]
+    pub const fn is_flat(self) -> bool {
+        self.color2 == self.color && self.alpha2 == self.alpha
+    }
+
     /// Canonical lossless words used by cursor-effect fingerprints.
+    ///
+    /// A FLAT quad folds to exactly the TWO words it always did, so every
+    /// fingerprint and golden over a flat stream is byte-identical to the
+    /// pre-gradient tree; a GRADIENT quad appends a third, TAGGED word
+    /// carrying its right edge (`color2 | alpha2 << 32 | GRADIENT_TAG`), so
+    /// the right edge is covered and a gradient can never fold as its own
+    /// left-flat twin.
     #[doc(hidden)]
     #[must_use]
-    pub const fn damage_words(self) -> [u64; 2] {
-        [
-            pack_u16x4(self.row, self.x, self.y, self.w),
-            self.h as u64 | (self.color as u64) << 16 | (self.alpha as u64) << 48,
-        ]
+    pub const fn damage_words(self) -> GlowQuadWords {
+        let first = pack_u16x4(self.row, self.x, self.y, self.w);
+        let second = self.h as u64 | (self.color as u64) << 16 | (self.alpha as u64) << 48;
+        if self.is_flat() {
+            GlowQuadWords {
+                words: [first, second, 0],
+                len: 2,
+            }
+        } else {
+            GlowQuadWords {
+                words: [
+                    first,
+                    second,
+                    self.color2 as u64 | (self.alpha2 as u64) << 32 | GlowQuadWords::GRADIENT_TAG,
+                ],
+                len: 3,
+            }
+        }
+    }
+}
+
+/// The fingerprint words of one [`GlowQuad`] — two for a flat quad, three for
+/// a gradient (see [`GlowQuad::damage_words`]). Iterates the live words only.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlowQuadWords {
+    words: [u64; 3],
+    len: u8,
+}
+
+impl GlowQuadWords {
+    /// Bits 48..64 of a gradient quad's third word (`"GR"`): `color2` sits in
+    /// bits 0..24 and `alpha2` in 32..40, so the tag is disjoint from both.
+    /// It is a hash-mixing aid, not a parser — the fingerprint is a hash, and
+    /// the stream's length prefix is what bounds the fold — but it keeps a
+    /// gradient's third word from ever being a plausible `(row, x, y, w)` of a
+    /// following flat quad with a small `w`.
+    const GRADIENT_TAG: u64 = 0x4752_0000_0000_0000;
+
+    /// The live words as a slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u64] {
+        &self.words[..self.len as usize]
+    }
+}
+
+impl IntoIterator for GlowQuadWords {
+    type Item = u64;
+    type IntoIter = std::iter::Take<std::array::IntoIter<u64, 3>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.words.into_iter().take(self.len as usize)
     }
 }
 
@@ -515,8 +669,14 @@ const fn pack_u16x4(a: u16, b: u16, c: u16, d: u16) -> u64 {
 }
 
 fn hash_glow_quad(quad: &GlowQuad, hasher: &mut EffectStreamFingerprint) {
-    let [first, second] = quad.damage_words();
-    hasher.write_pair(first, second);
+    let words = quad.damage_words();
+    let words = words.as_slice();
+    hasher.write_pair(words[0], words[1]);
+    // A gradient's right edge rides a third word; a flat quad writes exactly
+    // the pair it always did (see `GlowQuad::damage_words`).
+    if let Some(&third) = words.get(2) {
+        hasher.write_pair(third, 0);
+    }
 }
 
 fn hash_rain_halo(halo: &RainHalo, hasher: &mut EffectStreamFingerprint) {
@@ -4589,6 +4749,8 @@ mod rain_channel_tests {
             color: 0x0060_2008,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0060_2008,
+            alpha2: 0,
         }
     }
 
@@ -4944,6 +5106,29 @@ mod rain_channel_tests {
             "h" => GlowQuad { h: 9, ..glow },
             "color" => GlowQuad { color: 0x65_4321, ..glow },
             "alpha" => GlowQuad { alpha: 9, ..glow },
+            "color2" => GlowQuad { color2: 0x65_4321, ..glow },
+            "alpha2" => GlowQuad { alpha2: 9, ..glow },
+        );
+        // A FLAT quad folds to exactly the two historical words; a gradient
+        // appends a third (see `GlowQuad::damage_words`).
+        assert_eq!(glow.damage_words().as_slice().len(), 2);
+        assert_eq!(
+            GlowQuad {
+                color2: 0x65_4321,
+                ..glow
+            }
+            .damage_words()
+            .as_slice()
+            .len(),
+            3
+        );
+        assert_eq!(
+            glow.damage_words().as_slice(),
+            &[
+                super::pack_u16x4(glow.row, glow.x, glow.y, glow.w),
+                glow.h as u64 | (glow.color as u64) << 16 | (glow.alpha as u64) << 48,
+            ][..],
+            "a flat quad's words are the pre-gradient pair, bit for bit"
         );
 
         let rain = rain_halo(1);
@@ -5003,6 +5188,8 @@ mod rain_channel_tests {
                 h: 10,
                 color: 0x0060_2008,
                 alpha: 0,
+                color2: 0x0060_2008,
+                alpha2: 0,
             })
             .collect();
         source.refresh_cursor_effect_damage();
@@ -5056,6 +5243,8 @@ mod rain_channel_tests {
                 h: 10,
                 color: 0x0060_2008,
                 alpha: 0,
+                color2: 0x0060_2008,
+                alpha2: 0,
             })
             .collect();
         let mut source = RenderInput::empty();

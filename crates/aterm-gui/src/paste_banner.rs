@@ -236,6 +236,13 @@ pub(crate) fn banner_rows(
             false,
         );
     }
+    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE — the `config_notice` contract this
+    // builder's header claims, which it was not actually keeping. The question and
+    // the answer keys are written over the row `blank_row` seamed, and `write_str`
+    // rebuilds each cell without an overline, so the band's top edge arrived as
+    // stubs. Closed here, in the label tone: the row carries the warn title and the
+    // full-tone answer keys, and the rule belongs to neither of them.
+    chrome_band::seal_band_top(&mut rows[0], c.label);
     rows
 }
 
@@ -273,6 +280,51 @@ mod tests {
             "{:?}",
             text_of(&rows[3])
         );
+    }
+
+    /// THE SEAM IS THE BAND'S TOP EDGE, so it must run the whole width. It did not:
+    /// this builder inherited the `config_notice` band pattern its header names, and
+    /// the same hole with it — `blank_row` stamps the rule, then the question and the
+    /// answer keys punch themselves out of it (`write_str` rebuilds every cell it
+    /// touches with no overline), leaving three stubs where a boundary belongs. A
+    /// security question is the last band that should look half-drawn.
+    #[test]
+    fn the_seam_runs_unbroken_and_one_toned_across_the_question_row() {
+        let theme = Theme::default();
+        let rows = banner_rows("ls\nrm -rf ~", 80, 3, theme);
+        let question = &rows[0];
+        assert!(
+            question.iter().all(|cell| cell.overline),
+            "the seam breaks at columns {:?}",
+            question
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| !cell.overline)
+                .map(|(col, _)| col)
+                .collect::<Vec<_>>()
+        );
+        // AND IT IS ONE TONE. The row carries the warn-coloured question beside the
+        // full-tone answer keys, so a seam left to each cell's `fg` would change colour
+        // twice along a single hairline.
+        let seams: std::collections::BTreeSet<Option<[u8; 3]>> =
+            question.iter().map(|cell| cell.overline_color).collect();
+        assert_eq!(
+            seams.len(),
+            1,
+            "the rule takes as many tones as the band has inks: {seams:?}"
+        );
+        assert!(
+            seams.iter().all(Option::is_some),
+            "an uncoloured seam falls back to its cell's ink: {seams:?}"
+        );
+        let inks: std::collections::BTreeSet<[u8; 3]> =
+            question.iter().map(|cell| cell.fg).collect();
+        assert!(
+            inks.len() > 1,
+            "the question row is meant to carry two inks, so this proof is not vacuous: {inks:?}"
+        );
+        // ONLY the top row is an edge; the preview rows sit inside the band.
+        assert!(rows[1].iter().all(|cell| !cell.overline));
     }
 
     /// A CAPPED PREVIEW MUST SAY IT IS CAPPED — five shown lines with no tally

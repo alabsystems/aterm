@@ -2896,7 +2896,21 @@ impl App {
         if let Some((terminal_id, alternate_screen)) = focus_coordinate_space {
             sync_cursor_effect_coordinate_space(ws, terminal_id, alternate_screen);
         }
-        if pet_mode {
+        // THE RESIDENT'S OWNER GATE, applied where it is used. The prepare
+        // pass computed this very predicate and parked its result on the
+        // window for this call — and NO LINE EVER READ THAT FIELD, so the
+        // capture observed a console the gate said not to look at. `pet_mode`
+        // alone is not the gate: `pet_species.is_some()` is resolved from the
+        // style STRING, so it already implies the style term and loses exactly
+        // `enabled && serious_allows(CursorCat)` — the trail master switch and
+        // Serious Mode. Read FRESH here, on the same clock as
+        // `retire_pet_without_owner` below, rather than from a parked copy
+        // that a config reload landing mid-pass would make stale.
+        if crate::app_render::resident_pet_owner_present(
+            pet_mode,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
+        ) {
             observe_capture_pet_world(ws, &exact_focus, true);
         }
         let (win_rows, win_cols) = (ws.rows, ws.cols);
@@ -3291,7 +3305,21 @@ impl App {
             exact_focus.terminal_id,
             exact_focus.alternate_screen,
         );
-        if pet_mode {
+        // THE RESIDENT'S OWNER GATE, applied where it is used. The prepare
+        // pass computed this very predicate and parked its result on the
+        // window for this call — and NO LINE EVER READ THAT FIELD, so the
+        // capture observed a console the gate said not to look at. `pet_mode`
+        // alone is not the gate: `pet_species.is_some()` is resolved from the
+        // style STRING, so it already implies the style term and loses exactly
+        // `enabled && serious_allows(CursorCat)` — the trail master switch and
+        // Serious Mode. Read FRESH here, on the same clock as
+        // `retire_pet_without_owner` below, rather than from a parked copy
+        // that a config reload landing mid-pass would make stale.
+        if crate::app_render::resident_pet_owner_present(
+            pet_mode,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
+        ) {
             observe_capture_pet_world(ws, &exact_focus, false);
         }
         // Capture consumes the same admitted catalog Arc as application-present. Asset
@@ -10453,6 +10481,8 @@ mod terminal_split_capture_tests {
                 color: 0x0001_0101,
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: 0x0001_0101,
+                alpha2: 0,
             }];
             window.input_scratch.glow_halo = vec![aterm_render::RainHalo {
                 row: 4,
@@ -10736,6 +10766,8 @@ mod terminal_split_capture_tests {
                 color: 0x0012_3456,
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: 0x0012_3456,
+                alpha2: 0,
             }];
             window.trail_scratch = vec![
                 aterm_render::TrailCell {
@@ -13039,6 +13071,8 @@ mod encode_worker_tests {
                 color: 0x0042_84C6,
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: 0x0042_84C6,
+                alpha2: 0,
             }];
             window.trail_scratch = vec![
                 aterm_render::TrailCell {

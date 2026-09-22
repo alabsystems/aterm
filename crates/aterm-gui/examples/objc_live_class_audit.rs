@@ -309,7 +309,7 @@
 ///
 /// The `allow` is scoped to the builds where the constant is genuinely
 /// unreachable — off macOS the only outcome is `NOT_RUN` — rather than to the
-/// whole file, so the three codes can still be declared together where the
+/// whole file, so the four codes can still be declared together where the
 /// contract is stated.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const PASS: i32 = 0;
@@ -318,6 +318,19 @@ const PASS: i32 = 0;
 const FAIL: i32 = 1;
 /// The audit could not execute here. NOT a pass; see the module docs.
 const NOT_RUN: i32 = 2;
+/// Every row agreed, and at least one row's authority was THIS FORK'S OWN
+/// DECLARATION rather than this host's runtime — the [`HostLacks`] path, taken
+/// on a host whose AppKit does not register a protocol the class claims.
+///
+/// A SEPARATE CODE, and the reason is the sentence the gate prints. `PASS` means
+/// "every method agrees with the runtime's own authority", and on such a host
+/// that sentence is false for the rows the runtime could not speak for — the
+/// receipt the merge gate writes would assert runtime authority nobody had. The
+/// gate reads this as a pass (the tree is not at fault and every row WAS held to
+/// a shape) under a label that says which claim was actually made, so a reader
+/// six months later can tell the two runs apart. See `objc_audit_outcome` in
+/// `crates/aterm-verify/src/stages.rs`, which is where that label lives.
+const FORK_DECLARED: i32 = 3;
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> std::process::ExitCode {
@@ -351,7 +364,7 @@ mod macos {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId};
 
-    use super::{FAIL, NOT_RUN, PASS};
+    use super::{FAIL, FORK_DECLARED, NOT_RUN, PASS};
 
     /// One class this audit is responsible for.
     ///
@@ -383,6 +396,13 @@ mod macos {
         /// checked by part D, against an encoding generated from the fork's
         /// own Rust signature, and driven through `NSMethodSignature`.
         unchecked: &'static [Unchecked],
+        /// Rows whose authority is a protocol THIS HOST MAY NOT REGISTER, with
+        /// the fork's own shape written down so they are still checked there —
+        /// see [`HostLacks`]. Also not an exemption list: where the host HAS the
+        /// protocol the ordinary path checks the row against it and
+        /// [`Audit::host_lacks_pins`] checks the written shape against the
+        /// protocol, so an entry here is a claim that can fail.
+        host_lacks: &'static [HostLacks],
         /// Rows whose authority is DERIVED from siblings the runtime does
         /// declare — see [`Family`]. Consulted after the protocols and the
         /// superclass chain and before a row is called unauthoritative.
@@ -449,6 +469,7 @@ mod macos {
         // `observeValueForKeyPath:ofObject:change:context:` live.
         authority_classes: &[c"NSObject"],
         unchecked: &[],
+        host_lacks: &[],
         families: &[],
         // EMPTY, and that is what keeps plant B fatal: `NSWindowDelegate` is a
         // formal protocol, `NSObject` does not conform to it, so a class that
@@ -485,6 +506,7 @@ mod macos {
         // `WinitView -> NSView -> NSResponder -> NSObject`.
         authority_classes: &[c"NSView", c"NSResponder", c"NSObject"],
         unchecked: VIEW_UNCHECKED,
+        host_lacks: &[],
         families: VIEW_FAMILIES,
         informal: VIEW_INFORMAL,
         rows: Rows::Declared,
@@ -502,21 +524,75 @@ mod macos {
     /// to fail at, and no test that sends one would notice either.
     ///
     /// `NSApplicationDelegate` is also the one protocol here a host's AppKit
-    /// may not register (macOS 14.4.1 does not; the macOS 26 cutter does), in
-    /// which case `aterm_objc` supplied a name-only stand-in at declaration and
-    /// these three rows have NO authority on that host: part A says so and the
-    /// verdict is NOT RUN rather than a pass.
+    /// may not register (macOS 14.4.1 and macOS 13.7.8 do not; the macOS 26
+    /// cutter does), in which case `aterm_objc` supplied a name-only stand-in at
+    /// declaration and the runtime can speak for none of these three rows. Until
+    /// 2026-09-21 that made the whole audit NOT RUN there, and with it the merge
+    /// gate on every such host. They are now checked against the fork's own
+    /// declaration instead ([`APP_DELEGATE_HOST_LACKS`]), the verdict is
+    /// [`FORK_DECLARED`] — a pass that names the weaker claim rather than
+    /// borrowing `PASS`'s sentence — and part F holds those written shapes to the
+    /// protocol on every host that has one.
     ///
     /// The `claimed` list is TWO names, transcribed from the fork's
     /// `protocols:` list, which is itself what objc2's
     /// `unsafe impl NSObjectProtocol` + `unsafe impl NSApplicationDelegate`
     /// called `class_addProtocol` for.
+    ///
+    /// **THE THREE ROWS A HOST MAY NOT BE ABLE TO SPEAK FOR.** All three are
+    /// `@optional` rows of `NSApplicationDelegate`, the one protocol here a
+    /// host's AppKit may not register, and each carries the fork's own declared
+    /// shape so it is checked on such a host too — see [`HostLacks`] for why that
+    /// is a check and not an exemption, and [`Audit::host_lacks_pins`] for the
+    /// tooth that keeps these three shapes honest wherever the protocol IS
+    /// registered.
+    ///
+    /// The types are transcribed from the fork's `declare_class!` site
+    /// (`vendor/winit/src/platform_impl/macos/app_state.rs`) and the encodings
+    /// are GENERATED from them, never typed out. `applicationShouldTerminate:`
+    /// returns `usize` and not a `Bool`, which is the runtime's own reading:
+    /// that site records `NSApplicationDelegate` declaring it `Q24@0:8@16` — an
+    /// eight-byte `NSApplicationTerminateReply` — on a host that registers the
+    /// protocol, and the `-> bool` trap that bit `draggingEntered:` is exactly
+    /// what the generated encoding makes impossible to reintroduce silently here.
+    const APP_DELEGATE_HOST_LACKS: &[HostLacks] = &[
+        HostLacks {
+            sel: "applicationDidFinishLaunching:",
+            protocol: c"NSApplicationDelegate",
+            rust: "fn app_did_finish_launching(&self, _notification: Id)",
+            expected: || aterm_objc::method_encoding!(() ; Id),
+            why: "an @optional row of NSApplicationDelegate, which macOS 14.4.1 \
+                  and macOS 13.7.8 do not register (macOS 26 does); \
+                  aterm_objc::protocol_or_register supplies a name-only stand-in \
+                  there and a stand-in declares nothing",
+        },
+        HostLacks {
+            sel: "applicationWillTerminate:",
+            protocol: c"NSApplicationDelegate",
+            rust: "fn app_will_terminate(&self, _notification: Id)",
+            expected: || aterm_objc::method_encoding!(() ; Id),
+            why: "the same protocol, the same @optional table, the same \
+                  stand-in on a host that lacks it",
+        },
+        HostLacks {
+            sel: "applicationShouldTerminate:",
+            protocol: c"NSApplicationDelegate",
+            rust: "fn app_should_terminate(&self, _sender: Id) -> usize",
+            expected: || aterm_objc::method_encoding!(usize ; Id),
+            why: "the same protocol and stand-in; the RETURN is the part worth \
+                  writing down — NSApplicationTerminateReply is eight bytes, \
+                  which app_state.rs measured as Q24@0:8@16 from a host that \
+                  registers the protocol, so a Bool here would be a defect",
+        },
+    ];
+
     const APP_DELEGATE: Target = Target {
         class_name: "WinitApplicationDelegate",
         claimed: &[c"NSObject", c"NSApplicationDelegate"],
         // `NSObject` the CLASS is where `-dealloc` lives.
         authority_classes: &[c"NSObject"],
         unchecked: &[],
+        host_lacks: APP_DELEGATE_HOST_LACKS,
         families: &[],
         // EMPTY, and formal: `NSApplicationDelegate` is a real protocol that
         // `NSObject` does not conform to, so a class that implements its rows
@@ -553,6 +629,7 @@ mod macos {
         // `WinitWindow -> NSWindow -> NSResponder -> NSObject`.
         authority_classes: &[c"NSWindow", c"NSResponder", c"NSObject"],
         unchecked: &[],
+        host_lacks: &[],
         families: &[],
         informal: &[],
         rows: Rows::Declared,
@@ -598,6 +675,7 @@ mod macos {
         claimed: &[],
         authority_classes: &[c"NSApplication"],
         unchecked: &[],
+        host_lacks: &[],
         families: &[],
         informal: &[],
         rows: Rows::Patched(&["sendEvent:"]),
@@ -696,6 +774,62 @@ mod macos {
         /// macro expands to a `String`: `BOOL` is `B` on arm64 and `c` on the
         /// x86_64 compat slice, and a literal would be wrong on one of them.
         expected: fn() -> String,
+    }
+
+    /// A row whose authority is a protocol THIS HOST MAY NOT REGISTER, with the
+    /// fork's own declared shape written down so the row is still CHECKED where
+    /// the protocol is absent — and held to the protocol wherever it is present.
+    ///
+    /// **WHY THIS EXISTS, and why it is not an exemption.** `NSApplicationDelegate`
+    /// is the one protocol in this tree a host's AppKit may not register: macOS
+    /// 14.4.1's does not, macOS 13.7.8's does not, macOS 26's does.
+    /// `aterm_objc::protocol_or_register` supplies a name-only stand-in on such a
+    /// host so the class can claim it — which is what stopped v0.72.0–v0.75.0
+    /// dying before their first window — and a stand-in declares nothing. Until
+    /// this struct existed, the three `WinitApplicationDelegate` rows therefore
+    /// had NO authority on those hosts and the whole audit ended NOT RUN, so the
+    /// merge gate could not go green on any of them: measured on the fleet's
+    /// Intel Mac (macOS 13.7.8), where `none of the 1635 protocols loaded here
+    /// declares this row` was the verdict for all three and every other row
+    /// agreed. A gate that cannot pass on a whole platform for ANY input is a
+    /// verdict carrying no information — the disease this file's own `LaneVerdict`
+    /// note describes — and the rows that went unchecked were exactly the
+    /// `@optional` ones whose failure mode is silence (see the `declare_class!`
+    /// note in `app_state.rs`: a row that fails to register does not crash, the
+    /// app simply never finishes launching).
+    ///
+    /// **WHAT IT PROVES, AND WHAT IT DOES NOT.** Where the host registers the
+    /// protocol, nothing changes: the protocol is the authority, the row is
+    /// checked against it by the ordinary path, and [`Audit::host_lacks_pins`]
+    /// additionally holds THIS WRITTEN SHAPE to the protocol's own declaration —
+    /// so the written shape cannot rot unnoticed, and the host that can check it
+    /// does so on every run. Where the host does not register it, the row is
+    /// checked against [`Self::expected`] and printed as such, never as though a
+    /// framework had answered. A disagreement is a FINDING either way.
+    ///
+    /// The shape is generated by `aterm_objc::method_encoding!` over the fork's
+    /// own types rather than typed out, for the reason [`Unchecked::expected`]
+    /// gives: a literal would be wrong on one of the two slices. It is therefore
+    /// the same question the runtime answers where it can — "does the registered
+    /// encoding match the declared types?" — asked of the declaration this fork
+    /// wrote, and it catches both plants this file exists for: a retyped argument
+    /// changes the registered string and not this one, and deleting the protocol
+    /// claim leaves `protocol` naming a name the class no longer claims, which
+    /// [`Audit::host_lacks_pins`] refuses.
+    struct HostLacks {
+        /// The selector, as the fork's `@sel(…)` spells it.
+        sel: &'static str,
+        /// The protocol that declares it on a host that has one. MUST be one of
+        /// the target's `claimed` names — checked, not trusted.
+        protocol: &'static CStr,
+        /// The fork's Rust signature for this row, as source text, so the
+        /// expectation below can be read against the thing it describes.
+        rust: &'static str,
+        /// The encoding [`Self::rust`] produces, built by
+        /// `aterm_objc::method_encoding!` over those same types.
+        expected: fn() -> String,
+        /// Why this host may not have the protocol, and where that was measured.
+        why: &'static str,
     }
 
     /// A row nothing declares whose shape is DERIVED from siblings that
@@ -976,6 +1110,22 @@ mod macos {
     /// The cost is irrelevant and the answer is the difference between a finding
     /// that names the one-line fix and a finding that sends its reader to write
     /// down a signature by hand.
+    /// Whether a [`HostLacks`] entry is the authority for its row ON THIS HOST.
+    ///
+    /// Both halves, and neither is optional. The target must still CLAIM the
+    /// protocol — otherwise the entry speaks for a row nothing ties to that
+    /// declaration, and deleting the name from the fork's `protocols:` list
+    /// would silently convert plant two into a pass. And the object under that
+    /// name must be the stand-in THIS PROCESS registered, not the framework's
+    /// own: asking `objc_getProtocol` for nil-ness instead would read a
+    /// name-only stand-in as AppKit, which is the reading
+    /// `crates/aterm-objc/tests/winit_seam.rs`'s `host_registers` and three
+    /// production sites in this tree all guard against the same way.
+    fn host_lacks_is_active(target: &Target, pin: &HostLacks) -> bool {
+        target.claimed.contains(&pin.protocol)
+            && aterm_objc::protocols_registered_by_aterm().contains(&pin.protocol)
+    }
+
     fn protocols_declaring(sel: Sel) -> Vec<(String, String)> {
         let mut found = Vec::new();
         for (name, proto) in loaded_protocols() {
@@ -1259,6 +1409,14 @@ mod macos {
         /// wrong — and not passes either: with any of these the verdict is
         /// NOT RUN.
         host_unchecked: Vec<String>,
+        /// Rows that WERE checked on this host, against this fork's own
+        /// declaration rather than the runtime, because the protocol declaring
+        /// them is one this AppKit does not register — see [`HostLacks`]. Held
+        /// to a shape, so not `host_unchecked`; held to OUR shape and not the
+        /// framework's, so not silently a `PASS` either. The verdict is
+        /// [`FORK_DECLARED`], and this list is what its count and its transcript
+        /// lines are made of.
+        fork_declared: Vec<String>,
     }
 
     impl Audit {
@@ -1445,6 +1603,15 @@ mod macos {
                     Source::Class(_) | Source::Nowhere => {}
                 }
                 let covered_by_part_d = target.unchecked.iter().any(|u| u.sel == name.as_str());
+                // A row whose protocol this host does not register, and whose
+                // shape the fork wrote down: checked below against that, and
+                // cross-checked in part F on a host that HAS the protocol. The
+                // same reasoning as `covered_by_part_d` — `?? ` would say
+                // "unknown" of a row that is in fact held to a shape.
+                let covered_by_part_f = target
+                    .host_lacks
+                    .iter()
+                    .any(|h| h.sel == name.as_str() && host_lacks_is_active(target, h));
                 let verdict = match &authority {
                     Some(a) if *a == registered => "ok ",
                     Some(_) => "BAD",
@@ -1452,12 +1619,17 @@ mod macos {
                     // [`Unchecked`] list that is the old lie: it has no
                     // AUTHORITY, and it is still checked, in part D.
                     None if covered_by_part_d => "D  ",
+                    None if covered_by_part_f => "F  ",
                     None => "?? ",
                 };
                 println!(
                     "  {verdict} {name:<52} {registered:<16} {:<16} {}",
                     authority.as_deref().unwrap_or("-"),
-                    source.label(selector)
+                    if covered_by_part_f {
+                        "fork declaration".to_owned()
+                    } else {
+                        source.label(selector)
+                    }
                 );
                 if matches!(source, Source::Siblings(_))
                     && let Some(family) = target.families.iter().find(|f| f.sel == name.as_str())
@@ -1533,6 +1705,54 @@ mod macos {
                                     loaded_protocol_count(),
                                     named.join(", ")
                                 ));
+                            } else if let Some(pin) = target
+                                .host_lacks
+                                .iter()
+                                .find(|h| h.sel == name.as_str())
+                                .filter(|h| {
+                                    supplied.iter().any(|s| {
+                                        s.as_str() == h.protocol.to_string_lossy().as_ref()
+                                    })
+                                })
+                            {
+                                // Nothing loaded declares it, the target claims
+                                // a protocol this host does not register, AND
+                                // the fork wrote down what it declared for this
+                                // row. So the row IS checked — against that,
+                                // said plainly, and never as though a framework
+                                // had answered. `host_lacks_pins` holds the same
+                                // written shape to the protocol's own
+                                // declaration on every host that has one, which
+                                // is what keeps this from being an exemption.
+                                let expected = (pin.expected)();
+                                println!(
+                                    "      CHECKED AGAINST THE FORK'S OWN DECLARATION, not this \
+                                     host's runtime: its AppKit does not register {} (aterm \
+                                     supplied a name-only stand-in) and none of the {} protocols \
+                                     loaded here declares this row",
+                                    supplied.join(", "),
+                                    loaded_protocol_count()
+                                );
+                                println!("      expected  {expected}   from `{}`", pin.rust);
+                                println!("      {}", pin.why);
+                                self.fork_declared.push(format!(
+                                    "{}: {name} — checked against `{}` ({expected}), not against \
+                                     {} which this host does not register",
+                                    target.class_name,
+                                    pin.rust,
+                                    supplied.join(", ")
+                                ));
+                                if registered != expected {
+                                    self.fail(format!(
+                                        "{name}: registered {registered} but the fork declares \
+                                         `{}`, which encodes {expected}. This host does not \
+                                         register {} so the runtime cannot arbitrate, and the \
+                                         registered shape disagrees with the source it was \
+                                         generated from",
+                                        pin.rust,
+                                        supplied.join(", ")
+                                    ));
+                                }
                             } else if !supplied.is_empty() {
                                 // Nothing loaded declares it, and the target
                                 // claims a protocol this host does not
@@ -1810,6 +2030,70 @@ mod macos {
         /// the PROTOCOL's layout, whatever we registered, and the question
         /// worth asking is whether our string is that string. See
         /// [`Audit::first_rect_through_foundation`].
+        /// PART C FOR THE APPLICATION DELEGATE: one live send through the one
+        /// row whose return is not `void`.
+        ///
+        /// `applicationShouldTerminate:` is registered `Q@:@` — an eight-byte
+        /// `NSApplicationTerminateReply` — and until 2026-09-21 nothing sent it:
+        /// part A compared the registered string with an authority, and on a
+        /// host whose AppKit does not register `NSApplicationDelegate` that
+        /// authority is the fork's own declaration ([`HostLacks`]). Two strings
+        /// agreeing is not the IMP answering. This drives the registered IMP with
+        /// the prototype the encoding promises and reads the whole `usize` back.
+        ///
+        /// WHAT IT PROVES, said exactly. With no quit-confirm hook registered —
+        /// this process installs none — the fork answers `NSTerminateNow`, which
+        /// is `1`, so the row is live, dispatches with this prototype, and its
+        /// veto logic is wired the way `app_state.rs` says. What it does NOT
+        /// deterministically prove is the return WIDTH: a `-> bool` IMP that
+        /// answers `true` leaves `al = 1` and unspecified upper bits, which can
+        /// happen to read as exactly `1`. The deterministic guard against that
+        /// retype is part A's encoding check — a `-> bool` fn registers `B@:@`
+        /// or `c@:@`, never `Q@:@` — and this send is its behavioural
+        /// complement, not a substitute. Side effects: none. The handler reads
+        /// `QUIT_CONFIRM_HOOK` and returns; only `-terminate:` acts on the reply,
+        /// and nothing here sends it.
+        fn app_delegate_live_sends(
+            &mut self,
+            app_delegate: Id,
+            app: Id,
+            registered: &BTreeMap<String, String>,
+        ) {
+            println!("\n=== C. LIVE SENDS THROUGH THE REGISTERED IMPS ===");
+            let want = "applicationShouldTerminate:";
+            if !registered.contains_key(want) {
+                // A selector the class no longer registers would reach
+                // `-doesNotRecognizeSelector:` and ABORT — a red with a useless
+                // diagnosis, as the window delegate's part C says. Report the
+                // absence as the finding it is instead.
+                self.fail(format!(
+                    "{want} is not in the registered table, so the live send that would exercise \
+                     its return shape cannot be made"
+                ));
+                return;
+            }
+            // NSTerminateCancel = 0, NSTerminateNow = 1, NSTerminateLater = 2.
+            const NS_TERMINATE_NOW: usize = 1;
+            // SAFETY: `applicationShouldTerminate:` is registered `Q@:@` (audited
+            // in part A, against the protocol where this host has it and the
+            // fork's declaration where it does not); `app_delegate` and `app` are
+            // the live objects AppKit is holding; the handler consults a hook this
+            // process never installs and performs no send of its own.
+            let reply: usize = unsafe {
+                let send: unsafe extern "C-unwind" fn(Id, Sel, Id) -> usize = msg();
+                send(app_delegate, sel!(applicationShouldTerminate:), app)
+            };
+            println!("  -applicationShouldTerminate: = {reply:#018x}");
+            if reply != NS_TERMINATE_NOW {
+                self.fail(format!(
+                    "applicationShouldTerminate: answered {reply:#018x}; with no quit-confirm hook \
+                     registered the fork returns NSTerminateNow ({NS_TERMINATE_NOW:#018x}), so \
+                     either the veto path is wired wrong or the IMP is not returning the \
+                     eight-byte NSApplicationTerminateReply its registered Q@:@ promises"
+                ));
+            }
+        }
+
         fn view_live_sends(&mut self, view: Id, registered: &BTreeMap<String, String>) {
             println!("\n=== C. LIVE SENDS THROUGH THE REGISTERED IMPS (WinitView) ===");
             let mut absent = false;
@@ -2725,7 +3009,103 @@ mod macos {
             let authorities = derived_authority_protocols(target, cls);
             let (used, registered) = self.methods(target, &authorities, cls);
             self.protocols(target, &authorities, cls, instance, &used);
+            self.host_lacks_pins(target, &registered);
             Some(registered)
+        }
+
+        /// PART F — THE WRITTEN SHAPES, HELD TO THE RUNTIME WHEREVER IT HAS ONE.
+        ///
+        /// [`HostLacks`] lets a row be checked on a host whose AppKit does not
+        /// register the protocol that declares it. That is only honest if the
+        /// written shape cannot quietly stop matching what the protocol says, so
+        /// this asks the runtime the same question on every host that CAN answer
+        /// it — which is the host the release is cut on. Three claims, each a
+        /// finding when it fails:
+        ///
+        ///  * the entry's protocol is one this target CLAIMS. Deleting the name
+        ///    from the fork's `protocols:` list — plant two — therefore cannot
+        ///    turn these rows into unchecked ones: it turns them into a finding.
+        ///  * the entry's selector is one the class really REGISTERS. A row that
+        ///    is renamed or dropped leaves a stale entry behind, and a stale
+        ///    entry is a free pass for a row nobody audits.
+        ///  * where the protocol is the HOST's (not the stand-in `aterm_objc`
+        ///    supplies), what it declares for that selector EQUALS the written
+        ///    shape. This is the anti-rot tooth: on macOS 26 it runs for real,
+        ///    and a fork that retypes an argument without updating the written
+        ///    signature fails here even though the registered table still agrees
+        ///    with the protocol.
+        ///
+        /// On a host that lacks the protocol the third claim cannot be asked, and
+        /// this says so rather than counting silence as agreement.
+        fn host_lacks_pins(&mut self, target: &Target, registered: &BTreeMap<String, String>) {
+            if target.host_lacks.is_empty() {
+                return;
+            }
+            println!("\n=== F. THE WRITTEN SHAPES, AGAINST THE RUNTIME THAT MAY HAVE THEM ===");
+            let supplied = aterm_objc::protocols_registered_by_aterm();
+            for pin in target.host_lacks {
+                let proto_name = pin.protocol.to_string_lossy().into_owned();
+                if !target.claimed.contains(&pin.protocol) {
+                    self.fail(format!(
+                        "{}: the written shape for {} names {proto_name}, which this target does \
+                         not claim — so the row it speaks for is not this protocol's, and the \
+                         entry would check a row against a declaration nothing ties it to",
+                        target.class_name, pin.sel
+                    ));
+                    continue;
+                }
+                if !registered.contains_key(pin.sel) {
+                    self.fail(format!(
+                        "{}: the written shape for {} is stale — the class registers no such \
+                         selector, so the entry holds nothing to any shape at all",
+                        target.class_name, pin.sel
+                    ));
+                    continue;
+                }
+                let expected = (pin.expected)();
+                let sel = sel_named(pin.sel);
+                // "The host has it" means BOTH halves: the runtime knows the
+                // name, and the object under that name is not the stand-in this
+                // process registered for itself. Either half alone would read a
+                // stand-in as a framework — the reading three other sites in
+                // this tree guard against the same way.
+                let host_has = !supplied.contains(&pin.protocol)
+                    && loaded_protocols()
+                        .iter()
+                        .any(|(name, _)| *name == proto_name);
+                if !host_has {
+                    println!(
+                        "  {:<46} {expected:<10} not cross-checkable here: {proto_name} is \
+                         aterm's stand-in on this host",
+                        pin.sel
+                    );
+                    continue;
+                }
+                match protocols_declaring(sel)
+                    .into_iter()
+                    .find(|(name, _)| *name == proto_name)
+                {
+                    Some((_, declared)) if declared == expected => println!(
+                        "  {:<46} {expected:<10} agrees with {proto_name}, which THIS host \
+                         registers",
+                        pin.sel
+                    ),
+                    Some((_, declared)) => self.fail(format!(
+                        "{}: the written shape for {} says {expected} (from `{}`) but \
+                         {proto_name}, which this host registers, declares {declared}. The \
+                         written shape is what a host LACKING this protocol checks the row \
+                         against, so it may not disagree with the protocol where one exists",
+                        target.class_name, pin.sel, pin.rust
+                    )),
+                    None => self.fail(format!(
+                        "{}: the written shape for {} claims {proto_name} declares it, and this \
+                         host registers {proto_name} but it declares no such row — so on a host \
+                         that lacks the protocol this entry would check the row against a \
+                         signature the protocol never had",
+                        target.class_name, pin.sel
+                    )),
+                }
+            }
         }
 
         /// Everything, given the two objects AppKit is holding.
@@ -2749,7 +3129,9 @@ mod macos {
             // whose classes no gate reads is the D1 failure this campaign has
             // repeated once already, and the fix is the same code reading three
             // more objects, not three more copies of this file.
-            self.table_and_conformance(&APP_DELEGATE, app_delegate);
+            if let Some(registered) = self.table_and_conformance(&APP_DELEGATE, app_delegate) {
+                self.app_delegate_live_sends(app_delegate, app, &registered);
+            }
             self.table_and_conformance(&WINDOW, window);
             if self.table_and_conformance(&APP, app).is_some() {
                 self.patched_rows(&APP, app);
@@ -3046,6 +3428,23 @@ mod macos {
                 driver.audit.host_unchecked.len()
             );
             NOT_RUN
+        } else if !driver.audit.fork_declared.is_empty() {
+            // Every row was held to a shape, and some were held to OURS because
+            // this host's AppKit could not speak for them. That is a pass the
+            // gate can land on, under a sentence that does not claim the runtime
+            // answered — see [`FORK_DECLARED`].
+            for row in &driver.audit.fork_declared {
+                println!("  CHECKED AGAINST THE FORK'S OWN DECLARATION: {row}");
+            }
+            println!(
+                "objc-live-class-audit: OK — every registered row agrees, and {} of them were \
+                 checked against this fork's own declaration because this host's AppKit does not \
+                 register the protocol that declares them. Part F held those written shapes to \
+                 nothing here; a host that registers the protocol checks them against it on every \
+                 run.",
+                driver.audit.fork_declared.len()
+            );
+            FORK_DECLARED
         } else {
             println!("objc-live-class-audit: OK — every registered row agrees with the runtime.");
             PASS

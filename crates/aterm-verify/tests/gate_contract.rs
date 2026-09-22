@@ -442,9 +442,10 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        33,
-        "30 gate stages (driver builds since 2026-09-13, the sealed fabric lane since \
-         2026-09-14) plus the three --full tiers"
+        34,
+        "31 gate stages (driver builds since 2026-09-13, the sealed fabric lane since \
+         2026-09-14, the conformance-release prime since 2026-09-22) plus the three \
+         --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -1433,6 +1434,10 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ),
             ("skip", "gate counts (selftest: not executed)"),
             ("skip", "driver builds (selftest: not executed)"),
+            (
+                "skip",
+                "targo build --locked --release -p aterm (the artifact paint/spin/untracked_stage judge) (selftest: not executed)"
+            ),
             // The sealed fabric rung, behind the driver builds since 2026-09-14:
             // the aterm-gui it drives, then the suite — an integration test alone
             // (no doctests), so neither child takes a doc-driver suffix.

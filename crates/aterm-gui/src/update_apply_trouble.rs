@@ -275,6 +275,17 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "the handover could not be set up",
         "couldn\u{2019}t be set up",
     ),
+    // ── The outgoing process's own capture refused itself: `screen_digest_refs`
+    // (`seamless.rs`) names the session, the field and the bound — "visible
+    // checkpoint set could not be committed canonically: session 0: meta out of
+    // bounds at 55x149 with 0 carried line(s): …" — and the park stands the held
+    // successor down. Twice now (the alt blob, 2026-08-24; the DECSC slot,
+    // 2026-09-22) this class sat under GENERIC with no next step.
+    (
+        "could not be committed canonically",
+        "a session\u{2019}s screen could not be captured for the handover",
+        "couldn\u{2019}t capture a session",
+    ),
     // ── Not the GUI's lane at all: `aterm-update`'s own boot-trial recovery writes
     // this slot too (`install.rs`, both arms end "disarmed the boot sentinel to keep
     // updates possible"). The update was installed, would not prove itself across
@@ -508,6 +519,11 @@ mod tests {
         "overlap handoff failed safely: could not create the handoff-commit channel",
         "overlap handoff failed safely: handoff process could not start: \
          Resource temporarily unavailable (os error 35)",
+        // `screen_digest_refs`, via the park: the refusal names the session, the
+        // field and the bound (measured 2026-09-22).
+        "overlap handoff failed safely: visible checkpoint set could not be committed \
+         canonically: session 0: meta out of bounds at 55x149 with 0 carried line(s): \
+         saved_cursor_main.cursor_row=55 must be below rows=55",
         // `aterm_update::install`, both boot-trial recovery arms.
         "update trial for build 1787699398 was unrecoverable across 3 launches of build \
          1787690000; disarmed the boot sentinel to keep updates possible",

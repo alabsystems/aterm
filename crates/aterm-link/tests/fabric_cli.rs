@@ -202,6 +202,144 @@ fn publish(sock: &str, records: &[(String, String)]) -> Vec<u64> {
         .collect()
 }
 
+/// **`doctor --retire-ghosts` IS DRY UNTIL IT IS TOLD OTHERWISE.**
+///
+/// A presence row under THIS state dir's node says `state=live` and no aterm
+/// instance here hosts it — the round-21 residual the bridge's own sweep
+/// refuses to touch, because it cannot prove a death it did not witness. The
+/// bare run NAMES it and publishes nothing; `--yes` rewrites the row to
+/// `exited`, carrying the row's own `inc=`/`epoch=` through so the next bridge
+/// can still reason about it.
+#[test]
+fn doctor_retire_ghosts_lists_dry_and_publishes_exited_with_yes() {
+    let s = Scratch::new("ghosts");
+    let sock = s.sock();
+    let _broker = Broker::spawn(&s);
+    let node = "n-00000000000000aa";
+    let subject = format!("/f/t1/pub/{node}/s-ghost/presence");
+    let live = "v=1 t=1789400000000 inc=7 epoch=e1 gen=g1 state=live hold=0";
+    publish(&sock, &[(subject.clone(), live.to_string())]);
+    let env_cmd = s.command(&sock, true);
+
+    // DRY: it names the row, publishes nothing, and exits 0.
+    let (code, out, err) = fabric(&s, Some(&env_cmd), &["doctor", "--retire-ghosts"]);
+    assert_eq!(code, 0, "out={out} err={err}");
+    assert!(out.contains("@s-ghost"), "{out}");
+    assert!(out.contains("nothing published (dry)"), "{out}");
+    assert_eq!(
+        last_body(&sock, &subject).as_deref(),
+        Some(live),
+        "a dry run must not touch the bus"
+    );
+
+    // --yes: the row is retired, and only `state=`/`t=` moved.
+    let (code, out, err) = fabric(&s, Some(&env_cmd), &["doctor", "--retire-ghosts", "--yes"]);
+    assert_eq!(code, 0, "out={out} err={err}");
+    assert!(out.contains("published `exited` for 1 row"), "{out}");
+    let after = last_body(&sock, &subject).expect("the row is still there");
+    assert!(after.contains("state=exited"), "{after}");
+    assert!(!after.contains("state=live"), "{after}");
+    assert!(
+        after.contains("inc=7"),
+        "the bridge's facts are carried: {after}"
+    );
+    assert!(
+        after.contains("epoch=e1") && after.contains("gen=g1"),
+        "{after}"
+    );
+    assert!(
+        !after.contains("t=1789400000000"),
+        "t= is refreshed: {after}"
+    );
+
+    // And now there is nothing left to retire.
+    let (code, out, _) = fabric(&s, Some(&env_cmd), &["doctor", "--retire-ghosts"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("no ghost rows"), "{out}");
+}
+
+/// **AN INSTANCE THAT DID NOT ANSWER KEEPS ITS ROWS OUT OF THE RETIRE SET.**
+/// A live socket with no token is discovered, kept in the report with `error`
+/// set and NO sessions — so every live row on this node reads unhosted. `status`
+/// refuses to NAME such a row; the doctor must refuse to TOUCH any of them,
+/// because the rows it would publish `exited` for may be hosted perfectly well
+/// by the instance it could not reach.
+#[test]
+fn doctor_retire_ghosts_refuses_while_an_instance_has_not_answered() {
+    let s = Scratch::new("ghostmute");
+    let sock = s.sock();
+    let _broker = Broker::spawn(&s);
+    let node = "n-00000000000000aa";
+    let subject = format!("/f/t1/pub/{node}/s-ghost/presence");
+    let live = "v=1 t=1789400000000 inc=7 epoch=e1 gen=g1 state=live hold=0";
+    publish(&sock, &[(subject.clone(), live.to_string())]);
+    let env_cmd = s.command(&sock, true);
+
+    // An instance socket nobody can authenticate against: alive, unanswerable.
+    let dir = std::path::PathBuf::from(s.path("run")).join("aterm");
+    std::fs::create_dir_all(&dir).expect("run/aterm");
+    let mute = dir.join(format!("aterm-{}.sock", std::process::id()));
+    let _listener = UnixListener::bind(&mute).expect("bind a mute instance socket");
+
+    let (code, out, err) = fabric(&s, Some(&env_cmd), &["doctor", "--retire-ghosts", "--yes"]);
+    assert_ne!(code, 0, "out={out} err={err}");
+    assert!(out.contains("did not answer"), "{out}");
+    assert!(!out.contains("published"), "{out}");
+    assert_eq!(
+        last_body(&sock, &subject).as_deref(),
+        Some(live),
+        "a row an unanswered instance may host must not be retired"
+    );
+}
+
+/// **A PIPED `y` IS NOT CONSENT.** Without a terminal there is exactly one way
+/// to say yes and it is `--yes`, which says so in the argv. Reading whatever
+/// stdin happens to be turned `echo y | …` into a publish, and an inherited
+/// idle pipe parked `read_line` for ever.
+#[test]
+fn doctor_retire_ghosts_does_not_take_a_piped_yes() {
+    let s = Scratch::new("ghostpipe");
+    let sock = s.sock();
+    let _broker = Broker::spawn(&s);
+    let node = "n-00000000000000aa";
+    let subject = format!("/f/t1/pub/{node}/s-ghost/presence");
+    let live = "v=1 t=1789400000000 inc=7 epoch=e1 gen=g1 state=live hold=0";
+    publish(&sock, &[(subject.clone(), live.to_string())]);
+    let env_cmd = s.command(&sock, true);
+
+    let mut child = fabric_cmd(&s, Some(&env_cmd), &["doctor", "--retire-ghosts"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the doctor");
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("stdin");
+        let _ = stdin.write_all(b"y\n");
+    }
+    let out = child.wait_with_output().expect("wait");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("not a terminal"), "{text}");
+    // Not a bare "published": the dry line itself says "nothing published".
+    assert!(!text.contains("published `exited`"), "{text}");
+    assert_eq!(
+        last_body(&sock, &subject).as_deref(),
+        Some(live),
+        "a piped `y` must publish nothing"
+    );
+}
+
+/// The LAST body on `subject`, read back through a fresh client.
+fn last_body(sock: &str, subject: &str) -> Option<String> {
+    let mut c = Client::connect(sock).expect("connect to the test broker");
+    let (rows, _) = c.last(subject, "", 8).expect("a Last walk");
+    rows.into_iter()
+        .rev()
+        .find(|(_, s, _)| s == subject)
+        .map(|(_, _, raw)| String::from_utf8_lossy(&raw).into_owned())
+}
+
 /// An `in` record: `<src>` tells `<sid>@<node>` something of `kind`.
 fn msg(node: &str, sid: &str, src: &str, kind: &str, text: &str) -> (String, String) {
     (

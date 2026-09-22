@@ -375,6 +375,13 @@ pub const PROBE: &str = "Manager's watcher: the usage limit should have reset. A
 pub const REBRIEF: &str = "Manager's watcher, standing rules restated after a limit: ";
 /// `meta set attention` takes 256 bytes at most (the server's cap).
 const ATTENTION_BYTES: usize = 256;
+/// The prefix every attention this loop writes opens with
+/// ([`Session::open_episode`]), and the ONLY attention it ever unsets
+/// ([`Session::close_episode`]). The worker's `attention` is shared: the
+/// link Notification hook writes `claude needs approval: …` there and the
+/// harness writes `aterm harness: …`, and each writer sets and clears only
+/// its own prefix (docs/DESIGN-aterm-wrapper-2026-09-17.md §4.3 L1).
+pub const ATTENTION_PREFIX: &str = "limited:";
 
 /// How long an outage is ridden out before it ends the loop, unless
 /// `--reconnect-s` says otherwise.
@@ -2929,7 +2936,11 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<(), Fail> {
         let reset_text = reset.map_or_else(|| "-".to_string(), str::to_string);
         let reset_unix = self.reset_unix(reset);
-        let text = format!("limited: {} reset={}", one_line(message), reset_text);
+        let text = format!(
+            "{ATTENTION_PREFIX} {} reset={}",
+            one_line(message),
+            reset_text
+        );
         let retry = self.retry.take();
         self.escalate(seq, &text, retry.as_ref().map(|r| r.seq), review)?;
         self.limit = Some(Episode {
@@ -2982,19 +2993,38 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The episode is over: the attention cleared (`meta unset attention` —
-    /// on the wire `meta set attention ''` is a usage error, measured) and
-    /// journaled as `CLEARED seq=<n> attention=<reply> <why>`, `seq` the
-    /// read it closed on.
+    /// The episode is over: the attention cleared IF IT IS STILL OURS, and
+    /// journaled as `CLEARED seq=<n> attention=<said> <why>`, `seq` the read
+    /// it closed on.
+    ///
+    /// The attention is read first (`meta`), and `meta unset attention` (on
+    /// the wire `meta set attention ''` is a usage error, measured) goes only
+    /// when the standing text opens with [`ATTENTION_PREFIX`]. The field is
+    /// shared: while the episode was open the link Notification hook may have
+    /// raised `claude needs approval: …` over ours, and that box is still
+    /// open when the limit ends — an unconditional unset wiped the badge the
+    /// human was meant to answer. So `<said>` is the unset's reply word when
+    /// it went, `kept` when another writer's text stands (untouched), `none`
+    /// when nothing stands, and the read's own reply word when the read was
+    /// refused (nothing is unset on a read that did not say it was ours).
     fn close_episode(&mut self, seq: u64, why: &str, review: &mut dyn Review) -> Result<(), Fail> {
         if self.limit.take().is_none() {
             return Ok(());
         }
-        let r = self.call(&["meta", "unset", "attention"])?;
-        review.note(&format!(
-            "CLEARED seq={seq} attention={} {why}",
-            reply_word(&r)
-        ));
+        let read = self.call(&["meta"])?;
+        let said = if read.ok() {
+            match standing_attention(&read.stdout) {
+                Some(text) if text.starts_with(ATTENTION_PREFIX) => {
+                    let r = self.call(&["meta", "unset", "attention"])?;
+                    reply_word(&r)
+                }
+                Some(_) => "kept".to_string(),
+                None => "none".to_string(),
+            }
+        } else {
+            reply_word(&read)
+        };
+        review.note(&format!("CLEARED seq={seq} attention={said} {why}"));
         Ok(())
     }
 
@@ -3420,6 +3450,19 @@ fn fit_bytes(s: &str, n: usize) -> String {
 
 /// A reply's first line, for the journal: stdout's when it was `OK`, else
 /// the error, on one line and cut at 160 characters.
+/// The `attention=` a bare `meta` reply carries, decoded, or `None` when it
+/// is unset (`-`), empty, or absent from the reply.
+pub(crate) fn standing_attention(stdout: &str) -> Option<String> {
+    let line = stdout.lines().find(|l| l.starts_with("OK"))?;
+    let raw = line
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("attention="))?;
+    if raw == "-" || raw.is_empty() {
+        return None;
+    }
+    Some(super::report::pct_decode(raw)).filter(|t| !t.trim().is_empty())
+}
+
 fn reply_word(r: &CtlReply) -> String {
     let text = if r.ok() {
         r.stdout.lines().next().unwrap_or("OK")
@@ -3503,7 +3546,8 @@ pub fn render_phase_and_survey(turn: &Turn, python_allow: &[String]) -> String {
 }
 
 /// The lines `phase` / `await-turn` print: the phase word, then for a prompt
-/// its parsed kind, command, description, classification and options; for
+/// its parsed kind, command, description, one `note <text>` per note row (a
+/// Bash box's warning rows — `Prompt::notes`), classification and options; for
 /// busy, `reason <zone>: <rule>` (which signal fired, and where — `whole
 /// screen, no composer frame: output still changing` when a wait ran out on a
 /// screen without the composer frame that kept changing, `no screen: no read
@@ -3733,6 +3777,9 @@ fn render_prompt(p: &Prompt, python_allow: &[String]) -> String {
     if !p.description.is_empty() && p.kind != PromptKind::Other {
         out.push_str(&format!("description {}\n", p.description));
     }
+    for note in &p.notes {
+        out.push_str(&format!("note {note}\n"));
+    }
     if p.kind == PromptKind::Bash {
         let Verdict { read_only, reason } = classify_command_with(&p.command, python_allow);
         if read_only {
@@ -3841,7 +3888,9 @@ pub fn utc_stamp(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::prompt::fixtures::{bash_one_row, composer, rows, workflow_box};
+    use super::super::prompt::fixtures::{
+        bash_multi_row, bash_multi_row_with_note, bash_one_row, composer, rows, workflow_box,
+    };
     use super::*;
     use std::collections::{BTreeMap, VecDeque};
 
@@ -3945,6 +3994,15 @@ mod tests {
         /// 3 on a stray digit); off the caret row's column 2, text on the
         /// caret row is a typed draft ([`typed_draft`]).
         cursor_col: Option<usize>,
+        /// The worker's `attention` meta, as the server holds it: set by an
+        /// accepted `meta set attention`, cleared by an accepted `meta unset
+        /// attention`, and read back (pct-encoded) by a bare `meta` — so the
+        /// episode's close reads the `limited: …` its escalation wrote.
+        attention: Option<String>,
+        /// Another writer's text that lands over ours right after the
+        /// loop's `meta set attention` — the link Notification hook raising
+        /// `claude needs approval: …` while the episode is open.
+        foreign_attention: Option<String>,
     }
 
     fn ok(stdout: &str) -> CtlReply {
@@ -4025,7 +4083,31 @@ mod tests {
                 stall_sleep: None,
                 dead_after_turns: None,
                 cursor_col: None,
+                attention: None,
+                foreign_attention: None,
             }
+        }
+        /// The bare `meta` reply, `attention=` pct-encoded as the server
+        /// spells it (`-` = unset).
+        fn meta_line(&self) -> String {
+            let attention = self.attention.as_deref().map_or_else(
+                || "-".to_string(),
+                |t| {
+                    t.bytes()
+                        .map(|b| {
+                            if b.is_ascii_graphic() && b != b'%' {
+                                char::from(b).to_string()
+                            } else {
+                                format!("%{b:02X}")
+                            }
+                        })
+                        .collect()
+                },
+            );
+            format!(
+                "OK title=- user_title=- description=- icon=- role=- attention={attention} \
+                 cwd=- state=alive\n"
+            )
         }
         fn last_served(&self) -> &[String] {
             &self.screens[self.served.saturating_sub(1).min(self.screens.len() - 1)]
@@ -4171,6 +4253,23 @@ mod tests {
                     .offscreen
                     .pop_front()
                     .unwrap_or_else(|| err("unknown verb (try: help)"))),
+                "meta" if tail.is_empty() => Ok(ok(&self.meta_line())),
+                "meta" => {
+                    let r = self.replies.pop_front().unwrap_or_else(|| ok("OK\n"));
+                    if r.ok() && tail.get(1) == Some(&"attention") {
+                        match tail.first() {
+                            Some(&"set") => {
+                                self.attention = Some(tail[2..].join(" "));
+                                if let Some(f) = self.foreign_attention.take() {
+                                    self.attention = Some(f);
+                                }
+                            }
+                            Some(&"unset") => self.attention = None,
+                            _ => {}
+                        }
+                    }
+                    Ok(r)
+                }
                 _ => Ok(self.replies.pop_front().unwrap_or_else(|| ok("OK\n"))),
             }
         }
@@ -4880,6 +4979,69 @@ mod tests {
             "limited\nmessage You've hit your session limit · resets 7:30pm \
              (America/Los_Angeles)\nreset 7:30pm (America/Los_Angeles)\n"
         );
+    }
+
+    /// A prompt's note rows print as `note <text>` lines, one per row, after
+    /// the `description` line and before `classify`: the 2.1.278 box with
+    /// the `│`-led critical-path warning, and the earlier build's bare
+    /// ` This command requires approval`. The EVENT summary does not carry
+    /// them.
+    #[test]
+    fn render_prompt_prints_the_notes_after_the_description_and_before_classify() {
+        let turn_for = |rows: Vec<String>| Turn {
+            phase: worker_phase(&rows),
+            screen: Screen {
+                rows,
+                ..Screen::default()
+            },
+            timed_out: false,
+        };
+        let turn = turn_for(bash_multi_row_with_note());
+        assert_eq!(turn.phase, Phase::Prompt);
+        let out = render_phase(&turn, &[]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "prompt", "{out}");
+        assert_eq!(lines[1], "kind bash", "{out}");
+        assert!(
+            lines[2].starts_with("command cd /work/trust-vc && S="),
+            "{out}"
+        );
+        assert!(lines[2].ends_with("sed 's#^t_mb/##'"), "{out}");
+        assert_eq!(
+            lines[3],
+            "description Extract three trees to scratch, format them identically, and diff for real content changes",
+            "{out}"
+        );
+        assert!(
+            lines[4].starts_with("note Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf $S/$1`"),
+            "{out}"
+        );
+        assert!(lines[5].starts_with("classify not-read-only "), "{out}");
+        assert_eq!(
+            &lines[6..],
+            ["option 1 Yes", "option 2 No", "cancel esc"],
+            "{out}"
+        );
+        assert_eq!(out.matches("\nnote ").count(), 1, "{out}");
+        let event = event_line(&turn, &[]);
+        assert!(!event.contains("note"), "{event}");
+        assert!(
+            event.starts_with("EVENT prompt seq=0 kind=bash classify=not-read-only:"),
+            "{event}"
+        );
+
+        let out = render_phase(&turn_for(bash_multi_row()), &[]);
+        assert!(
+            out.starts_with(
+                "prompt\nkind bash\ncommand cd ~/ay && git status --short --branch && git pull 2>&1 | tail -20\n\
+                 description Sync the checkout before verifying\nnote This command requires approval\n\
+                 classify "
+            ),
+            "{out}"
+        );
+
+        let out = render_phase(&turn_for(bash_one_row()), &[]);
+        assert!(!out.contains("\nnote "), "{out}");
     }
 
     /// The EVENT summary is the worker's last row, never the session survey
@@ -8880,7 +9042,9 @@ mod tests {
                 // The answer: the busy footer leaving, then the read.
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
-                // EVENT resumed: the attention cleared, the rules restated.
+                // EVENT resumed: the attention read, found still ours
+                // (`limited: …`) and cleared, the rules restated.
+                "meta",
                 "meta unset attention",
                 &format!("turn idle=600 timeout=2500 {RULES_LINE}"),
                 // The next look: the answer still showing is the point
@@ -8947,6 +9111,54 @@ mod tests {
         assert_eq!(count(&m, "turn"), 1);
         assert_eq!(count(&m, "meta unset attention"), 1);
         assert!(!lines.iter().any(|l| l.starts_with("EXTEND")), "{lines:?}");
+    }
+
+    /// The attention is SHARED, and the episode's close unsets only its own:
+    /// with the link Notification hook's `claude needs approval: …` raised
+    /// over the escalation's `limited: …` while the episode was open, the
+    /// close reads `meta`, finds another writer's text standing and leaves
+    /// it — the box that text names is still open. Journaled `attention=kept`.
+    #[test]
+    fn a_standing_approval_attention_survives_the_episode_close() {
+        let (dir, path) = journal_file("limit-foreign-attention");
+        let approval = "claude needs approval: Bash rm -rf build";
+        let mut m = Mock::new(
+            true,
+            vec![busy_screen(), weekly_limited(), switched(), answered()],
+        );
+        m.vanish_after = Some(2);
+        m.foreign_attention = Some(approval.to_string());
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(3 * 86_400, None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_resume(Some(Resume { rules: None }));
+        });
+        assert!(
+            lines.iter().any(|l| l.starts_with("EVENT resumed")),
+            "the episode closed: {lines:?}"
+        );
+        assert_eq!(count(&m, "meta set attention"), 1);
+        assert_eq!(
+            m.requests.iter().filter(|r| *r == "meta").count(),
+            1,
+            "the close read the standing attention first: {:?}",
+            m.requests
+        );
+        assert_eq!(count(&m, "meta unset attention"), 0, "{:?}", m.requests);
+        assert_eq!(m.attention.as_deref(), Some(approval));
+        let (records, _) = journal_records(&path);
+        let cleared = records
+            .iter()
+            .find(|r| r.kind == "cleared")
+            .expect("a CLEARED row");
+        assert!(
+            cleared.summary.starts_with("attention=kept "),
+            "{}",
+            cleared.summary
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The notice again after the probe (the limit had not reset after all)

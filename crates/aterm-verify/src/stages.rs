@@ -48,6 +48,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::FreezeGate => freeze_gate(ctx, &mut r),
         StageId::ProofInventory => proof_inventory(ctx, &mut r),
         StageId::DriverBuilds => driver_builds(ctx, &mut r),
+        StageId::ConformanceRelease => conformance_release(ctx, &mut r),
         StageId::ControlSocketSmoke => smoke_stages::control_socket_smoke(ctx, &mut r),
         StageId::GuiSmoke => smoke_stages::gui_typing_smoke(ctx, &mut r),
         StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
@@ -192,6 +193,34 @@ pub fn atpkg_build_args() -> Vec<String> {
         .into_iter()
         .map(String::from)
         .collect()
+}
+
+/// `targo --unverified build --locked --release -p aterm` — the RELEASE
+/// artifact the live-conformance suites judge.
+///
+/// THIS ARGV IS NOT A CHOICE. It is transcribed from
+/// `crates/aterm-conformance/tests/support/mod.rs`'s `release_bin`, which spawns
+/// `<$CARGO or "cargo"> [--unverified when the driver's file stem starts with
+/// "targo"] build --locked --release -p aterm` with
+/// `CARGO_TARGET_DIR=<root>/target/conformance-release` and cwd `<root>`. Change
+/// one flag here and cargo's fingerprint stops matching, the helper rebuilds
+/// from scratch inside the test stage, and this row becomes a second build
+/// rather than a prime. [`conformance_release_cmd`] carries the other three
+/// halves of that match — the driver, the lane's directory, and the cwd every
+/// child already has.
+#[must_use]
+pub fn conformance_release_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "aterm",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// `targo --unverified test -p aterm-search --features regex --no-fail-fast`
@@ -469,11 +498,24 @@ pub fn objc_class_audit_build_args() -> Vec<String> {
 ///
 /// A FUNCTION, and tested, for the same reason [`redraw_outcome`] is: `2` means
 /// no window server answered, no delegate was installed, or the audit ran and
-/// some rows had no authority on this host because a protocol the class claims
-/// is one its AppKit does not register (aterm supplies a name-only stand-in —
-/// macOS 14.4.1's `NSApplicationDelegate`); read as green it would restore
+/// some row had no authority on this host at all; read as green it would restore
 /// exactly the silence this gate exists to remove — the two plants it was
 /// built against both left a GREEN build behind them.
+///
+/// `3` IS A PASS, AND IT IS A DIFFERENT CLAIM FROM `0` (2026-09-21). A protocol
+/// the class claims may be one this host's AppKit does not register — macOS
+/// 14.4.1's and macOS 13.7.8's lack `NSApplicationDelegate`, macOS 26's has it —
+/// and `aterm_objc` then supplies a name-only stand-in so the class can claim it,
+/// which is what stopped v0.72.0–v0.75.0 dying before their first window. A
+/// stand-in declares nothing, so those rows once had NO authority and this
+/// function read the whole audit as NOT RUN: the merge gate could not go green on
+/// any such host, which made a whole platform unable to land anything. The
+/// auditor now carries the fork's own declared shape for exactly those rows
+/// (`HostLacks`), checks them against it, holds that written shape to the
+/// protocol on every host that HAS one, and answers `3` to say which claim it
+/// made. `0` still means what its label says — the runtime arbitrated every row —
+/// and the two are not merged, because the receipt a green run writes would
+/// otherwise assert runtime authority nobody had.
 #[must_use]
 pub fn objc_audit_outcome(code: Option<i32>) -> (Outcome, String) {
     match code {
@@ -487,11 +529,15 @@ pub fn objc_audit_outcome(code: Option<i32>) -> (Outcome, String) {
         ),
         Some(2) => (
             Outcome::Fail(Severity::CouldNotRun),
-            "objc live-class audit: NOT RUN — no event loop, no delegate was installed, or rows whose claimed protocol this host's AppKit does not register (aterm's name-only stand-in declares nothing; the auditor's NOT CHECKED lines name them), so the registered class was not fully proven (exit 2, never a pass)".to_string(),
+            "objc live-class audit: NOT RUN — no event loop, no delegate was installed, or a row whose claimed protocol this host's AppKit does not register and for which the fork wrote down no shape either (aterm's name-only stand-in declares nothing; the auditor's NOT CHECKED lines name them), so the registered class was not fully proven (exit 2, never a pass)".to_string(),
+        ),
+        Some(3) => (
+            Outcome::Ok,
+            "objc live-class audit: every registered row agrees — and at least one was checked against THIS FORK'S OWN DECLARATION, not this host's runtime, because its AppKit does not register the protocol that declares it (the auditor's part F and VERDICT lines name each one). A host that registers the protocol holds those same written shapes to it on every run".to_string(),
         ),
         Some(c) => (
             Outcome::Fail(Severity::GateFailed),
-            format!("objc live-class audit: unexpected exit {c} (the auditor answers only 0/1/2)"),
+            format!("objc live-class audit: unexpected exit {c} (the auditor answers only 0/1/2/3)"),
         ),
         None => (
             Outcome::Fail(Severity::CouldNotRun),
@@ -973,7 +1019,7 @@ fn run_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     }
     let out = exec::run(cmd, ctx.exec_env());
     r.raw(out.output.as_str());
-    r.decide(out.ok, label);
+    r.decide_child(&out, label);
     out.ok
 }
 
@@ -1003,10 +1049,19 @@ fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 /// Initial values (2026-09-13), to be tuned from the stage timings: the side
 /// lanes overlap the build, and uncapped each would claim every core. Cargo does
 /// not fingerprint the job count, so a cap never causes a rebuild.
+///
+/// `ConformanceRelease` joined on 2026-09-22 at 6 — an initial value like the
+/// rest, above the four-job verb lanes because it is one long release compile
+/// of the whole `-p aterm` graph rather than a handful of small ones, and below
+/// the driver lane's eight because the driver lane's binaries gate the
+/// EXCLUSIVE smokes at the tail while this one only has to beat the test
+/// stage's first conformance suite. The lane's own `ATERM_VERIFY_TIMINGS` row
+/// is what to tune it from.
 #[must_use]
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
         Lane::RegexTarget | Lane::XtaskTarget => Some(4),
+        Lane::ConformanceRelease => Some(6),
         Lane::DriverTarget => Some(8),
         _ => None,
     }
@@ -1524,7 +1579,7 @@ fn grep_guards(ctx: &Ctx, r: &mut Report) {
     }
     let out = exec::run(&script_cmd(&g, &ctx.root), ctx.exec_env());
     r.raw(out.output.as_str());
-    r.decide(out.ok, "grep_guard.sh");
+    r.decide_child(&out, "grep_guard.sh");
 }
 
 // ---------------------------------------------------------------------------
@@ -1808,7 +1863,7 @@ fn license_headers(ctx: &Ctx, r: &mut Report) {
     }
     let out = exec::run(&script_cmd(&lic, &ctx.root), ctx.exec_env());
     r.raw(out.output.as_str());
-    r.decide(out.ok, "license_check.sh");
+    r.decide_child(&out, "license_check.sh");
 }
 
 // ---------------------------------------------------------------------------
@@ -1881,6 +1936,17 @@ fn libc_oracle(ctx: &Ctx, r: &mut Report) {
     }
     let out = exec::run(&cmd, ctx.exec_env());
     r.raw(out.output.as_str());
+    // THE MACHINE BEFORE THE EXIT CODE. `libc_oracle_outcome` reads run.sh's
+    // exit contract (3 is COULD NOT RUN, every other non-zero is a finding),
+    // and that contract cannot see a full disk: run.sh's own `step` maps a
+    // cargo child that died of `No space left on device` — exit 101, because
+    // targo never answers 3 — onto rc=1, which arrives here as a FINDING about
+    // the tree. This stage builds into `libc-oracle/target`, one of the lane
+    // dirs the disk floor exists to bound, so that is the stage most likely to
+    // meet ENOSPC first.
+    if r.child_could_not_run(&out, label) {
+        return;
+    }
     r.record(libc_oracle_outcome(out.code), label);
 }
 
@@ -2008,6 +2074,96 @@ fn driver_builds(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
+// 5b) CONFORMANCE RELEASE ARTIFACT — the RELEASE `aterm` that paint, spin and
+//    the untracked-staging suite JUDGE. They share one helper
+//    (`crates/aterm-conformance/tests/support/mod.rs`, `release_bin`) and one
+//    directory, so the first of the three to run pays for the whole release
+//    build inside its own test time — and cargo runs test binaries ONE AT A
+//    TIME, so nothing else in the gate is running while it does. This row moves
+//    that build to t0 in a lane of its own, so the helper's own invocation
+//    afterwards has a warm directory to check rather than an empty one to fill
+//    — read the measured caveat below before calling it a freshness no-op.
+//
+//    THE HELPER IS UNCHANGED, deliberately. It still builds its artifact if it
+//    finds it cold — a developer running `targo test -p aterm-conformance` by
+//    hand gets exactly what they got before, and the suites never depend on
+//    this gate having run.
+//
+//    WHAT THIS ROW DOES *NOT* BUY, MEASURED 2026-09-22, because the honest
+//    number is smaller than the obvious one. Two of this argv's build scripts
+//    track variables that CARGO ITSELF injects into every test binary and that
+//    `release_bin` then forwards to its nested cargo — read straight out of
+//    `target/conformance-release/release/.fingerprint/*/run-build-script-*.json`:
+//
+//      ring             CARGO_MANIFEST_DIR, CARGO_PKG_NAME,
+//                       CARGO_PKG_VERSION_{MAJOR,MINOR,PATCH,PRE}
+//      aterm-update-core  CARGO_PKG_REPOSITORY
+//
+//    This row's child has none of them, so `ring`'s build script reruns inside
+//    the suite and `ring -> rustls -> rustls-webpki -> aterm-http/-net ->
+//    aterm-update-core -> aterm-update -> atpkg -> aterm-gui -> aterm-cli ->
+//    aterm` relinks: 208-245 s of the 326 s cold build, measured three times.
+//    The row still takes the OTHER ~120 s off the critical path and makes the
+//    lane's dependency graph warm, which is why it is worth having as written.
+//
+//    AND THE SAME DEFECT ALREADY COSTS THE GATE, WITHOUT THIS ROW. The
+//    recorded fingerprint above holds `CARGO_PKG_NAME = "aterm-conformance"`,
+//    so `atpkg`'s `untracked_stage` — which presents `atpkg` — invalidates
+//    exactly that subtree after paint and spin have built it, every run. That
+//    is the likeliest reason the two slowest suites of the 2026-09-22 `--fast`
+//    were `untracked_stage` (424 s) and `paint` (417 s) rather than one slow
+//    suite and one fast one, and the helper's own comment ("after the first
+//    Cargo freshness check the other suite is warm") holds only WITHIN a
+//    package. The fix belongs in `release_bin`, in one sweep — clear
+//    `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_LINKS` and `CARGO_PKG_*` from the
+//    nested `Command` — and it is NOT made here: this stage may not change
+//    what the suites judge. With it, this row's prime becomes the freshness
+//    check it is shaped to be and the whole 326 s leaves the critical path.
+// ---------------------------------------------------------------------------
+
+/// The ladder label of this row's one child.
+pub const CONFORMANCE_RELEASE_LABEL: &str =
+    "targo build --locked --release -p aterm (the artifact paint/spin/untracked_stage judge)";
+
+/// The exact command the prime spawns — extracted so a test asserts on THIS and
+/// not on a replica.
+///
+/// Every column of it is the helper's: [`conformance_release_args`] is the
+/// helper's argv, [`Lane::ConformanceRelease`] is the helper's
+/// `CARGO_TARGET_DIR`, and the cwd is `<root>`, which every gate child already
+/// has ([`exec::ExecEnv`]). What the lane adds on top is `CARGO_BUILD_JOBS`, and
+/// cargo does not fingerprint the job count (see [`lane_build_jobs`]), so the
+/// cap can never turn the helper's freshness check back into a build.
+///
+/// [`Cmd::demoted`] because this child only COMPILES — the rule that doc states.
+#[must_use]
+pub fn conformance_release_cmd(ctx: &Ctx) -> Cmd {
+    in_lane(
+        ctx,
+        Lane::ConformanceRelease,
+        targo(ctx, conformance_release_args()),
+    )
+    .demoted()
+}
+
+/// A FAILING PRIME IS A FAIL, never a skip: the artifact the three suites judge
+/// could not be built, so those suites would fail on the same build a few
+/// minutes later. `run_labeled` decides it exactly as every other build child is
+/// decided — this stage adds no vocabulary of its own.
+fn conformance_release(ctx: &Ctx, r: &mut Report) {
+    if !ctx.tools.have_targo() {
+        r.skip("conformance release artifact (no targo)");
+        return;
+    }
+    run_labeled(
+        ctx,
+        r,
+        CONFORMANCE_RELEASE_LABEL,
+        &conformance_release_cmd(ctx),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 5c) CONTROL REDRAW CONFORMANCE — the one check that can see a control-socket
 //    `select` actually repaint a window. `EventLoop` construction panics off the
 //    process main thread and libtest runs every `#[test]` on a spawned one, so
@@ -2070,7 +2226,10 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!("targo build --bin {REDRAW_CONFORMANCE_BIN}"));
+        r.fail_child(
+            &build,
+            format!("targo build --bin {REDRAW_CONFORMANCE_BIN}"),
+        );
         return;
     }
     let bin = debug_bin(
@@ -2090,6 +2249,9 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = redraw_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2127,7 +2289,10 @@ fn objc_class_audit(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!("targo build --example {OBJC_CLASS_AUDIT_EXAMPLE}"));
+        r.fail_child(
+            &build,
+            format!("targo build --example {OBJC_CLASS_AUDIT_EXAMPLE}"),
+        );
         return;
     }
     let bin = debug_example(
@@ -2148,6 +2313,9 @@ fn objc_class_audit(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_audit_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2187,7 +2355,10 @@ fn objc_ime_drive(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!("targo build --example {OBJC_IME_DRIVE_EXAMPLE}"));
+        r.fail_child(
+            &build,
+            format!("targo build --example {OBJC_IME_DRIVE_EXAMPLE}"),
+        );
         return;
     }
     let bin = debug_example(
@@ -2208,6 +2379,9 @@ fn objc_ime_drive(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_ime_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2249,9 +2423,10 @@ fn objc_toolbar_drive(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!(
-            "targo build --example {OBJC_TOOLBAR_DRIVE_EXAMPLE}"
-        ));
+        r.fail_child(
+            &build,
+            format!("targo build --example {OBJC_TOOLBAR_DRIVE_EXAMPLE}"),
+        );
         return;
     }
     let bin = debug_example(
@@ -2272,6 +2447,9 @@ fn objc_toolbar_drive(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_toolbar_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2295,7 +2473,10 @@ fn objc_window_drive(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!("targo build --example {OBJC_WINDOW_DRIVE_EXAMPLE}"));
+        r.fail_child(
+            &build,
+            format!("targo build --example {OBJC_WINDOW_DRIVE_EXAMPLE}"),
+        );
         return;
     }
     let bin = debug_example(
@@ -2316,6 +2497,9 @@ fn objc_window_drive(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_window_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2339,7 +2523,10 @@ fn objc_event_drive(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!("targo build --example {OBJC_EVENT_DRIVE_EXAMPLE}"));
+        r.fail_child(
+            &build,
+            format!("targo build --example {OBJC_EVENT_DRIVE_EXAMPLE}"),
+        );
         return;
     }
     let bin = debug_example(
@@ -2360,6 +2547,9 @@ fn objc_event_drive(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_event_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2383,7 +2573,10 @@ fn objc_alert_drive(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!("targo build --example {OBJC_ALERT_DRIVE_EXAMPLE}"));
+        r.fail_child(
+            &build,
+            format!("targo build --example {OBJC_ALERT_DRIVE_EXAMPLE}"),
+        );
         return;
     }
     let bin = debug_example(
@@ -2404,6 +2597,9 @@ fn objc_alert_drive(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_alert_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2427,9 +2623,10 @@ fn objc_swizzle_drive(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!(
-            "targo build -p aterm-objc --example {OBJC_SWIZZLE_DRIVE_EXAMPLE}"
-        ));
+        r.fail_child(
+            &build,
+            format!("targo build -p aterm-objc --example {OBJC_SWIZZLE_DRIVE_EXAMPLE}"),
+        );
         return;
     }
     // An `aterm-objc` example lands under the same `<target>/debug/examples/`
@@ -2451,6 +2648,9 @@ fn objc_swizzle_drive(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_swizzle_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2474,9 +2674,10 @@ fn objc_bound_drive(ctx: &Ctx, r: &mut Report) {
     );
     if !build.ok {
         r.raw(build.output.as_str());
-        r.fail(format!(
-            "targo build -p aterm-objc --example {OBJC_BOUND_DRIVE_EXAMPLE}"
-        ));
+        r.fail_child(
+            &build,
+            format!("targo build -p aterm-objc --example {OBJC_BOUND_DRIVE_EXAMPLE}"),
+        );
         return;
     }
     let bin = debug_example(
@@ -2497,6 +2698,9 @@ fn objc_bound_drive(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_bound_outcome(out.code);
+    if r.child_could_not_run(&out, &label) {
+        return;
+    }
     r.record(outcome, label);
 }
 
@@ -2608,6 +2812,9 @@ fn cross_cells(ctx: &Ctx, r: &mut Report) {
     }
     let out = exec::run(&targo(ctx, xtask_gate_args("cells")), ctx.exec_env());
     r.raw(out.output.as_str());
+    if r.child_could_not_run(&out, "gate cells") {
+        return;
+    }
     let (outcome, label) = cells_outcome(out.ok, out.output.as_str());
     r.record(outcome, label);
 }
@@ -2665,6 +2872,9 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
         // which forfeits the merge-contract claim) and no run changes verdict.
         let out = exec::run(&kani_cmd(&gate, krate, &mc_root, &ay_dir), ctx.exec_env());
         r.raw(out.output.as_str());
+        if r.child_could_not_run(&out, &format!("verify-kani-proofs.sh ({krate})")) {
+            continue;
+        }
         let (outcome, why) = kani_floor_outcome(out.ok, &out.output);
         r.record(outcome, format!("verify-kani-proofs.sh ({krate}){why}"));
     }
@@ -2733,6 +2943,7 @@ mod tests {
             smoke_stages::smoke_build_args(),
             sealed_lane_args(),
             atpkg_build_args(),
+            conformance_release_args(),
             xtask_gate_args("drift"),
             freeze_gate_args(),
             differential_args(),
@@ -2778,6 +2989,138 @@ mod tests {
             ],
             "the harness discovers the fresh local artifact; no ATERM_GUI_BIN bypass"
         );
+    }
+
+    /// THE PRIME IS THE HELPER'S OWN INVOCATION, READ FROM THE HELPER.
+    ///
+    /// The row is worth having only if cargo agrees the two are the same build,
+    /// and cargo agrees only if the driver, the argv, the target directory and
+    /// the cwd all match. Three of those are data here; this test reads the
+    /// fourth party — `crates/aterm-conformance/tests/support/mod.rs` — and
+    /// checks the argv and the directory against what is actually written
+    /// there. A rename, an added flag or a moved directory on either side
+    /// reddens this instead of quietly turning the prime into a SECOND build
+    /// that the suites then redo (measured on 2026-09-22: when the two
+    /// invocations disagree, each run rebuilds what the other wrote).
+    #[test]
+    fn the_conformance_prime_spawns_what_the_suites_helper_spawns() {
+        let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../aterm-conformance/tests/support/mod.rs");
+        let src = std::fs::read_to_string(&helper)
+            .unwrap_or_else(|e| panic!("read {}: {e}", helper.display()));
+
+        let args = conformance_release_args();
+        assert_eq!(args[0], "--unverified");
+        assert!(
+            src.contains(r#"command.arg("--unverified")"#),
+            "the helper no longer names the lane, so the two argvs differ: {}",
+            helper.display()
+        );
+        let literal = args[1..]
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            src.contains(&format!(".args([{literal}])")),
+            "the helper does not spawn `.args([{literal}])`: {}",
+            helper.display()
+        );
+
+        let c = ctx(Scope::workspace());
+        let dir = lane_dir(&c, Lane::ConformanceRelease).expect("a cargo lane");
+        let rel = dir
+            .strip_prefix("/repo")
+            .expect("the lane sits under the root");
+        assert!(
+            src.contains(&format!("root.join({:?})", rel.to_string_lossy())),
+            "the helper builds into a different directory than the lane: {}",
+            helper.display()
+        );
+        assert!(
+            src.contains(".current_dir(root)"),
+            "the helper's cwd is no longer the root, which every gate child has: {}",
+            helper.display()
+        );
+        // AND THE HELPER MUST NOT FORWARD ITS PACKAGE IDENTITY. Cargo sets
+        // `CARGO_MANIFEST_DIR` and `CARGO_PKG_*` for the test binary it runs,
+        // and build scripts track them (`ring`, `aterm-update-core`), so a
+        // forwarded one makes this shared directory package-specific: the gate
+        // child, which has none of them, would then build a copy the suites
+        // rebuild — and `paint` (aterm-conformance) and `untracked_stage`
+        // (atpkg) would go on invalidating each other's, 208.9 s per
+        // alternation MEASURED 2026-09-22.
+        for var in [
+            r#""CARGO_PKG_""#,
+            r#""CARGO_MANIFEST_DIR""#,
+            r#""CARGO_MANIFEST_LINKS""#,
+        ] {
+            assert!(
+                src.contains(var) && src.contains("env_remove"),
+                "the helper no longer strips {var} from the nested build, so its \
+                 fingerprint stops matching this prime's: {}",
+                helper.display()
+            );
+        }
+
+        // And the command carries exactly that directory, the lane's job cap
+        // (which cargo does not fingerprint) and nothing else — no override
+        // that would let the prime build something the suites do not judge.
+        let cmd = conformance_release_cmd(&c);
+        assert_eq!(cmd.program, c.tools.targo);
+        assert_eq!(
+            cmd.args,
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cmd.envs,
+            [
+                (
+                    "CARGO_TARGET_DIR".into(),
+                    "/repo/target/conformance-release".into()
+                ),
+                ("CARGO_BUILD_JOBS".into(), "6".into()),
+            ]
+        );
+        assert!(cmd.demoted, "it only compiles, so it yields the CPU");
+    }
+
+    /// A PRIME THAT CANNOT BUILD IS A FAIL, NOT A SKIP. The three suites judge
+    /// that artifact and refuse to run without one, so a failed prime is a
+    /// finding the test stage would reach anyway — demoting it to a skip would
+    /// narrow the verdict for a failure the gate really did find.
+    #[test]
+    fn a_failed_conformance_prime_is_a_finding_and_a_missing_targo_is_a_skip() {
+        let c = ctx(Scope::workspace());
+        assert!(!c.tools.have_targo());
+        let mut r = Report::new("prime");
+        conformance_release(&c, &mut r);
+        let (outcome, label) = r.outcomes().next().expect("a decision");
+        assert_eq!(outcome, crate::Outcome::Skip, "{label}");
+        assert!(label.contains("no targo"), "{label}");
+
+        // With a driver that exits non-zero, the same stage FAILS — the
+        // ordinary `decide_child` verdict, no vocabulary of its own.
+        let mut c = ctx(Scope::workspace());
+        c.root = std::env::temp_dir();
+        c.scratch = std::env::temp_dir();
+        c.tools.targo = PathBuf::from("/usr/bin/false");
+        c.tools.refused = None;
+        assert!(
+            c.tools.have_targo(),
+            "the stand-in driver must be reachable"
+        );
+        let mut r = Report::new("prime");
+        conformance_release(&c, &mut r);
+        let (outcome, label) = r.outcomes().next().expect("a decision");
+        assert_eq!(
+            outcome,
+            crate::Outcome::Fail(crate::Severity::GateFailed),
+            "{label}"
+        );
+        assert!(label.contains(CONFORMANCE_RELEASE_LABEL), "{label}");
     }
 
     #[test]
@@ -3685,6 +4028,65 @@ mod tests {
     }
 
     #[test]
+    fn the_objc_audits_four_codes_map_to_four_distinct_claims() {
+        // EXIT 2 IS NEVER GREEN. It is the auditor saying a row had no authority
+        // at all, or that no window server answered — the silence this gate was
+        // written to remove.
+        let (two, two_label) = objc_audit_outcome(Some(2));
+        assert_eq!(two, Outcome::Fail(Severity::CouldNotRun));
+        assert_ne!(two, Outcome::Ok);
+        assert_ne!(two, Outcome::Skip);
+        assert!(two_label.contains("NOT RUN"), "{two_label}");
+
+        // EXIT 3 IS GREEN, AND SAYS A WEAKER THING THAN 0. It is the pass a host
+        // whose AppKit lacks a claimed protocol can reach: every row held to a
+        // shape, some to the fork's own declaration rather than the runtime's. A
+        // gate that read this as `0` would write a receipt asserting runtime
+        // authority for rows the runtime could not speak for.
+        let (three, three_label) = objc_audit_outcome(Some(3));
+        assert_eq!(three, Outcome::Ok);
+        assert!(
+            three_label.contains("FORK'S OWN DECLARATION"),
+            "exit 3's label must name the authority it actually used: {three_label}"
+        );
+        assert_ne!(
+            three_label,
+            objc_audit_outcome(Some(0)).1,
+            "0 and 3 are different claims and may not share a sentence"
+        );
+        assert!(
+            objc_audit_outcome(Some(0))
+                .1
+                .contains("runtime's own authority"),
+            "exit 0 must keep claiming the runtime arbitrated"
+        );
+        assert!(
+            !objc_audit_outcome(Some(0)).1.contains("FORK'S OWN"),
+            "exit 0 must not claim the fork-declaration path"
+        );
+
+        assert_eq!(objc_audit_outcome(Some(0)).0, Outcome::Ok);
+        assert_eq!(
+            objc_audit_outcome(Some(1)).0,
+            Outcome::Fail(Severity::GateFailed)
+        );
+        // Anything else is a broken auditor, never green: a panic (101), a code
+        // a future edit adds without teaching this function, and no status at
+        // all (a signal).
+        for code in [4, 5, 101, 255] {
+            assert_eq!(
+                objc_audit_outcome(Some(code)).0,
+                Outcome::Fail(Severity::GateFailed),
+                "exit {code} must not be green"
+            );
+        }
+        assert_eq!(
+            objc_audit_outcome(None).0,
+            Outcome::Fail(Severity::CouldNotRun)
+        );
+    }
+
+    #[test]
     fn a_redraw_gate_that_could_not_run_is_never_a_pass_and_never_a_skip() {
         // THE WHOLE POINT OF THE MAPPING. Exit 2 is the harness saying no event
         // loop is constructible here; a headless box must not read that as green,
@@ -3873,6 +4275,11 @@ mod tests {
                 );
             }
             assert_eq!(drivers_dir(&c), PathBuf::from("/repo/target-drivers"));
+            assert_eq!(
+                env(&conformance_release_cmd(&c)),
+                lane("/repo/target/conformance-release", Some("6")),
+                "the prime names the helper's dir, never the caller's"
+            );
             assert_eq!(
                 env(&freeze_gate_cmd(&c)),
                 lane("/repo/tools/freeze-safety-gate/target", None),

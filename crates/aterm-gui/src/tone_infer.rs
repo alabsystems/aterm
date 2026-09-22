@@ -256,11 +256,24 @@ impl ToneTracker {
 /// incident printed `live` over a silent synth for hours, whichever state it
 /// was in). `Inert` = sealed headless/test form, non-macOS build, or
 /// permanent failure (including an exhausted wedge-revival budget).
+/// `Live` means a PLATFORM CALL SUCCEEDED — `AudioQueueStart` returned OK —
+/// not merely that an ingress channel exists, which is all it meant until
+/// 2026-09-22. `Opening` is the lazily-dormant host that had never opened a
+/// device and used to print `live`; `Paused`, `Failed` and `Stopped` are the
+/// other three states that used to print it too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AudioHost {
     Live,
     Wedged,
     Inert,
+    Opening,
+    Paused,
+    Failed,
+    /// A fault was seen and the worker is inside its bounded reopen schedule
+    /// — recoverable, and the state a transient CoreAudio hiccup used to skip
+    /// straight past into permanent silence.
+    Reopening,
+    Stopped,
 }
 
 impl AudioHost {
@@ -269,6 +282,27 @@ impl AudioHost {
             Self::Live => "live",
             Self::Wedged => "wedged",
             Self::Inert => "inert",
+            Self::Opening => "opening",
+            Self::Paused => "paused",
+            Self::Failed => "failed",
+            Self::Reopening => "reopening",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+impl From<crate::trail_audio::HostState> for AudioHost {
+    fn from(s: crate::trail_audio::HostState) -> Self {
+        use crate::trail_audio::HostState as H;
+        match s {
+            H::Inert => Self::Inert,
+            H::Opening => Self::Opening,
+            H::Running => Self::Live,
+            H::Paused => Self::Paused,
+            H::Failed => Self::Failed,
+            H::Reopening => Self::Reopening,
+            H::Stopped => Self::Stopped,
+            H::Wedged => Self::Wedged,
         }
     }
 }
@@ -307,6 +341,38 @@ pub(crate) struct ToneStatus {
     /// the host's lifetime. A handful is a burst; thousands alongside
     /// `audio=wedged` is the wedge's cost, printed instead of private.
     pub(crate) dropped: u64,
+    /// THE ANSWER: `None` ⇒ a keypress right now makes a sound; `Some(r)` ⇒
+    /// the gate that stops it. Carried as the `Copy` enum rather than a
+    /// `String` so this struct keeps `Copy` for the wire tests; `line()`
+    /// renders it.
+    pub(crate) seam: Option<crate::sound_seam::SeamReason>,
+    /// `CursorGlow::sound_seam_open()` — the engine's own key gate, the term
+    /// that was MISSING while a load-shed frame and macOS `Reduce Motion`
+    /// silenced typing with `audio=live` on the row.
+    pub(crate) engine_sound: bool,
+    /// `GlowConfig::enabled` — the master knob AND serious mode AND a style
+    /// that resolves, i.e. the gate the engine itself reads.
+    pub(crate) trail: bool,
+    /// The cursor-effect focus fold, the SAME value `trail status` prints as
+    /// `focused=`, so the two verbs cannot contradict each other.
+    pub(crate) focused: bool,
+    /// `SeriousEffect::TerminalSound`, spelled as `streak status` spells it.
+    pub(crate) serious_sound: bool,
+    /// `full` or `reduced` — the D1/D2 evidence pair with `shed`, in the same
+    /// spellings and formats `trail status` uses, so a human diffing the two
+    /// rows on one process is never misled by precision skew.
+    pub(crate) motion_stage: &'static str,
+    /// The soft load-shed envelope in 0..1 (1.0 = not shedding).
+    pub(crate) shed: f32,
+    /// Wedge revivals SPENT. A revival stands up a fresh worker with a fresh
+    /// counter, so `dropped=0` beside `revives=2` stops being a lie by
+    /// omission.
+    pub(crate) revives: u64,
+    /// Device reopens the audio worker has LEFT ([`REOPEN_BUDGET`] at birth).
+    /// One lower than baseline after a transient CoreAudio fault is the
+    /// signal that the host recovered rather than died; `0` beside
+    /// `audio=failed` is the one honestly terminal reading.
+    pub(crate) reopens_left: u8,
 }
 
 impl ToneStatus {
@@ -315,7 +381,9 @@ impl ToneStatus {
     pub(crate) fn line(&self) -> String {
         format!(
             "tone={} effective={} knob={} sounds={} volume={:.2} audio={} \
-             active={} window_chars={} inferences={} dropped={}",
+             active={} window_chars={} inferences={} dropped={} \
+             seam={} engine_sound={} trail={} focused={} serious_sound={} \
+             motion_stage={} shed={:.2} revives={} reopens_left={}",
             self.tone.label(),
             self.effective.label(),
             if self.knob { "on" } else { "off" },
@@ -326,6 +394,15 @@ impl ToneStatus {
             self.window_chars,
             self.inferences,
             self.dropped,
+            crate::sound_seam::seam_field(self.seam),
+            if self.engine_sound { "open" } else { "closed" },
+            if self.trail { "on" } else { "off" },
+            self.focused,
+            self.serious_sound,
+            self.motion_stage,
+            self.shed,
+            self.revives,
+            self.reopens_left,
         )
     }
 }
@@ -536,11 +613,22 @@ mod tests {
             window_chars: 27,
             inferences: 5,
             dropped: 0,
+            seam: None,
+            engine_sound: true,
+            trail: true,
+            focused: true,
+            serious_sound: true,
+            motion_stage: "full",
+            shed: 1.0,
+            revives: 0,
+            reopens_left: 6,
         };
         assert_eq!(
             status.line(),
             "tone=frustrated effective=technical knob=off sounds=on volume=0.40 \
-             audio=live active=false window_chars=27 inferences=5 dropped=0",
+             audio=live active=false window_chars=27 inferences=5 dropped=0 \
+             seam=open engine_sound=open trail=on focused=true serious_sound=true \
+             motion_stage=full shed=1.00 revives=0 reopens_left=6",
         );
     }
 
@@ -560,11 +648,22 @@ mod tests {
             window_chars: 0,
             inferences: 104,
             dropped: 4_096,
+            seam: Some(crate::sound_seam::SeamReason::HostWedged),
+            engine_sound: true,
+            trail: true,
+            focused: true,
+            serious_sound: true,
+            motion_stage: "full",
+            shed: 1.0,
+            revives: 2,
+            reopens_left: 4,
         };
         assert_eq!(
             status.line(),
             "tone=technical effective=technical knob=on sounds=on volume=0.40 \
-             audio=wedged active=false window_chars=0 inferences=104 dropped=4096",
+             audio=wedged active=false window_chars=0 inferences=104 dropped=4096 \
+             seam=closed:host-wedged engine_sound=open trail=on focused=true \
+             serious_sound=true motion_stage=full shed=1.00 revives=2 reopens_left=4",
         );
     }
 

@@ -222,7 +222,31 @@ pub fn self_sock_test_guard() -> std::sync::MutexGuard<'static, ()> {
 pub fn publish_session(sid: &SessionId, nonce: &LaunchNonce) {
     let guard = SELF_SOCK.read().unwrap_or_else(|p| p.into_inner());
     if let Some((dir, sock)) = guard.as_ref() {
-        publish_graph_entry(dir, sid, sock, nonce);
+        // What goes on DISK is the spelling every reader can dial and dedupe:
+        // the recorded path is canonical (the self-dial guard needs that), and
+        // on Windows canonical means the verbatim `\\?\C:\…` form — which is
+        // not what the bind-time publish above wrote for the root session, so
+        // one instance's sessions reached `aterm-ctl` under two spellings and
+        // it listed the instance twice (2026-09-22, 0.90.0). Un-verbatim it
+        // here; the in-memory record keeps its canonical form untouched.
+        publish_graph_entry(dir, sid, &published_sock_spelling(sock), nonce);
+    }
+}
+
+/// The spelling of our socket path a graph entry carries: the canonical path
+/// with a Windows verbatim-disk prefix removed (`\\?\C:\x` → `C:\x`). Every
+/// Win32 file API and the client's dialer accept the shorter form, and it is
+/// the form the bind-time publish and the readdir already use. Unix paths and
+/// verbatim UNC paths pass through unchanged.
+fn published_sock_spelling(sock: &str) -> String {
+    let stripped = sock.strip_prefix(r"\\?\").unwrap_or(sock);
+    let drive = stripped.len() >= 2
+        && stripped.as_bytes()[1] == b':'
+        && stripped.as_bytes()[0].is_ascii_alphabetic();
+    if drive {
+        stripped.to_string()
+    } else {
+        sock.to_string()
     }
 }
 
@@ -681,6 +705,29 @@ pub fn drain_buffered<R: Read>(reader: &mut std::io::BufReader<R>) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    /// The published spelling of a Windows socket path drops the verbatim
+    /// prefix and nothing else, so the bind-time entry and every later
+    /// session entry agree on how ONE socket is spelled.
+    #[test]
+    fn published_sock_spelling_drops_only_the_verbatim_drive_prefix() {
+        assert_eq!(
+            published_sock_spelling(r"\\?\C:\Users\u\AppData\Local\Temp\aterm\aterm-1.sock"),
+            r"C:\Users\u\AppData\Local\Temp\aterm\aterm-1.sock"
+        );
+        assert_eq!(
+            published_sock_spelling(r"C:\Users\u\aterm-1.sock"),
+            r"C:\Users\u\aterm-1.sock"
+        );
+        assert_eq!(
+            published_sock_spelling(r"\\?\UNC\srv\share\aterm.sock"),
+            r"\\?\UNC\srv\share\aterm.sock"
+        );
+        assert_eq!(
+            published_sock_spelling("/private/var/folders/x/aterm-1.sock"),
+            "/private/var/folders/x/aterm-1.sock"
+        );
+    }
 
     #[test]
     fn graph_entry_roundtrips_through_disk() {

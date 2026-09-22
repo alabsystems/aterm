@@ -386,6 +386,7 @@ impl EffectsPipeline {
                 duration: Duration::from_millis(260),
                 length: 24,
                 intensity: 0.7,
+                audible: true,
                 radius: 0.6,
                 ring: true,
                 beam: true,
@@ -967,6 +968,7 @@ impl EffectsPipeline {
             duration: Duration::from_millis(duration_ms.clamp(30, 2000)),
             length: (length as usize).clamp(1, 512),
             intensity: intensity.clamp(0.0, 1.0),
+            audible: true,
             radius: radius.clamp(0.0, 2.0),
             ring,
             // Water (its fluid wave wake is the streak) and rainbow kitty (its banded

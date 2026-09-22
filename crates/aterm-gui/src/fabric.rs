@@ -202,7 +202,7 @@ pub(crate) fn fabric_event_wire_kind(kind: &str) -> Option<&'static str> {
 ///
 /// NOT the set a SENDER may claim — that is [`POSTABLE`], and the difference
 /// between the two lists is the whole reason there are two.
-const KINDS: &[&str] = &[
+pub(crate) const KINDS: &[&str] = &[
     "ask",
     "answer",
     "task",
@@ -340,6 +340,15 @@ pub(crate) struct InboxRow {
     pub len: usize,
     /// The body, as delivered (pct-DECODED, so already lossy-valid UTF-8).
     pub body: String,
+    /// THE BROADCAST TOPIC this row arrived on, when it is a broadcast.
+    ///
+    /// It is the row's ANSWER TO "why is this in my mailbox?": an addressed
+    /// message is here because somebody chose this session, and a broadcast is
+    /// here because this session chose the topic (`topic add`). Nothing else
+    /// about the row changes — the ring, the quota, the demotion and `trust=`
+    /// are the same — so an agent that ignores the field reads a broadcast as
+    /// the `note` it is.
+    pub topic: Option<String>,
     /// Whether a non-peek `inbox` has listed this row. Unlisted rows are what the
     /// quota counts and what an eviction reports.
     pub listed: bool,
@@ -354,6 +363,90 @@ impl InboxRow {
     }
 }
 
+/// The sender CLASS of a delivered row, read from the prefix the subject's
+/// `<src>` segment carries: `h-` a human, `s-` another session's agent, `a-` a
+/// service. Anything else is `other`, which `from=` can still name — a filter
+/// never silently matches nothing it did not ask for.
+pub(crate) fn sender_class(from: &str) -> &'static str {
+    if from.starts_with("h-") {
+        "human"
+    } else if from.starts_with("s-") {
+        "agent"
+    } else if from.starts_with("a-") {
+        "service"
+    } else {
+        "other"
+    }
+}
+
+/// Which delivered rows a `subscribe … mail` subscriber asked for.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct MailFilter {
+    /// `kinds=<k,..>`: empty means every kind.
+    pub kinds: Vec<String>,
+    /// `from=<class|principal>`: a [`sender_class`] or an exact principal.
+    /// `None` means anyone.
+    pub from: Option<String>,
+    /// `topic=<t>`: only BROADCAST rows that arrived on that topic. `None`
+    /// means every row, broadcast or addressed — it is not a "no broadcasts"
+    /// filter, because a subscriber that named no topic asked for its mailbox,
+    /// and a broadcast it opted into is its mail.
+    pub topic: Option<String>,
+}
+
+impl MailFilter {
+    fn wants(&self, row: &InboxRow) -> bool {
+        if !self.kinds.is_empty() && !self.kinds.contains(&row.kind) {
+            return false;
+        }
+        if self.topic.is_some() && self.topic != row.topic {
+            return false;
+        }
+        self.from
+            .as_ref()
+            .is_none_or(|f| f == &row.from || f == sender_class(&row.from))
+    }
+}
+
+/// One `MAIL` frame's fields — METADATA ONLY.
+///
+/// There is no body field and there is no `text=`: the ring's bodies are not
+/// read to build this, so the push stream cannot carry one by mistake. That is
+/// the same rule the hook's metadata block follows, for the same reason — a
+/// peer's words must reach an agent only through a drain it ran itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MailLine {
+    pub id: u64,
+    pub off: u64,
+    pub from: String,
+    pub kind: String,
+    pub re: Option<u64>,
+    /// The broadcast topic, when the row is one. METADATA, like every other
+    /// field here: it names which face the row came in on, never what it said.
+    pub topic: Option<String>,
+}
+
+/// What [`SessionFabric::mail_since`] answers.
+pub(crate) struct MailSince {
+    /// The matching rows newer than the cursor, oldest first.
+    pub rows: Vec<MailLine>,
+    /// The highest row id ever delivered here, matched or not — the cursor to
+    /// resume from, so a filtered-out row is stepped over and never re-read.
+    pub high: u64,
+    /// How many rows with id above the cursor the ring still HOLDS — counted
+    /// WITHOUT the filter, because a GAP is about what was lost, not about
+    /// what was wanted.
+    ///
+    /// `(high - cursor) - present` is what was evicted unseen. The ring's
+    /// OLDEST id cannot answer that: eviction is BY CLASS ([`Inbox::evict_for`]
+    /// drops an agent's row first, wherever it sits), so one human row pinned
+    /// at the front holds `oldest` still while agent rows behind it vanish —
+    /// measured, 612 rows into a 512 ring with a human row first lost 100 and
+    /// a front-anchored gap reported 0.
+    pub present: u64,
+}
+
+/// One outbound message this session sent. It stays listed until the bridge
 /// One outbound message this session sent. It stays listed until the bridge
 /// reports the offset it landed at, so an agent sees at turn start what is still
 /// in flight rather than assuming.
@@ -480,7 +573,7 @@ fn caller_sized_bytes(body: &str, via: Option<&str>) -> usize {
 struct Inbox {
     rows: VecDeque<InboxRow>,
     posts: VecDeque<PostRow>,
-    next_msg_id: u64,
+    last_msg_id: u64,
     next_post_id: u64,
     /// The HANDLED watermark: moved only by `inbox seen`.
     ///
@@ -497,6 +590,11 @@ struct Inbox {
     /// human's `task` waiting through a long turn), and while this counter said
     /// "unlisted" that was the one case it stayed silent for. [`RING_CAP`] and
     /// [`evict_for`] state the same rule; this field used to state the older one.
+    ///
+    /// A BROADCAST REFUSED BY THE QUOTA COUNTS TOO: an addressed refusal rides
+    /// back to the sender, but a broadcast's sender did not choose this
+    /// recipient and is told nothing, so the recipient is the only party who
+    /// can be.
     ///
     /// Monotone: `inbox` reports it, so a drop is always visible to the next
     /// drain even if the agent missed the one it happened on.
@@ -712,6 +810,19 @@ impl Inbox {
     }
 }
 
+/// ONE BROADCAST OPT-IN as the session holds it: what the caller asked to
+/// resume from, and which `topic add` it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TopicEntry {
+    /// The `since=` TOKEN the add carried: `head` or `@<off>`. An intent, not
+    /// a position — only the bridge knows where the bus is.
+    pub since: String,
+    /// The add's per-session serial, printed as `serial=` on the `topic ls` row.
+    /// The bridge keys its cursor on (topic, serial), so a `drop` and an `add`
+    /// under the same name are two entries and the second's `since=` is read.
+    pub serial: u64,
+}
+
 /// The per-session fabric state, hung on [`crate::SessionCtx`].
 ///
 /// LOCK DISCIPLINE. `inbox` is a LEAF, with exactly one sanctioned nesting:
@@ -721,7 +832,7 @@ impl Inbox {
 /// and `post --wait` event-driven instead of polled — no sleep anywhere in this
 /// module.
 #[derive(Default)]
-pub(crate) struct SessionFabric {
+pub struct SessionFabric {
     inbox: Mutex<Inbox>,
     /// Signalled on every state change a parked waiter could care about: a new
     /// row, a post landing, a hold transition.
@@ -732,11 +843,139 @@ pub(crate) struct SessionFabric {
     /// it is a SEPARATE lock from `inbox`, never nested with it: the mailbox and
     /// the keyboard seam share a session and nothing else.
     idem: crate::pty_idem::PtyIdem,
+    /// THE BROADCAST TOPICS THIS SESSION OPTED INTO (`topic add`).
+    ///
+    /// Receiver-side opt-in is the whole safety story of broadcast: a record on
+    /// `say/<topic>` reaches a session only because that session asked for the
+    /// topic, so a fleet-wide shout cannot put anything in front of an agent
+    /// that did not want it. Empty by default, and an empty set receives
+    /// NOTHING.
+    ///
+    /// Its own lock, not the ring's: the bridge reads it on every roster round
+    /// and the ring is a leaf taken under `deliver`, so sharing one would put a
+    /// poll in the path of every delivery.
+    /// Keyed by topic, valued by the `since=` TOKEN the add asked for (`head`
+    /// or `@<off>`) and the SERIAL of the add that created it — the bridge
+    /// resolves the token to an offset once, when it first learns the entry,
+    /// and remembers that resolution in its own state, so a bridge restart
+    /// resumes the topic instead of re-reading `head`.
+    ///
+    /// The serial is what makes `drop` then `add` work: the bridge keys its
+    /// cursor on (topic, serial), so a re-add is a new entry even inside one
+    /// roster round.
+    topics: Mutex<std::collections::BTreeMap<String, TopicEntry>>,
+    /// The next `topic add` serial for this session. Monotone for the
+    /// session's life, never reused, and not persisted: the bridge compares it
+    /// with what it last sampled, so the only property it needs is that a new
+    /// add never looks like an old one within one bridge's memory. A restart
+    /// of either side re-resolves from the `since=` token anyway.
+    topic_serial: std::sync::atomic::AtomicU64,
 }
 
 impl SessionFabric {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
         self.inbox.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The delivered rows newer than `after` that `want` asks for, with the
+    /// cursor to resume from and the oldest id still in the ring.
+    ///
+    /// THE PUSH FACE OF THE RING, and a LEAF READ: one short lock, no
+    /// allocation beyond the matched rows' two short strings, and nothing
+    /// written — `listed`, `seen` and the eviction counters are untouched, so a
+    /// `subscribe … mail` subscriber never changes what a drain the agent runs
+    /// itself would show. That is the whole difference between watching a
+    /// mailbox and reading it.
+    pub(crate) fn mail_since(&self, after: u64, want: &MailFilter) -> MailSince {
+        let inbox = self.lock();
+        MailSince {
+            rows: inbox
+                .rows
+                .iter()
+                .filter(|r| r.id > after && want.wants(r))
+                .map(|r| MailLine {
+                    id: r.id,
+                    off: r.off,
+                    from: r.from.clone(),
+                    kind: r.kind.clone(),
+                    re: r.re,
+                    topic: r.topic.clone(),
+                })
+                .collect(),
+            // The LAST id assigned, not the ring's maximum: a filtered-out row
+            // still advances the cursor, and an emptied ring must not rewind
+            // it. The field was called `next_msg_id` while holding exactly
+            // this — it is pre-incremented — and reading the name instead of
+            // the code cost a `- 1` that re-pushed every row's first sighting
+            // twice, which `subscribe_mail_pushes_…` caught. Renamed so the
+            // next reader cannot make that trade.
+            high: inbox.last_msg_id,
+            present: inbox.rows.iter().filter(|r| r.id > after).count() as u64,
+        }
+    }
+
+    /// The topics this session opted into with each one's `since=` token and
+    /// add serial, in topic order.
+    pub(crate) fn topics(&self) -> Vec<(String, TopicEntry)> {
+        self.topics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(t, e)| (t.clone(), e.clone()))
+            .collect()
+    }
+
+    /// Add a topic with the `since=` token to resume it from. `true` when it
+    /// was not already there.
+    ///
+    /// A REPEATED ADD DOES NOT REWIND. The token is recorded only on the first
+    /// add, because the bridge has by then resolved it to an offset and
+    /// delivered from it: re-arming `since=@0` on a topic already running would
+    /// replay the whole backlog into a ring that has already seen it. `drop`
+    /// then `add` is how a caller asks for that on purpose.
+    pub(crate) fn topic_add(&self, t: &str, since: &str) -> bool {
+        let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
+        // `entry`, not `insert`: `insert` REPLACES, so a repeated
+        // `topic add t since=@0` would rewind a running topic to the start of
+        // the log while answering `added=0` — the value would have moved and
+        // the reply would say nothing had.
+        let mut added = false;
+        set.entry(t.to_string()).or_insert_with(|| {
+            added = true;
+            TopicEntry {
+                since: since.to_string(),
+                // STAMPED UNDER THE SAME LOCK the map is taken under, so two
+                // adds racing on one session cannot be handed one serial.
+                serial: self
+                    .topic_serial
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .wrapping_add(1),
+            }
+        });
+        added
+    }
+
+    /// Drop a topic. `true` when it was there.
+    pub(crate) fn topic_drop(&self, t: &str) -> bool {
+        self.topics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(t)
+            .is_some()
+    }
+
+    /// Replace the whole set — the handoff's carry, and nothing else.
+    ///
+    /// The serial counter is moved past every carried entry, so the first
+    /// `topic add` in the adopted session cannot mint a serial a carried entry
+    /// already wears — which would make a genuinely new entry look to the
+    /// bridge like the one it is holding a cursor for.
+    pub(crate) fn set_topics(&self, topics: impl IntoIterator<Item = (String, TopicEntry)>) {
+        let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
+        *set = topics.into_iter().collect();
+        let high = set.values().map(|e| e.serial).max().unwrap_or(0);
+        self.topic_serial
+            .fetch_max(high, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// This session's PTY idempotency marks (A6).
@@ -1177,6 +1416,18 @@ fn note_work_owed() {
     // all, which made `owed_since` the one field of `LinkReport` that leaked
     // across the section lock `with_link` exists to provide.
     if LINK.state.load(Ordering::Relaxed) != FABRIC_CONNECTED {
+        return;
+    }
+    // A SIBLING TEST'S `post` OWES THIS BRIDGE NOTHING (see [`LINK_SECTION`]),
+    // and the round-21 gate above is not enough to say so: it refuses a write
+    // while the link is not connected, which is exactly the state a live
+    // section has moved it OUT of. So a test running outside the section, whose
+    // own store has posted, armed the debt inside someone else's measurement
+    // and `a_bridge_that_owes_an_answer_reads_stale_and_a_quiet_one_does_not`
+    // read `stale` where it had established `connected`. Every other writer of
+    // this struct already carries this guard; this one was the last without it.
+    #[cfg(test)]
+    if link_write_is_foreign() {
         return;
     }
     let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
@@ -1963,6 +2214,20 @@ pub(crate) fn app_halt_refusal(store: &Store, verb: &str) -> Option<String> {
 /// boundary rather than restating the constant.
 const PRINCIPAL_NAME_MAX: usize = 32;
 
+/// A BROADCAST TOPIC: `[a-z0-9][a-z0-9._-]{0,31}`, one subject segment.
+///
+/// The same rule `aterm_link::subject::is_topic` enforces on the publish side,
+/// spelled here because the endpoint refuses a bad address at the `post` rather
+/// than letting the bridge retire it as unroutable — a sender who mistyped a
+/// topic learns it from the reply, not from an `off=-` row it may never read.
+pub(crate) fn is_topic(t: &str) -> bool {
+    let mut cs = t.chars();
+    cs.next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && t.len() <= 32
+        && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+}
+
 /// A principal segment: class prefix + a bounded lowercase name, optionally
 /// `@<node>` for a session behind a node. Nothing a sender types reaches this on
 /// the INBOUND side — the bridge renders `from=` from the delivered subject — but
@@ -2654,6 +2919,8 @@ struct DeliverFields {
     len: usize,
     /// The `len=` token itself, when the line carried one.
     declared_len: Option<usize>,
+    /// `topic=<t>` — the broadcast face this record came in on.
+    topic: Option<String>,
     body: String,
 }
 
@@ -2675,6 +2942,7 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
         verdict: None,
         len: 0,
         declared_len: None,
+        topic: None,
         body: String::new(),
     };
     let mut declared_len: Option<usize> = None;
@@ -2713,6 +2981,15 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
                 return Err(DELIVER_USAGE.to_string());
             }
             f.via = Some(v.to_string());
+        } else if let Some(v) = kv(tok, "topic") {
+            // CLOSED TO THE GRAMMAR, like every other word on this line: the
+            // bridge is a separate process and its output is still input, and a
+            // topic that could carry a space or an `=` is a topic that can
+            // invent a second field on the `msg` row this becomes.
+            if !is_topic(v) {
+                return Err(DELIVER_USAGE.to_string());
+            }
+            f.topic = Some(v.to_string());
         } else if let Some(v) = kv(tok, "verdict") {
             // CLOSED, like `trust=`: a receipt's word is one of three, and an
             // agent never reads a verdict token this endpoint did not classify.
@@ -3063,6 +3340,7 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
         verdict,
         len,
         declared_len: _,
+        topic,
         body,
     } = match parse_deliver_fields(toks, BODY_MAX) {
         Ok(f) => f,
@@ -3098,11 +3376,17 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
         .filter(|r| !r.listed && quota_key(&r.from) == key)
         .count();
     if unread_from_peer >= SENDER_QUOTA {
+        // A BROADCAST HAS NOBODY TO TELL BUT THE RECIPIENT — see
+        // [`Inbox::dropped`]. The addressed lane's refusal rides back to the
+        // sender on their own lane; this one is counted here or it is nowhere.
+        if topic.is_some() {
+            inbox.dropped += 1;
+        }
         return "ERR quota\n".to_string();
     }
 
-    inbox.next_msg_id += 1;
-    let id = inbox.next_msg_id;
+    inbox.last_msg_id += 1;
+    let id = inbox.last_msg_id;
     let re_id = re.and_then(|r| inbox.posts.iter().find(|p| p.off == Some(r)).map(|p| p.id));
     let row = InboxRow {
         id,
@@ -3121,6 +3405,7 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
         via,
         len,
         body,
+        topic,
         listed: false,
     };
     evict_for(&mut inbox);
@@ -3203,6 +3488,138 @@ fn evict_for(inbox: &mut Inbox) {
         inbox.dropped += 1;
     }
 }
+
+// ---------------------------------------------------------------------------
+// topic — the receiver-side broadcast opt-in
+// ---------------------------------------------------------------------------
+
+/// `topic add <t> [since=head|@<off>] | topic drop <t> | topic ls` — the
+/// RECEIVER-SIDE OPT-IN for broadcast.
+///
+/// A record on `say/<topic>` reaches this session only because this session
+/// asked for the topic. That is the whole safety story: a fleet-wide shout
+/// cannot put a word in front of an agent that did not want it, and an empty
+/// set — the default — receives nothing at all.
+///
+/// `since=` is the LATE SUBSCRIBER's choice and is answered by the bridge, not
+/// here: `head` (the default) takes only records published after the add, and
+/// `@<off>` replays the topic from that broker offset so a session joining a
+/// conversation can read what it missed. It is echoed on the `OK` line so the
+/// caller can see which it got.
+///
+/// Owner scope: adding a topic changes what reaches an agent's inbox, which is
+/// the same authority class as the halt, not a read.
+pub(crate) fn cmd_topic(ctx: &SessionCtx, rest: &str) -> String {
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        Some("ls") | None => {
+            if words.next().is_some() {
+                return TOPIC_USAGE.to_string();
+            }
+            let topics = ctx.fabric.topics();
+            let mut out = format!("OK {}\n", topics.len());
+            for (t, e) in topics {
+                // `serial=` is the add's serial, for the bridge's cursor key.
+                out.push_str(&format!(
+                    "topic {t} since={} serial={}\n",
+                    e.since, e.serial
+                ));
+            }
+            out
+        }
+        Some("add") => {
+            let Some(t) = words.next() else {
+                return TOPIC_USAGE.to_string();
+            };
+            if !is_topic(t) {
+                return TOPIC_USAGE.to_string();
+            }
+            let since = match words.next() {
+                None => "head".to_string(),
+                // ONE GRAMMAR FOR THE TOKEN, shared with the handoff carry's
+                // validator, so the two cannot disagree about what `@+5` is.
+                Some(tok) => match tok.strip_prefix("since=") {
+                    Some(v) if valid_since(v) => v.to_string(),
+                    _ => return TOPIC_USAGE.to_string(),
+                },
+            };
+            if words.next().is_some() {
+                return TOPIC_USAGE.to_string();
+            }
+            let added = ctx.fabric.topic_add(t, &since);
+            ctx.fabric.changed.notify_all();
+            format!("OK {t} since={since} added={}\n", u8::from(added))
+        }
+        Some("drop") => {
+            let Some(t) = words.next() else {
+                return TOPIC_USAGE.to_string();
+            };
+            if words.next().is_some() || !is_topic(t) {
+                return TOPIC_USAGE.to_string();
+            }
+            let dropped = ctx.fabric.topic_drop(t);
+            ctx.fabric.changed.notify_all();
+            format!("OK {t} dropped={}\n", u8::from(dropped))
+        }
+        Some(_) => TOPIC_USAGE.to_string(),
+    }
+}
+
+/// The topic set as the HANDOFF MANIFEST carries it: one `"<topic> <since>"`
+/// row per opt-in, in topic order.
+pub(crate) fn render_topics(topics: &[(String, TopicEntry)]) -> Vec<String> {
+    topics
+        .iter()
+        .map(|(t, e)| format!("{t} {} {}", e.since, e.serial))
+        .collect()
+}
+
+/// The inverse of [`render_topics`], VALIDATING every row.
+///
+/// The manifest is a file on disk that an older build, a rollback, or anything
+/// that can write the state directory may have produced, and a topic set is
+/// what decides which broadcasts reach an agent. A row whose topic is not
+/// `[a-z0-9][a-z0-9._-]{0,31}` or whose `since` is not `head`/`@<n>` is
+/// DROPPED, not repaired: the carry re-seeds consent, so a malformed row must
+/// not be able to invent one.
+pub(crate) fn parse_topics(rows: &[String]) -> Vec<(String, TopicEntry)> {
+    rows.iter()
+        .filter_map(|row| {
+            let mut words = row.split(' ');
+            let t = words.next()?;
+            let since = words.next()?;
+            // A two-field row is what a build before the serial wrote; it
+            // reads as generation 0, which is stable, so a carry through a
+            // downgrade does not look to the bridge like a fresh add.
+            let serial = match words.next() {
+                Some(g) => g.parse().ok()?,
+                None => 0,
+            };
+            if words.next().is_some() || !is_topic(t) || !valid_since(since) {
+                return None;
+            }
+            Some((
+                t.to_string(),
+                TopicEntry {
+                    since: since.to_string(),
+                    serial,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Whether `s` is a `since=` token: `head`, or `@<decimal offset>`.
+fn valid_since(s: &str) -> bool {
+    s == "head"
+        || s.strip_prefix('@').is_some_and(|n| {
+            // Digits only: `u64::from_str` would accept `@+5`.
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && n.parse::<u64>().is_ok()
+        })
+}
+
+const TOPIC_USAGE: &str = "ERR usage: topic add <t> [since=head|@<off>] | topic drop <t> | \
+                           topic ls (topic is [a-z0-9][a-z0-9._-]{0,31})\n";
 
 // ---------------------------------------------------------------------------
 // inbox / inbox get / inbox seen
@@ -3374,6 +3791,9 @@ fn render_row(row: &InboxRow, meta_only: bool) -> String {
     }
     if let Some(v) = &row.via {
         s.push_str(&format!(" via={v}"));
+    }
+    if let Some(t) = &row.topic {
+        s.push_str(&format!(" topic={t}"));
     }
     s.push_str(&format!(" len={}", row.len));
     // `truncated=1` means the ENDPOINT NEVER RECEIVED the rest: the delivering
@@ -3643,7 +4063,7 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
 // post
 // ---------------------------------------------------------------------------
 
-const POST_USAGE: &str = "ERR usage: post to=<@<sid>[@<node>]|<principal>|say> \
+const POST_USAGE: &str = "ERR usage: post to=<@<sid>[@<node>]|<principal>|say[:<topic>]> \
                           kind=<ask|answer|task|report|note|ack|control> [re=<n>] [dl=<ms>] \
                           [via=<p>] [key=<token>] [--wait[=<ms>]] [--wait-ack[=<ms>]] \
                           (<text> | len=<n> + <n> raw bytes)\n";
@@ -3782,7 +4202,14 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     // is no part of the address grammar the `post` row publishes
     // (`to=<@<sid>[@<node>]|<principal>|say>`) — so it is REFUSED here rather
     // than trimmed here and refused by `resolve_to` a publish later.
-    if to != "say" && !valid_principal(to.strip_prefix('@').unwrap_or(&to)) {
+    // `say` and `say:<topic>` are the BROADCAST addresses. The topic is one
+    // subject segment, so it is validated HERE — a bad one is a usage error the
+    // sender sees, not a post the bridge retires as unroutable a publish later.
+    if let Some(topic) = to.strip_prefix("say:") {
+        if !is_topic(topic) {
+            return POST_USAGE.to_string();
+        }
+    } else if to != "say" && !valid_principal(to.strip_prefix('@').unwrap_or(&to)) {
         return POST_USAGE.to_string();
     }
     if let Some(v) = &via
@@ -4219,6 +4646,98 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
 }
 
 #[cfg(test)]
+mod topic_tests {
+    use super::{TopicEntry, is_topic, parse_topics, render_topics};
+
+    /// **THE TOPIC GRAMMAR IS ONE BOUNDED LOWERCASE SEGMENT, and the refusals
+    /// are the point.**
+    ///
+    /// A topic becomes the LAST SEGMENT of a subject and a `topic=` token on a
+    /// `deliver` line and on a `msg` row — three grammars, and the intersection
+    /// is narrow. `a/b` would invent a subject segment, `has space` a second
+    /// field on the row, `a*` a wildcard in a filter, and a leading `.` or `-`
+    /// a token that reads as a relative path or a flag. This asserts the
+    /// REFUSALS, not the acceptances: a widened predicate passes an
+    /// accept-only test unchanged.
+    #[test]
+    fn the_topic_grammar_refuses_everything_that_is_not_one_segment() {
+        for good in [
+            "say",
+            "build.failed",
+            "sat-comp",
+            "a",
+            "0",
+            "a_b",
+            &"z".repeat(32),
+        ] {
+            assert!(is_topic(good), "`{good}` is a topic");
+        }
+        for bad in [
+            "",
+            "Build",
+            ".dot",
+            "-lead",
+            "_lead",
+            "a/b",
+            "has space",
+            "a:b",
+            "a*",
+            "a>",
+            &"z".repeat(33),
+        ] {
+            assert!(!is_topic(bad), "`{bad}` must not be a topic");
+        }
+    }
+
+    /// **THE HANDOFF CARRY RE-VALIDATES EVERY ROW IT READS.**
+    ///
+    /// The manifest is a file on disk. An older build, a rollback, or anything
+    /// that can write the state directory may have produced it, and what it
+    /// carries here is CONSENT — the only reason a broadcast reaches a session
+    /// at all. So a row that is not a topic and a `since` that is not a token
+    /// are dropped rather than repaired: a malformed row must not be able to
+    /// invent an opt-in, and a repaired one would be an opt-in nobody asked
+    /// for under a name nobody typed.
+    #[test]
+    fn the_carry_round_trips_and_a_malformed_row_invents_nothing() {
+        let entry = |since: &str, serial: u64| TopicEntry {
+            since: since.to_string(),
+            serial,
+        };
+        let live = vec![
+            ("build.failed".to_string(), entry("head", 7)),
+            ("sat-comp".to_string(), entry("@42", 9)),
+        ];
+        let wire = render_topics(&live);
+        assert_eq!(wire, ["build.failed head 7", "sat-comp @42 9"]);
+        assert_eq!(parse_topics(&wire), live);
+        // A two-field row from a build before the serial reads as generation 0.
+        assert_eq!(
+            parse_topics(&["old.topic @3".to_string()]),
+            vec![("old.topic".to_string(), entry("@3", 0))]
+        );
+
+        let hostile: Vec<String> = [
+            "Build head",          // not a topic
+            "a/b head",            // a subject segment
+            "ok yesterday",        // not a `since` token
+            "ok @notanumber",      // nor is this
+            "ok @+5",              // an offset has no sign
+            "ok head x",           // a serial that is not a number
+            "noseparator",         // no `since` at all
+            "build.failed head 2", // …and one good row, so the drop is selective
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        assert_eq!(
+            parse_topics(&hostile),
+            vec![("build.failed".to_string(), entry("head", 2))],
+        );
+    }
+}
+
+#[cfg(test)]
 mod inbox_hold {
 
     /// `hold`'s help ENUMERATES the PTY-reaching verbs, and `is_pty_reaching` is
@@ -4315,6 +4834,147 @@ mod inbox_hold {
             store,
             &format!("{sid} off={off} from={from} kind={kind} trust=agent text={text}"),
         )
+    }
+
+    /// **THE PUSH FACE OF THE RING: METADATA, A CURSOR, AND A GAP.**
+    /// `mail_since` answers the rows above a cursor that the filter wants,
+    /// never their bodies; the cursor it hands back is the ring's HIGH, so a
+    /// row the filter rejected is stepped over once instead of re-walked on
+    /// every wake; and the oldest id it reports is what tells a subscriber the
+    /// ring dropped rows it was never shown.
+    #[test]
+    fn mail_since_answers_metadata_a_cursor_and_the_oldest_row_held() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        for (n, (from, kind)) in [
+            ("h-andrew", "task"),
+            ("s-peer", "note"),
+            ("h-andrew", "ask"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let off = 100 + n as u64;
+            assert!(deliver(&store, &sid, off, from, kind, "the%20words").starts_with("OK"));
+        }
+
+        // EVERYTHING, from the beginning: three rows, metadata only.
+        let all = ctx.fabric.mail_since(0, &MailFilter::default());
+        assert_eq!(all.rows.len(), 3, "{:?}", all.rows);
+        assert_eq!(all.high, 3);
+        assert_eq!(all.present, 3, "the ring holds all three");
+        assert_eq!(
+            all.rows[0],
+            MailLine {
+                id: 1,
+                off: 100,
+                from: "h-andrew".to_string(),
+                kind: "task".to_string(),
+                re: None,
+                topic: None,
+            }
+        );
+
+        // A CURSOR: only what is newer.
+        let after = ctx.fabric.mail_since(2, &MailFilter::default());
+        assert_eq!(after.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [3]);
+
+        // `kinds=` and `from=` narrow, and `from=` takes a CLASS as well as a
+        // principal — but the cursor still advances past what they rejected.
+        let kinds = MailFilter {
+            kinds: vec!["task".to_string(), "ask".to_string()],
+            from: None,
+            topic: None,
+        };
+        let got = ctx.fabric.mail_since(0, &kinds);
+        assert_eq!(got.rows.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(got.high, 3, "a filtered-out row still moves the cursor");
+        let human = MailFilter {
+            kinds: Vec::new(),
+            from: Some("human".to_string()),
+            topic: None,
+        };
+        assert_eq!(
+            ctx.fabric
+                .mail_since(0, &human)
+                .rows
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        let exact = MailFilter {
+            kinds: Vec::new(),
+            from: Some("s-peer".to_string()),
+            topic: None,
+        };
+        assert_eq!(
+            ctx.fabric
+                .mail_since(0, &exact)
+                .rows
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(sender_class("h-a"), "human");
+        assert_eq!(sender_class("s-a"), "agent");
+        assert_eq!(sender_class("a-a"), "service");
+        assert_eq!(sender_class("weird"), "other");
+    }
+
+    /// **A GAP COUNTS WHAT WAS EVICTED, NOT WHAT IS BELOW THE FRONT ROW.**
+    /// Eviction is by CLASS — an agent's row goes first, wherever it sits — so
+    /// a human row pinned at the front keeps the ring's oldest id still while
+    /// agent rows behind it vanish. `present` is the honest input: how many
+    /// rows above the cursor the ring actually holds, so
+    /// `(high - cursor) - present` is what was lost, whether or not the front
+    /// moved.
+    #[test]
+    fn mail_since_reports_what_was_evicted_even_when_the_front_row_is_pinned() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        // One human row first — eviction will never choose it — then enough
+        // agent rows to overflow the ring.
+        assert!(deliver(&store, &sid, 100, "h-andrew", "task", "x").starts_with("OK"));
+        // A DISTINCT SENDER PER ROW: `SENDER_QUOTA` caps one sender at 64
+        // unread rows, and a quota refusal would end the fixture long before
+        // the ring overflowed.
+        let overflow = RING_CAP + 100;
+        for n in 1..overflow {
+            let off = 1000 + n as u64;
+            let from = format!("s-p{n}");
+            let reply = deliver(&store, &sid, off, &from, "note", "x");
+            assert!(reply.starts_with("OK"), "row {n}: {reply}");
+        }
+        let since = ctx.fabric.mail_since(0, &MailFilter::default());
+        assert_eq!(since.high, overflow as u64, "every row was issued");
+        assert_eq!(
+            since.present, RING_CAP as u64,
+            "the ring holds its cap, no more"
+        );
+        let lost = since.high - since.present;
+        assert_eq!(lost, (overflow - RING_CAP) as u64);
+        assert!(lost > 0, "this fixture must actually lose rows");
+        // The pinned human row is still there, so a front-anchored gap would
+        // have reported nothing at all.
+        assert_eq!(
+            ctx.fabric.lock().rows.front().map(|r| r.id),
+            Some(1),
+            "the human row is pinned at the front, which is the trap"
+        );
+        // AND THE OLD FORMULA, FOR THE RECORD. The gap used to be read off
+        // that front row as `oldest - cursor - 1`. The front row is the human
+        // one, still id 1, so the old formula reports ZERO on a fixture that
+        // lost a hundred rows — the defect, written down here rather than left
+        // to a revert nobody will re-run.
+        let oldest = ctx.fabric.lock().rows.front().map_or(0, |r| r.id);
+        assert_eq!(
+            oldest.saturating_sub(1),
+            0,
+            "the front-anchored gap saw nothing"
+        );
+        assert_eq!(lost, 100, "while a hundred rows were in fact evicted");
     }
 
     /// `cmd_hold` as the BRIDGE issues it — the form every pre-local-halt test
@@ -6933,7 +7593,7 @@ mod inbox_hold {
         let inbox = ctx.fabric.lock();
         // `seq` = rows ever pushed, `lo` = the oldest still live: the model's two
         // variables, projected onto the real ring.
-        let seq = inbox.next_msg_id;
+        let seq = inbox.last_msg_id;
         let lo = inbox.rows.front().map(|r| r.id).expect("non-empty");
         assert_eq!(seq, pushes, "every delivery minted exactly one row");
         let live_window = seq - lo + 1;
@@ -8266,6 +8926,17 @@ mod inbox_hold {
             ),
             ("dial-list", "lists saved peers"),
             ("dial-token", "mints a token for the relay above"),
+            (
+                "topic",
+                "arranges FUTURE deliveries into this session's inbox ring, and a \
+                 delivery is already something a halt does not stop: `deliver` and \
+                 `post` are both exempt, because a halted agent must still be able \
+                 to ask why it is halted and be told. A halt stops DRIVERS — bytes \
+                 reaching the program — and a topic set reaches no PTY, moves no \
+                 keyboard and re-aims no seam that writes. Refusing it would only \
+                 mean an operator could not arm a held session to hear the \
+                 all-clear on the topic the fleet is about to publish it on",
+            ),
         ];
 
         // No stale entries: an exemption for a verb that no longer ships is a

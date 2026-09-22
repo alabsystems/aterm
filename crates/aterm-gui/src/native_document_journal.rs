@@ -2118,7 +2118,13 @@ mod tests {
         let initialized = settle_busy(|| host.initialize(first.clone(), &disk, &disk)).unwrap();
         let before = fs::read(&initialized.path).unwrap();
 
-        let error = host.initialize(stale, &disk, &disk).unwrap_err();
+        // Ridden out through `settle_busy` like the first attempt above: the
+        // full-suite pool can land this call inside a peer's lock window, and
+        // on 2026-09-22 the merge contract reported the journal BUSY here where
+        // the assertion wanted the stale-inspection refusal. The helper retries
+        // only the busy refusal, so the first real answer is still what the
+        // assertion sees.
+        let error = settle_busy(|| host.initialize(stale.clone(), &disk, &disk)).unwrap_err();
         assert!(
             error.contains("changed after recovery inspection"),
             "{error}"

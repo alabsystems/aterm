@@ -1155,8 +1155,10 @@ impl Frame<'_> {
 
 /// Hang `addPresentedHandler:` on `drawable`, reporting `presentDrawable:`
 /// registration → `-[MTLDrawable presentedTime]` through
-/// [`crate::present_glass::deliver`]. The registration instant is read here on
-/// `CACurrentMediaTime`, the clock `presentedTime` is stated in.
+/// [`crate::present_glass::deliver_report`], with the registration's serial and
+/// pacing tag. The registration instant is read here on `CACurrentMediaTime`,
+/// the clock `presentedTime` is stated in — and the clock the tag's "within one
+/// refresh of the previous registration" is decided on.
 ///
 /// # Safety
 ///
@@ -1165,6 +1167,11 @@ impl Frame<'_> {
 unsafe fn register_presented_handler(drawable: Id) {
     // SAFETY: a pure clock read.
     let registered_s = unsafe { CACurrentMediaTime() };
+    // This registration's serial and its pacing tag, decided HERE from the
+    // facts the presenting thread armed (`present_glass::arm_present`) and this
+    // registration instant, so the handler reports the present it belongs to
+    // whatever registers after it.
+    let (serial, tag) = crate::present_glass::registration_begin(registered_s);
     // The handler itself, defined OUTSIDE any `unsafe` block so its one real
     // unsafe operation — the `presentedTime` message — carries its own scope.
     let handler = move |presented: Id| {
@@ -1175,12 +1182,17 @@ unsafe fn register_presented_handler(drawable: Id) {
             let get: unsafe extern "C" fn(Id, Sel) -> f64 = msg();
             get(presented, sel(c"presentedTime"))
         };
-        crate::present_glass::deliver(crate::present_glass::classify(registered_s, presented_s));
+        crate::present_glass::deliver_report(
+            serial,
+            tag,
+            crate::present_glass::classify(registered_s, presented_s),
+        );
     };
     // SAFETY: `MTLDrawablePresentedHandler` is `void (^)(id<MTLDrawable>)` —
     // exactly `(Id) -> ()`, the prototype this block is invoked with. The
-    // closure captures one `f64`, performs no allocation or panicking
-    // operation, and the sink contract forbids blocking or unwinding.
+    // closure captures one `f64`, one `u64` and one `PresentTag` (all `Copy`),
+    // performs no allocation or panicking operation, and the sink contract
+    // forbids blocking or unwinding.
     let block = unsafe { aterm_objc::RcBlock::new1(handler) };
     let Some(block) = block else { return };
     // SAFETY: `addPresentedHandler:` takes one block argument and copies it
@@ -3515,9 +3527,9 @@ mod tests {
     #[test]
     fn a_present_delivers_a_glass_sample_once_a_sink_listens() {
         use crate::metal::loss::{CbOutcome, LossLatch};
-        use crate::present_glass::{GlassSample, delivered, install_sink};
+        use crate::present_glass::{GlassReport, delivered, install_sink};
 
-        fn sink(_: GlassSample) {}
+        fn sink(_: GlassReport) {}
 
         let Some(dev) = device() else { return };
         let _test_pool = AutoreleasePool::new();

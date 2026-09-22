@@ -924,7 +924,7 @@ mod tests {
         let checked_in = include_str!("robi_glyphs_gen.rs");
         assert_eq!(
             generated, checked_in,
-            "robi_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_robi_glyphs`"
+            "robi_glyphs_gen.rs is stale — rerun `targo --unverified run -p aterm-effects --example gen_robi_glyphs`"
         );
     }
 
@@ -938,7 +938,7 @@ mod tests {
         let checked_in = include_str!("animal_glyphs_gen.rs");
         assert_eq!(
             generated, checked_in,
-            "animal_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_animal_glyphs`"
+            "animal_glyphs_gen.rs is stale — rerun `targo --unverified run -p aterm-effects --example gen_animal_glyphs`"
         );
     }
 
@@ -952,7 +952,7 @@ mod tests {
         let checked_in = include_str!("cat_glyphs_gen.rs");
         assert_eq!(
             generated, checked_in,
-            "cat_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_cat_glyphs`"
+            "cat_glyphs_gen.rs is stale — rerun `targo --unverified run -p aterm-effects --example gen_cat_glyphs`"
         );
     }
 
@@ -966,7 +966,7 @@ mod tests {
         let checked_in = include_str!("pet_glyphs_gen.rs");
         assert_eq!(
             generated, checked_in,
-            "pet_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_pet_glyphs`"
+            "pet_glyphs_gen.rs is stale — rerun `targo --unverified run -p aterm-effects --example gen_pet_glyphs`"
         );
     }
 
@@ -985,7 +985,7 @@ mod tests {
         let checked_in = include_str!("dog_glyphs_gen.rs");
         assert_eq!(
             generated, checked_in,
-            "dog_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_dog_glyphs`"
+            "dog_glyphs_gen.rs is stale — rerun `targo --unverified run -p aterm-effects --example gen_dog_glyphs`"
         );
     }
 

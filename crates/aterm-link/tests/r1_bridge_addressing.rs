@@ -133,7 +133,14 @@ fn an_explicit_node_address_never_writes_the_pin_table() {
     );
 }
 
-/// **`post to=say` reaches the `say` face.**
+/// **`post to=say` reaches the `say` face — on the TOPIC, with the kind in the
+/// body.**
+///
+/// Round 23 retired the per-kind leaf: `say/<topic>` costs one subject per
+/// topic, where `say/<topic>/<kind>` would have cost one per topic AND kind on
+/// a budget this round has not reclaimed. Bare `to=say` is the topic `say`, so
+/// every address that worked before still does — only the subject's last
+/// segment changed meaning, and the kind moved into the record.
 ///
 /// The verb catalog, `POST_USAGE` and §11.2's serve spec all name `to=say`;
 /// `cmd_post` accepts it and answers `OK <id>`; the tui renders and publishes
@@ -150,7 +157,7 @@ fn a_post_to_say_reaches_the_say_face() {
     let posted = w.verb(&format!("@{a} post to=say kind=note r1announced"));
     assert!(posted.ok(), "{}", posted.header());
 
-    let face = format!("/f/{FLEET}/pub/{}/{a}/say/note", w.node);
+    let face = format!("/f/{FLEET}/pub/{}/{a}/say/say", w.node);
     let said = until("the announcement to reach the say face", || {
         let (rows, _) = w.god().last(&face, "", 8).ok()?;
         rows.into_iter()
@@ -158,6 +165,37 @@ fn a_post_to_say_reaches_the_say_face() {
             .map(|(_, _, b)| String::from_utf8_lossy(&b).into_owned())
     });
     assert!(said.contains("r1announced"), "{said}");
+    assert!(
+        said.contains("kind=note"),
+        "the kind rides in the body now, not the subject: {said}"
+    );
+
+    // AND A NAMED TOPIC gets its own last segment.
+    let posted = w.verb(&format!("@{a} post to=say:build.failed kind=note r1topic"));
+    assert!(posted.ok(), "{}", posted.header());
+    let face = format!("/f/{FLEET}/pub/{}/{a}/say/build.failed", w.node);
+    let said = until("the topic face", || {
+        let (rows, _) = w.god().last(&face, "", 8).ok()?;
+        rows.into_iter()
+            .find(|(_, s, _)| *s == face)
+            .map(|(_, _, b)| String::from_utf8_lossy(&b).into_owned())
+    });
+    assert!(
+        said.contains("r1topic") && said.contains("kind=note"),
+        "{said}"
+    );
+
+    // A TOPIC THAT IS NOT ONE IS A USAGE ERROR, at the post — not a record
+    // retired `unroutable` a publish later, which a non-waiting sender never
+    // sees.
+    for bad in ["say:", "say:Build", "say:.dot", "say:a/b", "say:has space"] {
+        let r = w.verb(&format!("@{a} post to={bad} kind=note x"));
+        assert!(
+            r.header().starts_with("ERR usage"),
+            "{bad} must be refused: {}",
+            r.header()
+        );
+    }
 }
 
 /// **A session's `ev` records live on the SESSION's own face.**

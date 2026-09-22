@@ -1737,8 +1737,10 @@ fn prediction_visibility_requires_redraw(was_visible: bool, is_visible: bool) ->
 /// Whether a typing click cued at the KEY could ever reach a speaker — the
 /// host half of the touch-to-glass audio seam (`CursorGlow::cue_keystroke`).
 ///
-/// The ENGINE owns the darkness law (master switch, real geometry, nonzero
-/// amplitude); this seam answers "could a click cued right now reach a speaker",
+/// The ENGINE owns the darkness law (master switch, real geometry, and the
+/// host's `GlowConfig::audible` focus verdict — NO LONGER the folded
+/// amplitude, which now carries the accessibility stage and the load-shed
+/// envelope, neither of which may mute typing); this seam answers "could a click cued right now reach a speaker",
 /// so a build whose sound can only ever be silence — headless, a non-macOS stub,
 /// a permanently failed worker, the knob off, volume 0 — never pays the
 /// cue-delivering redraw on its hottest path. Same "never runs headless-muted"
@@ -1781,13 +1783,39 @@ struct KeyClickSynth {
 
 #[inline]
 pub(crate) fn keystroke_click_audible(
-    worker_live: bool,
+    host: crate::trail_audio::HostState,
     sounds_on: bool,
     volume: f32,
     sound_allowed: bool,
     resize_quiet: bool,
 ) -> bool {
-    worker_live && sounds_on && volume > 0.0 && sound_allowed && !resize_quiet
+    // ONE AUTHOR for the reason table. This is `sound_seam` with the terms
+    // the key path must not re-judge PINNED OPEN, so "will it sound" and
+    // "should we push" differ by one visible literal block rather than by two
+    // independently-edited expressions that drift.
+    crate::sound_seam::sound_seam(&crate::sound_seam::SeamInputs {
+        sounds_on,
+        volume,
+        serious_allows: sound_allowed,
+        resize_quiet,
+        // PINNED OPEN, on purpose. The key path must keep PUSHING under a
+        // wedged host, because the push is what drives `revive_or_seal`; and
+        // the trail / focus / engine terms are the ENGINE's own gate, read
+        // one line later under the window borrow at
+        // `CursorGlow::cue_keystroke_shifted`. Only `HostState::Inert` — the
+        // exact complement of `TrailAudio::is_live()` — closes this
+        // projection, which is what the previous `worker_live: bool`
+        // parameter meant.
+        host: if matches!(host, crate::trail_audio::HostState::Inert) {
+            crate::trail_audio::HostState::Inert
+        } else {
+            crate::trail_audio::HostState::Running
+        },
+        trail_on: true,
+        focused: true,
+        engine_sound_live: true,
+    })
+    .is_none()
 }
 
 /// WHAT KIND OF GLYPH the key landed, for Rainbow Kitty v2's engine
@@ -2302,6 +2330,53 @@ pub(crate) fn egress_to_outcome(e: input::Egress) -> InputOutcome {
         input::Egress::Reported(input::Delivery::Full | input::Delivery::FullAt { .. })
         | input::Egress::TrackingOff { .. } => InputOutcome::Ok,
         input::Egress::Reported(_) => InputOutcome::WriteFailed,
+    }
+}
+
+/// M1b: RELEASE (or stack onto) the elastic-overscroll bounce for `excess_px`
+/// of motion the history-end clamp ate (signed: + past the top, − past the live
+/// bottom). Resisted 0.3× and negated so a top overscroll bounces the band
+/// DOWN (negative frac) and a bottom overscroll bounces it UP (positive frac);
+/// clamped to one cell (the sub-row translate's domain); the bounce decays to
+/// rest via the proven spring and self-disarms (`tick_overscroll`). The PEAK is
+/// presented on this very frame (the tick advances the decay on subsequent
+/// wakes) so the rubber-band renders immediately. Shared by the notch arm
+/// (parked at an edge) and the tracked band (a finger pushing past one);
+/// `set_scroll_band` still gates the presented frac on the SmoothScroll policy.
+fn release_overscroll(
+    ws: &mut crate::WindowState,
+    excess_px: i64,
+    cell_h: i64,
+    tick_interval: std::time::Duration,
+    now: std::time::Instant,
+) {
+    let impulse = -(crate::scroll_motion::overscroll_resist(excess_px) as f64);
+    let max_px = f64::from((cell_h as i32 - 1).max(0));
+    if impulse != 0.0 && max_px > 0.0 {
+        match ws.overscroll.as_mut() {
+            Some(sp) => {
+                sp.add_impulse(impulse, max_px, now);
+                // A bounce already in flight keeps its phase-locked anchor; one
+                // that somehow fell behind `now` re-anchors one period out.
+                if sp.next_tick() <= now {
+                    sp.set_next_tick(now + tick_interval);
+                }
+            }
+            None => {
+                let mut sp = crate::scroll_motion::OverscrollSpring::new(
+                    impulse.clamp(-max_px, max_px),
+                    now,
+                );
+                // The first decay tick is one panel period out, ANCHORED here
+                // (`OverscrollSpring::next_tick`); the tick advances it
+                // phase-locked, and no park re-derives it from `now`.
+                sp.set_next_tick(now + tick_interval);
+                ws.overscroll = Some(sp);
+            }
+        }
+        if let Some(sp) = ws.overscroll.as_ref() {
+            ws.scroll_frac_px = sp.sample(now).0.round() as i32;
+        }
     }
 }
 
@@ -3016,6 +3091,7 @@ fn ambiguous_width_shaping(
 /// a priced zero, which the engine distinguishes from an erase it was told
 /// nothing about — the one retires no cell of any press, the other the whole
 /// newest press.
+#[cfg(test)]
 fn committed_grapheme_cells_into(text: &str, ambiguous_width_double: bool, out: &mut Vec<u16>) {
     if aterm_grapheme::str_width(text) == 0 {
         return;
@@ -3060,11 +3136,21 @@ impl ErasePriceMemory {
         self.trim();
     }
 
-    /// A committed Text/IME run, one width per grapheme in order
-    /// ([`committed_grapheme_cells_into`]).
+    /// A committed Text/IME run, one width per grapheme in order, using the
+    /// same width rule as [`committed_text_cells`]. Process bounded chunks so
+    /// a large IME commit never stores all the widths we immediately discard.
     fn price_graphemes(&mut self, text: &str, ambiguous_width_double: bool) {
-        committed_grapheme_cells_into(text, ambiguous_width_double, &mut self.0);
-        self.trim();
+        if aterm_grapheme::str_width(text) == 0 {
+            return;
+        }
+        let shaping = ambiguous_width_shaping(ambiguous_width_double);
+        let mut widths = aterm_grapheme::split_graphemes_with_config(text, &shaping)
+            .map(|g| u16::try_from(g.width).unwrap_or(u16::MAX))
+            .peekable();
+        while widths.peek().is_some() {
+            self.0.extend(widths.by_ref().take(Self::CAP));
+            self.trim();
+        }
     }
 
     /// `n` priced zeros — a paste's graphemes, each an erase that retires
@@ -3097,6 +3183,46 @@ impl ErasePriceMemory {
     #[cfg(test)]
     fn widths(&self) -> &[u16] {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod erase_price_memory_tests {
+    use super::{ErasePriceMemory, committed_grapheme_cells_into};
+
+    #[test]
+    fn large_commits_keep_only_the_bounded_erase_tail_without_retaining_their_allocation() {
+        let long = "x日e\u{301}👩🏽‍💻·".repeat(4096);
+        for double_width in [false, true] {
+            let mut memory = ErasePriceMemory::default();
+            let mut reference = Vec::new();
+            memory.push(1);
+            memory.push_zeros(ErasePriceMemory::CAP);
+            reference.resize(ErasePriceMemory::CAP, 0);
+            // The full-vector reference is the previous implementation. Check
+            // append/pop/clear behavior, including zero-width-only commits and
+            // a leading zero-width cluster in a commit that does advance.
+            for text in ["ab", "\u{301}", "\u{301}日本", long.as_str(), "⚠️z"] {
+                committed_grapheme_cells_into(text, double_width, &mut reference);
+                if text == long {
+                    assert!(reference.capacity() > 2 * ErasePriceMemory::CAP);
+                }
+                let excess = reference.len().saturating_sub(ErasePriceMemory::CAP);
+                reference.drain(..excess);
+                memory.price_graphemes(text, double_width);
+                assert_eq!(memory.widths(), reference, "{double_width}");
+                // At most two chunks are live; allow Vec's geometric growth
+                // from an odd capacity left by the earlier typed/pasted mix.
+                assert!(memory.0.capacity() < 4 * ErasePriceMemory::CAP);
+                assert_eq!(memory.pop(), reference.pop());
+            }
+            memory.clear();
+            assert!(memory.widths().is_empty());
+            assert!(memory.0.capacity() < 4 * ErasePriceMemory::CAP);
+            memory.price_graphemes("é", double_width);
+            assert_eq!(memory.pop(), Some(if double_width { 2 } else { 1 }));
+            assert_eq!(memory.pop(), None);
+        }
     }
 }
 
@@ -4035,12 +4161,31 @@ impl App {
             return Err("no focused window".to_string());
         };
         let knob = self.config.tone_melody_or_default();
-        let audio = if !self.trail_audio.is_live() {
-            crate::tone_infer::AudioHost::Inert
-        } else if self.trail_audio.wedged_for().is_some() {
-            crate::tone_infer::AudioHost::Wedged
-        } else {
-            crate::tone_infer::AudioHost::Live
+        let host = self.trail_audio.host_state();
+        let audio = crate::tone_infer::AudioHost::from(host);
+        // THE AUDIBILITY TERMS, resolved here so the row can refute "sound is
+        // broken" on its own. Every one of them is the SAME read the seam or
+        // the sibling verb makes: `focused` is `trail status`'s `focused=`
+        // fold, `motion_stage`/`shed` are its `motion_stage=`/`shed=`, and
+        // `engine_sound` is the bit `cue_keystroke_shifted` tests on its
+        // first line. Nothing here is re-derived.
+        let now = std::time::Instant::now();
+        let focused = self.cursor_fx_focus(wid, ws.focused, now);
+        let mode = self.config.motion_mode();
+        let shed = self.effective_shed_envelope(mode, now);
+        let glow = self.glow_config();
+        let serious_sound = self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::TerminalSound);
+        let inputs = crate::sound_seam::SeamInputs {
+            sounds_on: self.config.trail_sounds_or_default(),
+            volume: self.config.trail_sound_volume(),
+            trail_on: glow.enabled,
+            serious_allows: serious_sound,
+            focused,
+            resize_quiet: ws.resize_sound_quiet(now),
+            host,
+            engine_sound_live: ws.cursor_glow.sound_seam_open(),
         };
         Ok(crate::tone_infer::ToneStatus {
             tone: ws.tone_tracker.current(),
@@ -4053,6 +4198,18 @@ impl App {
             window_chars: ws.tone_tracker.window_chars(),
             inferences: ws.tone_tracker.inferences,
             dropped: self.trail_audio.dropped_cues(),
+            seam: crate::sound_seam::sound_seam(&inputs),
+            engine_sound: inputs.engine_sound_live,
+            trail: inputs.trail_on,
+            focused,
+            serious_sound,
+            motion_stage: match self.motion_policy(focused) {
+                crate::motion::MotionPolicy::Full => "full",
+                crate::motion::MotionPolicy::Reduced => "reduced",
+            },
+            shed,
+            revives: self.trail_audio.revives_spent(),
+            reopens_left: self.trail_audio.reopens_left(),
         }
         .line())
     }
@@ -5241,7 +5398,7 @@ impl App {
                     // below is taken under a window borrow. Three Option reads — the
                     // same trivially-cheap accessors the per-frame drain calls.
                     let click_audible = keystroke_click_audible(
-                        self.trail_audio.is_live(),
+                        self.trail_audio.host_state(),
                         self.config.trail_sounds_or_default(),
                         self.config.trail_sound_volume(),
                         self.serious_mode_policy()
@@ -6893,9 +7050,20 @@ impl App {
             let lines = wheel_viewport_lines(wheel_lines, viewport.rows);
             if lines != 0 {
                 let delta = if wheel_up { lines } else { -lines };
-                let precise = self.windows.get(&wid).is_some_and(|ws| ws.wheel_precise);
+                let precise = self.windows.get(&wid).and_then(|ws| ws.wheel_precise_px);
                 self.scroll_wheel_animated_with(wid, term, delta, Some(viewport), precise);
             }
+        } else if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.wheel_precise_px.is_some())
+        {
+            // The seam REPORTED a precise delta (an app tracks the mouse, or DEC
+            // 1007 arrows on the alt screen): the band no longer belongs to the
+            // finger, so a glide still tracking from before the app took the
+            // mouse settles to its whole row now. The bytes are the seam's,
+            // untouched; this only ends a display-side gesture.
+            self.release_scroll_track(wid);
         }
         egress_to_outcome(egress)
     }
@@ -6943,7 +7111,12 @@ impl App {
             // row when still reachable and otherwise land at the current engine
             // boundary; either outcome is an exact whole-row rest state.
             let max_row = i64::try_from(term.grid().scrollback_lines()).unwrap_or(i64::MAX);
-            let target_row = target_row.clamp(0, max_row);
+            // MACHINE motion since the glide last set the engine row (SCR-1's
+            // re-pin after an output batch) carries the landing row with it —
+            // the same rule `apply_scroll_glide_sample` applies mid-flight.
+            let machine =
+                i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX) - st.engine_row;
+            let target_row = target_row.saturating_add(machine).clamp(0, max_row);
             loop {
                 let current = i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX);
                 let delta = target_row - current;
@@ -6967,24 +7140,23 @@ impl App {
     }
 
     /// Apply the shared settle transition only when this window's currently
-    /// resolved SmoothScroll policy is Reduced.
+    /// resolved SmoothScroll policy is Reduced — through
+    /// [`Self::smooth_scroll_animates`], so the load-shed latch (which never
+    /// governs SmoothScroll) can never land a live glide here.
     pub(crate) fn settle_scroll_motion_if_reduced(
         &mut self,
         wid: WindowId,
         now: std::time::Instant,
     ) -> bool {
-        let focused = self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused));
-        if self
-            .motion_policy(focused)
-            .animate(crate::motion::MotionEffect::SmoothScroll)
-        {
+        if self.smooth_scroll_animates(wid) {
             return false;
         }
         self.settle_scroll_motion_at_target(wid, now)
     }
 
     /// Reconcile every retained window after a fact that can change the resolved
-    /// motion policy (config, OS accessibility, focus, or adaptive shedding).
+    /// SmoothScroll policy (config `motion`, OS accessibility, or focus — the
+    /// load-shed latch is not one, see `App::effect_policy`).
     /// The snapshot avoids borrowing `windows` across the terminal-locking settle.
     pub(crate) fn settle_reduced_scroll_motion(&mut self, now: std::time::Instant) {
         let retained: Vec<WindowId> = self
@@ -7021,7 +7193,8 @@ impl App {
     /// history) through the ~180 ms ease-out GLIDE when W11's motion policy
     /// permits, and INSTANTLY otherwise (config `motion=reduced`, the OS Reduce
     /// Motion flag, or an unfocused window — all snap, per the M1 accessibility
-    /// clause). Either way the scroll pill wakes.
+    /// clause; the load-adaptive shedding latch is deliberately NOT on that
+    /// list, see `App::effect_policy`). Either way the scroll pill wakes.
     ///
     /// SOURCE-BLIND on purpose: this sits BELOW the seam's `TrackingOff` fallback,
     /// reached identically by a Human wheel notch and a controller `mouse` wheel
@@ -7049,7 +7222,7 @@ impl App {
         term: &Arc<Mutex<Terminal>>,
         delta_rows: i32,
     ) {
-        self.scroll_wheel_animated_with(wid, term, delta_rows, None, false);
+        self.scroll_wheel_animated_with(wid, term, delta_rows, None, None);
     }
 
     /// [`Self::scroll_wheel_animated`] with the engine facts the caller already
@@ -7064,22 +7237,37 @@ impl App {
     /// position and a target past the top of history would translate the
     /// sub-row band against a pinned engine for the rest of the ease.
     ///
-    /// `precise` is whether the delta came from a trackpad / Magic Mouse
-    /// (`PixelDelta`) rather than a notch. It changes ONE thing: how a chained
-    /// delta joins an in-flight ease of the same engine. A notch RETARGETS
-    /// (`Glide::retarget` — the M1 180 ms brief, written for notch wheels: each
-    /// detent earns its own ease); a precise delta EXTENDS
-    /// (`Glide::extend_target`): the target moves, the deadline does not, so a
-    /// 120 Hz stream of deltas no longer restarts the ease every 8 ms and
-    /// settles the content ~57 ms behind the finger — the ease progresses and
-    /// lands, and the next delta arms afresh from where it landed.
+    /// `precise` is the event's signed vertical PIXEL delta (+ = into history)
+    /// when it came from a trackpad / Magic Mouse (`PixelDelta`), `None` for a
+    /// notch. DIRECT MANIPULATION (2026-09-22): a precise delta moves the band
+    /// by exactly those pixels, NOW, with no ease (`Glide::track`) — `delta_rows`
+    /// is then only the seam's whole-row count and is NOT applied (the pixels
+    /// already contain those rows; applying both would double-count) — and the
+    /// band settles to the nearest whole row `TRACK_REST_MS` after the last
+    /// delta. A notch RETARGETS the M1 180 ms ease as before.
+    ///
+    /// WHY (replacing the 2026-09-06 `extend_target` chain): with whole-row
+    /// banking, ANY ease renders a constant finger speed as a sawtooth — the
+    /// band idles until a row banks, then covers it — and the extending chain's
+    /// shrinking remaining duration made the last delta before each deadline a
+    /// whole-row snap in one frame (`0,0,5,4,3,9,…,27,12,4,34` px/frame at 4
+    /// rows/100 ms; measured in `scroll_motion::tests`). A position is not an
+    /// intent to ease toward; the finger IS the ease.
+    ///
+    /// WHAT DOES NOT CHANGE: the seam's bytes for a tracking app and the
+    /// `mouse` verb path (`precise` is never `Some` for a controller event); the
+    /// `scroll_frac_px` sign convention and the ceil pairing (`apply_scroll_glide_sample`);
+    /// the history-end clamp with its overscroll bounce; keyboard snap /
+    /// `ScrollView` cancellation (both take `scroll_glide`); Reduced motion
+    /// (whole-row snap of `delta_rows`, no band — a sub-row-only delta is then
+    /// nothing to do and takes no lock).
     pub(crate) fn scroll_wheel_animated_with(
         &mut self,
         wid: WindowId,
         term: &Arc<Mutex<Terminal>>,
         delta_rows: i32,
         viewport: Option<input::WheelViewport>,
-        precise: bool,
+        precise: Option<f64>,
     ) {
         let now = std::time::Instant::now();
         // W12: the glide's pixel domain belongs to the window that received the
@@ -7088,12 +7276,16 @@ impl App {
         // per-window cell height (`set_scroll_band`), so both halves must share
         // the exact authority or a background-window gesture lands between rows.
         let cell_h = self.win_cell_size(wid).1.max(1) as i64;
-        let focused = self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused));
-        let animate = self
-            .motion_policy(focused)
-            .animate(crate::motion::MotionEffect::SmoothScroll);
+        let animate = self.smooth_scroll_animates(wid);
         if !animate {
             if !self.windows.contains_key(&wid) {
+                return;
+            }
+            // Reduced motion has no sub-row band: a precise delta's whole rows
+            // snap like a notch's, and a sub-row-only delta is nothing to do —
+            // and no lock to take (`track_precise_scroll` gates before its
+            // probe; this is the structural twin).
+            if delta_rows == 0 {
                 return;
             }
             // First finish a retained Full-policy gesture on its own pinned
@@ -7110,27 +7302,94 @@ impl App {
             }
             return;
         }
-        // The engine's current viewport + clamp bound: the seam's snapshot when
-        // it has one, else ONE short lock.
-        let (display_offset, scrollback_lines) = match viewport {
-            Some(v) => (v.display_offset, v.scrollback_lines),
-            None => {
-                let t = term_lock(term);
-                (t.grid().display_offset(), t.grid().scrollback_lines())
-            }
-        };
-        let cur_rows = i64::try_from(display_offset).unwrap_or(i64::MAX);
-        let max_rows = i64::try_from(scrollback_lines).unwrap_or(i64::MAX);
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
+        let app_interval = self.frame_interval;
         // Chain onto an in-flight glide of the SAME engine at the SAME geometry;
         // anything else (fresh gesture, pane switch, font zoom) starts anew from
         // the engine's real position.
-        let same = ws
-            .scroll_glide
-            .as_ref()
-            .is_some_and(|st| Arc::ptr_eq(&st.term, term) && st.cell_h == cell_h);
+        let chained = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.scroll_glide.as_ref())
+            .filter(|st| Arc::ptr_eq(&st.term, term) && st.cell_h == cell_h)
+            .map(|st| (st.engine_row, st.max_rows));
+        let same = chained.is_some();
+        // The engine's current viewport + clamp bound: the seam's snapshot when
+        // it has one; a chained PRECISE delta reuses the facts the glide already
+        // carries — NO lock, so a trackpad's sub-row deltas inside one row cost
+        // the engine nothing (`ScrollGlideState::max_rows`; `cur_rows` is unused
+        // on that path, the band continues from its own sample); else ONE short
+        // lock (the tests' notch-shaped wrapper).
+        let (cur_rows, max_rows) = match (viewport.as_ref(), chained, precise) {
+            (Some(v), _, _) => (
+                i64::try_from(v.display_offset).unwrap_or(i64::MAX),
+                i64::try_from(v.scrollback_lines).unwrap_or(i64::MAX),
+            ),
+            (None, Some((engine_row, max_rows)), Some(_)) => (engine_row, max_rows),
+            (None, _, _) => {
+                let t = term_lock(term);
+                (
+                    i64::try_from(t.grid().display_offset()).unwrap_or(i64::MAX),
+                    i64::try_from(t.grid().scrollback_lines()).unwrap_or(i64::MAX),
+                )
+            }
+        };
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        // The panel this window is on paces its glide (the same per-window
+        // authority the effect lane and the frame cap use).
+        let tick_interval = ws.frame_interval.unwrap_or(app_interval);
+        if let Some(dy_px) = precise {
+            // DIRECT MANIPULATION: the band goes where the finger is. A fresh
+            // gesture (or a pane switch / font zoom) parks a tracked glide at the
+            // engine's real row from the seam's facts; a chained delta joins
+            // whatever is armed — a tracked band, or a notch ease mid-flight —
+            // continuously from its current sample. The clamp is applied to the
+            // POSITION on every delta, never deferred (the same reason the notch
+            // clamp is not deferred to the tick), and its excess releases or
+            // stacks the elastic bounce exactly as a notch's does. The tracked
+            // glide stays ARMED at an edge (start == target == the edge row): its
+            // apply writes frac 0 and the bounce then owns `scroll_frac_px`, in
+            // that order, at the event and on every wake (`new_events` ticks
+            // glides before springs) — so a finger held past the top re-probes
+            // the route once per settle, not once per delta.
+            if !same {
+                ws.overscroll = None;
+                ws.scroll_frac_px = 0;
+                ws.scroll_glide = Some(crate::ScrollGlideState {
+                    glide: crate::scroll_motion::Glide::tracked(cur_rows * cell_h, cell_h, now),
+                    term: term.clone(),
+                    cell_h,
+                    engine_row: cur_rows,
+                    max_rows,
+                    // Re-anchored by the apply below to the rest-settle start.
+                    next_tick: now,
+                });
+            }
+            let excess_px = ws.scroll_glide.as_mut().map_or(0, |st| {
+                if viewport.is_some() {
+                    // A seam-fed delta (a banked whole row) refreshes the clamp
+                    // bound the lock-free sub-row deltas reuse.
+                    st.max_rows = max_rows;
+                }
+                st.glide.track(dy_px, cell_h, max_rows * cell_h, now)
+            });
+            self.apply_scroll_glide_sample(wid, now);
+            let Some(ws) = self.windows.get_mut(&wid) else {
+                return;
+            };
+            if excess_px != 0 {
+                release_overscroll(ws, excess_px, cell_h, tick_interval, now);
+            } else {
+                // Moving with room to move: we are no longer parked at an edge.
+                ws.overscroll = None;
+            }
+            ws.scroll_pill.touch(now);
+            if let Some(w) = ws.os_window.as_ref() {
+                w.request_redraw();
+            }
+            return;
+        }
         let base_px = if same {
             ws.scroll_glide
                 .as_ref()
@@ -7141,17 +7400,19 @@ impl App {
         let want_px = base_px + i64::from(delta_rows) * cell_h;
         let target_px = want_px.clamp(0, max_rows * cell_h);
         if same {
-            // A chained delta that still has room to move joins the ease — a
-            // notch by RETARGETING it (its own fresh 180 ms), a precise delta by
-            // EXTENDING it (same deadline, see the doc above) — and clears any
-            // stale bounce (we are no longer parked at an edge).
+            // A chained notch that still has room to move RETARGETS the ease
+            // (its own fresh 180 ms — also when the ease it joins is a tracked
+            // band: `retarget` restores the M1 duration) and clears any stale
+            // bounce (we are no longer parked at an edge).
             ws.overscroll = None;
             if let Some(st) = ws.scroll_glide.as_mut() {
-                if precise {
-                    st.glide.extend_target(target_px, now);
-                } else {
-                    st.glide.retarget(target_px, now);
-                }
+                st.glide.retarget(target_px, now);
+                st.max_rows = max_rows;
+                // A notch chained onto a PARKED tracked band (its anchor was the
+                // far-off rest boundary) starts easing now: pull the anchor to
+                // within one period. A chained notch onto an ease in flight
+                // leaves the phase-locked anchor exactly where it was.
+                st.next_tick = st.next_tick.min(now + tick_interval);
             }
         } else if target_px == cur_rows * cell_h {
             // Parked at a history end (the clamp ate the whole notch): nothing to
@@ -7165,25 +7426,7 @@ impl App {
             // self-disarms (`tick_overscroll`). `set_scroll_band` still gates the
             // presented frac on the SmoothScroll policy.
             ws.scroll_glide = None;
-            let excess_px = want_px - target_px;
-            let impulse = -(crate::scroll_motion::overscroll_resist(excess_px) as f64);
-            let max_px = f64::from((cell_h as i32 - 1).max(0));
-            if impulse != 0.0 && max_px > 0.0 {
-                match ws.overscroll.as_mut() {
-                    Some(sp) => sp.add_impulse(impulse, max_px, now),
-                    None => {
-                        ws.overscroll = Some(crate::scroll_motion::OverscrollSpring::new(
-                            impulse.clamp(-max_px, max_px),
-                            now,
-                        ));
-                    }
-                }
-                // Present the bounce PEAK on this very frame (the tick advances the
-                // decay on subsequent wakes) so the rubber-band renders immediately.
-                if let Some(sp) = ws.overscroll.as_ref() {
-                    ws.scroll_frac_px = sp.sample(now).0.round() as i32;
-                }
-            }
+            release_overscroll(ws, want_px - target_px, cell_h, tick_interval, now);
         } else {
             // A fresh ease with room to move: cancel any bounce and arm the glide.
             ws.overscroll = None;
@@ -7192,6 +7435,12 @@ impl App {
                 glide: crate::scroll_motion::Glide::new(cur_rows * cell_h, target_px, now),
                 term: term.clone(),
                 cell_h,
+                engine_row: cur_rows,
+                max_rows,
+                // The first tick is one panel period out, ANCHORED here: a
+                // chained notch re-enters through the `same` arm above and
+                // leaves it alone, and no park re-derives it from `now`.
+                next_tick: now + tick_interval,
             });
         }
         ws.scroll_pill.touch(now);
@@ -7210,10 +7459,7 @@ impl App {
         // The M1b sub-row residual is PRESENTED only under a Full motion policy for
         // SmoothScroll; a mid-glide flip to Reduced (e.g. the window lost focus)
         // must snap whole-row, so the pairing below drops to the floor offset.
-        let focused = self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused));
-        let animate = self
-            .motion_policy(focused)
-            .animate(crate::motion::MotionEffect::SmoothScroll);
+        let animate = self.smooth_scroll_animates(wid);
         if !animate {
             // Defensive convergence: even if a policy source changed without its
             // normal edge reducer running, the first pending tick lands and drops
@@ -7221,39 +7467,102 @@ impl App {
             self.settle_scroll_motion_at_target(wid, now);
             return;
         }
+        self.apply_scroll_glide_sample(wid, now);
+    }
+
+    /// Present the glide's sample at `now`: decompose the eased (or tracked)
+    /// absolute px into the whole-row engine OFFSET plus the sub-row residual,
+    /// move the pinned engine when — and only when — the row changed, bank the
+    /// residual, and drop the state once the sample lands on the target. Shared
+    /// by the frame tick ([`Self::tick_scroll_glide`]) and by every precise delta
+    /// (`scroll_wheel_animated_with`, which applies the finger's position AT the
+    /// event rather than a frame later).
+    ///
+    /// M1b: the present translate reveals the row scrolling in from BELOW at the
+    /// exposed bottom strip, so the shift-up pairing is the CEIL offset with
+    /// `frac = offset*cell_h - pos_px` (NOT the floor residual `decompose`
+    /// banks): the engine sits one row deeper into history and the up-shift
+    /// pulls it back by `frac`, so motion is continuous and lands cleanly
+    /// (`frac == 0`) on every row boundary. `frac ∈ [0, cell_h)` by the Euclidean
+    /// split (the proven `scroll_px_decomposition_law`). Unchanged since M1b.
+    ///
+    /// THE LOCK IS TAKEN ONLY ON A ROW CHANGE (`engine_row`). The tick used to
+    /// lock every wake to re-read `display_offset`; a tracked band presents ~120
+    /// sub-row positions a second, most inside one row, and each lock is a
+    /// queue position behind a flooding reader's `process()` slice. Under the
+    /// lock, a `display_offset` that is not the row this glide last set is
+    /// MACHINE motion — SCR-1's re-pin after an output batch (`prev_offset +
+    /// lines_added`) — and the glide's frame SHIFTS by it (`Glide::shift`) so
+    /// the ease continues relative to the content the reader is looking at.
+    /// The old tick forced the engine back to its absolute row on every wake,
+    /// scrolling the reader's content toward live by `lines_added` per batch
+    /// for the length of the ease — in a flooding session, a visible jump per
+    /// frame. `settle_scroll_motion_at_target` applies the same rule.
+    fn apply_scroll_glide_sample(&mut self, wid: WindowId, now: std::time::Instant) {
+        let app_interval = self.frame_interval;
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let Some((term, cell_h, pos_px, done)) = ws.scroll_glide.as_ref().map(|st| {
+        let Some((term, cell_h, pos_px, done, engine_row)) = ws.scroll_glide.as_ref().map(|st| {
             let (pos, done) = st.glide.sample(now);
-            (st.term.clone(), st.cell_h, pos, done)
+            (st.term.clone(), st.cell_h, pos, done, st.engine_row)
         }) else {
             return;
         };
-        // M1b: split the eased absolute position into a whole-row engine OFFSET plus
-        // the sub-row residual to shift the grid band UP by at present time. The
-        // present translate reveals the row scrolling in from BELOW at the exposed
-        // bottom strip, so the shift-up pairing is the CEIL offset with
-        // `frac = offset*cell_h - pos_px` (NOT the floor residual `decompose` banks):
-        // the engine sits one row deeper into history and the up-shift pulls it back
-        // by `frac`, so motion is continuous and lands cleanly (`frac == 0`) on every
-        // row boundary. `frac ∈ [0, cell_h)` by the
-        // Euclidean split (the proven `scroll_px_decomposition_law`).
         let (row_floor, s) = crate::scroll_motion::decompose(pos_px, cell_h);
         let (offset, frac) = if s == 0 {
             (row_floor, 0)
         } else {
             (row_floor + 1, cell_h - s)
         };
-        {
+        if offset != engine_row {
             let mut t = term_lock(&term);
             let cur = i64::try_from(t.grid().display_offset()).unwrap_or(i64::MAX);
+            let machine = cur - engine_row;
+            let offset = if machine != 0 {
+                if let Some(st) = ws.scroll_glide.as_mut() {
+                    st.glide.shift(machine.saturating_mul(cell_h));
+                }
+                offset + machine
+            } else {
+                offset
+            };
             let delta = offset - cur;
             if delta != 0 {
                 t.scroll_display(delta.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
             }
+            // The engine's live clamp is authoritative (history may have shrunk);
+            // remember the row it actually shows, so the next apply compares
+            // against reality rather than against a wish.
+            let landed = i64::try_from(t.grid().display_offset()).unwrap_or(i64::MAX);
+            if let Some(st) = ws.scroll_glide.as_mut() {
+                st.engine_row = landed;
+            }
         }
         ws.scroll_frac_px = i32::try_from(frac).unwrap_or(0);
+        // Advance the anchored tick. A PARKED tracked band (its ease not yet
+        // begun) owes exactly one wake, at its rest-settle start; an ease in
+        // flight advances PHASE-LOCKED to the slot that fired (the cursor
+        // train's own law, `phase_locked_effect_deadline`): the next slot is
+        // `next_tick + interval` while that is still ahead, so a tick served a
+        // couple of ms late — a redraw stood in front of it — does not
+        // accumulate the lateness into the cadence, and a tick more than a
+        // whole period late re-phases from `now`. The one and only writer after
+        // the arm, so a park's re-read is always this value.
+        let tick_interval = ws.frame_interval.unwrap_or(app_interval);
+        if let Some(st) = ws.scroll_glide.as_mut() {
+            st.next_tick = if now < st.glide.settle_start() {
+                st.glide.settle_start()
+            } else {
+                crate::app_render::phase_locked_effect_deadline(
+                    now,
+                    tick_interval,
+                    Some(st.next_tick),
+                    None,
+                    true,
+                )
+            };
+        }
         if done {
             ws.scroll_glide = None;
             // A completed glide lands on a whole row (the target is a `cell_h`
@@ -7268,6 +7577,51 @@ impl App {
         }
     }
 
+    /// Service every armed glide and bounce whose ANCHORED tick is due at `now`
+    /// — glides first (a tracked band parked at a history end keeps its glide
+    /// armed while the bounce owns `scroll_frac_px`: the glide's apply writes
+    /// frac 0 and the spring's tick must overwrite it in the SAME pass), then
+    /// bounces. Called on EVERY event-loop wake (`new_events`, whatever the
+    /// `StartCause`) and once more at park time (`about_to_wait`, before the
+    /// deadline fold), so a due slot is consumed by whichever wake comes first
+    /// and a park never arms an instant already behind `now`. Returns the
+    /// windows ticked (the headless tests' witness). Each tick may lock its own
+    /// pinned engine.
+    pub(crate) fn service_due_scroll_motion(&mut self, now: std::time::Instant) -> Vec<WindowId> {
+        let mut ticked: Vec<WindowId> = Vec::new();
+        let glide_due: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, ws)| {
+                ws.scroll_glide
+                    .as_ref()
+                    .is_some_and(|st| now >= st.wake_deadline())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in glide_due {
+            self.tick_scroll_glide(id, now);
+            ticked.push(id);
+        }
+        let bounce_due: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, ws)| {
+                ws.overscroll
+                    .as_ref()
+                    .is_some_and(|sp| now >= sp.wake_deadline())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in bounce_due {
+            self.tick_overscroll(id, now);
+            if !ticked.contains(&id) {
+                ticked.push(id);
+            }
+        }
+        ticked
+    }
+
     /// One deadline wake of an in-flight elastic-overscroll BOUNCE: sample the
     /// spring at `now`, PRESENT its signed sub-cell displacement as `scroll_frac_px`
     /// (the bidirectional grid-band translate renders the rubber-band), and DROP the
@@ -7277,10 +7631,8 @@ impl App {
     /// history end — display-only), unlike the glide tick. Called from `new_events`
     /// after the borrow loop, mirroring [`Self::tick_scroll_glide`].
     pub(crate) fn tick_overscroll(&mut self, wid: WindowId, now: std::time::Instant) {
-        let focused = self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused));
-        let animate = self
-            .motion_policy(focused)
-            .animate(crate::motion::MotionEffect::SmoothScroll);
+        let animate = self.smooth_scroll_animates(wid);
+        let app_interval = self.frame_interval;
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -7299,6 +7651,19 @@ impl App {
         // Sub-cell displacement, rounded to the nearest device px (the translate
         // consumes integer px). `set_scroll_band` clamps it into `(-cell_h, cell_h)`.
         ws.scroll_frac_px = disp.round() as i32;
+        // Advance the anchored tick phase-locked (the glide's law, see
+        // `apply_scroll_glide_sample`).
+        let tick_interval = ws.frame_interval.unwrap_or(app_interval);
+        if let Some(sp) = ws.overscroll.as_mut() {
+            let next = crate::app_render::phase_locked_effect_deadline(
+                now,
+                tick_interval,
+                Some(sp.next_tick()),
+                None,
+                true,
+            );
+            sp.set_next_tick(next);
+        }
         if done {
             // Settled: drop the spring (disarm) and rest whole-row.
             ws.overscroll = None;
@@ -15198,62 +15563,721 @@ mod smooth_scroll_tests {
         );
     }
 
-    /// G16 — how a chained delta joins an in-flight glide depends on its KIND:
-    /// a precise (trackpad) delta EXTENDS the ease — the target moves, the
-    /// deadline does not — while a notch RETARGETS it (its own fresh 180 ms,
-    /// the M1 brief). Both still land exactly and self-disarm.
+    /// DIRECT MANIPULATION (2026-09-22) — how a chained delta joins an in-flight
+    /// glide depends on its KIND: a precise (trackpad) delta TRACKS — the band
+    /// moves by exactly its pixels, now, and the glide becomes a rest-settle to
+    /// the nearest whole row (`end() == now + TRACK_REST_MS + TRACK_SETTLE_MS`)
+    /// — while a notch RETARGETS it (its own fresh 180 ms, the M1 brief). Both
+    /// still land exactly and self-disarm. FAILED against the 2026-09-06 code:
+    /// the precise chain then moved the TARGET by whole rows and kept the
+    /// deadline (`extend_target`), so the second assertion group below (the
+    /// position equals the pixels, the target is the nearest row) had no
+    /// implementation.
     #[test]
-    fn a_precise_chained_delta_extends_the_glide_and_a_notch_retargets_it() {
+    fn a_precise_chained_delta_tracks_the_finger_and_a_notch_retargets() {
+        use crate::scroll_motion::{TRACK_REST_MS, TRACK_SETTLE_MS};
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = seed_history(&app, wid);
-        let cell_h = app.cell_size().1.max(1) as i64;
-        let end_of = |app: &App| {
+        let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        assert!(cell_h >= 4, "fixture: a cell tall enough to split");
+        let state = |app: &App| {
             app.windows[&wid]
                 .scroll_glide
                 .as_ref()
-                .map(|st| (st.glide.end(), st.glide.target_px()))
+                .map(|st| (st.glide.end(), st.glide.target_px(), st.engine_row))
                 .expect("a glide is armed")
         };
 
-        // PRECISE chain: the deadline is kept, the target grows.
-        app.scroll_wheel_animated_with(wid, &term, 1, None, true);
-        let (end, target) = end_of(&app);
-        assert_eq!(target, cell_h);
-        std::thread::sleep(Duration::from_millis(5));
-        app.scroll_wheel_animated_with(wid, &term, 1, None, true);
-        let (end_after, target_after) = end_of(&app);
-        assert_eq!(
-            end_after, end,
-            "a precise chain does not push the deadline out"
+        // PRECISE chain: a third of a row, then another third.
+        let third = (cell_h / 3) as f64;
+        let before = std::time::Instant::now();
+        app.scroll_wheel_animated_with(wid, &term, 0, None, Some(third));
+        let (end, target, engine_row) = state(&app);
+        let rest = std::time::Duration::from_millis(TRACK_REST_MS + TRACK_SETTLE_MS);
+        assert!(
+            end >= before + rest,
+            "a tracked glide's deadline is the rest window plus the settle"
         );
-        assert_eq!(target_after, 2 * cell_h, "…but moves the target");
-        app.tick_scroll_glide(wid, end + Duration::from_millis(1));
         assert_eq!(
-            term_lock(&term).grid().display_offset(),
-            2,
-            "the extended ease lands exactly at the original deadline"
+            target, 0,
+            "a third of a row settles back to row 0 (nearest)"
         );
+        assert_eq!(
+            engine_row, 1,
+            "the ceil pairing parked the engine one row deeper…"
+        );
+        assert_eq!(term_lock(&term).grid().display_offset(), 1);
+        assert_eq!(
+            i64::from(app.windows[&wid].scroll_frac_px),
+            cell_h - third as i64,
+            "…and pulled the band back by the remainder: the position IS the pixels"
+        );
+        app.scroll_wheel_animated_with(wid, &term, 0, None, Some(third));
+        let (end_after, target_after, _) = state(&app);
+        assert!(end_after >= end, "each delta re-arms the rest window");
+        assert_eq!(
+            i64::from(app.windows[&wid].scroll_frac_px),
+            cell_h - 2 * (third as i64),
+            "the second delta moved the band by exactly its pixels — no ease"
+        );
+        // Two thirds is nearer the NEXT row when cell_h/3*2 > cell_h/2.
+        let expect_target = crate::scroll_motion::nearest_row_px(2 * (third as i64), cell_h);
+        assert_eq!(
+            target_after, expect_target,
+            "the settle target is the nearest row"
+        );
+        // The settle lands on the whole row at end() and disarms.
+        app.tick_scroll_glide(wid, end_after + Duration::from_millis(1));
+        assert_eq!(
+            term_lock(&term).grid().display_offset() as i64,
+            expect_target / cell_h,
+            "the rest-settle lands on the nearest whole row"
+        );
+        assert_eq!(app.windows[&wid].scroll_frac_px, 0, "…whole-row at rest");
         assert!(
             app.windows[&wid].scroll_glide.is_none(),
             "…and disarms there"
         );
 
         // NOTCH chain: the ease restarts (the deadline moves out with it).
+        let landed = term_lock(&term).grid().display_offset() as i64;
         app.scroll_wheel_animated(wid, &term, 1);
-        let (end, target) = end_of(&app);
-        assert_eq!(target, 3 * cell_h);
+        let (end, target, _) = state(&app);
+        assert_eq!(target, (landed + 1) * cell_h);
         std::thread::sleep(Duration::from_millis(5));
         app.scroll_wheel_animated(wid, &term, 1);
-        let (end_after, target_after) = end_of(&app);
+        let (end_after, target_after, _) = state(&app);
         assert!(
             end_after > end,
             "a notch chain retargets: a fresh 180 ms ease"
         );
-        assert_eq!(target_after, 4 * cell_h);
+        assert_eq!(target_after, (landed + 2) * cell_h);
         app.tick_scroll_glide(wid, end_after + Duration::from_millis(1));
-        assert_eq!(term_lock(&term).grid().display_offset(), 4);
+        assert_eq!(term_lock(&term).grid().display_offset() as i64, landed + 2);
         assert!(app.windows[&wid].scroll_glide.is_none());
+    }
+
+    /// DIRECT MANIPULATION, end to end through the winit handler: a precise
+    /// delta SMALLER than a row moves the band BEFORE the seam banks a whole
+    /// row — the engine sits at the ceil row with the remainder in
+    /// `scroll_frac_px`, the seam's own bank still holds the fraction (its
+    /// bytes for a tracking app are unchanged), and the engine paid ONE lock
+    /// for the row landing plus ONE for the gesture-start route probe; a second
+    /// sub-row delta inside the same row pays NONE. FAILED before 2026-09-22:
+    /// `wheel_notches` returned `None` and the handler returned without moving
+    /// anything (`scroll_glide` stayed `None`, `display_offset` stayed 0).
+    #[test]
+    fn a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        assert!(cell_h >= 4, "fixture: a cell tall enough to split");
+        let dy = (cell_h / 3) as f64;
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+
+        let before = acq();
+        app.on_mouse_wheel(
+            wid,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy)),
+        );
+        let locks = acq() - before;
+        assert!(
+            locks <= 2,
+            "gesture start: the route probe and the row landing, no more (took {locks})"
+        );
+        {
+            let ws = &app.windows[&wid];
+            assert!(
+                ws.scroll_residual > 0.0 && ws.scroll_residual < 1.0,
+                "the seam's bank still carries the sub-row fraction ({})",
+                ws.scroll_residual
+            );
+            assert!(
+                ws.scroll_glide.is_some(),
+                "a sub-row precise delta arms the tracked band"
+            );
+            assert_eq!(
+                i64::from(ws.scroll_frac_px),
+                cell_h - dy as i64,
+                "the band is pulled back by the remainder"
+            );
+        }
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            1,
+            "the ceil pairing parks the engine one row deeper"
+        );
+
+        // A second sub-row delta within the SAME row: no engine lock at all.
+        let before = acq();
+        app.on_mouse_wheel(
+            wid,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 1.0)),
+        );
+        assert_eq!(
+            acq() - before,
+            0,
+            "sub-row motion inside a row never touches the engine"
+        );
+        assert_eq!(
+            i64::from(app.windows[&wid].scroll_frac_px),
+            cell_h - dy as i64 - 1
+        );
+        assert_eq!(term_lock(&term).grid().display_offset(), 1);
+    }
+
+    /// DIRECT MANIPULATION — a 120 Hz precise stream at a constant 1 row per
+    /// 100 ms through the winit handler moves the PRESENTED position (engine row
+    /// × cell_h − frac) evenly: per-event motion `max <= 2 * min`, no zero-motion
+    /// event after the first, and the band within a pixel of the finger
+    /// throughout. FAILED before 2026-09-22 (the extend chain idled 4 of every
+    /// 12 frames and then covered a row in one; see the scroll_motion control).
+    /// Timing hazard, named: the handler reads the real clock, so a deschedule
+    /// longer than `TRACK_REST_MS` between two events would start a settle
+    /// mid-stream; 60 microsecond-apart events make that a machine stall, not a
+    /// flake of this test.
+    #[test]
+    fn a_constant_speed_precise_stream_moves_the_band_evenly() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        assert!(
+            cell_h >= 12,
+            "fixture: dy = cell_h*8.333/100 must be >= 1 px so no rounded step is zero"
+        );
+        let dy = cell_h as f64 * 8.333 / 100.0; // 1 row per 100 ms at 120 Hz
+        let presented = |app: &App| -> i64 {
+            let ws = &app.windows[&wid];
+            term_lock(&term).grid().display_offset() as i64 * cell_h - i64::from(ws.scroll_frac_px)
+        };
+        let mut finger = 0.0f64;
+        let mut prev = presented(&app);
+        let mut vels: Vec<i64> = Vec::new();
+        for i in 1..=60u32 {
+            app.on_mouse_wheel(
+                wid,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy)),
+            );
+            finger += dy;
+            let pos = presented(&app);
+            assert!(
+                (pos as f64 - finger).abs() <= 1.0,
+                "1:1 — presented {pos} vs finger {finger:.2} at event {i}"
+            );
+            if i > 1 {
+                vels.push(pos - prev);
+            }
+            prev = pos;
+        }
+        let (mx, mn) = (*vels.iter().max().unwrap(), *vels.iter().min().unwrap());
+        assert!(
+            mn >= 1 && mx <= 2 * mn,
+            "even motion: max {mx} px/event, min {mn} ({vels:?})"
+        );
+    }
+
+    /// GESTURE END — winit's `TouchPhase::Ended` (usually a zero delta, which
+    /// the axis guard drops) RELEASES the tracked band: its settle to the
+    /// nearest whole row starts now instead of `TRACK_REST_MS` later. FAILED
+    /// before 2026-09-22 (no phased entry; the phase was discarded at the winit
+    /// seam). A notch glide is untouched by a release.
+    #[test]
+    fn a_gesture_end_starts_the_rest_settle_at_once() {
+        use crate::scroll_motion::TRACK_SETTLE_MS;
+        use winit::dpi::PhysicalPosition;
+        use winit::event::{MouseScrollDelta, TouchPhase};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let _term = seed_history(&app, wid);
+        let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        let dy = (cell_h / 3) as f64;
+        app.on_mouse_wheel_phased(
+            wid,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy)),
+            TouchPhase::Moved,
+        );
+        let end_before = app.windows[&wid]
+            .scroll_glide
+            .as_ref()
+            .expect("armed")
+            .glide
+            .end();
+        app.on_mouse_wheel_phased(
+            wid,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+            TouchPhase::Ended,
+        );
+        let end_after = app.windows[&wid]
+            .scroll_glide
+            .as_ref()
+            .expect("still armed")
+            .glide
+            .end();
+        assert!(
+            end_after < end_before,
+            "the finger lifted: the settle no longer waits out the rest window"
+        );
+        assert!(
+            end_after
+                <= std::time::Instant::now() + std::time::Duration::from_millis(TRACK_SETTLE_MS),
+            "…it is exactly one settle away"
+        );
+    }
+
+    /// THE FENCE the direct-manipulation path must not cross: under a TRACKING
+    /// app a precise stream still produces exactly the seam's bytes — one
+    /// wheel report per WHOLE banked row, byte-identical to the engine's own
+    /// encoder — and moves NO band: no glide, no residual, `display_offset`
+    /// untouched. Sub-row motion is display-only and exists only on the
+    /// tracking-OFF route. Passes before and after 2026-09-22; it is what makes
+    /// the `bytes_human_eq_controller` invariant survive the sub-notch path.
+    #[cfg(unix)]
+    #[test]
+    fn a_precise_stream_under_a_tracking_app_reports_whole_rows_only_and_moves_no_band() {
+        use aterm_types::mouse::WheelDir;
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta;
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
+        let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(pipe[1]));
+        let mut app = App::headless_for_test_with_sink(sink);
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let expected = {
+            let mut t = term_lock(&term);
+            t.process(b"\x1b[?1000h\x1b[?1006h");
+            t.encode_mouse_wheel(WheelDir::Up, 0, 0, 0)
+                .expect("SGR tracking encodes a wheel report")
+        };
+        let cell_h = app.win_cell_size(wid).1.max(1) as f64;
+        // Ten quarter-row deltas: 2.5 rows, of which exactly 2 whole rows bank.
+        for _ in 0..10 {
+            app.on_mouse_wheel(
+                wid,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, cell_h / 4.0)),
+            );
+        }
+        let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        for _ in 0..2_000 {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if got.len() >= 2 * expected.len() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("pipe read: {e}"),
+            }
+        }
+        assert_eq!(
+            got,
+            expected.repeat(2),
+            "exactly two whole-row reports, the engine's own bytes"
+        );
+        let ws = &app.windows[&wid];
+        assert!(
+            ws.scroll_glide.is_none(),
+            "a tracking app gets no local band"
+        );
+        assert_eq!(ws.scroll_frac_px, 0);
+        assert!(ws.overscroll.is_none());
+        assert_eq!(term_lock(&term).grid().display_offset(), 0);
+        unsafe {
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// THE OTHER FENCE: the controller `mouse` verb has no pixel field, so its
+    /// wheel is a NOTCH — the glide retargets (a fresh 180 ms per verb), its
+    /// target is whole-row, and `wheel_precise_px` is never set on that path.
+    /// Passes before and after 2026-09-22.
+    #[test]
+    fn the_mouse_verb_wheel_is_a_notch_and_never_tracks() {
+        use crate::input::Source;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        // Exactly the event the `mouse wheelup … lines=N` verb parses into
+        // (`control::control_input::parse_mouse`): its grammar has no pixel
+        // field, so the seam-facing event is a whole-row NOTCH by construction.
+        let verb = |lines: i32| crate::input::InputEvent::Wheel {
+            dir: aterm_types::mouse::WheelDir::Up,
+            lines,
+            row: 0,
+            col: 0,
+            mods: 0,
+            px_off: crate::input::PixelOffset::CELL_ORIGIN,
+        };
+        app.input(
+            wid,
+            verb(2),
+            Source::Controller {
+                op: aterm_session::Op::WriteInput,
+            },
+        );
+        let (end, target) = {
+            let st = app.windows[&wid]
+                .scroll_glide
+                .as_ref()
+                .expect("a notch glide");
+            (st.glide.end(), st.glide.target_px())
+        };
+        assert_eq!(target, 2 * cell_h, "whole rows, from the verb's `lines=`");
+        assert_eq!(app.windows[&wid].wheel_precise_px, None);
+        std::thread::sleep(Duration::from_millis(5));
+        app.input(
+            wid,
+            verb(1),
+            Source::Controller {
+                op: aterm_session::Op::WriteInput,
+            },
+        );
+        {
+            let st = app.windows[&wid]
+                .scroll_glide
+                .as_ref()
+                .expect("still a glide");
+            assert!(
+                st.glide.end() > end,
+                "a chained verb RETARGETS (fresh ease)"
+            );
+            assert_eq!(st.glide.target_px(), 3 * cell_h);
+        }
+        assert_eq!(app.windows[&wid].wheel_precise_px, None);
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            0,
+            "no instant jump"
+        );
+    }
+
+    /// SCR-1 vs the glide: output that arrives MID-GLIDE re-pins the viewport
+    /// (`display_offset += lines_added`) so the reader keeps the content they
+    /// were looking at; the next glide wake must carry that shift instead of
+    /// scrolling the content back toward live. FAILED before 2026-09-22: the
+    /// tick forced `display_offset` back to the glide's absolute row every
+    /// wake, so after 3 lines of output the engine showed the row 3 lines
+    /// NEWER than the one the reader had.
+    #[test]
+    fn output_mid_glide_shifts_the_glide_instead_of_scrolling_the_reader_back() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        app.scroll_wheel_animated(wid, &term, 4);
+        let end = app.windows[&wid].scroll_glide.as_ref().unwrap().glide.end();
+        // Land the engine on a row mid-ease — BELOW the target row, so the
+        // landing wake must move the engine and therefore takes the lock where
+        // the machine's motion is discovered — then let output re-pin it.
+        app.tick_scroll_glide(wid, end - Duration::from_millis(150));
+        let mid = term_lock(&term).grid().display_offset();
+        assert!(
+            (1..4).contains(&mid),
+            "fixture: the ease has moved the engine short of its target ({mid})"
+        );
+        {
+            let mut t = term_lock(&term);
+            for i in 0..3 {
+                t.process(format!("late output {i}\r\n").as_bytes());
+            }
+        }
+        let repinned = term_lock(&term).grid().display_offset();
+        assert_eq!(repinned, mid + 3, "fixture: SCR-1 re-pinned the viewport");
+        // The landing wake: the target row is the ARMED target plus the machine's 3.
+        app.tick_scroll_glide(wid, end + Duration::from_millis(1));
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            4 + 3,
+            "the glide lands 4 rows into history RELATIVE to the re-pinned content"
+        );
+        assert!(app.windows[&wid].scroll_glide.is_none());
+    }
+
+    /// THE ANCHOR (2026-09-22). A notch glide's tick is armed once, one panel
+    /// period after the arm; a chained NOTCH (a fresh 180 ms retarget) leaves
+    /// it exactly where it was; the tick advances it PHASE-LOCKED from the slot
+    /// that fired (a tick served late by a redraw does not drift the cadence;
+    /// one served more than a period late re-phases from `now`); and a PRECISE
+    /// delta parks the band, so the one wake it then owes is its rest-settle
+    /// start. Against the retired law (`now + interval` re-derived on every
+    /// park) the chained notch's re-arm moved the deadline by the 5 ms slept.
+    #[test]
+    fn a_chained_notch_leaves_the_anchored_tick_alone_and_a_precise_delta_parks_it() {
+        use crate::scroll_motion::TRACK_REST_MS;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let interval = Duration::from_micros(8_333); // a 120 Hz panel
+        app.windows.get_mut(&wid).unwrap().frame_interval = Some(interval);
+        let tick_of = |app: &App| {
+            app.windows[&wid]
+                .scroll_glide
+                .as_ref()
+                .map(|st| (st.next_tick, st.wake_deadline(), st.glide.end()))
+                .expect("a glide is armed")
+        };
+
+        app.scroll_wheel_animated(wid, &term, 1);
+        let (tick, deadline, end) = tick_of(&app);
+        let t0 = end - Duration::from_millis(crate::scroll_motion::GLIDE_MS);
+        assert_eq!(
+            tick,
+            t0 + interval,
+            "the first tick is one panel period after the arm"
+        );
+        assert_eq!(
+            deadline, tick,
+            "…and it is the wake the glide owes (its end is far later)"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        app.scroll_wheel_animated(wid, &term, 1);
+        let (tick_after, deadline_after, end_after) = tick_of(&app);
+        assert!(end_after > end, "a notch chain retargets: a fresh ease");
+        assert_eq!(
+            tick_after, tick,
+            "a chained notch must not move the anchored tick"
+        );
+        assert_eq!(deadline_after, deadline);
+
+        // The tick is served 2 ms late (a redraw stood in front of it): the
+        // next slot is measured from the slot that FIRED, not from `now`.
+        app.tick_scroll_glide(wid, tick + Duration::from_millis(2));
+        let (next, _, _) = tick_of(&app);
+        assert_eq!(
+            next,
+            tick + interval,
+            "phase-locked: the lateness does not accumulate"
+        );
+        // More than a whole period late: re-phase from `now`.
+        let late = next + 2 * interval + Duration::from_millis(1);
+        app.tick_scroll_glide(wid, late);
+        let (rephased, _, _) = tick_of(&app);
+        assert_eq!(
+            rephased,
+            late + interval,
+            "a stalled tick re-phases from now"
+        );
+
+        // A precise delta PARKS the band: its one wake is the rest boundary.
+        let before = std::time::Instant::now();
+        app.scroll_wheel_animated_with(wid, &term, 0, None, Some(3.0));
+        let (parked_tick, parked_deadline, _) = tick_of(&app);
+        assert_eq!(parked_tick, parked_deadline);
+        assert!(
+            parked_tick >= before + Duration::from_millis(TRACK_REST_MS),
+            "a parked band owes one wake at its rest-settle start, not a frame cadence"
+        );
+        assert!(
+            parked_tick < before + Duration::from_millis(TRACK_REST_MS) + Duration::from_secs(1),
+            "…and that wake is not lost in the future"
+        );
+    }
+
+    /// THE DEFECT (2026-09-22, "scrolling has become less responsive and
+    /// blocky in a large Codex session"). `about_to_wait` armed the glide's
+    /// wake as `end.min(Instant::now() + interval)`, re-derived on EVERY park,
+    /// and `new_events` ticked the glide only on `ResumeTimeReached` — which
+    /// winit grants iff the loop woke AT OR AFTER the armed instant. A wake
+    /// landing before it — the trackpad's next `PixelDelta` (the 09-06 change
+    /// measured that stream at 120/s), a PTY burst — was `WaitCancelled`, and
+    /// the park after it armed a FRESH `now + interval`. With wakes closer
+    /// together than one period plus a redraw the tick never came due: the
+    /// glide sat frozen until its 180 ms end, then landed in ONE jump.
+    ///
+    /// This drives the loop the way winit does — a wake stream at 8 ms, a 2 ms
+    /// redraw per wake, the every-wake service (`service_due_scroll_motion`)
+    /// and the park's re-read — and pins that the glide ticks at panel cadence
+    /// through it, with real intermediate motion, and that a park NEVER arms a
+    /// past instant. The retired law is computed alongside as the WITNESS that
+    /// this stream is the adversarial one: under it the only wake that could
+    /// ever have ticked is the end itself.
+    #[test]
+    fn a_panel_rate_wake_stream_cannot_starve_the_glide() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let interval = Duration::from_micros(8_333); // a 120 Hz panel
+        app.windows.get_mut(&wid).unwrap().frame_interval = Some(interval);
+        let wake_gap = Duration::from_millis(8); // the trackpad's own stream
+        let redraw_cost = Duration::from_millis(2); // a dense 144x60 frame
+
+        app.scroll_wheel_animated(wid, &term, 5);
+        let (t0, end, mut armed) = {
+            let st = app.windows[&wid]
+                .scroll_glide
+                .as_ref()
+                .expect("Full policy arms a glide");
+            let end = st.glide.end();
+            (
+                end - Duration::from_millis(crate::scroll_motion::GLIDE_MS),
+                end,
+                st.wake_deadline(),
+            )
+        };
+        let mut next_event = t0 + wake_gap;
+        let mut ticks = 0u32;
+        let mut last_tick = t0;
+        let mut max_gap = Duration::ZERO;
+        let mut moved_before_end = false;
+        let mut retired_law_could_tick = 0u32;
+        let mut turns = 0u32;
+        loop {
+            turns += 1;
+            assert!(turns < 64, "the glide must disarm within its 180 ms");
+            // The loop wakes for whichever comes first: the armed timer or the
+            // next external event — and judges the anchored tick EITHER way.
+            let wake = armed.min(next_event);
+            if wake == next_event {
+                next_event += wake_gap;
+            }
+            if !app.service_due_scroll_motion(wake).is_empty() {
+                ticks += 1;
+                max_gap = max_gap.max(wake - last_tick);
+                last_tick = wake;
+                if app.windows[&wid].scroll_glide.is_none() {
+                    break;
+                }
+                let off = term_lock(&term).grid().display_offset();
+                if wake < end && off > 0 && off < 5 {
+                    moved_before_end = true;
+                }
+            }
+            // The redraw this wake requested, then the park: an overdue slot is
+            // served there too, and the fold reads the anchor back.
+            let park = wake + redraw_cost;
+            if !app.service_due_scroll_motion(park).is_empty() {
+                ticks += 1;
+                max_gap = max_gap.max(park - last_tick);
+                last_tick = park;
+                if app.windows[&wid].scroll_glide.is_none() {
+                    break;
+                }
+            }
+            armed = app.windows[&wid]
+                .scroll_glide
+                .as_ref()
+                .expect("armed until the end")
+                .wake_deadline();
+            assert!(
+                armed > park,
+                "a park never arms a past anchor (a past arm feeds the 29/32 streak clamp)"
+            );
+            // The retired law: `end.min(park + interval)`, ticked only when the
+            // next event does not land first.
+            let sliding = end.min(park + interval);
+            if next_event >= sliding {
+                retired_law_could_tick += 1;
+            }
+        }
+        let expected =
+            u32::try_from(crate::scroll_motion::GLIDE_MS * 1000 / 8_333).unwrap_or(u32::MAX);
+        assert!(
+            ticks >= expected,
+            "a 180 ms ease on a 120 Hz panel owes >= {expected} ticks under a panel-rate \
+             wake stream; got {ticks}"
+        );
+        assert!(
+            max_gap <= interval + redraw_cost + Duration::from_millis(1),
+            "no tick may wait out an extra period behind the wake stream (max gap {max_gap:?})"
+        );
+        assert!(
+            moved_before_end,
+            "non-vacuity: the viewport must move at an intermediate row before the end"
+        );
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            5,
+            "and still land exactly"
+        );
+        assert!(
+            retired_law_could_tick <= 1,
+            "witness: under the retired sliding law this stream admits at most the \
+             landing tick (got {retired_law_could_tick}) — the one-jump 'blocky' scroll"
+        );
+    }
+
+    /// The every-wake service is a LEVEL judge: a wake a microsecond before the
+    /// anchored tick ticks nothing (no phantom motion), a wake that finds the
+    /// slot long passed (a redraw outlasting two panel periods) ticks it and
+    /// re-phases the anchor strictly ahead of `now` — the post-state the park's
+    /// fold consumes, so it can never see a past instant. The bounce shares the
+    /// law: released at a history end, its anchored decay tick is served the
+    /// same way.
+    #[test]
+    fn the_every_wake_service_ticks_only_due_anchors_and_never_leaves_a_past_one() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let interval = Duration::from_micros(8_333);
+        app.windows.get_mut(&wid).unwrap().frame_interval = Some(interval);
+        app.scroll_wheel_animated(wid, &term, 5);
+        let tick = app.windows[&wid].scroll_glide.as_ref().unwrap().next_tick;
+        assert!(
+            app.service_due_scroll_motion(tick - Duration::from_micros(1))
+                .is_empty(),
+            "not due: no tick"
+        );
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            0,
+            "…and no phantom motion"
+        );
+        let late = tick + 2 * interval;
+        assert_eq!(
+            app.service_due_scroll_motion(late),
+            vec![wid],
+            "overdue: ticked"
+        );
+        let off = term_lock(&term).grid().display_offset();
+        assert!(off > 0 && off < 5, "an intermediate row ({off})");
+        let armed = app.windows[&wid]
+            .scroll_glide
+            .as_ref()
+            .unwrap()
+            .wake_deadline();
+        assert!(
+            armed > late,
+            "the anchor is re-phased strictly ahead of now"
+        );
+
+        // The bounce: parked at the live bottom, a notch toward live releases it
+        // with its own anchored tick; the same service advances it.
+        app.windows.get_mut(&wid).unwrap().scroll_glide = None;
+        term_lock(&term).scroll_to_bottom();
+        app.scroll_wheel_animated(wid, &term, -1);
+        let sp_tick = app.windows[&wid]
+            .overscroll
+            .as_ref()
+            .expect("a bounce released at the live bottom")
+            .next_tick();
+        assert!(sp_tick > std::time::Instant::now() - Duration::from_secs(1));
+        assert!(
+            app.service_due_scroll_motion(sp_tick - Duration::from_micros(1))
+                .is_empty(),
+            "not due: no bounce tick"
+        );
+        assert_eq!(
+            app.service_due_scroll_motion(sp_tick),
+            vec![wid],
+            "due: the bounce ticked"
+        );
+        if let Some(sp) = app.windows[&wid].overscroll.as_ref() {
+            assert!(sp.wake_deadline() > sp_tick, "…and re-anchored ahead");
+        }
     }
 
     /// M1(b) regression — the wheel's tracking-OFF fallback GLIDES under a Full
@@ -19290,25 +20314,55 @@ mod predictive_echo_input_gate_tests {
     /// that should have clicked.
     #[test]
     fn a_click_that_cannot_be_heard_is_never_cued() {
-        assert!(keystroke_click_audible(true, true, 0.4, true, false));
+        assert!(keystroke_click_audible(
+            crate::trail_audio::HostState::Running,
+            true,
+            0.4,
+            true,
+            false
+        ));
         assert!(
-            !keystroke_click_audible(false, true, 0.4, true, false),
+            !keystroke_click_audible(crate::trail_audio::HostState::Inert, true, 0.4, true, false),
             "no live worker ⇒ no redraw for a click nothing can play"
         );
         assert!(
-            !keystroke_click_audible(true, false, 0.4, true, false),
+            !keystroke_click_audible(
+                crate::trail_audio::HostState::Running,
+                false,
+                0.4,
+                true,
+                false
+            ),
             "trail sounds off ⇒ silent by the user's own knob"
         );
         assert!(
-            !keystroke_click_audible(true, true, 0.0, true, false),
+            !keystroke_click_audible(
+                crate::trail_audio::HostState::Running,
+                true,
+                0.0,
+                true,
+                false
+            ),
             "volume 0 is mute, exactly as the render drain's gain law reads it"
         );
         assert!(
-            !keystroke_click_audible(true, true, 0.4, false, false),
+            !keystroke_click_audible(
+                crate::trail_audio::HostState::Running,
+                true,
+                0.4,
+                false,
+                false
+            ),
             "serious mode mutes terminal sound at the drain, so it must not arm a credit here"
         );
         assert!(
-            !keystroke_click_audible(true, true, 0.4, true, true),
+            !keystroke_click_audible(
+                crate::trail_audio::HostState::Running,
+                true,
+                0.4,
+                true,
+                true
+            ),
             "the post-resize quiet window drains silently — a credit armed inside it \
              would mute the NEXT echo instead"
         );
@@ -25805,10 +26859,17 @@ mod tone_status_tests {
             !line.contains("hunter") && !line.contains("horse"),
             "the window text must never reach the wire: {line}",
         );
-        for ch in secret.chars() {
+        // NO PARTIAL LEAK EITHER: no run of four consecutive characters from
+        // the secret may appear anywhere on the row. (This replaces a
+        // per-character frequency heuristic that counted every `e` on the
+        // line — once the row grew the audibility fields it began failing on
+        // its own field NAMES rather than on any leak.)
+        let chars: Vec<char> = secret.chars().collect();
+        for window in chars.windows(4) {
+            let needle: String = window.iter().collect();
             assert!(
-                line.matches(ch).count() < secret.len(),
-                "no per-char leak either: {line}",
+                !line.contains(&needle),
+                "no partial leak either ({needle}): {line}",
             );
         }
         assert!(

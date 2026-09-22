@@ -64,7 +64,8 @@ mod control_query;
 // the stable `crate::control::NAME` path (`crate::subscribe`), so the path keeps
 // resolving after the move.
 pub(crate) use control_query::{
-    gather_styled_frame, serialize_styled_frame, trimmed_len, visible_row,
+    gather_styled_frame, screen_stamp, screen_text, serialize_styled_frame, trimmed_len,
+    visible_row,
 };
 // The shared full-history search (the GUI ⌘F find + the `search` verb both call it) and
 // its config-driven index depth cap, reached through the stable `crate::control::NAME`
@@ -969,7 +970,7 @@ fn cmd_help_full() -> String {
 #   image                what ATERM submitted (client frame: decorations, tab strip,
 #                        overlays; `image plain` strips host bling for bare pixels;
 #                        compositor visibility/scanout is outside this boundary)
-#   subscribe            the LIVE movie (pushed frames; add every-frame for animations)
+#   subscribe            the LIVE movie (pushed frames; every-frame for animations, mail)
 #   cast | temporal <t>  HISTORY: replayable timestamped recording | the screen as it WAS
 #                        at instant <t> (temporal needs config temporal_recording=true)
 #   search <pat>         FIND across the full scrollback history (trigram-indexed, = ⌘F)
@@ -4246,6 +4247,56 @@ fn dispatch_story_verb(
     control_query::cmd_story(proxy, session, rest)
 }
 
+/// `topic` — the RECEIVER-SIDE BROADCAST OPT-IN, owner-class and selector-taking.
+///
+/// It is `story`'s shape, for `hold`'s reason. The verb names a session with the
+/// ordinary `@<sid>` selector — a manager arms a worker's topics from its own
+/// window, which is the whole point of the surface — so it cannot be one of the
+/// self-only owner verbs above; and it is Owner-class rather than an ordinary
+/// scoped session verb because adding a topic changes what LANDS IN an agent's
+/// inbox. That is the halt's authority class, not a read's: an edge token with
+/// a read on a session must not be able to arrange for a stranger's words to
+/// arrive in it.
+///
+/// The refusal is AUDITED here, like `hold`'s and `story`'s, rather than left to
+/// the generic gate's silent `ERR denied`: an edge token arranging deliveries
+/// into somebody else's mailbox is a line the log should carry.
+fn dispatch_topic_verb(
+    rest: &str,
+    selector: Option<&Selector>,
+    scope: Scope,
+    store: &Store,
+    self_session: Option<u64>,
+) -> String {
+    if !scope.is_owner_class() {
+        log_denial(
+            AUDIT_SUBSYSTEM,
+            "topic",
+            aterm_containment::mode_or_containment(),
+            "topic is owner-class: an edge token may not choose what reaches a mailbox",
+        );
+        return "ERR denied\n".to_string();
+    }
+    let ctx = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        let handle = match selector {
+            Some(Selector::Local(n)) => g.by_local(*n),
+            Some(Selector::Sid(sid)) => g.by_sid(sid),
+            None | Some(Selector::SelfTok) => match self_session {
+                Some(s) => g.by_local(s),
+                None => {
+                    return "ERR topic: no session (name one: @<sid> topic ls)\n".to_string();
+                }
+            },
+        };
+        match handle {
+            Some(h) => h.ctx.clone(),
+            None => return "ERR no such session\n".to_string(),
+        }
+    };
+    crate::fabric::cmd_topic(&ctx, rest)
+}
+
 /// The `fabric` sub-forms. `attach`'s argv is the words after it, split on
 /// whitespace exactly as `fabric_launch::configured_command` splits the config
 /// string — and never a shell, for the same reason: a metacharacter is one more
@@ -4460,6 +4511,18 @@ fn dispatch_before_session(
         // carried when the verb was bridge-only, and it must keep carrying it.
         if verb == "hold" {
             return Some(dispatch_hold_verb(rest, selector.as_ref(), scope, store).into());
+        }
+        // `topic` is `story`'s shape: a selector names the session whose
+        // broadcast opt-ins are being read or changed — a manager arms a
+        // worker's topics from its own window — and that resolution needs no
+        // terminal either.
+        if verb == "topic" {
+            return match selector.as_ref() {
+                Some(sel @ (Selector::Local(_) | Selector::Sid(_))) => {
+                    Some(dispatch_topic_verb(rest, Some(sel), scope, store, None).into())
+                }
+                None | Some(Selector::SelfTok) => None,
+            };
         }
         // `story` names its session with the ordinary `@<sid>` selector (the
         // watcher's every request carries one), so it too is answered BEFORE the
@@ -7248,7 +7311,8 @@ fn subscription_peer_gone(stream: &CtlStream) -> bool {
 ///
 /// Grammar: `subscribe [@<sel>[,<sel>...]|@*] <streams> [since=<seq>] [since-turn=<id>]
 /// [since-block=<id>] [every-frame]` where `<streams>` is ONE whitespace-free token:
-/// a comma-separated list ⊆ {screen,cursor,events,cells,bytes,sessions} plus the
+/// a comma-separated list ⊆ `aterm_types::control_verbs::SUBSCRIBE_STREAMS` — the
+/// same list the refusal prints, so the two cannot drift — plus the
 /// `timestamps`/`ts` and `trim` modifiers (`trim` drops the trailing all-blank rows
 /// of every `screen` DELTA, the same rule as `text trim`). Only that one token
 /// reaches [`Requested::parse`]; a second stream token (`subscribe @. screen cursor`)
@@ -7268,6 +7332,26 @@ fn subscription_peer_gone(stream: &CtlStream) -> bool {
 /// gate writes a single `ERR ...` and the connection is closed without entering push
 /// mode (no partial subscription). On full success it writes `OK subscribe <n>\n` and
 /// hands the socket to [`subscribe::push_loop`].
+/// THE ONE `subscribe` REFUSAL, built from the one vocabulary
+/// ([`aterm_types::control_verbs::SUBSCRIBE_STREAMS`]) rather than typed out
+/// beside it. It is what an operator reads when they get the list wrong.
+///
+/// There were TWO hand-typed copies: this one, and a `const USAGE` served on
+/// four of the five refusal paths with the names in a different order. The
+/// first round of this fix replaced only the copy the fifth path used, which
+/// is why `subscribe` could still answer a list without `mail` on four of
+/// five ways in.
+fn subscribe_usage_bytes() -> Vec<u8> {
+    format!(
+        "ERR usage: subscribe [@<sel>[,<sel>]|@*] <streams> [since=<seq>] [since-turn=<id>] \
+         [since-block=<id>] [every-frame]\n  <streams>: a subset of {} and must name at \
+         least one frame source; mail takes mail:kinds=<k,..>, \
+         mail:from=<class|principal> and/or mail:topic=<t>\n",
+        aterm_types::control_verbs::SUBSCRIBE_STREAMS.join(",")
+    )
+    .into_bytes()
+}
+
 fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
     line: &str,
     active: &ActiveHandle,
@@ -7281,20 +7365,20 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
     // ONE grammar for every usage refusal: the selector list (or `@*`, the live
     // target set) is optional, and the trailing args are exactly what the parser
     // below accepts. Four hand-typed copies used to name only `since=`.
-    const USAGE: &[u8] = b"ERR usage: subscribe [@<sel>[,<sel>]|@*] <streams> [since=<seq>] \
-[since-turn=<id>] [since-block=<id>] [every-frame]\n";
+    let usage = subscribe_usage_bytes();
+    let usage = usage.as_slice();
     // Strip the verb; the remainder is `[@<sel>[,<sel>...]] <streams> [args]`.
     let rest = match line.split_once(' ') {
         Some(("subscribe", r)) => r.trim(),
         _ => {
-            let _ = writer.write_all(USAGE);
+            let _ = writer.write_all(usage);
             let _ = writer.flush();
             return;
         }
     };
     let mut it = rest.split_whitespace();
     let Some(first) = it.next() else {
-        let _ = writer.write_all(USAGE);
+        let _ = writer.write_all(usage);
         let _ = writer.flush();
         return;
     };
@@ -7306,7 +7390,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
         match it.next() {
             Some(s) => (first, s),
             None => {
-                let _ = writer.write_all(USAGE);
+                let _ = writer.write_all(usage);
                 let _ = writer.flush();
                 return;
             }
@@ -7314,7 +7398,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
     } else if Requested::parse(first).is_some() {
         ("@.", first)
     } else {
-        let _ = writer.write_all(USAGE);
+        let _ = writer.write_all(usage);
         let _ = writer.flush();
         return;
     };
@@ -7350,8 +7434,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
     }
 
     let Some(req) = Requested::parse(stream_tok) else {
-        let _ = writer
-            .write_all(b"ERR usage: streams are a subset of screen,cursor,events,cells,bytes,sessions,timestamps(ts),trim and must name at least one frame source\n");
+        let _ = writer.write_all(usage);
         let _ = writer.flush();
         return;
     };
@@ -7514,7 +7597,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
         }
         // De-dup by session: a repeated selector (`@.,@.`) or two selectors that
         // resolve to the same session must not install a second fanout slot.
-        if targets.iter().any(|(id, _, _, _, _)| *id == local_id) {
+        if targets.iter().any(|(id, _, _, _, _, _)| *id == local_id) {
             continue;
         }
         sub_map.push((local_id, ctx.self_id.as_str().to_string()));
@@ -7524,6 +7607,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
             ctx.byte_fanout.clone(),
             ctx.turns.clone(),
             ctx.timeline.clone(),
+            ctx.fabric.clone(),
         ));
     }
     // An EMPTY set is an error for an explicit list (the client named nothing
@@ -7578,6 +7662,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
             since_block,
             non_coalesced,
             timestamps: req.timestamps,
+            mail: req.mail.clone(),
         },
         writer,
         peer_gone,
@@ -8578,9 +8663,12 @@ fn handle(
         if verb == "hold" {
             return dispatch_hold_verb(rest, selector.as_ref(), scope, store);
         }
-        // `story` (round 19) takes a session selector like any session verb —
-        // see `dispatch_before_session`; the bare form lands here with the
-        // connection's own session.
+        // `topic` (round 23) and `story` (round 19) take a session selector like
+        // any session verb — see `dispatch_before_session`; the bare form lands
+        // here with the connection's own session.
+        if verb == "topic" {
+            return dispatch_topic_verb(rest, selector.as_ref(), scope, store, Some(self_session));
+        }
         if verb == "story" {
             return dispatch_story_verb(
                 rest,
@@ -9304,12 +9392,18 @@ fn handle(
             Err(error) => error.to_string(),
         },
         "signal" => control_input::cmd_signal(master, rest),
-        "mouse" if is_cross && targets_front => front_routed_input(
-            proxy,
-            session,
-            control_input::parse_mouse(rest).ok(),
-            control_input::MOUSE_USAGE,
-        ),
+        // The parser's refusal is the reply, as it is for the self verb
+        // (`cmd_mouse`) and the background cross arm (`cross_mouse`): a bad
+        // modifier answers `ERR bad modifier …` naming what a report can carry,
+        // not the generic usage line. Until 2026-09-21 this arm `.ok()`'d the
+        // Result and handed `front_routed_input` the usage line for every
+        // refusal, so the one drive whose target is the on-screen tab was the
+        // one that could not say why it refused — a divergence the `mods=`
+        // refusal of 367d85b9e made visible and the key arms above never had.
+        "mouse" if is_cross && targets_front => match control_input::parse_mouse(rest) {
+            Ok(ev) => front_routed_input(proxy, session, Some(ev), control_input::MOUSE_USAGE),
+            Err(refusal) => refusal,
+        },
         "mouse" if is_cross => cross_mouse(term, ctx, session, proxy, rest),
         // SELF (active-tab) mouse: pass `scope` so a NON-OWNER (scoped-edge) gesture
         // has its copy-on-select CLIPBOARD side-effect suppressed (the exfil fence);
@@ -12952,17 +13046,68 @@ mod tests {
 
     /// `take_mods` is ADDITIVE: a line WITHOUT `mods=` parses to empty mods and
     /// the untouched body, so every pre-Phase-0.5 caller stays byte-compatible.
+    /// A `mods=` NAME THE TABLE DOES NOT KNOW IS REFUSED, never dropped. Before
+    /// this, `key a mods=CTRL` (or `mods=shfit`, or `mods=fn`) answered `OK`
+    /// and delivered a BARE `a` — while the inline spelling of the same intent,
+    /// `key CTRL+a`, answered the usage line, and every sibling token on the
+    /// verb line (`type=`, `base=`) already refused its own bad values. A
+    /// controller cannot tell a chord that was sent from one that was silently
+    /// stripped, so the refusal is the only honest answer.
+    ///
+    /// The tail is the CONTROL: every name the table DOES know, and the empty
+    /// list, must still parse — or this would pass on a parser that refused
+    /// everything.
+    #[test]
+    fn an_unknown_key_mods_name_is_refused_not_dropped() {
+        for bad in [
+            "a mods=CTRL",
+            "a mods=Shift",
+            "a mods=shfit",
+            "a mods=fn",
+            "a mods=win",
+            "a mods=ctrl+bogus",
+            "up mods=ctrl,nope",
+        ] {
+            assert!(
+                take_mods(bad).is_none(),
+                "{bad:?} must refuse, not deliver an unmodified key"
+            );
+            assert!(
+                parse_key(bad).is_none(),
+                "{bad:?} must not reach an InputEvent"
+            );
+        }
+        for good in [
+            "a mods=shift",
+            "a mods=ctrl",
+            "a mods=control",
+            "a mods=alt",
+            "a mods=option",
+            "a mods=meta",
+            "a mods=hyper",
+            "a mods=super",
+            "a mods=cmd",
+            "a mods=command",
+            "a mods=ctrl+shift+alt",
+            "a mods=cmd,alt",
+            "a mods=",
+            "a",
+        ] {
+            assert!(take_mods(good).is_some(), "{good:?} must still parse");
+        }
+    }
+
     #[test]
     fn take_mods_is_additive() {
         use aterm_types::keyboard::Modifiers;
-        let (m, body) = take_mods("up");
+        let (m, body) = take_mods("up").expect("no mods= token parses");
         assert_eq!(m, Modifiers::empty());
         assert_eq!(body, "up");
-        let (m, body) = take_mods("up mods=ctrl+shift");
+        let (m, body) = take_mods("up mods=ctrl+shift").expect("known names parse");
         assert_eq!(m, Modifiers::CTRL | Modifiers::SHIFT);
         assert_eq!(body, "up");
         // Aliases + comma separator + token position-independence.
-        let (m, body) = take_mods("mods=cmd,alt end");
+        let (m, body) = take_mods("mods=cmd,alt end").expect("aliases parse");
         assert_eq!(m, Modifiers::SUPER | Modifiers::ALT);
         assert_eq!(body, "end");
     }
@@ -13156,14 +13301,14 @@ mod tests {
     #[test]
     fn take_mods_parses_meta_and_hyper_distinctly() {
         use aterm_types::keyboard::Modifiers;
-        let (m, _) = take_mods("a mods=meta");
+        let (m, _) = take_mods("a mods=meta").expect("a known modifier name parses");
         assert_eq!(m, Modifiers::META);
-        let (m, _) = take_mods("a mods=hyper");
+        let (m, _) = take_mods("a mods=hyper").expect("a known modifier name parses");
         assert_eq!(m, Modifiers::HYPER);
         // alt is still ALT, and meta no longer aliases it.
-        let (m, _) = take_mods("a mods=alt");
+        let (m, _) = take_mods("a mods=alt").expect("a known modifier name parses");
         assert_eq!(m, Modifiers::ALT);
-        let (m, _) = take_mods("a mods=ctrl+meta+hyper");
+        let (m, _) = take_mods("a mods=ctrl+meta+hyper").expect("a known modifier name parses");
         assert_eq!(m, Modifiers::CTRL | Modifiers::META | Modifiers::HYPER);
         // Inline-prefix form agrees.
         assert_eq!(parse_key("meta+x"), parse_key("x mods=meta"));
@@ -13813,6 +13958,42 @@ mod tests {
         assert_eq!(parse_ctrl("ab"), None);
     }
 
+    /// The SAME refusal on the `mouse` verb — and the vocabulary that made it
+    /// worse than a typo case. `super` / `cmd` / `command` / `hyper` are valid
+    /// names in `key`'s `take_mods` and absent from the mouse table, so one
+    /// advertised `mods=` grammar was honoured two different ways across two
+    /// input verbs: under DEC 1000, `mouse press left 4 4 mods=cmd` answered
+    /// `OK` and put the UNMODIFIED press on the wire. The legacy/SGR report
+    /// has bits for shift/alt-meta/ctrl and nothing else, so the honest answer
+    /// is to refuse and say what it can carry.
+    #[test]
+    fn an_unknown_mouse_mods_name_is_refused_not_dropped() {
+        for bad in [
+            "mods=CTRL",
+            "mods=cmd",
+            "mods=super",
+            "mods=hyper",
+            "mods=shfit",
+        ] {
+            assert!(
+                parse_mouse(&format!("press left 4 4 {bad}")).is_err(),
+                "`mouse press left 4 4 {bad}` must refuse, not report an \
+                 unmodified press"
+            );
+        }
+        // CONTROL: the three the report CAN carry, their aliases, and none.
+        for good in [
+            "press left 4 4 mods=shift+ctrl+alt",
+            "press left 4 4 mods=meta",
+            "press left 4 4 mods=option",
+            "press left 4 4 mods=control",
+            "press left 4 4 mods=",
+            "press left 4 4",
+        ] {
+            assert!(parse_mouse(good).is_ok(), "{good:?} must still parse");
+        }
+    }
+
     /// `parse_mouse` — the additive `mods=`/`count=`/`side=`/`block=` grammar, the
     /// load-bearing half of the mouse-convergence claim (kills a/b/i + the
     /// ambient-state read for block-select).
@@ -13925,7 +14106,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
-            fabric: crate::fabric::SessionFabric::default(),
+            fabric: std::sync::Arc::default(),
         });
         let active: ActiveHandle = Arc::new(Mutex::new(Some(ActiveSession {
             term: term_a.clone(),
@@ -14480,7 +14661,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
-            fabric: crate::fabric::SessionFabric::default(),
+            fabric: std::sync::Arc::default(),
         });
         let handle = SessionHandle {
             sid,
@@ -14999,7 +15180,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
-            fabric: crate::fabric::SessionFabric::default(),
+            fabric: std::sync::Arc::default(),
         });
         let before = ctx.cast.lock().unwrap().event_count();
 
@@ -15225,7 +15406,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
-            fabric: crate::fabric::SessionFabric::default(),
+            fabric: std::sync::Arc::default(),
         })
     }
 
@@ -15773,6 +15954,10 @@ mod tests {
                 "whoami",
                 "grant",
                 "revoke",
+                // The receiver-side broadcast opt-in: Owner-class because
+                // adding a topic decides what LANDS IN an agent's inbox, which
+                // is the halt's authority class rather than a read's.
+                "topic",
                 // The session-connection verbs (design §6): connection-grain
                 // authority twins of grant/revoke, plus the aggregated graph
                 // and the raise act — all Owner-only, no op edge reaches them.
@@ -17311,7 +17496,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
-            fabric: crate::fabric::SessionFabric::default(),
+            fabric: std::sync::Arc::default(),
         });
         SessionHandle {
             sid,
@@ -17981,6 +18166,370 @@ mod tests {
             }
         }
         acc
+    }
+
+    /// **THE REFUSAL NAMES EVERY STREAM THERE IS.** `subscribe`'s `ERR usage`
+    /// spells the vocabulary, so it is a THIRD copy of a list the catalog and
+    /// `Requested::parse` also hold — and it is the copy an operator reads
+    /// when they get it wrong. It went a whole round telling them `mail` did
+    /// not exist in the build that had it, and no test noticed because the
+    /// parse tests only check that a bad list returns `None`. This asserts the
+    /// string itself, against the one vocabulary.
+    #[test]
+    fn the_subscribe_refusal_names_every_stream() {
+        let usage = String::from_utf8(subscribe_usage_bytes()).expect("utf-8");
+        // THE LIST, not the whole message: the sentence after it says "mail
+        // takes mail:kinds=…", so `usage.contains("mail")` is true even when
+        // the LIST omits it — which is the defect, and what a loose assertion
+        // misses.
+        let list = usage
+            .split_once("a subset of ")
+            .and_then(|(_, rest)| rest.split_once(" and must name"))
+            .map(|(list, _)| list)
+            .unwrap_or_else(|| panic!("the refusal states a list: {usage}"));
+        assert_eq!(
+            list,
+            aterm_types::control_verbs::SUBSCRIBE_STREAMS.join(","),
+            "the refusal's list must BE the vocabulary, byte for byte"
+        );
+        // AND THE VOCABULARY NAMES EVERY STREAM THIS BUILD SERVES — a literal
+        // roster, deliberately. Iterating `SUBSCRIBE_STREAMS` cannot catch a
+        // deletion FROM it: removing `mail` would remove the assertion that
+        // would have caught removing `mail`. This is the half that fails.
+        for stream in [
+            "screen",
+            "cursor",
+            "events",
+            "cells",
+            "bytes",
+            "mail",
+            "sessions",
+            "timestamps",
+            "trim",
+        ] {
+            assert!(
+                aterm_types::control_verbs::SUBSCRIBE_STREAMS.contains(&stream),
+                "the vocabulary must name `{stream}`"
+            );
+        }
+        // AND THE `mail:` PARAMETERS, the same way: a literal roster, so a
+        // parameter deleted from the parser is a parameter this refusal is
+        // caught still promising.
+        for param in ["mail:kinds=", "mail:from=", "mail:topic="] {
+            assert!(
+                usage.contains(param),
+                "the refusal names `{param}`: {usage}"
+            );
+        }
+    }
+
+    /// **`topic` IS OWNER-CLASS AND SELECTOR-TAKING, and the refusal is
+    /// AUDITED.**
+    ///
+    /// Two properties, and both are load-bearing. It takes `@<sid>` because the
+    /// surface exists for a manager to arm a worker's topics from its own
+    /// window — the self-only owner verbs above would refuse that selector — and
+    /// it is Owner-class because adding a topic decides what LANDS IN an agent's
+    /// inbox. An edge token with a read on a session must not be able to
+    /// arrange for a stranger's words to arrive in it, which is why the refusal
+    /// here is the audited one and not the generic gate's silent `ERR denied`.
+    #[test]
+    fn topic_is_owner_class_and_names_its_session() {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        let sid = h.sid.clone();
+        store.write().unwrap().register(h);
+
+        // An EDGE token is refused, whatever it is a token for.
+        let edge = Scope::Edge(aterm_session::EdgeToken::generate());
+        assert_eq!(
+            dispatch_topic_verb("ls", Some(&Selector::Sid(sid.clone())), edge, &store, None),
+            "ERR denied\n"
+        );
+
+        // OWNER, naming the session: the empty set, which is the default.
+        let owner_ls = |rest: &str| {
+            dispatch_topic_verb(
+                rest,
+                Some(&Selector::Sid(sid.clone())),
+                Scope::Owner,
+                &store,
+                None,
+            )
+        };
+        assert_eq!(owner_ls("ls"), "OK 0\n");
+        assert_eq!(
+            owner_ls("add build.failed"),
+            "OK build.failed since=head added=1\n"
+        );
+        assert_eq!(
+            owner_ls("add sat-comp since=@42"),
+            "OK sat-comp since=@42 added=1\n"
+        );
+        // `serial=` is the add's serial: the bridge keys its cursor on it.
+        assert_eq!(
+            owner_ls("ls"),
+            "OK 2\ntopic build.failed since=head serial=1\ntopic sat-comp since=@42 serial=2\n"
+        );
+        // A REPEATED ADD DOES NOT REWIND: the answer says nothing was added and
+        // the stored `since` and serial are the ones the first add chose.
+        assert_eq!(
+            owner_ls("add sat-comp since=@0"),
+            "OK sat-comp since=@0 added=0\n"
+        );
+        assert!(owner_ls("ls").contains("topic sat-comp since=@42 serial=2\n"));
+        assert_eq!(owner_ls("drop sat-comp"), "OK sat-comp dropped=1\n");
+        assert_eq!(owner_ls("drop sat-comp"), "OK sat-comp dropped=0\n");
+        // DROP THEN ADD IS A NEW ENTRY: a fresh serial, never a reused one, so
+        // a bridge that sampled the old entry cannot mistake this for it.
+        assert_eq!(
+            owner_ls("add sat-comp since=@4"),
+            "OK sat-comp since=@4 added=1\n"
+        );
+        assert!(owner_ls("ls").contains("topic sat-comp since=@4 serial=3\n"));
+        // An offset has no sign: `@+5` is refused, not normalised to `@5`.
+        assert!(owner_ls("add signed since=@+5").starts_with("ERR usage: topic"));
+        // The grammar, on the verb's own door.
+        for bad in [
+            "add",
+            "add A",
+            "add a b",
+            "add a since=yesterday",
+            "wat",
+            "ls extra",
+        ] {
+            assert!(
+                owner_ls(bad).starts_with("ERR usage: topic"),
+                "`{bad}` must be a usage error: {}",
+                owner_ls(bad)
+            );
+        }
+        // A session nobody hosts.
+        assert_eq!(
+            dispatch_topic_verb(
+                "ls",
+                Some(&Selector::Sid(aterm_session::SessionId::new("s-nobody"))),
+                Scope::Owner,
+                &store,
+                None,
+            ),
+            "ERR no such session\n"
+        );
+    }
+
+    /// **AN ADOPTED SESSION'S `topic ls` ANSWERS THE CARRIED SET** — through
+    /// the verb, not just the codec — and its next `add` mints a serial above
+    /// every carried one, so the bridge cannot mistake it for an entry it
+    /// already holds a cursor for. `spawn_session` re-seeds exactly this way
+    /// (`set_topics(parse_topics(&adopted.topics))`); a real handoff needs a
+    /// PTY this test does not have.
+    #[test]
+    fn an_adopted_session_answers_the_carried_topics() {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        let sid = h.sid.clone();
+        let carried = vec![
+            "build.failed head 4".to_string(),
+            "sat-comp @42 9".to_string(),
+        ];
+        h.ctx
+            .fabric
+            .set_topics(crate::fabric::parse_topics(&carried));
+        store.write().unwrap().register(h);
+        let owner = |rest: &str| {
+            dispatch_topic_verb(
+                rest,
+                Some(&Selector::Sid(sid.clone())),
+                Scope::Owner,
+                &store,
+                None,
+            )
+        };
+        assert_eq!(
+            owner("ls"),
+            "OK 2\ntopic build.failed since=head serial=4\ntopic sat-comp since=@42 serial=9\n"
+        );
+        assert_eq!(owner("add fresh"), "OK fresh since=head added=1\n");
+        assert!(
+            owner("ls").contains("topic fresh since=head serial=10\n"),
+            "{}",
+            owner("ls")
+        );
+    }
+
+    /// **`subscribe … mail` PUSHES METADATA AND NOT ONE BODY BYTE.** Two rows
+    /// are delivered into the watched session's inbox and two `MAIL` lines come
+    /// back on the same connection and grammar as the events digest — and the
+    /// body both rows carry (`the-secret-words`) appears nowhere in the stream,
+    /// which is the whole point: a manager learns WHO wrote and WHAT KIND, and
+    /// reads the words with its own `inbox get`. Then `kinds=` narrows to one.
+    #[test]
+    fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
+        const SECRET: &str = "the-secret-words";
+        // `deliveries` is `(from, kind, extra)` — `extra` is whatever else the
+        // `deliver` line carries (`topic=…`), so one harness serves the
+        // addressed rows and the broadcast ones.
+        let watch = |streams: &'static str,
+                     deliveries: &'static [(&str, &str, &str)],
+                     want: usize|
+         -> String {
+            let store = session_store::new_store();
+            let h = registered_session(0, -1, b"");
+            store.write().unwrap().register(h.clone());
+            let active = active_for(&h);
+            let registry = subscribe::new_registry();
+            let sid = h.sid.as_str().to_string();
+
+            let (client, server) = CtlStream::pair().unwrap();
+            let (store_t, active_t, reg_t) = (store.clone(), active.clone(), registry.clone());
+            let line = format!("subscribe @. {streams}");
+            let join = std::thread::spawn(move || {
+                let mut w = server;
+                run_subscribe(&line, &active_t, &store_t, &reg_t, Scope::Owner, &mut w);
+            });
+            let acc = read_until(&client, String::new(), |s| s.contains("OK subscribe 1\n"));
+            assert!(acc.contains("OK subscribe 1\n"), "ack: {acc:?}");
+
+            // THE ACK IS NOT THE BARRIER, THE REGISTRATION IS. `run_subscribe`
+            // writes the ack before it calls the push loop, so a row delivered
+            // on the ack is racing the loop's seeding of each watch's cursor
+            // and would be folded into the seed. The loop now registers AFTER
+            // it seeds (it used to do the reverse, which made this wait prove
+            // nothing), so `watched_sessions() == 1` means every cursor is
+            // taken and the next delivery is genuinely new.
+            for _ in 0..400 {
+                if registry.lock().unwrap().watched_sessions() == 1 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(
+                registry.lock().unwrap().watched_sessions(),
+                1,
+                "the push loop registered its watch"
+            );
+
+            for (n, (from, kind, extra)) in deliveries.iter().enumerate() {
+                let off = 500 + n as u64;
+                let reply = crate::fabric::cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off={off} from={from} kind={kind} trust=agent {extra}text={SECRET}"
+                    ),
+                );
+                assert!(reply.starts_with("OK"), "deliver: {reply}");
+            }
+            // The mail stream rides the loop's liveness tick; a notify only
+            // makes it prompt.
+            registry.lock().unwrap().notify(0);
+            // WAIT FOR WHAT THIS SUBSCRIPTION WILL ACTUALLY SEND, not one line
+            // per delivery: a filtered watch drops rows on purpose, and
+            // `deliveries.len()` here spent the reader's whole 60 s deadline
+            // waiting for a line that was never coming.
+            let acc = read_until(&client, acc, |s| s.matches("MAIL 0 ").count() >= want);
+            // THE LOOP LEARNS THE PEER IS GONE ONLY WHEN IT WRITES, and a
+            // mail-only subscription with nothing new to say writes nothing —
+            // it just re-parks on the 250 ms tick. So the wind-down DELIVERS,
+            // which is this stream's equivalent of the content every other
+            // subscribe test here produces to close its loop. It delivers a
+            // `task`, which is the one kind BOTH subscriptions below accept: a
+            // row the filter rejects emits no frame, so a `note` here wound
+            // down the unfiltered watch and hung the `kinds=task` one. It
+            // carries `topic=build.failed` for the same reason, once
+            // `mail:topic=` existed: the wind-down row must be accepted by
+            // EVERY subscription this harness serves, or the one it does not
+            // match hangs on the reader's whole deadline.
+            drop(client);
+            for n in 0..40u64 {
+                let _ = crate::fabric::cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off={} from=h-andrew kind=task trust=agent \
+                         topic=build.failed text=bye",
+                        900 + n
+                    ),
+                );
+                registry.lock().unwrap().notify(0);
+                if join.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            join.join()
+                .expect("push loop ends cleanly on a dead client");
+            acc
+        };
+
+        let both = watch(
+            "mail",
+            &[("h-andrew", "task", ""), ("s-peer", "note", "")],
+            2,
+        );
+        assert!(
+            both.contains("MAIL 0 id=1 off=500 from=h-andrew kind=task\n"),
+            "{both:?}"
+        );
+        assert!(
+            both.contains("MAIL 0 id=2 off=501 from=s-peer kind=note\n"),
+            "{both:?}"
+        );
+        assert_eq!(both.matches("MAIL 0 ").count(), 2, "{both:?}");
+        // THE BODY IS NOWHERE IN THE STREAM.
+        assert!(
+            !both.contains(SECRET),
+            "a body reached a mail subscriber: {both:?}"
+        );
+        assert!(!both.contains("text="), "{both:?}");
+
+        // `kinds=` narrows: the `note` is stepped over, never pushed.
+        let filtered = watch(
+            "mail:kinds=task",
+            &[("h-andrew", "task", ""), ("s-peer", "note", "")],
+            1,
+        );
+        assert!(filtered.contains("MAIL 0 id=1 "), "{filtered:?}");
+        assert_eq!(filtered.matches("MAIL 0 ").count(), 1, "{filtered:?}");
+        assert!(!filtered.contains("kind=note"), "{filtered:?}");
+        assert!(!filtered.contains(SECRET), "{filtered:?}");
+
+        // A BROADCAST ROW SAYS SO ON THE PUSH LINE. `topic=` is the row's
+        // answer to "why is this in my mailbox?" — an addressed row is here
+        // because somebody chose this session, a broadcast because this session
+        // chose the topic — and a watcher that had to run a drain to find out
+        // would be reading the body this stream deliberately never carries.
+        let mixed = watch(
+            "mail",
+            &[
+                ("h-andrew", "task", ""),
+                ("s-peer", "note", "topic=build.failed "),
+            ],
+            2,
+        );
+        assert!(
+            mixed.contains("MAIL 0 id=1 off=500 from=h-andrew kind=task\n"),
+            "an addressed row carries no topic: {mixed:?}"
+        );
+        assert!(
+            mixed.contains("MAIL 0 id=2 off=501 from=s-peer kind=note topic=build.failed\n"),
+            "{mixed:?}"
+        );
+
+        // …AND `mail:topic=` NARROWS TO IT. The addressed row is stepped over,
+        // which is what makes this a filter rather than a label.
+        let only_topic = watch(
+            "mail:topic=build.failed",
+            &[
+                ("h-andrew", "task", ""),
+                ("s-peer", "note", "topic=build.failed "),
+                ("s-peer", "note", "topic=other.thing "),
+            ],
+            1,
+        );
+        assert_eq!(only_topic.matches("MAIL 0 ").count(), 1, "{only_topic:?}");
+        assert!(
+            only_topic.contains("MAIL 0 id=2 ") && only_topic.contains("topic=build.failed\n"),
+            "{only_topic:?}"
+        );
     }
 
     /// (a) SELF subscribe to `screen`: a write to the term pushes a sid-tagged DELTA
@@ -22960,6 +23509,57 @@ mod tests {
         );
     }
 
+    /// The front-routed cross-session `mouse` arm answers the PARSER'S refusal,
+    /// as the self verb and the background cross arm do — three arms, one
+    /// grammar, one reply for a bad modifier. Pinned on the source text like
+    /// the `key` pin above, for the same reason: `front_routed_input` needs a
+    /// live `EventLoopProxy`, so the arm cannot be driven from libtest. The
+    /// refusal it must forward is pinned behaviourally beside it, so this test
+    /// and `an_unknown_mouse_mods_name_is_refused_not_dropped` together say the
+    /// whole thing: the parser refuses by name, and no arm throws the name away.
+    ///
+    /// Found in the 2026-09-21 help-surfaces read of 367d85b9e's mouse doc
+    /// ("the honest answer is to refuse and say what it can carry"): that
+    /// sentence held for two of the three arms, and this one `.ok()`'d the
+    /// Result and handed `front_routed_input` the generic usage line instead.
+    #[test]
+    fn the_front_routed_cross_mouse_arm_forwards_the_parsers_refusal() {
+        let production = include_str!("control.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(p, _)| p)
+            .expect("control.rs has a tests module");
+        let (_, from) = production
+            .split_once("\"mouse\" if is_cross && targets_front")
+            .expect("the front-routed cross-session `mouse` arm");
+        let (arm, _) = from
+            .split_once("\"mouse\" if is_cross =>")
+            .expect("the background cross-session `mouse` arm follows it");
+        assert!(
+            arm.contains("match control_input::parse_mouse(rest)"),
+            "the front-routed `mouse` arm must match the parser's Result:\n{arm}"
+        );
+        assert!(
+            arm.contains("Err(refusal) => refusal"),
+            "the front-routed `mouse` arm must answer the parser's refusal verbatim:\n{arm}"
+        );
+        assert!(
+            !arm.contains(".ok()"),
+            "the front-routed `mouse` arm must not discard the refusal with `.ok()`:\n{arm}"
+        );
+        // The refusal that arm now forwards — the one the mouse doc promises.
+        let refused = control_input::parse_mouse("press left 4 4 mods=cmd")
+            .expect_err("`cmd` is not a modifier a mouse report can carry");
+        assert!(
+            refused.starts_with("ERR bad modifier"),
+            "the parser names the modifier it refused: {refused:?}"
+        );
+        assert_ne!(
+            refused,
+            control_input::MOUSE_USAGE,
+            "the refusal is specific, never the usage line the arm used to answer"
+        );
+    }
+
     /// The fail-closed halt is a DROP GUARD, so it fires however the bridge
     /// connection ends — a clean return, a hangup, or an unwind out of the serving
     /// worker. Dropping the guard is the exact production event ("the bridge is
@@ -23866,6 +24466,7 @@ mod tests {
             motion_mode: "auto",
             shed: 1.0,
             intensity: 0.7,
+            sound_seam: true,
             tally: AdmissionTally {
                 licensed: 8,
                 declined: 1,
@@ -23961,6 +24562,156 @@ mod tests {
              help-only: {:?}\n  row-only: {:?}",
             documented.difference(&emitted).collect::<Vec<_>>(),
             emitted.difference(&documented).collect::<Vec<_>>(),
+        );
+    }
+
+    /// THE SAME CONTRACT for `tone`, which is now the AUDIBILITY ORACLE and
+    /// carries eight more fields than it did. The `trail` twin above exists
+    /// because four fields shipped undocumented for a release; this one exists
+    /// so `seam=` and its six witnesses cannot go the same way.
+    ///
+    /// Set equality both ways: a key dropped from the row fails as loudly as
+    /// one added to it.
+    #[test]
+    fn tone_status_help_enumerates_exactly_the_keys_the_row_emits() {
+        let row = crate::tone_infer::ToneStatus {
+            tone: aterm_effects::tone::Tone::Technical,
+            effective: aterm_effects::tone::Tone::Technical,
+            knob: true,
+            sounds: true,
+            volume: 0.4,
+            audio: crate::tone_infer::AudioHost::Live,
+            active: true,
+            window_chars: 12,
+            inferences: 3,
+            dropped: 0,
+            seam: None,
+            engine_sound: true,
+            trail: true,
+            focused: true,
+            serious_sound: true,
+            motion_stage: "full",
+            shed: 1.0,
+            revives: 0,
+            reopens_left: 6,
+        };
+        let line = row.line();
+        let emitted = line
+            .split_whitespace()
+            .filter_map(|pair| pair.split_once('=').map(|(k, _)| k))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let help = aterm_types::control_verbs::spec("tone")
+            .expect("the tone verb ships")
+            .help_line();
+        let run = help
+            .split_once("(prints tone=")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(run, _)| run)
+            .expect("help documents the `tone` row");
+        let documented = std::iter::once("tone")
+            .chain(
+                run.split_whitespace()
+                    .filter_map(|token| token.strip_suffix('=')),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            documented,
+            emitted,
+            "`tone` help and the row it documents disagree:\n  \
+             help-only: {:?}\n  row-only: {:?}",
+            documented.difference(&emitted).collect::<Vec<_>>(),
+            emitted.difference(&documented).collect::<Vec<_>>(),
+        );
+    }
+
+    /// THE ROW ADJUDICATES THE OWNER'S MEASURED STATE. On 2026-09-22 a live
+    /// reading was `trail status` → `motion_stage=reduced shed=0.00
+    /// intensity=0.00` while `tone` in the same breath said `sounds=on
+    /// volume=0.40 audio=live active=true dropped=0` — and the owner heard
+    /// nothing. Neither row could say why. Both halves are pinned here.
+    #[test]
+    fn the_tone_row_answers_the_shed_window_the_owner_measured() {
+        let shed = crate::tone_infer::ToneStatus {
+            tone: aterm_effects::tone::Tone::Technical,
+            effective: aterm_effects::tone::Tone::Technical,
+            knob: true,
+            sounds: true,
+            volume: 0.4,
+            audio: crate::tone_infer::AudioHost::Live,
+            active: true,
+            window_chars: 4,
+            inferences: 2,
+            dropped: 0,
+            seam: None,
+            engine_sound: true,
+            trail: true,
+            focused: true,
+            serious_sound: true,
+            motion_stage: "reduced",
+            shed: 0.0,
+            revives: 0,
+            reopens_left: 6,
+        };
+        let line = shed.line();
+        // A shed, focused window: the light is off and the keys are HEARD.
+        assert!(line.contains("seam=open"), "{line}");
+        assert!(line.contains("motion_stage=reduced"), "{line}");
+        assert!(line.contains("shed=0.00"), "{line}");
+
+        // And the case that IS supposed to be silent names itself.
+        let unfocused = crate::tone_infer::ToneStatus {
+            seam: Some(crate::sound_seam::SeamReason::Unfocused),
+            focused: false,
+            ..shed
+        };
+        assert!(unfocused.line().contains("seam=closed:unfocused"));
+        assert!(unfocused.line().contains("focused=false"));
+
+        // The regression sensor: if a future policy re-closes the engine's
+        // key seam, the row says so instead of printing `audio=live`.
+        let engine_silent = crate::tone_infer::ToneStatus {
+            seam: Some(crate::sound_seam::SeamReason::EngineSilent),
+            engine_sound: false,
+            ..shed
+        };
+        assert!(engine_silent.line().contains("seam=closed:engine-silent"));
+        assert!(engine_silent.line().contains("engine_sound=closed"));
+    }
+
+    /// THE PRIVACY CONTRACT survives the eight new fields: the row carries
+    /// the typed window's LENGTH and never a word of its text.
+    #[test]
+    fn the_tone_row_never_carries_typed_text() {
+        let secret = "correcthorsebatterystaple";
+        let row = crate::tone_infer::ToneStatus {
+            tone: aterm_effects::tone::Tone::Frustrated,
+            effective: aterm_effects::tone::Tone::Frustrated,
+            knob: true,
+            sounds: true,
+            volume: 0.4,
+            audio: crate::tone_infer::AudioHost::Opening,
+            active: true,
+            window_chars: secret.len(),
+            inferences: 9,
+            dropped: 3,
+            seam: Some(crate::sound_seam::SeamReason::EngineSilent),
+            engine_sound: false,
+            trail: true,
+            focused: true,
+            serious_sound: true,
+            motion_stage: "reduced",
+            shed: 0.0,
+            revives: 1,
+            reopens_left: 5,
+        };
+        let line = row.line();
+        assert!(!line.contains(secret), "{line}");
+        assert!(!line.contains("correct"), "{line}");
+        assert!(
+            line.contains(&format!("window_chars={}", secret.len())),
+            "{line}"
         );
     }
 }

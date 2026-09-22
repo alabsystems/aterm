@@ -308,6 +308,42 @@ pub fn place_finished_bundle(dist: &Path, version: &str, build: u64) -> Result<u
             ));
         }
     }
+    // REFUSE TO DISPLACE A BUNDLE SOMETHING IS RUNNING OUT OF.
+    //
+    // The two renames below are exactly the shape that cost the owner three
+    // Full Disk Access grants on 2026-09-21: rename the live bundle aside,
+    // then delete it, while a process is still executing out of it. macOS
+    // resolves a running process's image by VNODE, so that process is
+    // instantly re-attributed to `.aterm.app.previous` and then to a path that
+    // does not resolve at all — after which `tccd` can build no code identity
+    // for it, no grant keyed to that identity matches, and, because a
+    // requirement mismatch is resolved by REPLACING the stored requirement, the
+    // grant is reset for every copy sharing the bundle id.
+    //
+    // This is the LAST step of a cut: the release is already published,
+    // verified and mirrored. Refusing here costs the dev install this pass and
+    // nothing else — the app's own updater will take the release on its next
+    // check — whereas proceeding costs the owner's consent state.
+    //
+    // A NARROWING, NOT A PROOF. `ps` can only be asked about the instant it
+    // runs, and a process that starts between the question and the rename is
+    // not caught. When the question cannot be asked at all the placement
+    // proceeds, which is the pre-existing behaviour: this refuses a hazard it
+    // can SEE, and never invents one it cannot.
+    if let Some(running) = pids_running_from(&live)
+        && !running.is_empty()
+    {
+        return Err(format!(
+            "{} is running (pid {}) — refusing to displace a bundle a live process is \
+             executing out of. macOS would re-attribute that process to a bundle this cut \
+             then deletes, and a copy macOS cannot match does not merely fail its own \
+             checks: it REPLACES the stored code requirement for this bundle id and resets \
+             the grant for every copy of aterm on this Mac. The release itself is already \
+             published and verified; only the dev install at this path was skipped.",
+            live.display(),
+            running.join(", "),
+        ));
+    }
     let had_live = live.exists();
     if had_live {
         std::fs::rename(&live, &previous)
@@ -324,6 +360,53 @@ pub fn place_finished_bundle(dist: &Path, version: &str, build: u64) -> Result<u
         let _ = std::fs::remove_dir_all(&previous);
     }
     Ok(dir_bytes(&live))
+}
+
+/// The pids executing out of a bundle at `root`, or `None` when the question
+/// could not be asked.
+///
+/// `ps -Ao pid=,comm=` reports each process's executable path as the KERNEL
+/// currently resolves it, which is the same view `tccd` attributes against —
+/// and the one `std::env::current_exe()` does not have, because on macOS that
+/// is the `execve`-time string and never follows a rename.
+///
+/// `None` and `Some(vec![])` are deliberately different: the first is "I could
+/// not look", the second is "I looked and nothing is running". Only the second
+/// licenses a displacement.
+fn pids_running_from(root: &Path) -> Option<Vec<String>> {
+    let prefix = format!("{}/", root.display());
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-Ao", "pid=,comm="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(pids_under_prefix(
+        &String::from_utf8_lossy(&out.stdout),
+        &prefix,
+    ))
+}
+
+/// The parsing half, pure: pids whose `comm` path sits under `prefix`.
+///
+/// Matching on the directory prefix (with its trailing separator) rather than
+/// on the bundle name is what keeps `dist/aterm.app` from matching
+/// `dist/aterm.app.rollback`, which is a different bundle with a different
+/// identity and is precisely the pair this whole area exists to tell apart.
+fn pids_under_prefix(ps_output: &str, prefix: &str) -> Vec<String> {
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid, comm) = line.split_once(char::is_whitespace)?;
+            comm.trim_start()
+                .starts_with(prefix)
+                .then(|| pid.to_string())
+        })
+        .collect()
 }
 
 /// Recursive byte total, tolerating anything unreadable — this feeds a transcript
@@ -599,6 +682,45 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod alias_tests {
+    /// THE PREFIX IS THE DIRECTORY, not the name.
+    ///
+    /// `dist/aterm.app` and `dist/aterm.app.rollback` are two bundles with two
+    /// identities, and telling them apart is the entire subject of this area.
+    /// A name-prefix match would report the rollback's process as the live
+    /// install's and refuse a placement that is safe — or, reversed, let the
+    /// cut displace a bundle a live process is executing out of, which is the
+    /// shape that cost the owner three grants on 2026-09-21.
+    #[test]
+    fn only_processes_under_the_bundle_itself_block_a_placement() {
+        use super::pids_under_prefix;
+        let ps = "\
+  101 /Users//a/aterm/dist/aterm.app/Contents/MacOS/aterm
+  102 /Users//a/aterm/dist/aterm.app.rollback/Contents/MacOS/aterm
+  103 /Applications/aterm.app/Contents/MacOS/aterm
+  104 /bin/zsh
+  105 /Users//a/aterm/dist/aterm.app/Contents/MacOS/aterm-gui
+";
+        assert_eq!(
+            pids_under_prefix(ps, "/Users//a/aterm/dist/aterm.app/"),
+            vec!["101", "105"],
+            "the bundle's own processes only"
+        );
+        // The sibling rollback is its OWN bundle.
+        assert_eq!(
+            pids_under_prefix(ps, "/Users//a/aterm/dist/aterm.app.rollback/"),
+            vec!["102"]
+        );
+        // An install elsewhere never blocks this one.
+        assert_eq!(
+            pids_under_prefix(ps, "/Applications/aterm.app/"),
+            vec!["103"]
+        );
+        // Nothing running out of it is an EMPTY list, which is what licenses
+        // the displacement — distinct from `None`, which does not.
+        assert!(pids_under_prefix(ps, "/Users//a/aterm/dist/other.app/").is_empty());
+        assert!(pids_under_prefix("", "/x/").is_empty());
+    }
+
     /// THE ARGV0 ALIAS SET IS HAND-TYPED IN FIVE PLACES, and on 2026-09-12 an
     /// audit found `aterm-link` in four of them. This pins the bundle's copy
     /// against the OTHER lists in the repository, so the next verb to grow an

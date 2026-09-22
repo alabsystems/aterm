@@ -321,7 +321,7 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
     let carried = source.tab_stops().to_vec();
     assert!(model.fire("CaptureProjection", &mut state));
     let mut restored = Grid::new(6, 40);
-    restored.restore_tab_stops(&carried);
+    restored.restore_tab_stops(&carried, false);
     assert!(model.fire("AdmitCoveringProjection", &mut state));
     assert!(model.fire("RestoreProjection", &mut state));
     assert_eq!(restored.tab_stops(), carried);
@@ -337,12 +337,12 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
     );
 
     let before = restored.tab_stops().to_vec();
-    restored.restore_tab_stops(&[false; 119]);
+    restored.restore_tab_stops(&[false; 119], false);
     let undersize = model.successors("SupplyUndersizeProjection", &model.init_state())[0].clone();
     let undersize_rejected = model.successors("RejectUndersizeProjection", &undersize)[0].clone();
     assert_eq!(restored.tab_stops(), before, "short projection is rejected");
     assert_eq!(undersize_rejected.get("rejected"), Some(&1));
-    restored.restore_tab_stops(&vec![false; usize::from(crate::MAX_GRID_COLS) + 1]);
+    restored.restore_tab_stops(&vec![false; usize::from(crate::MAX_GRID_COLS) + 1], false);
     let oversize = model.successors("SupplyOversizeProjection", &model.init_state())[0].clone();
     let oversize_rejected = model.successors("RejectOversizeProjection", &oversize)[0].clone();
     assert_eq!(

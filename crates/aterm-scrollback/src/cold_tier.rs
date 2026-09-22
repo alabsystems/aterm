@@ -299,8 +299,8 @@ impl ColdTier {
 
     /// Decode the page containing logical line `idx` and return OWNED lines
     /// from `idx` through the end of that page — the bulk-walk primitive
-    /// (ST-6). One decode + one `split_off` per page: no per-line binary
-    /// search, no per-line `Line` clone, and NO touch of the render-path
+    /// (ST-6). One decode per page, splitting only a partial prefix: no
+    /// per-line binary search or `Line` clone, and NO touch of the render-path
     /// page cache (a full-history walk must not evict the viewport's two
     /// hot slots).
     ///
@@ -329,6 +329,11 @@ impl ColdTier {
             )));
         };
         let mut lines = page.decompress()?;
+        // Full pages already own exactly the segment the iterator needs.
+        // Avoid split_off(0)'s spare allocation for a source Vec we discard.
+        if line_in_page == 0 {
+            return Ok(lines);
+        }
         // `min` keeps split_off total; a short decode yields a short
         // (possibly empty) segment, which the streaming iterator treats as
         // end-of-data — fail-closed, never a panic.

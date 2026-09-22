@@ -29,6 +29,12 @@
 #     directory walk over the release + packaging surface, so it costs a second
 #     and rides the merge contract rather than living only in `gate all`, which
 #     nothing automatic invokes (crates/xtask/src/gate.rs' header says so).
+#   * exception 6 (2026-09-22): the conformance-release prime — `build
+#     --locked --release -p aterm` into `<root>/target/conformance-release`,
+#     6 jobs. It is not a new build: it is the build
+#     `crates/aterm-conformance/tests/support/mod.rs`'s `release_bin` already
+#     ran INSIDE the test stage, for the paint, spin and untracked-staging
+#     suites that judge the RELEASE binary, moved to t0 in a lane of its own.
 # `<inherited>` means the child got the test process's own value.
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build --workspace
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --doc --workspace --no-fail-fast
@@ -60,3 +66,4 @@ targo-tippy CARGO_TARGET_DIR=<root>/target-tippy CARGO_BUILD_JOBS=<inherited> RU
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-gui -p aterm-ctl
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test -p aterm-link --features sealed --test two_nodes_sealed --no-fail-fast
 targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p atpkg
+targo CARGO_TARGET_DIR=<root>/target/conformance-release CARGO_BUILD_JOBS=6 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build --locked --release -p aterm

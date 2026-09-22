@@ -84,8 +84,11 @@ pub enum Item {
     Fleet(Record),
     /// One `EVENT …` line off aterm's push lane.
     Event(String),
-    /// A `/f/<F>/in/<node>/>` record from the durable group. LAST.
+    /// A `/f/<F>/in/<node>/>` record from the durable group.
     Inbox(Record),
+    /// A `/f/<F>/pub/*/*/say/>` BROADCAST record, fanned in to whichever local
+    /// sessions opted into its topic. LAST — see [`Queues::take`].
+    Say(Record),
     /// A source ended: its reader thread saw EOF or an error. Named so the loop
     /// can tell "the broker went away" (reconnect) from "aterm went away" (exit).
     Closed(Source),
@@ -96,6 +99,10 @@ pub enum Item {
 pub enum Source {
     Fleet,
     Inbox,
+    /// The fleet-wide broadcast face. A separate reader from `Inbox` because it
+    /// is a separate subscription with a separate priority, and a separate
+    /// bound: a shout is not allowed to starve addressed mail.
+    Say,
     Aterm,
 }
 
@@ -120,9 +127,10 @@ struct Queues {
     fleet: VecDeque<Record>,
     events: VecDeque<String>,
     inbox: VecDeque<Record>,
+    say: VecDeque<Record>,
     closed: VecDeque<Source>,
     /// Resident bytes per record queue, in the order `Source` names them.
-    bytes: [usize; 2],
+    bytes: [usize; 3],
     /// The broker incarnation whose inputs are currently accepted. Bumped by
     /// [`Mailbox::reset_broker_sources`]; see the module header.
     broker_gen: u64,
@@ -131,6 +139,7 @@ struct Queues {
 /// Which byte counter a record source uses.
 const FLEET: usize = 0;
 const INBOX: usize = 1;
+const SAY: usize = 2;
 
 /// Whether one source is over a bound AND has something to shed. Both halves
 /// matter: a queue that is over the byte cap because of ONE huge record must
@@ -144,12 +153,22 @@ impl Queues {
         self.fleet.is_empty()
             && self.events.is_empty()
             && self.inbox.is_empty()
+            && self.say.is_empty()
             && self.closed.is_empty()
     }
 
     /// THE PRIORITY, in one place. A closure notice outranks everything (the
     /// connection it names is gone, so anything queued behind it is stale), then
-    /// the fleet halt, then aterm's own events, and the inbox group last.
+    /// the fleet halt, then aterm's own events, then the inbox group, and the
+    /// BROADCAST face last.
+    ///
+    /// Say is last because it is the one lane whose volume nobody on this node
+    /// chose: an addressed message was sent to a session here, and a halt is a
+    /// safety order, but a `say` record is a shout any co-permitted peer in the
+    /// fleet may publish as often as it likes. Draining it ahead of the inbox
+    /// would let a chatty topic delay mail somebody addressed — and each say
+    /// record costs up to one synchronous `deliver` PER SUBSCRIBED SESSION,
+    /// which is the most expensive item the loop can take.
     fn take(&mut self) -> Option<Item> {
         if let Some(s) = self.closed.pop_front() {
             return Some(Item::Closed(s));
@@ -161,9 +180,13 @@ impl Queues {
         if let Some(e) = self.events.pop_front() {
             return Some(Item::Event(e));
         }
-        self.inbox.pop_front().map(|r| {
+        if let Some(r) = self.inbox.pop_front() {
             self.bytes[INBOX] = self.bytes[INBOX].saturating_sub(record_bytes(&r));
-            Item::Inbox(r)
+            return Some(Item::Inbox(r));
+        }
+        self.say.pop_front().map(|r| {
+            self.bytes[SAY] = self.bytes[SAY].saturating_sub(record_bytes(&r));
+            Item::Say(r)
         })
     }
 }
@@ -265,6 +288,35 @@ impl Mailbox {
         self.ready.notify_all();
     }
 
+    /// Push a BROADCAST record, WAITING while the say queue is over its bound.
+    ///
+    /// Blocking, like the other two, and the reason is the one the module header
+    /// gives for `Inbox` with one difference: the say face is a PLAIN
+    /// subscription, so there is no group cursor and nothing is redelivered.
+    /// What blocking buys here is the socket back-pressure the reader thread
+    /// removed — the broker sheds under its own write timeout, and a broadcast
+    /// this bridge was too busy to read is a broadcast it does not deliver,
+    /// which is the honest outcome for an opt-in fan-out with no delivery
+    /// promise. Dropping records here instead would spend the same memory bound
+    /// and lie about why.
+    pub fn push_say(&self, r: Record, generation: u64) {
+        let n = record_bytes(&r);
+        let mut q = self.lock();
+        while over_bound(q.say.len(), q.bytes[SAY]) {
+            if q.broker_gen != generation {
+                return;
+            }
+            q = self.wait_for_room(q);
+        }
+        if q.broker_gen != generation {
+            return;
+        }
+        q.bytes[SAY] += n;
+        q.say.push_back(r);
+        drop(q);
+        self.ready.notify_all();
+    }
+
     /// Park until the loop takes something (or a reconnect clears the queues).
     ///
     /// BOUNDED, and the bound is a hang detector rather than a poll: the wait is
@@ -330,7 +382,8 @@ impl Mailbox {
         q.broker_gen = q.broker_gen.wrapping_add(1);
         q.fleet.clear();
         q.inbox.clear();
-        q.bytes = [0; 2];
+        q.say.clear();
+        q.bytes = [0; 3];
         q.closed.retain(|s| *s == Source::Aterm);
         drop(q);
         // A reader parked on the bound belongs to a subscription that is being
@@ -404,6 +457,7 @@ mod tests {
     #[test]
     fn the_priority_is_the_declared_one() {
         let mb = Mailbox::default();
+        mb.push_say(rec(7), 0);
         mb.push_inbox(rec(4), 0);
         mb.push_event("EVENT 1 post 1".into());
         mb.push_fleet(rec(1), 0);
@@ -415,9 +469,13 @@ mod tests {
                 Item::Fleet(_) => "fleet",
                 Item::Event(_) => "event",
                 Item::Inbox(_) => "inbox",
+                Item::Say(_) => "say",
             });
         }
-        assert_eq!(seen, ["closed", "fleet", "event", "inbox"]);
+        // THE BROADCAST FACE IS LAST, behind the mail somebody addressed — see
+        // [`Queues::take`]. Pushed FIRST above so the order below is the
+        // priority and not the arrival.
+        assert_eq!(seen, ["closed", "fleet", "event", "inbox", "say"]);
     }
 
     /// The wait is EVENT-DRIVEN: a push from another thread wakes it, and the
@@ -444,6 +502,10 @@ mod tests {
         let mb = Mailbox::default();
         mb.push_fleet(rec(1), 0);
         mb.push_inbox(rec(3), 0);
+        // The broadcast face is a BROKER source like the other two: a shout
+        // queued under the dead connection must not be delivered against the
+        // fresh one, where the cursors have already been re-read off disk.
+        mb.push_say(rec(9), 0);
         mb.push_event("EVENT 1 post 1".into());
         mb.push_closed(Source::Inbox, 0);
         mb.push_aterm_closed();
@@ -456,6 +518,7 @@ mod tests {
                 Item::Fleet(_) => "fleet",
                 Item::Event(_) => "event",
                 Item::Inbox(_) => "inbox",
+                Item::Say(_) => "say",
             });
         }
         assert_eq!(

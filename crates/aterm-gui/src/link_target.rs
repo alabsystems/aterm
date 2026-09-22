@@ -430,19 +430,14 @@ pub(crate) fn caption_row(
             true,
         );
     }
-    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE. `write_str` builds each cell it
-    // writes from scratch and no chrome text carries an overline of its own, so
-    // a seam stamped only by `blank_row` survives exactly where the band happens
-    // to have no text: a rule broken into stubs by the words on top of it reads
-    // as debris rather than as the band's boundary. Drawn across the finished
-    // row, after every write, so no future field can chip it again — and given
-    // the seam's OWN ink, so the rule stays one tone across a row whose text
-    // deliberately carries two (see the module header).
+    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE — closed across the finished row,
+    // after every write, in the seam's own ink rather than each cell's. This band
+    // stated that rule first and kept it inline; it now lives in `chrome_band` so
+    // the config-notice and paste bands, which were both quietly chipping their
+    // own top edge, close theirs from the same three lines. See the module header
+    // for why the ink is the band's and not the text's.
     if seam {
-        for cell in &mut row {
-            cell.overline = true;
-            cell.overline_color = Some(c.label);
-        }
+        chrome_band::seal_band_top(&mut row, c.label);
     }
     Some(row)
 }

@@ -38,6 +38,8 @@ fn quad_at(cw: usize, ch: usize, row: u16, col: usize, color: u32) -> GlowQuad {
 
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: color,
+        alpha2: 0,
     }
 }
 

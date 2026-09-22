@@ -309,6 +309,52 @@ pub(crate) fn cmd_text(term: &Arc<Mutex<Terminal>>) -> String {
     cmd_text_opt(term, TextArgs::default())
 }
 
+/// THE SCREEN'S STAMP: `(content_seq, FNV-1a-64 of the untrimmed visible
+/// screen)` — `status`'s `seq=`/`hash=`, and the same pair `turn` returns and
+/// `history` keeps per turn id.
+///
+/// It lives HERE, beside [`visible_row`] and [`cmd_text_opt`], because the
+/// whole value of the hash is that a reader can recompute it from what `text`
+/// served: `aterm-link hook --report-to` reads `status` for the stamp and
+/// `text` for the rows, hashes the rows itself, and posts nothing when the two
+/// disagree. Two loops in two modules would have been two chances to disagree
+/// about a trailing space; `screen_stamp_matches_the_text_verbs_rows` pins
+/// that they do not.
+///
+/// COST, measured 2026-09-20 on a 60x200 grid: 61.6 us a call, of which 55.3 us
+/// is [`visible_row`] rendering the grid and ~6 us is the hash. `status` pays it
+/// on every call, under the terminal guard it already takes for `detail=`. That
+/// is the price of a stamp a reader can RECOMPUTE from `text`; a cheaper one
+/// (a running hash on the engine's write path, say) would be a second
+/// definition of the same value, which is the thing this function exists to
+/// avoid.
+pub(crate) fn screen_stamp(t: &Terminal) -> (u64, u64) {
+    (
+        t.content_seq(),
+        crate::turn_ledger::fnv1a_64(screen_text(t).as_bytes()),
+    )
+}
+
+/// The whole visible screen as text: every row [`visible_row`] renders, each
+/// followed by a newline, untrimmed.
+///
+/// THE ONE CONSTRUCTION the hashed screen has. `turn` used to build this inline
+/// and [`screen_stamp`] built it again, which made "the same pair `turn`
+/// returns" true by coincidence rather than by construction — a trailing space
+/// added to one loop and not the other would have made every `--report-to`
+/// unpostable and nothing would have failed until it did. `cmd_text_opt` keeps
+/// its own loop because it serves a row SPAN (`tail=`, `rows=`), and that the
+/// bare span agrees with this is pinned by
+/// `screen_stamp_matches_the_text_verbs_rows`.
+pub(crate) fn screen_text(t: &Terminal) -> String {
+    let mut screen = String::with_capacity(t.rows() as usize * (t.cols() as usize + 1));
+    for r in 0..t.rows() as usize {
+        screen.push_str(&visible_row(t, r));
+        screen.push('\n');
+    }
+    screen
+}
+
 /// `text [trim] [tail=<n>|rows=<a>-<b>]` -> `OK <n>[ trimmed=<k>][ first=<row>]\n`
 /// then `<n>` visible rows. Bare, `n` is the grid's row count. With `trim`, the rows
 /// after the last non-blank one are dropped ([`trimmed_len`]), `n` is the count
@@ -1012,6 +1058,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          redraw_attempts={} redraw_early_outs={} redraw_sync_holds={} redraw_retry_gated={} \
          frame_refills_scoped={} frame_refills_full={} frame_refills_skipped={} \
          frame_refill_full_causes={} \
+         offscreen_rasters={} last_offscreen_raster_ms={:.2} \
+         max_offscreen_raster_ms={:.2} \
          pre_present_attempts={} last_pre_present_ms={:.2} pre_present_total_ms={:.2} \
          max_pre_present_ms={:.2} \
          last_acquire_wait_ms={:.2} max_acquire_wait_ms={:.2} \
@@ -1100,6 +1148,18 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         m.frame_refills_full,
         m.frame_refills_skipped,
         refill_cause_pairs(&refill_causes),
+        // THE PIXELS THAT NEVER REACH GLASS. `record_offscreen_raster` exists
+        // so an `image` / `window` / `snapshot` rasterization stops moving
+        // `frames`, `max_frame_render_ms`, `slow_frames` and `max_frame_gap_ms`
+        // — correct, and argued at length where it is defined. But the three
+        // counters it moved that work INTO were read by nothing at all, so the
+        // cure took the contamination and the observability together: a
+        // full-frame raster of a 2208x1788 window changed no published number.
+        // Published here, on the ledger that same comment tells a driver to
+        // read.
+        m.offscreen_rasters,
+        ms(m.last_offscreen_raster_ns),
+        ms(m.max_offscreen_raster_ns),
         m.pre_present_attempts,
         ms(m.last_pre_present_ns),
         ms(m.pre_present_total_ns),
@@ -1571,7 +1631,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"redraw_sync_holds\":{},\"redraw_retry_gated\":{},\
          \"frame_refills_scoped\":{},\"frame_refills_full\":{},\
          \"frame_refills_skipped\":{},\
-         \"frame_refill_full_causes\":{},\"pre_present_attempts\":{},\
+         \"frame_refill_full_causes\":{},\
+         \"offscreen_rasters\":{},\"last_offscreen_raster_ms\":{:.2},\
+         \"max_offscreen_raster_ms\":{:.2},\"pre_present_attempts\":{},\
          \"last_pre_present_ms\":{:.2},\"pre_present_total_ms\":{:.2},\
          \"max_pre_present_ms\":{:.2},\
          \"last_acquire_wait_ms\":{:.2},\"max_acquire_wait_ms\":{:.2},\
@@ -1662,6 +1724,10 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         m.frame_refills_full,
         m.frame_refills_skipped,
         refill_cause_object(&refill_causes),
+        // Field-for-field twin of the text form's offscreen-raster ledger.
+        m.offscreen_rasters,
+        ms(m.last_offscreen_raster_ns),
+        ms(m.max_offscreen_raster_ns),
         m.pre_present_attempts,
         ms(m.last_pre_present_ns),
         ms(m.pre_present_total_ns),
@@ -5060,6 +5126,44 @@ mod tests {
         term
     }
 
+    /// **THE STAMP MUST MATCH THE ROWS.** `status`'s `hash=` is FNV-1a-64 over
+    /// the untrimmed visible screen, and `aterm-link hook --report-to` reads
+    /// `status` for the stamp, `text` for the rows, and hashes the rows ITSELF
+    /// to check the two describe one screen — posting nothing when they differ.
+    /// So the bytes `screen_stamp` hashes must be exactly the bytes `text`
+    /// sends under its header: same rows, same order, one `\n` after each,
+    /// trailing spaces and all. A row of blanks or a trailing space on either
+    /// side alone would make every report unpostable.
+    #[test]
+    fn screen_stamp_matches_the_text_verbs_rows() {
+        for lines in [
+            vec![],
+            vec![
+                "\u{23fa} All 248 tests pass; the branch is ready.",
+                "  Next: the e2e suite.",
+            ],
+            vec![
+                "trailing spaces follow   ",
+                "",
+                "\u{4e16}\u{754c} wide glyphs",
+            ],
+        ] {
+            let term = term_with(&lines);
+            let (_, stamp) = super::screen_stamp(&term.lock().unwrap());
+            let served = super::cmd_text(&term);
+            // The header is the first line; the rows are the rest, each of
+            // which the wire sends with its own `\n`.
+            let body = served
+                .split_once('\n')
+                .map_or(String::new(), |(_, rest)| rest.to_string());
+            assert_eq!(
+                stamp,
+                crate::turn_ledger::fnv1a_64(body.as_bytes()),
+                "stamp over {lines:?} must hash the rows `text` served:\n{served:?}"
+            );
+        }
+    }
+
     /// The `modes` doc names the frame and the keys; this pins both, so the
     /// header count and the twelve-key roster cannot drift from the prose again
     /// (the doc read `OK` and seven keys while the handler sent `OK 12`).
@@ -5877,6 +5981,55 @@ mod tests {
             raced.content_seq,
             term_lock(&term).content_seq(),
             "the result retains its original coordinate-generation stamp"
+        );
+    }
+
+    /// **THE OFFSCREEN RASTER LEDGER REACHES A SURFACE.** `record_offscreen_raster`
+    /// was introduced so an `image` / `window` / `snapshot` rasterization stops
+    /// contaminating the on-glass ledger — and the three counters it moved that
+    /// work into were read by NOTHING: not the text summary, not the JSON twin,
+    /// not a `ctl` verb, not a test. Measured against a live instance: a
+    /// 2208x1788 `aterm ctl image` moved none of the 160 published fields, so
+    /// the cure had removed the contamination and the observability together.
+    ///
+    /// Both surfaces, because they are two positional `format!`s that must stay
+    /// field-for-field twins — and a value that MOVES, so this cannot pass on a
+    /// surface that prints a constant.
+    #[test]
+    fn metrics_surfaces_publish_the_offscreen_raster_ledger() {
+        let before = super::cmd_metrics(None, "");
+        let before_json = super::cmd_metrics_json(None, "metrics_json");
+        for field in [
+            "offscreen_rasters=",
+            "last_offscreen_raster_ms=",
+            "max_offscreen_raster_ms=",
+        ] {
+            assert!(before.contains(field), "the text surface lost {field:?}");
+        }
+        for field in [
+            "\"offscreen_rasters\":",
+            "\"last_offscreen_raster_ms\":",
+            "\"max_offscreen_raster_ms\":",
+        ] {
+            assert!(before_json.contains(field), "the JSON twin lost {field:?}");
+        }
+        // …and the number is live: record a raster and it must move. The count
+        // is a process-global monotonic counter, so read it out of both forms
+        // and compare, rather than asserting an absolute value.
+        let count_of = |s: &str| -> u64 {
+            s.split("offscreen_rasters=")
+                .nth(1)
+                .and_then(|t| t.split_whitespace().next())
+                .and_then(|t| t.parse().ok())
+                .expect("offscreen_rasters is a number on the text surface")
+        };
+        let n0 = count_of(&before);
+        crate::metrics::record_offscreen_raster(1_500_000);
+        let after = super::cmd_metrics(None, "");
+        assert!(
+            count_of(&after) > n0,
+            "a recorded raster moved no published number ({n0} -> {})",
+            count_of(&after)
         );
     }
 

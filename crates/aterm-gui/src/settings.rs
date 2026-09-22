@@ -4208,6 +4208,11 @@ fn category_tint(sec: prefs::Section, r: &Roles, theme: Theme) -> [u8; 3] {
         // Packages: the parcel tile shares the window-furniture neutrality —
         // toolchain plumbing, not a personalization surface.
         prefs::Section::Packages => lerp_rgb(u32_rgb(theme.selection), r.text_secondary, 0.35),
+        // Harness: the danger family pulled well back toward the surface — a
+        // switch that can stop aterm acting inside another program belongs to
+        // the same family as Security, at a quieter strength because the page
+        // is a status surface, not a permission wall.
+        prefs::Section::Harness => lerp_rgb(r.danger, r.text_secondary, 0.55),
         // The Kitty Log's fixed rose accent. This is UI branding, not the
         // retired `[sparkle_words.feline] color` compatibility key.
         prefs::Section::KittyLog => [0xF7, 0xA8, 0xB8],
@@ -4519,6 +4524,32 @@ fn category_pictogram(
                 radius: 0.0,
                 fill: rgba(on, 0xFF),
                 blur: false,
+            });
+        }
+        // Harness: the MARK — a HOLLOW outline around a small live pip, the
+        // substrate-prim reading of design §4.6.1's `armed` glyph (an outline
+        // shape, filled only while acting). Not the glyph itself: there is no
+        // rotation primitive here, so this is a rounded outline rather than a
+        // diamond, and the tile says "a watcher, idle" in the same grammar as
+        // its neighbours (no glyphs).
+        prefs::Section::Harness => {
+            let d = s * 0.54;
+            let t = (s * 0.06).max(1.0);
+            prims.push(DrawPrim::Stroke {
+                x: cx - d * 0.5,
+                y: cy - d * 0.5,
+                w: d,
+                h: d,
+                radius: d * 0.5,
+                width: t,
+                color: rgba(on, 0xFF),
+            });
+            prims.push(DrawPrim::Dot {
+                cx,
+                cy,
+                r: (s * 0.09).max(1.5),
+                color: rgba(on, 0xFF),
+                breathe: false,
             });
         }
         // Kitty Log: a peeking cat head — two rounded ear nubs under a head
@@ -8681,14 +8712,19 @@ mod tests {
         );
         assert_eq!(
             sidebar_hit(24, 38),
-            Some(SidebarHit::Category(prefs::Section::KittyLog)),
+            Some(SidebarHit::Category(prefs::Section::Harness)),
             "the 11th category owns rows 24-25"
         );
         assert_eq!(
-            sidebar_hit(25, 38),
+            sidebar_hit(26, 38),
+            Some(SidebarHit::Category(prefs::Section::KittyLog)),
+            "the 12th category owns rows 26-27"
+        );
+        assert_eq!(
+            sidebar_hit(27, 38),
             Some(SidebarHit::Category(prefs::Section::KittyLog))
         );
-        assert_eq!(sidebar_hit(26, 38), None, "past the eleven categories");
+        assert_eq!(sidebar_hit(28, 38), None, "past the twelve categories");
         assert_eq!(sidebar_hit(37, 38), None, "the footer row never hits");
         assert_eq!(sidebar_hit(5, 6), None, "a too-short card clips the row");
         // The painter clips a category whose FULL 2-cell row does not fit above the
@@ -8981,7 +9017,7 @@ mod tests {
         assert_eq!(
             sidebar.as_str(),
             "sidebar selected=appearance \
-             sections=[appearance,cursor,cursor kitty,typography,window & tabs,input,terminal,performance,security,packages,kitty log]",
+             sections=[appearance,cursor,cursor kitty,typography,window & tabs,input,terminal,performance,security,packages,harness,kitty log]",
         );
         // Group captions interleave BEFORE their fields, exactly as painted:
         // Appearance = Theme (theme, window_theme) then Colors (4 colour rows).

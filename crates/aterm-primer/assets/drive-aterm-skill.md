@@ -132,9 +132,10 @@ the server's. *(`--sock`/`--pid` used to be silently ignored here, so a scoped `
 the user's real terminals. Fixed 2026-07-26; a stale build still has the old behavior.)*
 
 Line shapes:
-- `ls` → `<pid> <local> <sid> <parent|-> <state> <title-pct-encoded> meta=<0|1> nonce=<hex32> window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<cmd|->[ *]`
+- `ls` → `<pid> <local> <sid> <parent|-> <state> <title-pct-encoded> meta=<0|1> nonce=<hex32> window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<cmd|-> identity=<name|->[ *]`
 - `sessions` → the same without the leading pid
-- `windows` → `<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]`, then
+- `windows` → `<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]` (`active=-`
+  when nothing is on the active tab), then
   `<pid> window=none sessions=<n>` for sessions no window holds and `<pid> window=- sessions=<n>`
   for an instance that could not say (an older server, or its main thread did not answer).
   A headless instance owns one logical window, `0`. Takes no argument (`windows 1` is `ERR usage`).
@@ -148,8 +149,10 @@ cleared by a blur, a minimize or the app deactivating, so exactly one window per
 reads `1`; `detail=` the sanitized RUNNING command — the program plus an
 allow-listed subcommand, never its arguments (`claude`, `codex`, `targo%20test`; `-` idle;
 a compound line reads as the segment that runs — the last one once a trailing `|| …`
-alternative is dropped, so `a && b` → `b`, `a || b` → `a` — and a keyword opener stays
-the keyword; older builds read the first word, `cd`).
+alternative is dropped, so `a && b` → `b`, `a || b` → `a` — one wrapper (`sudo`, `env`,
+`time`, `nice`, `command`, `nohup`, `exec`) is unwrapped, and a keyword opener stays
+the keyword; older builds read the first word, `cd`); `identity=` the agent identity the
+session was spawned under (`spawn identity=<name>`), `-` for the human's own config.
 
 `*` / `self` mark the caller's own session/instance. **Parse by key, not by column:** the
 title is percent-encoded, **may be empty** (two consecutive spaces), and any program can set
@@ -246,7 +249,8 @@ aterm ctl "@$SID" blocks        # shell-integration command blocks; the executin
   (measured: 1,518 reads moved 8.1 MB for the last ~20 rows each time) — `text tail=20
   trim` is the cheap read there. Let `await gone` / `await seq` decide WHEN to read, and
   read the prompt box only at decision points — never on a poll.
-- `search` replies `OK <n>` (or `OK <n> incomplete` when scrollback was evicted mid-scan),
+- `search` replies `OK <n>` (or `OK <n> incomplete` when the match cap was hit or
+  scrollback was evicted mid-scan),
   then one `<row> <col> <len>` per match where **row is the ABSOLUTE scrollback row**.
 - `--json` goes *after* the verb. The verbs that honor it are named in the protocol header of
   `aterm ctl help --full`, which is GENERATED from the server's own allowlist — read it rather
@@ -456,8 +460,9 @@ aterm ctl "@$SID" wait 30000                         # OK complete <id> exit=<co
 - **Caveat: `seq` is per-grid.** An alt-screen (1049) round trip leaves the main grid's
   counter untouched, so a seq check alone can miss a whole TUI session. It also does not
   move on render-only changes (OSC recolor, DECSCNM, DECTCEM) or cursor moves.
-- `await` accepts `timeout <ms>` and `timeout=<ms>` from any position. `await match` also
-  takes `rows <a> <b>`. Bad regex → `ERR badregex`.
+- `await` accepts `timeout <ms>` and `timeout=<ms>` from any position. `await match` and
+  `await gone` also take `rows <a> <b>` (a span meeting no row of the grid is `ERR bad
+  rows`, since nothing-scanned is never "clear"). Bad regex → `ERR badregex`.
 - `ready` accepts a bare `<ms>` or `timeout=<ms>` (default 30000). `wait` accepts a **bare**
   `<ms>` only.
 - **`wait`, `await block`, and `blocks` require OSC-133 shell integration.** Against a plain
@@ -526,15 +531,29 @@ aterm ctl subscribe "@$SID" cells,ts since=1234 every-frame
 
 Grammar: `subscribe [@<sel>[,<sel>…]] <streams> [since=<n>] [since-turn=<n>]
 [since-block=<n>] [every-frame]`. **The selector is the SECOND token here** — the one verb
-where it follows the verb name. Streams ⊆ `screen,cursor,events,cells,bytes,sessions,timestamps|ts,trim`,
+where it follows the verb name. Streams ⊆ `screen,cursor,events,cells,bytes,mail,sessions,timestamps|ts,trim`,
 comma-joined into the **single `<streams>` token** — `ts` and `trim` are modifiers of that
 token, not trailing args, so `… cells since=1234 ts` is `ERR unknown subscribe arg` while
 `… cells,ts since=1234` is what you want. Fail-closed on unknown tokens **and on a
 modifier-only list** (bare `ts` or `trim` is `ERR usage` — it would ack and then push nothing
 forever; `trim` is inert without `screen`). `sessions` is **Owner-only**: it reports the whole
 instance roster, which your per-target read grants do not cover, so a scoped edge gets
-`ERR denied` rather than an empty stream. Max 256 targets; `since=` anchors require a single
-target.
+`ERR denied` rather than an empty stream. `mail` narrows INSIDE the same token with
+`mail:kinds=<k,…>` and/or `mail:from=<class|principal>` (class = `human|agent|service|other`,
+by the sender's `h-`/`s-`/`a-` prefix; `from=` takes exactly ONE value, never a list) — an
+unknown kind, key or repeat is `ERR usage`, never a subscription that silently matches
+nothing. Max 256 targets; `since=` anchors require a single target.
+
+`mail` takes its own parameters, colon-joined onto the stream name and in any order:
+`mail:kinds=<k,..>`, `mail:from=<class|principal>` (class is `human|agent|service|other`),
+and `mail:topic=<t>` — BROADCAST rows only, on that topic. Each `MAIL` line is metadata
+and never a body (`MAIL <sid> id= off= from= kind= [re=] [topic=]`); read the words with
+your own `inbox get`. An unknown key or kind is `ERR usage`, never a subscription that
+silently matches nothing, and the refusal prints the whole vocabulary on its second line.
+`topic=` is there because a broadcast is in a mailbox for a different reason than an
+addressed message: the session asked for the topic with `aterm ctl @<sid> topic add <t>`
+(Owner-only; `topic ls`/`topic drop <t>`), and a session that asked for nothing receives
+no broadcast at all.
 
 After the ack the connection is **push-only forever**.
 
@@ -546,7 +565,11 @@ After the ack the connection is **push-only forever**.
 - `EVENT <local> turn <id> submitted= status= dur_ms=` / `block-complete <id> exit=` / `title` / `bell` / `meta`
 - `EVENT <local> closing reason= by=` then `EVENT <local> exited` — the `exits` row, live
 - `BYTES <local> <len>` + raw PTY bytes
-- `GAP <local> resync=<seq>` | `bytes-dropped=<n>` | `events-resync=<floor>`
+- `MAIL <local> id=<n> off=<n> from=<p> kind=<k>[ re=<n>]` — `mail` only, one line per row
+  DELIVERED into that session's inbox. **Metadata only, never a body** — read the words
+  with `inbox get <id>`. Live-only: seeded to the ring's high, so it replays no backlog
+  (`await inbox` is what reads history).
+- `GAP <local> resync=<seq>` | `bytes-dropped=<n>` | `events-resync=<floor>` | `mail-dropped=<n>`
 - `EVENT * session-created <sid>` / `EVENT * session-exited <sid> reason=<…>` — `sessions`
   only; `*` is the instance tag, not a `<local>`, so it resolves against no `sub` map entry.
 - `T <tag> <t_us>` — `ts` only, once per channel per wake, immediately before that
@@ -633,7 +656,7 @@ aterm drive report "@$SID"                                    # what the worker 
 aterm drive report "@$SID" --final                            # only its LAST message block (no tool rows, no ⎿ output); --messages for every one
 aterm drive watch "@$SID" --journal j.jsonl                   # …and one JSON object per line it prints, for the ledger below
 aterm drive watch "@$SID" --mail --journal j.jsonl            # …with your inbox parked beside it: MAIL per delivery, ONE `EVENT turn` per worker turn
-aterm drive task "@$SID" --no-nudge 'run the suite and report'  # the task by MAIL (kind=task), never through the PTY; `task @<off> nudged=0|1`
+aterm drive task "@$SID" 'run the suite and report'             # the task by MAIL (kind=task) + a one-line nudge
 aterm drive task "@$SID" --wait 'which branch?'               # …and park for the answer|report|ack with re=<off>
 aterm drive ledger "@$SID" --journal j.jsonl --format html --out ledger.html   # how the loop ran: swimlanes on a time axis
 ```
@@ -666,15 +689,23 @@ more, except one screen read per 20 s step while an idle point is held, and noth
 end-of-turn `report` (its Stop hook posts it: `aterm link hook install claude --report-to
 @<you>`) is folded into the idle point of the same turn: `EVENT turn seq=<n> report=<id>
 rows=<n> <summary>`, one line per worker turn — measured 2026-09-14, one wake and one 2 KB
-read where the same turn was a 689-row `report`. An idle whose report never came within
+read where the same turn was a 689-row `report`. Since round 22 that report is what the
+worker's SCREEN says, read over the control socket: its body opens with a `seq=<n>
+hash=<hex16>[ busy=1]` stamp line (not counted by `rows=`), so you can hold it against
+`history` instead of believing it — `busy=1` means the screen was still mid-turn on every
+try and the stamp will NOT match the ledger. The rows are from the last `⏺` row down to
+the live zone, or the last six non-blank rows above it, trimmed to 4 KiB, posted once per
+screen. An idle whose report never came within
 `--idle-grace` (180 s) is `EVENT idle-no-report …` — and so is one a prompt or a new turn
 superseded under the hold (the screen is read once a step there). A report is the turn's
 when it came after the worker was read busy for the turn, or after the point; one from
 before the last point handed over never is; `--report-window` (120 s) bounds only a report
 from before the turn was seen to begin. `task` posts `kind=task` from your session and, only
 when the worker is idle and `--no-nudge` is not given, types the one-line nudge `Inbox:
-task @<off>` as a turn; a worker whose wake hooks accept you (`--accept-from` naming your
-sid) needs `--no-nudge`.
+task @<off>` as a turn. A worker installed `--keep-alive` whose wake hooks accept you
+(`--accept-from` naming your sid) parks on the mail and can take `--no-nudge`; WITHOUT
+`--keep-alive` — the default since round 22 — its `Stop` hook reports and returns, so
+`--no-nudge` posts a task nothing wakes for. When in doubt, nudge.
 
 **Never rate a session for the human.** While Claude Code's session survey (`● How is
 Claude doing this session?` over `1: Bad    2: Fine   3: Good   0: Dismiss`) is open

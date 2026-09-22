@@ -426,6 +426,18 @@ pub(crate) const EDIT_PACKAGES_AUTO_INSTALL: &str = "packages.auto_install";
 /// first run into an announced offer instead. Distinct from
 /// [`EDIT_PACKAGES_AUTO_INSTALL`], which governs NETWORK installs.
 pub(crate) const EDIT_PACKAGES_SEED_INSTALL: &str = "packages.seed_install";
+/// The aterm WRAPPER's durable master switch — the `[harness]` table's
+/// `enabled` key (design `docs/DESIGN-aterm-wrapper-2026-09-17.md` §4.6.2).
+/// A Bool, default ON, registered through [`NESTED_LEAVES`] like the other
+/// dotted leaves.
+///
+/// It is in `aterm.toml` and NOT in the harness's own config on purpose: *"the
+/// kill switch may never depend on the thing it kills"*, so it keeps working
+/// when the harness tree is missing, broken or mid-update. Everything finer —
+/// one switch per capability — lives in the harness's own state and is edited
+/// with `aterm harness enable|disable`; no key exists in both homes.
+pub(crate) const EDIT_HARNESS_ENABLED: &str = "harness.enabled";
+
 /// `[machine] universal_control` — `"off"` (default) disables macOS Universal Control
 /// for this host on every package pass; `"leave"` never touches it. Applied by the
 /// CO-LOCATED atpkg, which reads the same table; the Security page shows the measured
@@ -674,6 +686,14 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     NestedLeaf {
         key: "update.auto_apply",
         label: "Update: apply immediately",
+        kind: EditKind::Bool,
+    },
+    // [harness] — the aterm wrapper's ONE durable master switch. Everything
+    // finer lives in the harness's own state (`aterm harness enable|disable`),
+    // because two homes for one key drift.
+    NestedLeaf {
+        key: EDIT_HARNESS_ENABLED,
+        label: "Harness",
         kind: EditKind::Bool,
     },
     // [sparkle_words] — master + top-level scalars.
@@ -2346,6 +2366,10 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
             &format!("{} (default)", aterm_update_core::DEFAULT_REPO),
         ),
         "update.auto_apply" => boolean(upd.and_then(|u| u.auto_apply), true),
+        // Seeded through the RESOLVER that owns the default, never a literal
+        // `true` re-typed here — the streak pip's rule, so the switch and the
+        // harness can never start in different positions.
+        EDIT_HARNESS_ENABLED => boolean(Some(cfg.harness_enabled()), true),
         "sparkle_words.enabled" => boolean(sw.and_then(|s| s.enabled), true),
         "sparkle_words.reduced_motion" => boolean(sw.and_then(|s| s.reduced_motion), false),
         "sparkle_words.suppress_in_alt_screen" => {
@@ -2458,6 +2482,15 @@ pub(crate) enum Section {
     /// page that renders these rows itself), so it surfaces through Search and
     /// the Modified review only.
     Packages,
+    /// The aterm WRAPPER's own page (design
+    /// `docs/DESIGN-aterm-wrapper-2026-09-17.md` §4.6.2). Like
+    /// [`Section::Packages`] above, it is a SPECIAL page: the durable master
+    /// switch `harness.enabled` is the only key that routes here today, and
+    /// the per-capability switches, the account list and the ledger rows the
+    /// design's page shows live in the harness's own state rather than in
+    /// `aterm.toml`, so no ordinary registry row owns them. Search and the
+    /// Modified review still reach the master switch through the registry.
+    Harness,
     /// The read-only Kitty Log collection book (§F4.6): no editable keys ever
     /// map here ([`section_of`] never returns it), so the content pane paints
     /// the book instead of group-boxes and every row is non-activatable.
@@ -2466,7 +2499,7 @@ pub(crate) enum Section {
 
 impl Section {
     /// Display order of the section headers (top → bottom).
-    pub(crate) const ORDER: [Section; 11] = [
+    pub(crate) const ORDER: [Section; 12] = [
         Section::Appearance,
         Section::Cursor,
         Section::CursorKitty,
@@ -2477,6 +2510,7 @@ impl Section {
         Section::Performance,
         Section::Security,
         Section::Packages,
+        Section::Harness,
         Section::KittyLog,
     ];
 
@@ -2493,6 +2527,7 @@ impl Section {
             Section::Terminal => "Terminal",
             Section::Security => "Security",
             Section::Packages => "Packages",
+            Section::Harness => "Harness",
             Section::KittyLog => "Kitty Log",
         }
     }
@@ -2524,6 +2559,11 @@ pub(crate) fn section_of(key: &str) -> Section {
     }
     if key.starts_with("update.") {
         return Section::Terminal;
+    }
+    // The wrapper's master switch answers to the Harness page and to nothing
+    // else — it is not an update, a package or a terminal knob.
+    if key.starts_with("harness.") {
+        return Section::Harness;
     }
     // THE SOUND MENU (owner ask: "add the volume and SFX menu to settings").
     // Every audible knob in the product answers to ONE pane, so the box below
@@ -2732,6 +2772,9 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     }
     if key.starts_with("update.") {
         return ("Updates", 3);
+    }
+    if key.starts_with("harness.") {
+        return ("Harness", 0);
     }
     if key.starts_with("sparkle_words.") {
         return ("Sparkle words", 4);
@@ -2986,9 +3029,14 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
         | "net.listen"
         | "net.cert"
         | "net.key" => Some("Applies next launch"),
-        EDIT_ALLOW_KITTY_FILE_TRANSFER | EDIT_TEMPORAL_RECORDING | EDIT_SHELL | EDIT_SHELL_ARGS => {
-            Some("Applies to new sessions")
-        }
+        // Turning the harness off re-renders the launcher twin without the
+        // prelude, so the NEXT launch is plain; sessions already running keep
+        // what they launched with until they exit (design §4.6.2).
+        EDIT_ALLOW_KITTY_FILE_TRANSFER
+        | EDIT_TEMPORAL_RECORDING
+        | EDIT_SHELL
+        | EDIT_SHELL_ARGS
+        | EDIT_HARNESS_ENABLED => Some("Applies to new sessions"),
         EDIT_HDR_GLOW => Some("Disabling applies now; enabling may require a new window"),
         EDIT_RESTORE_SESSION => Some("Applies when closing or next launch"),
         EDIT_PACKAGES_AUTO_INSTALL
@@ -3061,6 +3109,9 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
         "update.owner" => "$ATERM_UPDATE_OWNER overrides this value",
         "update.repo" => "$ATERM_UPDATE_REPO overrides this value",
         "update.auto_apply" => "$ATERM_NO_AUTO_APPLY forces this off for the launch",
+        EDIT_HARNESS_ENABLED => {
+            "$ATERM_NO_HARNESS bypasses the harness for one session without writing anything"
+        }
         "packages.account" => "$ATPKG_ACCOUNT overrides this value for package operations",
         EDIT_PACKAGES_AUTO_UPDATE => {
             "$ATPKG_UPDATE_INTERVAL_SECS controls cadence only (default 21600 seconds; 0 runs once — a pass queued behind another aterm's install is retried on a short backoff until it runs, or given up on for this launch once that install has sat through three waits with no visible progress); it never overrides packages.enabled or packages.auto_update"
@@ -3734,6 +3785,19 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         // Nested tables share one intent vocabulary per table.
         k if k.starts_with("net.") => &["network", "remote", "drive", "listener", "tls"],
         k if k.starts_with("update.") => &["update", "channel", "github", "release"],
+        // The one word most people will search for here is the vendor's — so
+        // the wrapper's switch answers to "claude" as well as to "harness",
+        // and to the two words an operator reaches for when they want it to
+        // stop.
+        k if k.starts_with("harness.") => &[
+            "harness",
+            "wrapper",
+            "claude",
+            "agent",
+            "disable",
+            "off",
+            "kill switch",
+        ],
         // The bonk keys are sparkle-words leaves in the file but SFX in the UI:
         // give them the sound vocabulary too, or the one sparkle gesture a user
         // searches for by ear ("bonk", "sound") would be findable only under
@@ -4372,7 +4436,8 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             // Load-adaptive shedding drops decorative effects under sustained RENDER
             // overload. Default ON; the checkbox reflects the resolved state directly.
             // Turn OFF (or set Motion = full) to keep the cursor trail / aurora on
-            // regardless of load.
+            // regardless of load. Smooth scrolling and the scroll pill are never
+            // shed under either setting (`App::effect_policy`).
             label: "Load-adaptive motion",
             key: EDIT_LOAD_ADAPTIVE_MOTION,
             kind: EditKind::Bool,
@@ -5458,10 +5523,16 @@ mod trail_style_tests {
                 // …and `rainbow kitty flat` since 2026-09-13, the A/B twin of
                 // the default body: it must differ from the default in the
                 // body alone, so it draws the same resident.
+                // …and `rainbow kitty tall` since 2026-09-21, for the third
+                // time and the plainest reason: `… tall` names the geometry
+                // the DEFAULT ALREADY DRAWS, so the word changed nothing it
+                // named and swapped the animal instead. Both docs a user
+                // reads call it "an explicit spelling of the default".
                 s == "rainbow kitty pet"
                     || s == "rainbow kitty"
                     || s == "rainbow kitty underline"
-                    || s == "rainbow kitty flat",
+                    || s == "rainbow kitty flat"
+                    || s == "rainbow kitty tall",
                 "style {s:?}"
             );
         }
@@ -5523,7 +5594,8 @@ mod trail_style_tests {
                     || s == "rainbow kitty pet"
                     || s == "rainbow kitty"
                     || s == "rainbow kitty underline"
-                    || s == "rainbow kitty flat",
+                    || s == "rainbow kitty flat"
+                    || s == "rainbow kitty tall",
                 "any-pet union, style {s:?}"
             );
         }
@@ -6513,6 +6585,86 @@ mod edit_tests {
             .find(|f| f.key == key)
             .unwrap();
         assert_eq!(row_off.seed.as_deref(), Some("false"), "resolved OFF");
+    }
+
+    /// THE OFF SWITCH (design `docs/DESIGN-aterm-wrapper-2026-09-17.md`
+    /// §4.6.2): the aterm wrapper's master switch is an ordinary Bool row, so
+    /// it is reachable from Search, from the Modified review and from
+    /// `settings set harness.enabled false`. It lives in `aterm.toml` and NOT
+    /// in the harness's own config precisely so a kill switch never depends on
+    /// the thing it kills — this test is what pins the key's HOME.
+    #[test]
+    fn the_harness_master_switch_round_trips_through_set_and_unset() {
+        let key = super::EDIT_HARNESS_ENABLED;
+        assert_eq!(super::edit_kind(key), EditKind::Bool);
+        assert_eq!(super::section_of(key), super::Section::Harness);
+        assert_eq!(super::group_of(key), ("Harness", 0));
+        for word in ["harness", "claude", "off"] {
+            assert!(keywords_of(key).contains(&word), "{word}");
+        }
+        assert!(
+            super::environment_precedence(key).is_some_and(|n| n.contains("ATERM_NO_HARNESS")),
+            "the per-session bypass must be disclosed on the row"
+        );
+
+        // The row seeds its RESOLVED state, and an absent key is ON: a fresh
+        // machine has no aterm.toml and must not read as switched off.
+        let row = editable_fields(&Config::default())
+            .into_iter()
+            .find(|f| f.key == key)
+            .expect("the row exists on an unconfigured install");
+        assert_eq!(row.label, "Harness");
+        assert_eq!(row.seed.as_deref(), Some("true"), "absent means ON");
+
+        // SET: the writer creates `[harness]` non-destructively, leaves the
+        // rest of the file alone, and what it writes re-parses as `Config`.
+        let written = apply_prefs_edits("font_px = 14\n", &[(key, set("false"))])
+            .expect("the nested writer creates [harness]");
+        assert!(written.contains("[harness]"), "{written}");
+        assert!(
+            written.contains("font_px = 14"),
+            "an untouched key survives: {written}"
+        );
+        let off: Config = aterm_toml::from_str(&written).expect("re-parses as Config");
+        assert!(!off.harness_enabled());
+        assert_eq!(
+            editable_fields(&off)
+                .into_iter()
+                .find(|f| f.key == key)
+                .and_then(|f| f.seed),
+            Some("false".to_string()),
+            "the row reads back exactly what was written"
+        );
+
+        // UNSET: clearing the key returns the resolved default, ON. The switch
+        // has two positions and no third "unknown" one.
+        let cleared = apply_prefs_edits(&written, &[(key, None)]).expect("unset");
+        let back: Config = aterm_toml::from_str(&cleared).expect("re-parses as Config");
+        assert!(back.harness_enabled(), "{cleared}");
+        assert!(!cleared.contains("enabled = false"), "{cleared}");
+
+        // An explicit `true` is indistinguishable from absent, by design.
+        let on = apply_prefs_edits("", &[(key, set("true"))]).expect("set true");
+        let on_cfg: Config = aterm_toml::from_str(&on).expect("re-parses as Config");
+        assert!(on_cfg.harness_enabled());
+
+        // THE HOME, asserted rather than described: nothing the writer
+        // produces for this key mentions the harness's own state directory,
+        // and no OTHER registered leaf claims the same dotted path.
+        assert_eq!(
+            super::NESTED_LEAVES.iter().filter(|l| l.key == key).count(),
+            1,
+            "one registration, one home"
+        );
+        // The SHAPE the writer produces, MEASURED by this test on 2026-09-21
+        // and pinned here because `aterm harness` reads this same file with
+        // its own minimal reader and no GUI in the path: a `[harness]` header
+        // and `enabled = false` under it. The harness side transcribes this
+        // fixture in `harness::cli`'s `the_master_switch_is_read_out_of_aterm_toml`.
+        assert!(
+            written.ends_with("[harness]\nenabled = false\n"),
+            "{written}"
+        );
     }
 
     /// The `[packages]` maintenance switches: Bool-typed dotted keys, sectioned in

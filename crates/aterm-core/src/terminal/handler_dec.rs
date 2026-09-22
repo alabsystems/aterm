@@ -411,7 +411,7 @@ impl TerminalHandler<'_> {
             .unwrap_or_else(|| Grid::with_scrollback(self.grid.rows(), self.grid.cols(), 0));
         // Per xterm: tab stops are global, shared between main and alt screens.
         // Copy main screen tab stops to the new alt screen (#7494).
-        new_grid.restore_tab_stops(self.grid.tab_stops());
+        new_grid.restore_tab_stops(self.grid.tab_stops(), self.grid.tab_defaults_suppressed());
         // Per xterm the cursor is shared by both screen buffers: modes 47 and
         // 1047 swap the buffer without moving it (only 1048/1049 save/restore).
         let cursor = self.grid.cursor();
@@ -467,6 +467,7 @@ impl TerminalHandler<'_> {
         // Per xterm: tab stops are global. Preserve alt screen tab stop
         // changes back to the main screen (#7494).
         let tab_stops = self.grid.tab_stops().to_vec();
+        let tab_suppressed = self.grid.tab_defaults_suppressed();
         if let Some(mut main_grid) = self.alt_grid.take() {
             // Per xterm the cursor is shared by both screen buffers: modes 47
             // and 1047 exit performs no cursor restore — the cursor stays
@@ -483,7 +484,7 @@ impl TerminalHandler<'_> {
             *self.alt_grid = Some(alt);
         }
         self.flatten_restored_display_offset();
-        self.grid.restore_tab_stops(&tab_stops);
+        self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
         self.modes.alternate_screen = false;
         // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
         // do NOT record `SelectionDamage::All`. A switch no longer destroys the
@@ -603,7 +604,7 @@ impl TerminalHandler<'_> {
         new_grid.erase_screen();
         // Per xterm: tab stops are global, shared between main and alt screens.
         // Copy main screen tab stops to the new alt screen (#7494).
-        new_grid.restore_tab_stops(self.grid.tab_stops());
+        new_grid.restore_tab_stops(self.grid.tab_stops(), self.grid.tab_defaults_suppressed());
         // Per xterm the cursor is shared by both screen buffers and 1049 SET
         // is CursorSave + ToAlternate + ClearScreen — none of which moves the
         // cursor (charproc.c `srm_OPT_ALTBUF_CURSOR`). Entering must NOT home it.
@@ -685,6 +686,7 @@ impl TerminalHandler<'_> {
         // Per xterm: tab stops are global. Preserve alt screen tab stop
         // changes back to the main screen (#7494).
         let tab_stops = self.grid.tab_stops().to_vec();
+        let tab_suppressed = self.grid.tab_defaults_suppressed();
         if let Some(mut main_grid) = self.alt_grid.take() {
             // Margins are shared TScreen state in xterm: whatever DECSTBM/
             // DECSLRM set while in the alt screen stays in force after exit.
@@ -692,7 +694,7 @@ impl TerminalHandler<'_> {
             *self.grid = main_grid;
         }
         self.flatten_restored_display_offset();
-        self.grid.restore_tab_stops(&tab_stops);
+        self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
         // Restore from the shared DECSC slot WITHOUT consuming it: xterm
         // CursorRestore leaves sc->saved set, so a later bare DECRC restores
         // the same state again.
@@ -1474,6 +1476,79 @@ impl TerminalHandler<'_> {
         };
 
         self.grid.selective_erase_rect(top, left, bottom, right);
+    }
+}
+
+#[cfg(test)]
+mod cursor_damage_scope_tests {
+    use crate::terminal::Terminal;
+
+    /// THE FIX THE 2026-09-21 RESPONSIVENESS AUDIT ASKED FOR, as a law: a
+    /// cursor-only change damages the CURSOR CELL and not the grid.
+    ///
+    /// Both halves matter. It must still damage SOMETHING — a bare DECTCEM with
+    /// no grid write is otherwise swallowed by the frontend's redraw early-out
+    /// and the cursor does not appear until the next write (the regression
+    /// `mark_full` was taken for). And it must not damage EVERYTHING: a TUI that
+    /// brackets each repaint in `?25l` … `?25h` — Claude Code does, ten times a
+    /// second — handed the frontend a `Damage::Full` on every frame, so 99 % of
+    /// the owner's content frames took the full-refill arm and re-extracted the
+    /// whole viewport (measured: 8403 of 8431 full refills were `full_damage`).
+    #[test]
+    fn a_cursor_only_change_damages_the_cursor_cell_not_the_whole_grid() {
+        // Each case must be a real TRANSITION: a mode already in the requested
+        // state damages nothing at all (the handlers early-return), which is
+        // correct and is not what this test is about.
+        for (name, setup, seq) in [
+            ("DECTCEM hide", &b""[..], &b"\x1b[?25l"[..]),
+            ("DECTCEM show", &b"\x1b[?25l"[..], &b"\x1b[?25h"[..]),
+            ("DECSCUSR shape", &b"\x1b[2 q"[..], &b"\x1b[6 q"[..]),
+            ("mode 12 blink", &b"\x1b[?12l"[..], &b"\x1b[?12h"[..]),
+        ] {
+            let mut term = Terminal::new(24, 80);
+            // Put the cursor somewhere that is not the origin, so "the cursor
+            // cell" is a claim with content: a full mark would damage row 0 too.
+            term.process(b"\x1b[9;20H");
+            term.process(setup);
+            term.take_damage();
+            assert!(!term.has_damage(), "{name}: the fixture starts clean");
+
+            term.process(seq);
+
+            assert!(
+                term.has_damage(),
+                "{name}: a cursor-only change must still damage, or the \
+                 frontend's redraw early-out swallows it"
+            );
+            assert!(
+                !term.grid().damage().is_full(),
+                "{name}: a cursor-only change must NOT damage the whole grid"
+            );
+            assert!(
+                term.grid().damage().is_row_damaged(8),
+                "{name}: the cursor's own row (0-based 8) carries the damage"
+            );
+            assert!(
+                !term.grid().damage().is_row_damaged(0),
+                "{name}: an unrelated row is untouched"
+            );
+        }
+    }
+
+    /// The control: a change that really does repaint every cell still marks the
+    /// whole grid. Reverse video (DECSCNM) and the bidi direction are resolved at
+    /// render-snapshot time over cells already stored, so they own the full mark
+    /// — this test is what keeps the narrowing above from spreading to them.
+    #[test]
+    fn a_whole_screen_change_still_marks_the_whole_grid() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[9;20H");
+        term.take_damage();
+        term.process(b"\x1b[?5h"); // DECSCNM: reverse video
+        assert!(
+            term.grid().damage().is_full(),
+            "reverse video repaints every cell and must mark the grid full"
+        );
     }
 }
 

@@ -143,6 +143,19 @@ pub struct SessionRecord {
     /// label (the `frozen_path`-style degradation, accepted and documented).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
+    /// BROADCAST OPT-INS (additive, absent ⇒ none; round 23): this session's
+    /// `topic add` set, one `"<topic> <since>"` row each
+    /// (`fabric::render_topics`).
+    ///
+    /// A topic set is CONSENT — it is the only reason a `post to=say:<topic>`
+    /// record reaches a session at all — and a seamless update that dropped it
+    /// would silently unsubscribe an agent mid-conversation, which looks
+    /// exactly like a broadcast that was never sent. Carried per record for the
+    /// same reason `frozen_path` is: it must survive a SECOND handoff. Every
+    /// row is re-validated on the way in (`fabric::parse_topics`), so a
+    /// manifest an older build or a rollback wrote cannot invent an opt-in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topics: Vec<String>,
 }
 
 /// THE BUILD WHOSE SESSIONS ALWAYS HAVE THE MANAGED `agents/` ON PATH
@@ -420,6 +433,9 @@ impl SessionHandoff {
                         // The label the handle wears, from the spawn (or the
                         // record it was adopted from).
                         identity: h.identity.as_deref().map(str::to_owned),
+                        // The broadcast opt-ins, off the one live copy — the
+                        // same leaf lock the `topic` verb takes.
+                        topics: crate::fabric::render_topics(&h.ctx.fabric.topics()),
                     }
                 })
                 .collect(),
@@ -1296,7 +1312,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
-        fabric: crate::fabric::SessionFabric::default(),
+        fabric: std::sync::Arc::default(),
     });
     SessionHandle {
         sid,

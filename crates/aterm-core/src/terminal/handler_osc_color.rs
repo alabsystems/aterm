@@ -1164,6 +1164,85 @@ mod osc_color_response_cap_tests {
         );
     }
 
+    /// The cursor-state escapes mark CURSOR-SCOPED damage, never the whole grid.
+    ///
+    /// DECTCEM (`ESC[?25l` / `ESC[?25h`), DECSCUSR and DEC mode 12 change only the
+    /// cursor's appearance. They must still advance `damage_epoch` — the frontend's
+    /// redraw early-out is keyed on it and a bare DECTCEM writes no cell — but
+    /// marking the WHOLE grid re-stamps every `row_rev`, and the renderer's stamped
+    /// dirty gate trusts a changed stamp without comparing content, so one cursor
+    /// escape cost a whole-screen raster with no changed cell. Measured on the
+    /// owner's 50-row daily driver: 92% of every full refill. `TERM=xterm-256color`
+    /// spells `cnorm` as `\E[?12l\E[?25h`, so each ncurses `curs_set()` that re-showed
+    /// the cursor paid a whole-screen raster.
+    ///
+    /// The VACATED row is deliberately not this layer's job: `aterm-render`'s cursor
+    /// diff marks both `prev_input.cursor_row` and `input.cursor_row` off its own
+    /// `prev_shown != cur_shown` / `prev_style != cur_style` arms, which is what
+    /// makes scoping safe ACROSS A MOVE — the case this test pins.
+    #[test]
+    fn cursor_state_escapes_damage_the_cursor_cell_not_the_whole_grid() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"X");
+        term.take_damage();
+
+        // DECTCEM hide: scoped, and the epoch still advances.
+        let e0 = term.damage_epoch();
+        term.process(b"\x1b[?25l");
+        assert!(term.has_damage(), "DECTCEM hide must mark damage");
+        assert_eq!(term.damage_epoch(), e0 + 1, "hide advances damage_epoch");
+        assert!(
+            !term.grid().damage().is_full(),
+            "DECTCEM hide must NOT mark the whole grid"
+        );
+
+        // A cursor MOVE combined with a visibility change: the mark lands on the
+        // NEW position and is still scoped. CUP is 1-indexed, so this is row 10.
+        term.take_damage();
+        term.process(b"\x1b[11;41H");
+        term.take_damage();
+        let e1 = term.damage_epoch();
+        term.process(b"\x1b[?25h");
+        assert_eq!(term.damage_epoch(), e1 + 1, "show advances damage_epoch");
+        assert!(
+            !term.grid().damage().is_full(),
+            "DECTCEM show must NOT mark the whole grid after a cursor move"
+        );
+        assert!(
+            term.grid().damage().is_row_damaged(10),
+            "the NEW cursor row carries the scoped damage"
+        );
+
+        // DECSCUSR shape change (steady bar): same contract.
+        term.take_damage();
+        let e2 = term.damage_epoch();
+        term.process(b"\x1b[6 q");
+        assert_eq!(
+            term.damage_epoch(),
+            e2 + 1,
+            "DECSCUSR advances damage_epoch"
+        );
+        assert!(
+            !term.grid().damage().is_full(),
+            "DECSCUSR must NOT mark the whole grid"
+        );
+
+        // DEC mode 12, the other half of terminfo's `cnorm`. The cursor is a STEADY
+        // bar here, so enabling blink is a real style change and must mark damage.
+        term.take_damage();
+        let e3 = term.damage_epoch();
+        term.process(b"\x1b[?12h");
+        assert!(
+            term.has_damage(),
+            "DEC mode 12 blink change must mark damage"
+        );
+        assert_eq!(term.damage_epoch(), e3 + 1, "mode 12 advances damage_epoch");
+        assert!(
+            !term.grid().damage().is_full(),
+            "DEC mode 12 must NOT mark the whole grid"
+        );
+    }
+
     /// OSC 19 is a real dynamic color, not merely a transient callback event:
     /// persist it for render snapshots, answer xterm-style queries with the
     /// request terminator, and clear it through OSC 119.

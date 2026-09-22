@@ -216,6 +216,13 @@ fn main() -> ExitCode {
             // These read the shared ledger and run the one-shot checker
             // in-process: no socket, no GUI.
             aterm_cli::Verb::Update => update_verb(&forwarded),
+            // The Claude Code harness (docs/DESIGN-aterm-wrapper-2026-09-17.md
+            // §4.5, §5.7). Routed here beside its siblings for the reason the
+            // comment above this match gives: `aterm harness hook …` is run by
+            // the VENDOR through `/bin/sh` with the payload on stdin, where
+            // stdin is a pipe — and `aterm harness status` is typed at a
+            // prompt, where it is a TTY. Both must reach the same code.
+            aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
             // `agents` is parsed by aterm-cli itself (it prints and exits), so routing
             // it means handing the WHOLE operand list back to that parser.
             aterm_cli::Verb::Agents => {

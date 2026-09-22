@@ -56,9 +56,14 @@ impl ConfigNotice {
         now >= self.until
     }
 
-    /// Rows to paint: a title row + one row per warning, capped at [`MAX_NOTICE_ROWS`].
+    /// Rows to paint: a title row + one row per DISPLAY row, capped at
+    /// [`MAX_NOTICE_ROWS`].
+    ///
+    /// Counted in display rows rather than notices because a notice is one PROBLEM,
+    /// not one LINE — see [`notice_display_rows`]. Asking for one row per notice is
+    /// what let a five-line parse error be handed a single row to be crushed into.
     pub(crate) fn wanted_rows(&self) -> usize {
-        (self.lines.len() + 1).min(MAX_NOTICE_ROWS)
+        (display_row_count(&self.lines) + 1).min(MAX_NOTICE_ROWS)
     }
 
     /// Fold more notices into a LIVE banner and restart its clock, skipping any
@@ -146,6 +151,58 @@ pub(crate) fn take_deferred() -> Vec<String> {
 const MARGIN: usize = 2;
 const BULLET_INDENT: usize = MARGIN + 2;
 
+/// One control character, made VISIBLE. The band spends exactly one cell per char
+/// (`settings::write_str`), so a control byte in a diagnostic neither draws anything
+/// nor honestly occupies the cell it took — it silently eats a column of the row it
+/// landed in. `paste_banner::sanitized` spells a hostile clipboard's control bytes
+/// this way for the same reason; a config diagnostic is the same hazard arriving from
+/// the other direction.
+const CONTROL_MARK: char = '\u{00b7}';
+
+/// The PHYSICAL rows one notice asks the band for.
+///
+/// A NOTICE IS ONE PROBLEM, NOT ONE LINE. The config lane hands this band whole
+/// diagnostics, and a rejected `aterm.toml` arrives from
+/// `App::surface_native_config_lane_error` as a `toml` parse error carrying its caret
+/// diagram across five lines. Written into the band as one string it was not one row
+/// of anything: each `\n` took a cell and drew nothing, and the diagram's gutter ran
+/// inline through the sentence — `Config observation was not valid TOML: TOML parse
+/// error at line 7, column 3   |7 | foo = [bad  |      ^^^…` — until the width cut off
+/// whatever was left. The module header has named that input as real since the band was
+/// written; it was only ever described, never handled.
+///
+/// Split here, ONCE, so the painted rows and the announced rows are the same rows by
+/// construction (see [`band_text`]). Blank rows are dropped — a `toml` diagram opens on
+/// a bare gutter line, and a band with five rows to spend cannot spend one on nothing —
+/// trailing whitespace goes with them, and any control character that survives the split
+/// becomes [`CONTROL_MARK`]. Every notice yields at least one row, so a notice can never
+/// leave the band silently.
+fn notice_display_rows(line: &str) -> Vec<String> {
+    let mut rows: Vec<String> = line
+        .lines()
+        .map(|row| {
+            row.trim_end()
+                .chars()
+                .map(|ch| if ch.is_control() { CONTROL_MARK } else { ch })
+                .collect::<String>()
+        })
+        .filter(|row| !row.trim().is_empty())
+        .collect();
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+/// How many display rows `lines` asks for in total — [`ConfigNotice::wanted_rows`]'s
+/// half of the same count [`band_text`] then lays out.
+fn display_row_count(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .map(|line| notice_display_rows(line).len())
+        .sum()
+}
+
 /// `s` cut to `max` cells with a trailing ellipsis when it does not fit. A hard cut ends
 /// a warning mid-token and reads like corruption; an ellipsis says "there is more".
 fn ellipsized(s: &str, max: usize) -> String {
@@ -191,20 +248,47 @@ fn title_for(count: usize) -> String {
 pub(crate) struct BandText {
     /// The title row. Counts EVERY notice, including the ones the panel has no room for.
     pub(crate) title: String,
-    /// One entry per warning the panel has room for, each already cut to the width the
-    /// band writes it at.
-    pub(crate) warnings: Vec<String>,
+    /// One entry per display ROW the panel has room for, each already cut to the width
+    /// the band writes it at. A notice that spans several lines contributes several.
+    pub(crate) warnings: Vec<BandWarning>,
     /// The `+N more` tally, present only when the list overflowed AND a row was left to
     /// say so — a capped list that looks complete is worse than no banner.
     pub(crate) more: Option<String>,
 }
 
+/// One warning ROW of the band.
+pub(crate) struct BandWarning {
+    /// The row's words, already cut to the width the band writes it at.
+    pub(crate) text: String,
+    /// This row CONTINUES the notice above it instead of starting a new one, so the
+    /// band hangs it under the bullet rather than giving it a second one. Five bullets
+    /// down the side of one parse error would read as five separate problems, and a
+    /// bullet in front of a caret diagram's gutter reads as nothing at all.
+    pub(crate) continuation: bool,
+}
+
 /// [`BandText`] for a banner of `lines` painted `panel_rows` tall in a `cols`-wide window.
 pub(crate) fn band_text(lines: &[String], cols: usize, panel_rows: usize) -> BandText {
+    // Every notice split into the rows it actually occupies FIRST, so the capacity
+    // arithmetic below counts the same rows the band will paint. Counting notices
+    // instead is what handed a five-line parse error one row.
+    let rows: Vec<BandWarning> = lines
+        .iter()
+        .flat_map(|line| {
+            notice_display_rows(line)
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| BandWarning {
+                    text,
+                    continuation: index > 0,
+                })
+        })
+        .collect();
+    let total = rows.len();
     // Capacity for warning rows, reserving one for the "+N more" tally when the list
     // overflows and there is room to say so.
     let capacity = panel_rows.saturating_sub(1);
-    let overflow = lines.len() > capacity;
+    let overflow = total > capacity;
     let shown = if overflow && capacity >= 2 {
         capacity - 1
     } else {
@@ -212,14 +296,23 @@ pub(crate) fn band_text(lines: &[String], cols: usize, panel_rows: usize) -> Ban
     };
     let text_w = cols.saturating_sub(BULLET_INDENT + MARGIN);
     BandText {
+        // The title still counts NOTICES — one malformed file is one notice however
+        // many rows its diagnostic needs, and "5 notices" for one parse error would
+        // be the same miscount in the other direction.
         title: title_for(lines.len()),
-        warnings: lines
-            .iter()
+        warnings: rows
+            .into_iter()
             .take(shown)
-            .map(|line| ellipsized(line, text_w))
+            .map(|row| BandWarning {
+                text: ellipsized(&row.text, text_w),
+                continuation: row.continuation,
+            })
             .collect(),
         more: (overflow && shown < capacity).then(|| {
-            let more = format!("+{} more \u{2014} see the log", lines.len() - shown);
+            // "rows", not "notices": what was dropped is measured in rows now that one
+            // notice can ask for several, and the tally must not imply a count of
+            // problems it is not counting.
+            let more = format!("+{} more rows \u{2014} see the log", total - shown);
             ellipsized(&more, text_w)
         }),
     }
@@ -263,21 +356,24 @@ pub(crate) fn notice_rows(
         write_str(&mut rows[0], cols, hint_col, HINT, c.label, c.bar_bg, false);
     }
 
-    for (i, line) in band.warnings.iter().enumerate() {
-        write_str(
-            &mut rows[1 + i],
-            cols,
-            MARGIN,
-            "\u{2022}",
-            c.label,
-            c.bar_bg,
-            false,
-        );
+    for (i, warning) in band.warnings.iter().enumerate() {
+        // The bullet marks a NOTICE, so a row that continues one does not get a second.
+        if !warning.continuation {
+            write_str(
+                &mut rows[1 + i],
+                cols,
+                MARGIN,
+                "\u{2022}",
+                c.label,
+                c.bar_bg,
+                false,
+            );
+        }
         write_str(
             &mut rows[1 + i],
             cols,
             BULLET_INDENT,
-            line,
+            &warning.text,
             c.value,
             c.bar_bg,
             false,
@@ -294,6 +390,13 @@ pub(crate) fn notice_rows(
             false,
         );
     }
+    // THE SEAM IS THE WHOLE EDGE, AND ONE TONE. `blank_row` stamped it and the two
+    // writes above chipped it straight back out — `write_str` rebuilds every cell it
+    // touches with no overline — so the band's top edge reached the screen as three
+    // stubs with `!  Config \u{00B7} 1 notice` and `dismisses on its own` punched out
+    // of it. Closed across the finished row, in the label tone, because this row
+    // carries two inks and the rule belongs to neither.
+    chrome_band::seal_band_top(&mut rows[0], c.label);
     rows
 }
 
@@ -421,6 +524,147 @@ mod tests {
         // A list that FITS says nothing about overflow.
         let rows = notice_rows(&lines[..3], 80, 4, Theme::default());
         assert!(!text_of(&rows[3]).contains("more"), "no spurious tally");
+    }
+
+    /// THE SEAM IS THE BAND'S TOP EDGE, so it must run the whole width. It did not:
+    /// `blank_row` stamped it and then the title and the right-aligned hint punched
+    /// themselves out of it (`write_str` rebuilds every cell it touches, with no
+    /// overline), so the rule reached the screen as three stubs — left margin, the gap
+    /// between the two runs, right margin — which reads as rendering debris rather than
+    /// as a boundary. The same defect `link_target::caption_row` named first and
+    /// `the_seam_runs_unbroken_and_one_toned_across_every_cell_of_the_band` pins there.
+    #[test]
+    fn the_seam_runs_unbroken_and_one_toned_across_the_title_row() {
+        let theme = Theme::default();
+        let cols = 80;
+        let rows = notice_rows(
+            &["config line 10: show_scene_hud was removed".into()],
+            cols,
+            2,
+            theme,
+        );
+        let title = &rows[0];
+        assert!(
+            title.iter().all(|cell| cell.overline),
+            "the seam breaks at columns {:?}",
+            title
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| !cell.overline)
+                .map(|(col, _)| col)
+                .collect::<Vec<_>>()
+        );
+        // AND IT IS ONE TONE. The row deliberately carries two inks — the warn-coloured
+        // title beside the label-coloured aside — so a seam left to each cell's `fg`
+        // would run bright yellow for the title's cells and dim for the rest.
+        let seams: std::collections::BTreeSet<Option<[u8; 3]>> =
+            title.iter().map(|cell| cell.overline_color).collect();
+        assert_eq!(
+            seams.len(),
+            1,
+            "the rule takes as many tones as the band has inks: {seams:?}"
+        );
+        assert!(
+            seams.iter().all(Option::is_some),
+            "an uncoloured seam falls back to its cell's ink: {seams:?}"
+        );
+        let inks: std::collections::BTreeSet<[u8; 3]> = title.iter().map(|cell| cell.fg).collect();
+        assert!(
+            inks.len() > 1,
+            "the title row is meant to carry two inks, so this proof is not vacuous: {inks:?}"
+        );
+        // ONLY the top row is an edge. The warning rows sit inside the band and a rule
+        // over each of them would be a stack of hairlines, not a boundary.
+        assert!(rows[1].iter().all(|cell| !cell.overline));
+    }
+
+    /// A NOTICE IS ONE PROBLEM, NOT ONE LINE. A rejected `aterm.toml` reaches the band
+    /// as a `toml` parse error with its caret diagram — the input the module header has
+    /// named as real since the band was written — and it used to be handed exactly one
+    /// row: each `\n` took a cell and drew nothing, the diagram's gutter ran inline
+    /// through the sentence, and the width cut off whatever was left. The error string
+    /// here comes from the real parser, not a literal, so the test cannot pass because
+    /// the shape it assumes has changed.
+    #[test]
+    fn a_multi_line_diagnostic_is_painted_as_the_rows_it_actually_has() {
+        let error = "x = [bad\n"
+            .parse::<aterm_toml::edit::DocumentMut>()
+            .expect_err("a malformed document")
+            .to_string();
+        assert!(
+            error.contains('\n'),
+            "this test is about a multi-line diagnostic: {error:?}"
+        );
+        let line = format!("Config observation was not valid TOML: {error}");
+        let notice = ConfigNotice::new(vec![line.clone()], Instant::now()).unwrap();
+        assert!(
+            notice.wanted_rows() > 2,
+            "one notice of several lines asks for several rows, not one: {}",
+            notice.wanted_rows()
+        );
+
+        let cols = 80;
+        let rows = notice_rows(&[line], cols, notice.wanted_rows(), Theme::default());
+        let painted: Vec<String> = rows.iter().map(|row| text_of(row)).collect();
+
+        // NO CONTROL CHARACTER REACHES A CELL. `write_str` spends one cell per char, so
+        // a `\n` in a cell is a column that draws nothing and says nothing.
+        for row in &rows {
+            assert!(
+                row.iter().all(|cell| !cell.ch.is_control()),
+                "a control character took a cell: {:?}",
+                row.iter().map(|cell| cell.ch).collect::<String>()
+            );
+        }
+        // The diagnostic's own opening sentence and its caret row land on DIFFERENT
+        // rows. Matched on a short prefix, because the sentence is the one row wide
+        // enough to be ellipsized and the cut is not what this test is about.
+        let first = "TOML parse error";
+        let caret = error
+            .lines()
+            .find(|row| row.contains('^'))
+            .expect("the parser's caret row")
+            .trim_end();
+        let row_of = |needle: &str| {
+            painted
+                .iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is on no row: {painted:?}"))
+        };
+        assert_ne!(
+            row_of(first),
+            row_of(caret),
+            "the caret diagram must not share a row with the sentence: {painted:?}"
+        );
+        // ONE PROBLEM, ONE BULLET. A bullet per row would read as several problems, and
+        // one in front of the caret gutter reads as nothing at all.
+        let bullets = painted
+            .iter()
+            .filter(|row| row.trim_start().starts_with('\u{2022}'))
+            .count();
+        assert_eq!(bullets, 1, "one notice takes one bullet: {painted:?}");
+        // …and the title still counts NOTICES, not rows.
+        assert!(painted[0].contains("1 notice"), "{:?}", painted[0]);
+
+        // WHAT THE EYE SEES IS WHAT THE READER HEARS: the announcement is built from
+        // the same split, so it cannot describe a screen nobody is looking at.
+        let band = band_text(
+            &[format!("Config observation was not valid TOML: {error}")],
+            cols,
+            notice.wanted_rows(),
+        );
+        assert!(
+            band.warnings.len() > 1 && !band.warnings[0].continuation,
+            "{:?}",
+            band.warnings
+                .iter()
+                .map(|w| (&w.text, w.continuation))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            band.warnings[1..].iter().all(|w| w.continuation),
+            "every row after the first continues the same notice"
+        );
     }
 
     /// Degenerate geometry must not panic: one row, zero columns, a single warning wider

@@ -45,6 +45,8 @@ fn push_nova(input: &mut aterm_core::render::RenderInput, cw: usize, ch: usize) 
             color: premul_rgb(core, 200),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(core, 200),
+            alpha2: 0,
         });
     }
     // Ring chords: left + right chord slabs in rows 1..4 (the fixed-count
@@ -60,6 +62,8 @@ fn push_nova(input: &mut aterm_core::render::RenderInput, cw: usize, ch: usize) 
                 color: premul_rgb(fringe, 120),
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: premul_rgb(fringe, 120),
+                alpha2: 0,
             });
         }
     }
@@ -95,6 +99,8 @@ fn nova_additive_is_byte_exact_over_background() {
             color: premul_rgb(base, *a),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(base, *a),
+            alpha2: 0,
         });
     }
     push_nova(&mut input, cw, ch);
@@ -278,6 +284,8 @@ fn damaged_path_multi_row_nova_parity_cpu_matches_gpu() {
                 color,
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: color,
+                alpha2: 0,
             })
             .collect()
     };

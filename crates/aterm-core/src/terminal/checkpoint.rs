@@ -113,6 +113,14 @@ pub struct GridCursorRepr {
     pub margin_right: u16,
     /// Per-column tab stops (`true` = stop set at that column).
     pub tab_stops: Vec<bool>,
+    /// Whether TBC 3 has suppressed the every-8 defaults. The OTHER half of
+    /// the tab state, and the half a resize reads: without it a restored grid
+    /// that had been told "clear ALL tab stops" re-seeds the default into the
+    /// columns the next widen adds. `#[serde(default)]` for the additive rule
+    /// this file already follows — a checkpoint written before this field
+    /// existed restores `false`, which is what those producers meant.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tab_defaults_suppressed: bool,
 }
 
 impl GridCursorRepr {
@@ -128,6 +136,7 @@ impl GridCursorRepr {
             margin_left: margins.left,
             margin_right: margins.right,
             tab_stops: grid.tab_stops().to_vec(),
+            tab_defaults_suppressed: grid.tab_defaults_suppressed(),
         }
     }
 
@@ -138,7 +147,7 @@ impl GridCursorRepr {
         grid.set_horizontal_margins(self.margin_left, self.margin_right);
         grid.set_cursor(self.cursor_row, self.cursor_col);
         grid.set_pending_wrap(self.pending_wrap);
-        grid.restore_tab_stops(&self.tab_stops);
+        grid.restore_tab_stops(&self.tab_stops, self.tab_defaults_suppressed);
     }
 }
 
@@ -212,6 +221,29 @@ pub struct SavedCursorRepr {
 }
 
 impl SavedCursorRepr {
+    /// Project a DECSC slot for the wire — RAW, exactly as the engine keeps it.
+    ///
+    /// The slot is absolute coordinates that nothing reads until DECRC or a
+    /// 1049 exit, and those clamp to the grid AT THAT MOMENT (`Grid::set_cursor`;
+    /// xterm's `CursorRestore` does the same to a `sc->row` its `ScreenResize`
+    /// never touched). `Terminal::resize` therefore leaves `cursor_save` alone,
+    /// and after a shrink the slot can honestly name a row the grid no longer
+    /// has. That is state, not damage: if the grid grows back before the slot
+    /// is read, the cursor lands on its original row, as it should.
+    ///
+    /// So the projection must not clamp. Measured 2026-09-22 (this fix's first
+    /// draft did): a successor restores at the 55-row size the outgoing process
+    /// parked at, its "finishing" bar folds seconds later and every session
+    /// grows back to 56, and when the user then quits the full-screen app the
+    /// restored engine put the shell's cursor one row ABOVE where the
+    /// pre-update engine — and xterm — put it. The in-memory checkpoint that
+    /// temporal replay hydrates from would have diverged the same way.
+    ///
+    /// What the handoff wire admits for this slot is the consumer's business,
+    /// and it is the engine's protocol ceiling, not the current grid — see
+    /// `seamless::checkpoint_meta_bound_violation`, and the incident recorded
+    /// there: with the bound at the grid, every automatic self-update from
+    /// v0.87.0 through v0.90.0 refused on the owner's daily driver.
     fn capture(saved: SavedCursorState) -> Self {
         Self {
             cursor_row: saved.cursor.row,
@@ -368,6 +400,8 @@ impl Terminal {
             "checkpoint() requires parser_is_ground() (B.3.3)"
         );
 
+        let rows = self.grid.rows();
+        let cols = self.grid.cols();
         let grid_lines = self.grid.checkpoint_lines_bounded(max_history);
         // How many of those records are history, as the consumer must be told.
         // Derived from the produced vector rather than from `max_history` so it is
@@ -408,8 +442,8 @@ impl Terminal {
         };
 
         TerminalCheckpoint {
-            rows: self.grid.rows(),
-            cols: self.grid.cols(),
+            rows,
+            cols,
             grid: grid_bytes,
             history_lines,
             cursor,
@@ -505,6 +539,24 @@ impl Terminal {
     /// bindings and auth state are untouched, so this composes with the spawn
     /// path's configure_* wiring instead of re-deriving it.
     pub fn restore_checkpoint(&mut self, c: &TerminalCheckpoint) {
+        // RETENTION IS THIS PROCESS'S CONFIG, NOT THE CHECKPOINT'S.
+        // `scrollback_lines` reached `self` through the host's normal
+        // config-applied constructor (`new_live_terminal` → `apply_config` →
+        // `set_scrollback_line_limit`) BEFORE this adopt runs — and
+        // `restore_grid` below hands the rebuilt grid a brand-new store with
+        // NO limit, deliberately, so the carried history is not dropped on the
+        // way in. Nothing put the configured limit back, so every session a
+        // seamless update adopted retained scrollback UNBOUNDED for the rest
+        // of its life, silently withdrawing a setting that had already reached
+        // the engine. (`apply_config` could not repair it either: it early-outs
+        // on `current_limit != new_limit`, so only a live config EDIT re-armed
+        // it.) Measured: `scrollback_lines = 50` retains 50 lines in a session
+        // that never updated and 450 in one that did.
+        //
+        // Read HERE, while the grids the host configured are still installed —
+        // `scrollback_line_limit()` reads the main grid, which `restore_grid`
+        // is about to replace.
+        let configured_scrollback_limit = self.scrollback_line_limit();
         // The grids are REPLACED below, so every generation stamp the cached
         // search index (and any budgeted-search cursor) was keyed against —
         // `content_gen`, `absolute_row_counter`, `history_renumber_epoch` —
@@ -524,6 +576,13 @@ impl Terminal {
             _ => None,
         };
         self.modes = c.modes;
+        // …and re-imposed HERE, after `modes` is the adopted session's: the
+        // Terminal-level setter targets the PRIMARY-CONTENT grid (`alt_grid`
+        // while the alternate screen is up, `grid` otherwise), and that choice
+        // is only correct once the restored modes are in place. Going through
+        // the setter rather than reaching into a grid keeps "which grid holds
+        // the history" as ONE spelling.
+        self.set_scrollback_line_limit(configured_scrollback_limit);
         self.cursor_save.main = c.saved_cursor_main.map(SavedCursorRepr::into_saved);
         self.cursor_save.alt = c.saved_cursor_alt.map(SavedCursorRepr::into_saved);
         self.charset = c.charset;
@@ -1260,5 +1319,38 @@ mod tests {
             after,
             "the restored grid carries no latent scroll sentinel to double-report"
         );
+    }
+    /// The engine keeps a DECSC slot RAW across a resize, as xterm does, and
+    /// the wire carries it RAW — see `SavedCursorRepr::capture`. Pinned
+    /// together because the 2026-09-22 refusal needed both to be true at once,
+    /// and this fix's first draft clamped the wire, which was measured lossy
+    /// once the grid grew back.
+    #[test]
+    fn a_resize_leaves_the_decsc_slot_raw_and_the_wire_carries_it_raw() {
+        let mut t = Terminal::new(56, 149);
+        t.process(b"\x1b[56;1H\x1b[?1049h");
+        assert_eq!(t.cursor_save.main.map(|saved| saved.cursor.row), Some(55));
+        t.resize(55, 149);
+        assert_eq!(
+            t.cursor_save.main.map(|saved| saved.cursor.row),
+            Some(55),
+            "the slot is absolute and untouched by the resize"
+        );
+        let cp = t.checkpoint_carry(0).expect("Ground");
+        assert_eq!(cp.rows, 55);
+        assert_eq!(
+            cp.saved_cursor_main.map(|saved| saved.cursor_row),
+            Some(55),
+            "the wire carries the slot as the engine holds it, one row past the grid"
+        );
+        // Grown back before the slot is read, the cursor lands where it was
+        // saved — on the live engine and on one restored from that wire alike.
+        let mut restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+        for terminal in [&mut t, &mut restored] {
+            terminal.resize(56, 149);
+            terminal.process(b"\x1b[?1049l");
+        }
+        assert_eq!(t.cursor().row, 55);
+        assert_eq!(restored.cursor(), t.cursor());
     }
 }

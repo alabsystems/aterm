@@ -106,6 +106,17 @@
 //!   round's ceiling, so a bigger landing is wider and longer, never taller
 //!   or fatter. Every classic style's landing ring takes the same grade
 //!   (`cursor_glow::classic_ring_radius_factor`).
+//! * **The shower stops where the hand stopped (2026-09-22)** — measured on
+//!   glass at a real bash prompt: a `^A` that LANDED on the prompt's first
+//!   column threw its sparks six to eight columns INTO the prompt text and
+//!   marched them there over fourteen frames, with the ribbon not moving at
+//!   all underneath. The impact's one TRAVELLING mark now keeps the
+//!   ribbon's own floor law (`spark_room`, `ribbon::Ribbon::hand_floor`): a
+//!   spark whose throw would carry it left of the leftmost column the hand
+//!   has held on that row is thrown the other way instead, at its own
+//!   speed, for its own life. Nothing else of the landing moved — the
+//!   burst's isotropy and reach, the flash's three cells, the pin, the fan
+//!   and every clock are byte for byte what they were.
 //! * **What did not move**: the flight clock (`timing::flight_ms`, §8.1 —
 //!   responsiveness is untouched), frame-0, idle → zero, zero allocation
 //!   per frame, the bed's legibility ceiling, the pin, and the other nine
@@ -2484,6 +2495,12 @@ pub struct Meteors {
     /// the pool is never brisk and its one change is the theme's linear
     /// fade at the end of the life.
     reduced: bool,
+    /// **THE HAND'S FLOOR** (`ribbon::Ribbon::hand_floor`), `(row, col)`,
+    /// refreshed by `Engine::tick` before the frame's events reach this
+    /// pool and read at ONE place: the shower's wall at the mint
+    /// ([`spark_room`]). `None` — no row has seen the hand — bounds
+    /// nothing, exactly as it bounds nothing in the ribbon's reach.
+    hand_floor: Option<(u16, u16)>,
 }
 
 impl Default for Meteors {
@@ -2508,7 +2525,31 @@ impl Meteors {
             verts: Vec::with_capacity(STATIONS_MAX),
             ord: 0,
             reduced: false,
+            hand_floor: None,
         }
+    }
+
+    /// **THE HAND'S FLOOR, HANDED OVER** — `Engine::tick` passes the
+    /// ribbon's own `Ribbon::hand_floor` in before the frame's events are
+    /// dealt, so a landing minted on this frame is bounded by the floor as
+    /// it stands on this frame, the jump's own relocation included (the
+    /// ribbon folds a non-echo `Move` into the floor when it replays it,
+    /// which `Engine::tick` does first). Passing `None` is how a host with
+    /// no ribbon state says "unknown", and an unknown floor bounds nothing.
+    pub fn set_hand_floor(&mut self, floor: Option<(u16, u16)>) {
+        self.hand_floor = floor;
+    }
+
+    /// The floor this pool is holding — what the last
+    /// [`Meteors::set_hand_floor`] handed it. The seam reads it to pin that
+    /// the engine's wiring is live; the shower's own law is measured in
+    /// COLUMNS OF INK, not here (`the_shower_stops_where_the_hand_stopped`).
+    /// `_cell`, not the field's own name, for the reason
+    /// `ribbon::Ribbon::hand_floor_cell` gives: one name for both makes the
+    /// field's doc link ambiguous, and that doc is the law.
+    #[must_use]
+    pub fn hand_floor_cell(&self) -> Option<(u16, u16)> {
+        self.hand_floor
     }
 
     /// Ingest one engine event; mint a meteor if it earns one.
@@ -2588,6 +2629,9 @@ impl Meteors {
         // for the emit and hands it straight back, so nothing allocates and
         // nothing borrows `self` twice.
         let mut verts = mem::take(&mut self.verts);
+        // Copied out before the pools are lent: the floor is a `Copy` pair,
+        // and the mint below needs it while `live` is borrowed.
+        let hand_floor = self.hand_floor;
         let (live, landings, sown) = (&mut self.live, &mut self.landings, &mut self.sown);
 
         for m in live.iter_mut() {
@@ -2618,7 +2662,7 @@ impl Meteors {
                 if !on_glass(ctx.geom, m.x1, m.y1) {
                     continue;
                 }
-                let landing = mint_landing(m, ctx);
+                let landing = mint_landing(m, ctx, hand_floor);
                 // §6.5 layer 11 (restated 2026-09-14): the fan wears the
                 // landing's walk — the band's own colour at each star's
                 // rest column, the pin's stop under the caret — so the
@@ -4569,12 +4613,87 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
     }
 }
 
+/// **THE SHOWER'S ROOM TO THE LEFT** — how far left of the landing a spark
+/// may travel, px, or `None` when nothing bounds it.
+///
+/// **THE LAW, the ribbon's own (`ribbon::Ribbon::hand_floor`):
+/// nothing the hand did not put there goes left of where the hand has been
+/// on that row.** The ribbon keeps it on its REACH; this keeps it on the
+/// impact's one travelling mark. The room is measured from the landing to
+/// the CENTRE of the hand's floor cell — the station a spark may come to
+/// rest on is a cell the hand has held, and a star centred on that cell
+/// spills its arm into the next one exactly as the pin and the flash spill
+/// theirs at the caret.
+///
+/// **MEASURED ON GLASS, 2026-09-22.** Real bash, a 28-column `PS1`, the
+/// prompt on row 6, a caret that had only ever held columns 28..43: typing
+/// `hello there now` and pressing `^A` (`licence=key`, origin `6,42`,
+/// target `6,28`) lit columns 27, 26, 25, 24, 23, 22, 21 and 20 over the
+/// next fourteen frames — six to eight columns INSIDE the prompt text, in
+/// `(159,160,53)`, `(126,127,47)`, `(27,83,34)` — and then retreated. The
+/// ribbon was not moving through any of it (`ribbon_segments=44`,
+/// `ribbon_drawn=638`, constant) while `v2_quads` swung `1260 → 2063 →
+/// 1694` in step with the march. Re-measured in this file's own terms
+/// (`the_shower_stops_where_the_hand_stopped`): of everything the impact
+/// draws, the burst's lances and jets settle two columns left of the
+/// landing and stay there, the flash and the pin take the caret's own cell
+/// and its neighbour, and it is [`draw_sparks`] alone that MARCHES — 26,
+/// 25, 24 … 18, ten columns in, because a spark's station is `vx · age` and
+/// nothing ever bounded `vx`.
+///
+/// **What was tried and rejected.**
+/// * *Bounding every mark of the landing at the floor.* The flash's left
+///   neighbour, the pin's disc and the burst's leftward lances are the mark
+///   OF the cell the hand holds, fixed at one to two columns whatever the
+///   distance — and the burst's isotropy is load-bearing (the starburst
+///   ruling of 2026-09-10 killed two designs over "uniform angular coverage
+///   in SCREEN space"). Clamping those either flattens the star on one side
+///   or, if the whole star is shrunk to fit, deletes it outright at a shell
+///   prompt, where the room is zero by construction.
+/// * *Clamping the station per frame* (`dx.max(-room)` in [`spark_at`]).
+///   That is a wall: the leftward half of the shower slides down it with
+///   its horizontal motion stopped dead mid-flight, which is the pop §19.1
+///   deletes, and it costs the frame path a branch per spark per frame.
+/// * *Squeezing the leftward throws in proportion* (`vx · room / worst`).
+///   It keeps the spread where there IS room, but at the case that matters
+///   — `^A` to the prompt's first column, where the landing cell IS the
+///   floor cell — the room is zero and every leftward spark becomes a
+///   vertical line at the caret. Mirroring keeps each spark's own speed,
+///   life and spread and spends them on the side the hand owns: a shower
+///   thrown at a wall comes back off it.
+/// * *Bounding the FAN's reach here too.* The fan's stars are the sky's,
+///   and the sky already prices them against its glyph clearance (§5.4):
+///   over the prompt's own ink a grain is dropped. Its five fixed slots are
+///   points, not a march, and shrinking `reach` shrinks the fan on BOTH
+///   sides. Left alone deliberately; if the five ever read as wrong there,
+///   the wall belongs on `FanSow`, not on `fan_reach_ch`.
+///
+/// `None` — no floor at all, or a floor on another row — bounds nothing,
+/// the ribbon's rule for an unknown floor. The landing's row is taken from
+/// the pixel ENDPOINT, never from [`Meteor::landing`]: a scroll moves the
+/// endpoint and leaves the cell behind (seam point 12), and a wall read off
+/// the stale cell would bound the wrong row.
+#[must_use]
+fn spark_room(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> Option<f32> {
+    let (row, col) = hand_floor?;
+    let geom = ctx.geom;
+    let ch = (geom.ch as f32).max(1.0);
+    let land_row = ((m.y1 - geom.origin_y as f32) / ch).floor();
+    if !land_row.is_finite() || land_row < 0.0 || land_row != f32::from(row) {
+        return None;
+    }
+    Some((m.x1 - geom.cell_center(row, col).0).max(0.0))
+}
+
 /// Mint the three marks the arrival edge owns (§6.7). ONE `Instant`, spent
 /// once. The fan's composition — **always 1 gold m1 + 4 m2 + the rest m3**
 /// (D6), or D8's 5-7 m3 + one m2 with no hero for an Enter's small landing —
 /// is the sky's class ladder ([`Stardust::sow_fan`]); what is decided HERE is
 /// the count, the reach, the hero flag and the seed.
-fn mint_landing(m: &Meteor, ctx: &Ctx<'_>) -> Landing {
+///
+/// `hand_floor` is the ribbon's own `(row, col)` floor as the frame stands —
+/// the shower's wall, spent once, here ([`spark_room`]).
+fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> Landing {
     let at = m.arrival();
     let ch = ctx.geom.ch as f32;
     // The landing is the train's END — the endpoint a scroll moves with the
@@ -4623,6 +4742,16 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>) -> Landing {
     let mut spark = [Spark::default(); SPARK_N_MAX];
     for (k, sp) in spark.iter_mut().enumerate().take(sparks) {
         *sp = mint_spark(seed, k, ch);
+    }
+    // **THE SHOWER STOPS WHERE THE HAND STOPPED** ([`spark_room`]) — the
+    // throw is bounded at the mint, where it is already hashed, so the frame
+    // path is untouched and no spark ever changes its mind in the air.
+    if let Some(room) = spark_room(m, ctx, hand_floor) {
+        for sp in spark.iter_mut().take(sparks) {
+            if sp.vx < 0.0 && -sp.vx * sp.life > room {
+                sp.vx = -sp.vx;
+            }
+        }
     }
 
     Landing {
@@ -4959,6 +5088,8 @@ fn push_ink_rect(
             h: (band_end - yy) as u16,
             color: premul,
             alpha,
+            color2: premul,
+            alpha2: alpha,
         });
         yy = band_end;
     }
@@ -10825,5 +10956,137 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- the hand's floor, on the impact's one travelling mark --------------
+
+    /// **THE SHOWER STOPS WHERE THE HAND STOPPED** ([`spark_room`]) — the
+    /// ribbon's own law kept on the landing: nothing the hand did not put
+    /// there goes left of where the hand has been on that row.
+    ///
+    /// The 2026-09-22 measurement, in this file's terms. Real bash, a
+    /// 28-column `PS1`, the prompt on row 6, a caret whose only columns were
+    /// 28..43; `hello there now` then `^A` (`licence=key`, origin `6,42`,
+    /// target `6,28`). On glass the ink appeared at column 27 and marched to
+    /// 26, 25, 24, 23, 22, 21 and 20 — six to eight columns inside the
+    /// prompt — and retreated, while `ribbon_segments` and `ribbon_drawn`
+    /// never moved. Reproduced here the same way and attributed: of the four
+    /// marks the impact draws, only [`draw_sparks`] marches (26, 25 … 18 on
+    /// this cell), because a spark's station is `vx · age` and nothing
+    /// bounded `vx`.
+    ///
+    /// **READ AS GLASS READS IT — COLUMNS**, not an internal scalar: the
+    /// quads and halos the shower actually paints, every frame of its life.
+    /// The floor here is column 28, and a star centred on the floor cell
+    /// spills its arm into column 27 exactly as the pin and the flash do at
+    /// the caret, so 27 is the absolute bound this states; the defect put
+    /// ink nine columns further in. The station clause is the same law on
+    /// the spark's own centre: no spark ever STANDS left of the floor cell.
+    ///
+    /// The last two clauses are why this is not a mute: the shower keeps
+    /// every spark it minted and still spreads across the row, and a landing
+    /// with no floor known is bounded by nothing at all.
+    #[test]
+    fn the_shower_stops_where_the_hand_stopped() {
+        let cfg = config();
+        let g = geom();
+        let cw = g.cw as f32;
+        let ch = g.ch as f32;
+        let col_of = |x: f32| (x / cw).floor() as i32;
+
+        // The hand has held columns 28..43 of row 6 and nothing left of 28.
+        let floor = (6_u16, 28_u16);
+        let (from, to) = ((6_u16, 42_u16), (6_u16, 28_u16));
+
+        let run = |bounded: bool| {
+            let t0 = Instant::now();
+            let mut m = Meteors::new();
+            if bounded {
+                m.set_hand_floor(Some(floor));
+            }
+            let ctx = ctx_at(t0, &cfg, to, 0.30);
+            m.on_event(&mv_as(from, to, Licence::Nav), t0, &ctx)
+                .expect("a 14-cell keyed jump must fly");
+            let mut sc = Scratch::default();
+            let mut ink_min = i32::MAX;
+            let mut ink_max = i32::MIN;
+            let mut station_min = i32::MAX;
+            let mut seen = 0_usize;
+            for f in 0..45_u64 {
+                let at = t0 + ms(f * 16);
+                let ctx = ctx_at(at, &cfg, to, 0.30);
+                // The pool advances exactly as it does on glass…
+                sc.emit(&mut m, &ctx);
+                // …and the shower alone is read back off it, so the burst's
+                // rooted lances and the flash's own cell are not mistaken
+                // for the travelling mark (they do not travel).
+                let mut sp = Scratch::default();
+                {
+                    let mut fr = sp.frame();
+                    for l in &m.landings {
+                        draw_sparks(l, &ctx, &mut fr, SPARK_HALO_CAP);
+                    }
+                }
+                for x in sp
+                    .out
+                    .iter()
+                    .map(|q| f32::from(q.x))
+                    .chain(sp.halos.iter().map(|q| f32::from(q.x)))
+                {
+                    seen += 1;
+                    ink_min = ink_min.min(col_of(x));
+                }
+                for q in &sp.out {
+                    ink_max = ink_max.max(col_of(f32::from(q.x) + f32::from(q.w)));
+                }
+                for l in &m.landings {
+                    let age = ms_since(l.pin.at, ctx.now);
+                    for s in l.spark.iter().take(usize::from(l.sparks)) {
+                        if let Some(((dx, _), _)) = spark_at(*s, age, ch) {
+                            station_min = station_min.min(col_of(l.x + dx));
+                        }
+                    }
+                }
+            }
+            (ink_min, ink_max, station_min, seen)
+        };
+
+        let (ink_min, ink_max, station_min, seen) = run(true);
+        assert!(
+            seen > 0,
+            "the shower drew nothing at all — nothing is pinned"
+        );
+
+        // THE LAW, in the terms glass measures it.
+        assert!(
+            ink_min >= 27,
+            "the shower painted column {ink_min}: the hand's floor is column 28 and a star \
+             centred on it spills no further than 27"
+        );
+        // …and on the spark's own station: no spark STANDS in the prompt.
+        assert!(
+            station_min >= 28,
+            "a spark came to rest in column {station_min}, left of the hand's floor (28)"
+        );
+
+        // NOT A MUTE: the shower still crosses the row, into the room the
+        // hand owns. (The landing is column 28; this is four columns of
+        // travel and more.)
+        assert!(
+            ink_max >= 32,
+            "the bounded shower reached only column {ink_max} — it is a wall, not a shower"
+        );
+
+        // AN UNKNOWN FLOOR BOUNDS NOTHING — the ribbon's own rule. Without a
+        // floor the same jump throws its sparks deep to the left, which is
+        // both the defect and the proof that the clamp above is the floor's
+        // doing and not a new ceiling on every landing.
+        let (free_min, _, free_station, free_seen) = run(false);
+        assert_eq!(free_seen, seen, "the wall must not cost the shower a spark");
+        assert!(
+            free_min <= 20 && free_station <= 21,
+            "with no floor the shower reached column {free_min} (stations {free_station}); \
+             it used to reach 18"
+        );
     }
 }

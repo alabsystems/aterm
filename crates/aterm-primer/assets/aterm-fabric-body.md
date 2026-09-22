@@ -17,12 +17,13 @@ become of the message it has already queued.
 ## Is it even on?
 
 ```sh
-aterm ctl @self status        # ... hold=<0|1> fabric=<connected|stalled|disconnected|absent> fabric_rtt_ms=<n|-> fabric_link_age_ms=<n|->
+aterm ctl @self status        # ... hold=<0|1> fabric=<connected|stale|stalled|disconnected|absent> fabric_rtt_ms=<n|-> fabric_link_age_ms=<n|->
 ```
 
 | `fabric=` | what it means | what to do |
 |---|---|---|
 | `connected` | a bridge is attached **and** its last exchange with the broker was acked | use it; `fabric_link_age_ms=` says how old that ack is |
+| `stale` | a bridge is attached and has never said its link is down, but it has owed this instance an answer for three refreshes (6 s) | DERIVED, not reported — no event carries it. A `--wait` post answers `ERR fabric stale id=<n> queued=1` **at once**: queued, do not re-post. The difference from `stalled` is only what to go and fix — a bridge that has said nothing at all against one that has said its link is down |
 | `stalled` | a bridge is attached but its broker link is down (no socket, refused, closed, or no ack within 5 s) | a `--wait` post answers `ERR fabric stalled id=<n> queued=1` **at once** (under `reason=starting` — attached, nothing said yet — it parks instead, and an older bridge lands it all the same): do not re-post, report "queued, the bridge's broker link is down"; the bridge redials on its own |
 | `absent` | no bridge is attached — none was ever launched, **or** the first is still attaching | a `--wait` post answers `queued=1` if a bridge can still attach, `no-bridge=1` if none ever will. Read that token, not this state |
 | `disconnected` | the bridge is gone, and its sessions are HELD | report it; only a reconnecting bridge lifts that hold |
@@ -31,12 +32,15 @@ aterm ctl @self status        # ... hold=<0|1> fabric=<connected|stalled|disconn
 single `absent` on a machine that has `[fabric] command` set is worth one re-read.
 
 **`fabric=` is the bridge's broker LINK, not its process, and there is no heartbeat.** The
-bridge tells the instance about that link on every change and after an ack that moved the
-round trip by more than 2x — never on a timer. So `connected` means the last exchange was
+bridge tells the instance about that link on every change, on an ack more than 2 s after its
+last report, and on an ack that moved the round trip by more than 2x — never on a timer, so
+a link nobody is acking sends nothing at all. So `connected` means the last exchange was
 acked (`fabric_rtt_ms=` is its round trip, `fabric_link_age_ms=` how long ago), `stalled`
 means the bridge itself has said the link is down (a killed broker, a wrong socket path, a
 broker that accepts and never answers — each within one back-off tick of being noticed),
-and a large `fabric_link_age_ms=` on `connected` is a quiet link, not a dead one: only the
+`stale` is the one state no report carries — the instance derives it when the bridge has
+owed it an answer since work was handed over and three refreshes have passed — and a large
+`fabric_link_age_ms=` on `connected` is a quiet link, not a dead one: only the
 next exchange can tell, and it will. `aterm ctl fabric status` adds `reason=` for a
 `stalled` link; `aterm fabric` warns on it and `aterm fabric doctor` names the fix.
 
@@ -104,15 +108,20 @@ aterm ctl @self post to=@<sid> kind=answer re=<n> 'Three failed, all in vt_categ
 
 Kinds: `ask answer task report note ack control`. `ask` and `task` wait for the bridge to
 confirm the record landed (`--wait` is on by default for those two); the rest return at
-once. `to=say` is a public broadcast subject — it does **not** copy the body into every
-session's inbox; a recipient must be subscribed.
+once. `to=say[:<topic>]` is a public broadcast subject — ONE record on the bus, whatever the
+audience. It does **not** copy the body into every session's inbox: a recipient hears it
+only because it asked, with `aterm ctl @self topic add <topic>` (`topic ls` lists them,
+`topic drop <topic>` stops them, `since=@<off>` replays a topic from a bus offset). A
+session that asked for nothing receives nothing — including the sender's own. A delivered
+broadcast is an ordinary `msg` row carrying `topic=<t>`, demotions and all.
 
 Failure tokens that mean opposite things, and are easy to confuse:
 
-- `ERR fabric absent|stalled|disconnected id=<n> queued=1` — the message **is** in the
+- `ERR fabric absent|stale|stalled|disconnected id=<n> queued=1` — the message **is** in the
   outbox and a bridge will publish it. Do **not** re-post: without `key=` there is no
-  idempotency key, so you would duplicate it. `stalled` is answered at once — the bridge
-  has said its broker link is down, so there is no wait to sit out.
+  idempotency key, so you would duplicate it. `stalled` and `stale` are answered at once —
+  the bridge has said its broker link is down, or has owed an answer for three refreshes —
+  so there is no wait to sit out.
 - `… no-bridge=1` — this instance has **no bridge right now**. Not a verdict on the
   message: `aterm ctl fabric attach <command...>` arms a supervisor and the same outbox
   drains (measured 2026-09-12, the post landed the moment a bridge attached). Report it as
@@ -234,10 +243,21 @@ the start of a turn, and again before you stop.** An `ask` or `task` addressed t
 work you were given; unread, it simply sits there while you finish.
 
 - **Claude Code** — `aterm link hook install claude --merge --settings <file>` merges
-  four hooks into that settings file (backup at `<file>.bak-<unix>` first; without
+  FIVE hooks into that settings file (backup at `<file>.bak-<unix>` first; without
   `--merge` it writes a new file and refuses to touch an existing one).
-  `SessionStart`/`UserPromptSubmit` put inbox *metadata* in context, `PreToolUse`
-  blocks tool calls while held, `Stop` keeps the turn alive when unread mail arrives.
+  `SessionStart`/`UserPromptSubmit` put inbox *metadata* in context; `Stop` reports;
+  `PermissionRequest` answers only a guarded `rm`/`rmdir` in bypassPermissions (every other
+  box still shows); `Notification` — for the types that mean the vendor is waiting on a
+  human (`permission_prompt`, an elicitation dialog) — sets `attention` (cleared by the next
+  session start, prompt, stop or guarded allow) and sends a kind=ask to `--report-to`. An
+  installed aterm window's primer pass installs this block into `~/.claude/settings.json`
+  by default. Two more
+  behaviours are OPT-IN and off by default, because a hook that fails blocks the
+  agent and a hook that holds a turn open hides its end from the human watching:
+  `--gate-tools` adds `PreToolUse`, which refuses tool calls while the session is
+  held, and `--keep-alive` makes `Stop` wait on `await inbox` and
+  wake for unread mail. Without `--keep-alive` a `Stop` reports and returns, so
+  nothing wakes a stopped agent for you — drain with `aterm ctl @self inbox`.
   Metadata only: no body ever rides the wake path. **Claude Code loads a hook edit into
   the running session, no restart, and reads a failing hook as a block** — a hook that
   does not run stops the agent the moment it is saved. So the installer executes every
@@ -246,13 +266,18 @@ work you were given; unread, it simply sits there while you finish.
   which prints `ok session=<sid> sock=<path>` (found the way `aterm ctl` finds aterm:
   the rendezvous dir, through `$ATERM_PARENT_SESSION_ID`) or the reason. A hook that
   cannot reach aterm exits 0 and says why on stderr; only a hold and a wake block.
-  `--report-to @<sid>` makes your end-of-turn report structural: before the `Stop` hook
-  waits for mail it posts your LAST message (the last assistant text in the transcript
-  Claude Code hands it) to `<sid>` as `kind=report`, `re=` the newest task in your inbox
-  that is unhandled or newer than your last report (so a task you `inbox seen <id>
-  handled` before you stop is still answered), trimmed to 4 KiB, once per message — you
-  are never told to post it, and a re-fired `Stop` posts nothing twice; the recipient is
-  asked `status` first and the post waited on for its landing. `aterm link hook run stop
+  `--report-to @<sid>` makes your end-of-turn report structural: the `Stop` hook posts
+  what your SCREEN says to `<sid>` as `kind=report` — `status` names the settled
+  screen's `seq=`/`hash=`, `text` hands over its rows, the hook hashes the rows itself
+  and checks them against that stamp, and the body is that stamp line then the rows
+  from your last `⏺` row down to where the live zone begins (or the last six non-blank
+  rows). The stamp rides the body so the manager can hold the report against
+  `history` instead of believing it; ` busy=1` on it means the screen was still mid-turn
+  on every read, so the stamp will NOT match the ledger. `re=` the newest task in your
+  inbox that is unhandled or newer than your last report (so a task you `inbox seen
+  <id> handled` before you stop is still answered), trimmed to 4 KiB, once per SCREEN
+  — you are never told to post it, and a re-fired `Stop` posts nothing twice; the
+  recipient is asked `status` first and the post waited on for its landing. `aterm link hook run stop
   --check` ends `report-to=<sid>` once the recipient answers `status`; the installer
   refuses one that does not exist, and an instance with no bridge and none coming.
   `--accept-from <sid>,...` is who may WAKE you beside every human: name your manager's

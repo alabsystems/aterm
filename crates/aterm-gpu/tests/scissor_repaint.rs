@@ -642,6 +642,8 @@ fn bloom_glow_rides_the_scissor_path_byte_identical() {
             color: premul_rgb(0x0050_FA7B, (120 + c * 10).min(230) as u8),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(0x0050_FA7B, (120 + c * 10).min(230) as u8),
+            alpha2: 0,
         })
         .collect()
     };
@@ -716,6 +718,8 @@ fn input_hot_presents_the_same_halo_as_settle() {
             color: premul_rgb(0x0050_FA7B, (120 + c * 10).min(230) as u8),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(0x0050_FA7B, (120 + c * 10).min(230) as u8),
+            alpha2: 0,
         })
         .collect()
     };
@@ -804,6 +808,8 @@ fn bloom_scissor_dirty_band_stays_proportional() {
                 color: premul_rgb(0x0050_FA7B, 200),
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: premul_rgb(0x0050_FA7B, 200),
+                alpha2: 0,
             })
             .collect()
     };

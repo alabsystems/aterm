@@ -149,6 +149,8 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
             color: premul_rgb(fire, *a),
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: premul_rgb(fire, *a),
+            alpha2: 0,
         });
     }
     // A radial halo (ember) centred over the glow, spanning its row band.
@@ -175,6 +177,8 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
         color: premul_rgb(fire, 150),
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
+        color2: premul_rgb(fire, 150),
+        alpha2: 0,
     });
     input.char_fg.push(CharFg {
         row: 2,

@@ -319,8 +319,10 @@ fn newest_turn(turns: Vec<LedgerTurn>) -> Option<LedgerTurn> {
 /// Decode the control protocol's `%XX` escape (every byte that is not ASCII
 /// graphic, and `%`). TOTAL: a malformed escape passes through verbatim and
 /// invalid UTF-8 decodes lossily. The same rule as `aterm_control::wire::
-/// pct_decode`, which this crate does not depend on.
-pub(super) fn pct_decode(s: &str) -> String {
+/// pct_decode`, which this crate does not depend on. `pub(crate)` since the
+/// harness's grid spine (`harness::observe`) decodes `status` fields with it
+/// rather than carrying a fourth copy.
+pub(crate) fn pct_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

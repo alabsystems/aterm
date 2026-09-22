@@ -904,6 +904,18 @@ pub fn native_update_auto_intent_model() -> Model {
 /// run WEDGES before landing, which is the terminal that never updated. It also
 /// parks without the rule. `ActivityNeverLatchesManualOnly` catches the first;
 /// `ParkedOnlyWhenTheLadderAdmits` catches the second.
+///
+/// Two more mutants from the 2026-09-21 audit of the landed ladder. A park that
+/// MISSED its freeze budget (`ParkMissed`: readers back, nothing granted, the
+/// machine was busy) is a fact about the moment and keeps the lane where it is;
+/// the mutant files it as a physical failure and latches (`ParkMissLatches`,
+/// caught by the same `ActivityNeverLatchesManualOnly`). A GENUINE physical
+/// failure (`PhysicalFailure`) latches for the schedule's spacing while the
+/// clock keeps running underneath, and its `Lapse` resumes the ladder where the
+/// clock is; the mutant restarts the ladder at the lapse
+/// (`LapseRestartsTheLadder`), so one 600 s latch buys a fresh fifteen minutes —
+/// caught by `TheLadderNeverRestarts`, a high-water mark the phase may never
+/// fall below.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_apply_ladder_model() -> Model {
@@ -919,13 +931,20 @@ pub fn native_update_apply_ladder_model() -> Model {
             var focused = 1;
             var manual_only = 0;
             var landed = 0;
+            var latched = 0;
+            var failures = 0;
+            var reached = 0;
             var parked_phase = 0;
             var parked_quiet = 0;
             var parked_keys = 0;
             var parked_output = 0;
             var parked_focused = 0;
+            // The wall clock. Not guarded on the latch: the anchor keeps
+            // counting while a physical-failure latch holds, and `reached` is
+            // the high-water mark the phase may never fall below.
             action Advance when (landed == 0 && manual_only == 0 && phase <= Land - 1) {
                 phase = phase + 1;
+                reached = phase + 1;
             }
             action Busy when (landed == 0 && manual_only == 0) {
                 quiet = 0;
@@ -957,7 +976,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 manual_only = 1;
             }
             action Park when (
-                landed == 0 && manual_only == 0 &&
+                landed == 0 && manual_only == 0 && latched == 0 &&
                 (phase == Land ||
                     (keys == 1 && (phase == 2 ||
                         (phase == 1 && (focused == 0 || output == 1)) ||
@@ -969,6 +988,56 @@ pub fn native_update_apply_ladder_model() -> Model {
                 parked_keys = keys;
                 parked_output = output;
                 parked_focused = focused;
+            }
+            // A PARK THAT MISSED ITS FREEZE BUDGET: the readers are back, nothing
+            // was granted, and the machine was busy. A fact about the moment,
+            // filed with keystrokes and the hold cap — the lane keeps its phase
+            // and its anchor and is gated afresh. Never a latch.
+            action ParkMissed when (
+                landed == 0 && manual_only == 0 && latched == 0 &&
+                (phase == Land ||
+                    (keys == 1 && (phase == 2 ||
+                        (phase == 1 && (focused == 0 || output == 1)) ||
+                        (phase == 0 && quiet == 1))))
+            ) {
+                quiet = 0;
+            }
+            // A GENUINE PHYSICAL FAILURE of an admitted park (a successor that
+            // died, a proof that did not match): the lane latches for the
+            // physical schedule's spacing. Once, to keep the space finite.
+            action PhysicalFailure when (
+                landed == 0 && manual_only == 0 && latched == 0 && failures == 0 &&
+                (phase == Land ||
+                    (keys == 1 && (phase == 2 ||
+                        (phase == 1 && (focused == 0 || output == 1)) ||
+                        (phase == 0 && quiet == 1))))
+            ) {
+                latched = 1;
+                failures = 1;
+            }
+            // The latch lapses: the intent is re-armed and the ladder resumes
+            // where the clock is.
+            action Lapse when (landed == 0 && manual_only == 0 && latched == 1) {
+                latched = 0;
+            }
+            // THE 2026-09-21 MUTANTS. A park miss filed as a physical failure
+            // with a two-attempt lifetime: the lane latches.
+            action ParkMissLatches when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 0 &&
+                (phase == Land ||
+                    (keys == 1 && (phase == 2 ||
+                        (phase == 1 && (focused == 0 || output == 1)) ||
+                        (phase == 0 && quiet == 1))))
+            ) {
+                manual_only = 1;
+            }
+            // And a lapse that clears the anchor: the 600 s latch buys the
+            // artifact a fresh fifteen minutes.
+            action LapseRestartsTheLadder when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && latched == 1
+            ) {
+                latched = 0;
+                phase = 0;
             }
             // The other mutant: a park that ignores the ladder's rule — its own
             // dead action, so the closure can credit it as an independently
@@ -982,6 +1051,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 parked_focused = focused;
             }
             invariant ActivityNeverLatchesManualOnly: manual_only == 0;
+            invariant TheLadderNeverRestarts: reached <= phase;
             invariant ParkedOnlyWhenTheLadderAdmits:
                 if landed == 1 {
                     parked_phase == Land ||

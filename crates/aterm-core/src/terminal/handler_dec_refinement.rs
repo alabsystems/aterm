@@ -106,11 +106,22 @@ impl TerminalHandler<'_> {
         if !self.modes.cursor_visible {
             self.modes.cursor_visible = true;
             // Cursor visibility changes the rendered frame without changing any
-            // cell's content, so mark grid damage (like DECSCNM / a recolor) — else
-            // `damage_epoch` doesn't advance and a bare DECTCEM with no grid write is
-            // swallowed by the frontend's redraw early-out, delaying the cursor's
-            // (dis)appearance until the next grid write.
-            self.grid.damage_mut().mark_full();
+            // cell's content, so mark damage — else `damage_epoch` doesn't advance
+            // and a bare DECTCEM with no grid write is swallowed by the frontend's
+            // redraw early-out, delaying the cursor's (dis)appearance until the
+            // next grid write.
+            //
+            // THE CURSOR CELL, NOT THE GRID (2026-09-21 responsiveness audit).
+            // This used to `mark_full()`, and the cell that changed is one cell.
+            // The cost was not theoretical: every TUI that brackets a repaint in
+            // `?25l` … `?25h` — Claude Code does, ten times a second — handed the
+            // frontend a Damage::Full and took the full-refill arm, so 99% of the
+            // owner's content frames re-extracted the whole viewport (measured:
+            // 8403 of 8431 full refills attributed to `full_damage`). A single
+            // cell bit discharges both obligations the full mark was taken for:
+            // `has_damage()` is true and `damage_epoch` advances, so nothing is
+            // swallowed, and the scoped refill repaints the cursor cell.
+            self.grid.mark_cursor_damage();
         }
     }
 
@@ -125,7 +136,8 @@ impl TerminalHandler<'_> {
     fn hide_cursor(&mut self) {
         if self.modes.cursor_visible {
             self.modes.cursor_visible = false;
-            self.grid.damage_mut().mark_full(); // see `show_cursor`
+            // The cell the cursor is leaving is the cell that must repaint.
+            self.grid.mark_cursor_damage(); // see `show_cursor`
         }
     }
 
@@ -401,8 +413,8 @@ impl TerminalHandler<'_> {
             // The same two obligations DECSCUSR discharges for a shape change:
             // advance damage so a frontend keyed by `damage_epoch` cannot
             // swallow a mode-only change, and tell the host its cursor moved
-            // class.
-            self.grid.damage_mut().mark_full();
+            // class. The cursor cell carries both (see `show_cursor`).
+            self.grid.mark_cursor_damage();
             if let Some(callback) = self.cursor_style_callback {
                 callback(style);
             }

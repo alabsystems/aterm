@@ -723,9 +723,9 @@ pub(crate) fn executing_detail(term: &aterm_core::terminal::Terminal) -> Option<
         .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty());
-    let text = match explicit {
+    let text: String = match explicit {
         // OSC 633;E: the shell said the command line itself.
-        Some(explicit) => explicit.to_string(),
+        Some(explicit) => return command_detail(explicit),
         // The screen scrape reads WHOLE rows, so the command's first row still
         // carries the prompt in front of it (`$ sleep 30`); cut at the column
         // the shell marked the command start (OSC 133;B) — by display column,
@@ -858,12 +858,17 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
     /// screen-scraped line.
     const MAX_CHARS: usize = 48;
 
-    let clean = |word: &str| -> String {
-        word.trim_matches(WORD_TRIM)
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect()
-    };
+    fn clean(word: &str) -> std::borrow::Cow<'_, str> {
+        let word = word.trim_matches(WORD_TRIM);
+        if word.chars().any(char::is_control) {
+            word.chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .into()
+        } else {
+            word.into()
+        }
+    }
     // Which part of the line to read: the FIRST segment whose program slot
     // holds a keyword opener, else the segment that is running. A keyword's
     // `;`s are its own grammar, so the running-segment cut of `for …; do …;
@@ -871,11 +876,14 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
     // `fi`, `esac`, `}`), never a program. The one line whose running segment
     // opens with a closer and has no opener before it is a syntax error the
     // shell never runs, so that shape is left to the cut.
-    let segment = split_list(cmdline)
-        .into_iter()
-        .map(|(_, text)| text)
+    // This runs during every due status observation. Parse once and keep the
+    // segment and ordinary words borrowed through the final privacy filter.
+    let segments = split_list(cmdline);
+    let segment = segments
+        .iter()
+        .map(|(_, text)| *text)
         .find(|text| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&w)))
-        .unwrap_or_else(|| running_segment(cmdline));
+        .unwrap_or_else(|| running_segment(cmdline, &segments));
     let mut words = segment
         .split_whitespace()
         .map(clean)
@@ -895,18 +903,17 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
     // looked at, the wrapper included: a shell that reports `/usr/bin/env
     // FOO=1 codex` names the same wrapper as `env FOO=1 codex`, and comparing
     // the full path would leave the `env` in place as the "program".
-    let basename = |word: &str| -> Option<String> {
+    fn basename(word: &str) -> Option<&str> {
         word.rsplit(['/', '\\'])
             .next()
             .filter(|base| !base.is_empty())
-            .map(str::to_string)
-    };
-    let mut program = basename(&words.next()?)?;
-    if WRAPPERS.contains(&program.as_str()) {
+    }
+    let mut program_word = words.next()?;
+    if WRAPPERS.contains(&basename(&program_word)?) {
         // Unwrap one level: skip the wrapper's own flags (and the value a
         // value-taking flag consumes), then any assignments `env` carries.
         while let Some(next) = words.peek() {
-            if WRAPPER_FLAGS_WITH_VALUE.contains(&next.as_str()) {
+            if WRAPPER_FLAGS_WITH_VALUE.contains(&next.as_ref()) {
                 words.next();
                 words.next();
             } else if next.starts_with('-') || is_assignment(next) {
@@ -915,10 +922,17 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
                 break;
             }
         }
-        program = basename(&words.next()?)?;
+        program_word = words.next()?;
     }
 
-    let mut detail = program.clone();
+    let program = basename(&program_word)?;
+    // Bound before allocating too: truncating an owned long token would keep
+    // its entire command-sized capacity in the published status record.
+    let program_end = program
+        .char_indices()
+        .nth(MAX_CHARS)
+        .map_or(program.len(), |(end, _)| end);
+    let mut detail = program[..program_end].to_string();
     if let Some((_, vocabulary)) = SUBCOMMANDS.iter().find(|(p, _)| *p == program) {
         // The first word after the program that does not start with `-`, and
         // ONLY when the vocabulary owns it; otherwise the program stands
@@ -931,12 +945,15 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
         // never an argument: nothing outside the closed list can follow the
         // program on the wire.
         let sub = words.find(|w| !w.starts_with('-'));
-        if let Some(sub) = sub.filter(|s| vocabulary.contains(&s.as_str())) {
+        if let Some(sub) = sub.filter(|s| vocabulary.contains(&s.as_ref())) {
             detail.push(' ');
             detail.push_str(&sub);
         }
     }
-    Some(detail.chars().take(MAX_CHARS).collect())
+    if let Some((end, _)) = detail.char_indices().nth(MAX_CHARS) {
+        detail.truncate(end);
+    }
+    Some(detail)
 }
 
 /// A list operator between two segments of a command line.
@@ -1016,22 +1033,21 @@ fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
 /// left to right, and a trailing `|| …` is the alternative that runs only on
 /// failure, so it is dropped and the last operand left is the answer. A line
 /// with no list operator (or nothing but blank ones) is its own segment.
-fn running_segment(cmdline: &str) -> &str {
-    let mut groups: Vec<Vec<(ListOp, &str)>> = Vec::new();
-    for (op, text) in split_list(cmdline) {
-        if op == ListOp::Seq || groups.is_empty() {
-            groups.push(Vec::new());
-        }
-        groups
-            .last_mut()
-            .expect("a group was just pushed")
-            .push((op, text));
-    }
-    let mut chain = groups
-        .into_iter()
-        .rev()
-        .find(|group| group.iter().any(|(_, text)| !text.trim().is_empty()))
-        .unwrap_or_default();
+fn running_segment<'a>(cmdline: &'a str, segments: &[(ListOp, &'a str)]) -> &'a str {
+    // The last nonblank operand identifies the last nonblank `;` group. Any
+    // trailing blank operands would be dropped below anyway, so the group's
+    // borrowed slice can end there. No nested group vectors or second parse.
+    let Some(end) = segments
+        .iter()
+        .rposition(|(_, text)| !text.trim().is_empty())
+    else {
+        return cmdline;
+    };
+    let start = segments[..=end]
+        .iter()
+        .rposition(|(op, _)| *op == ListOp::Seq)
+        .unwrap_or(0);
+    let mut chain = &segments[start..=end];
     // `a && b || c`: `c` runs only if `a && b` failed, so it is not the running
     // segment; `a && b` is left, and its last operand is. A blank operand (a
     // trailing `&&`) is dropped the same way.
@@ -1040,7 +1056,7 @@ fn running_segment(cmdline: &str) -> &str {
             .last()
             .is_some_and(|(op, text)| *op == ListOp::Or || text.trim().is_empty())
     {
-        chain.pop();
+        chain = &chain[..chain.len() - 1];
     }
     chain.last().map_or(cmdline, |(_, text)| text)
 }
@@ -2132,6 +2148,19 @@ impl crate::App {
         // contended — the roster's `detail=` is the same value from the same
         // producer, so the two verbs can never disagree about who lives here.
         let detail = term.as_deref().and_then(executing_detail);
+        // THE SETTLED SCREEN'S STAMP, read under the SAME guard as `detail=` so
+        // the two cannot describe different instants. `seq=` is the terminal's
+        // `content_seq` and `hash=` is FNV-1a-64 of the UNTRIMMED visible screen
+        // — byte for byte the pair `turn` returns and `history` keeps for a turn
+        // id, so a report built from this screen can be matched against the
+        // ledger rather than believed (`aterm-link hook --report-to`). A session
+        // whose terminal could not be locked answers `-`/`-`: the poll never
+        // waits on the guard for a field it can say it does not have.
+        let stamp = term.as_deref().map(crate::control::screen_stamp);
+        let (seq, hash) = stamp.map_or_else(
+            || ("-".to_string(), "-".to_string()),
+            |(seq, hash)| (seq.to_string(), format!("{hash:016x}")),
+        );
         drop(term);
         // THE TWO ADDITIVE FIELDS (design §5.2). Additive: `schema=1` does not
         // move. Computed after the terminal guard is released, from the cwd
@@ -2156,7 +2185,7 @@ impl crate::App {
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
-                 identity={identity} {presence}",
+                 identity={identity} {presence} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -2194,7 +2223,7 @@ impl crate::App {
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail} \
-             identity={identity} {presence}",
+             identity={identity} {presence} seq={seq} hash={hash}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -2330,6 +2359,25 @@ mod idle_cost_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// `seq=<n|-> hash=<hex16|->`, last on the record and in that order — the
+    /// pair `aterm-link hook --report-to` reads to stamp a report, and the one
+    /// `history` can be held against.
+    fn assert_stamp_rides_last(record: &str) {
+        let stamp = record
+            .rsplit_once(" seq=")
+            .expect("the record ends with the stamp")
+            .1;
+        let (seq, hash) = stamp.split_once(" hash=").expect("seq= then hash=");
+        assert!(
+            seq == "-" || seq.chars().all(|c| c.is_ascii_digit()),
+            "seq={seq:?} in {record}"
+        );
+        assert!(
+            hash == "-" || (hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit())),
+            "hash={hash:?} in {record}"
+        );
+    }
     use super::*;
 
     const QUIET: Duration = Duration::from_millis(5_000);
@@ -3140,7 +3188,13 @@ mod tests {
             record.contains(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=- identity=- "),
             "{record}"
         );
-        assert!(record.ends_with(" hand=- level=quiet story=0"), "{record}");
+        // Round 22 appended the SCREEN'S STAMP after the round-19 tail, the same
+        // additive way, so the tail is no longer the end of the record.
+        assert!(
+            record.contains(" hand=- level=quiet story=0 seq="),
+            "{record}"
+        );
+        assert_stamp_rides_last(&record);
         assert!(
             record.starts_with("schema=1 "),
             "additive, not a new schema"
@@ -3275,7 +3329,13 @@ mod tests {
             "{record}"
         );
         // Round 19 appended three more (`hand=`, `level=`, `story=`), the same way.
-        assert!(record.ends_with(" hand=- level=quiet story=0"), "{record}");
+        // Round 22 appended the SCREEN'S STAMP after the round-19 tail, the same
+        // additive way, so the tail is no longer the end of the record.
+        assert!(
+            record.contains(" hand=- level=quiet story=0 seq="),
+            "{record}"
+        );
+        assert_stamp_rides_last(&record);
 
         assert!(
             app.session_status_record(9999).is_err(),
@@ -3900,6 +3960,11 @@ mod tests {
             ("nice -n 5 kubectl get pods -n prod", Some("kubectl get")),
             ("docker compose up", Some("docker compose")),
             ("'claude' 'resume'", Some("claude")),
+            // Control removal must apply before wrapper/vocabulary matching,
+            // even though ordinary words are now borrowed without a copy.
+            ("clau\u{7f}de --private", Some("claude")),
+            ("s\u{7f}udo -u user codex", Some("codex")),
+            ("targo te\u{7f}st private", Some("targo test")),
             ("npm run build:prod", Some("npm run")),
             ("pnpm dlx create-foo", Some("pnpm dlx")),
             ("yarn build --token abc", Some("yarn build")),
@@ -3981,9 +4046,68 @@ mod tests {
         }
         // Bounded: a screen-scraped line can be long; the reply cannot.
         let long = format!("{} arg", "p".repeat(200));
-        assert_eq!(command_detail(&long).map(|d| d.chars().count()), Some(48));
+        let detail = command_detail(&long).unwrap();
+        assert_eq!(detail.chars().count(), 48);
+        assert!(
+            detail.capacity() <= 48 * 4,
+            "long input capacity must not be retained"
+        );
+        let wide = format!("{} private", "終".repeat(80));
+        assert_eq!(command_detail(&wide), Some("終".repeat(48)));
         // A program name is never reported with a subcommand it does not own.
         assert_eq!(command_detail("claude commit").as_deref(), Some("claude"));
+    }
+
+    /// The allocation-free selection must keep the old group/pop semantics,
+    /// especially blank groups and trailing OR alternatives. Quoting stays in
+    /// the unchanged splitter and is exercised by the privacy table above.
+    #[test]
+    fn borrowed_running_segment_matches_the_previous_group_selection() {
+        fn previous<'a>(cmdline: &'a str, segments: &[(ListOp, &'a str)]) -> &'a str {
+            let mut groups: Vec<Vec<(ListOp, &str)>> = Vec::new();
+            for &(op, text) in segments {
+                if op == ListOp::Seq || groups.is_empty() {
+                    groups.push(Vec::new());
+                }
+                groups.last_mut().unwrap().push((op, text));
+            }
+            let mut chain = groups
+                .into_iter()
+                .rev()
+                .find(|group| group.iter().any(|(_, text)| !text.trim().is_empty()))
+                .unwrap_or_default();
+            while chain.len() > 1
+                && chain
+                    .last()
+                    .is_some_and(|(op, text)| *op == ListOp::Or || text.trim().is_empty())
+            {
+                chain.pop();
+            }
+            chain.last().map_or(cmdline, |(_, text)| text)
+        }
+
+        let words = ["", " ", "first", "last"];
+        let operators = [";", "\n", "&&", "||"];
+        // Four operands and three operators: all 16,384 combinations include
+        // empty first operands, entirely blank groups and mixed &&/|| tails.
+        for case in 0..4usize.pow(7) {
+            let mut choices = case;
+            let mut cmdline = String::new();
+            for segment in 0..4 {
+                if segment != 0 {
+                    cmdline.push_str(operators[choices % 4]);
+                    choices /= 4;
+                }
+                cmdline.push_str(words[choices % 4]);
+                choices /= 4;
+            }
+            let segments = split_list(&cmdline);
+            assert_eq!(
+                running_segment(&cmdline, &segments),
+                previous(&cmdline, &segments),
+                "{cmdline:?}",
+            );
+        }
     }
 
     /// `executing_detail` is the one producer: a block that is EXECUTING names

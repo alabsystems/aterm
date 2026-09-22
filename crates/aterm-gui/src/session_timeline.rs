@@ -680,7 +680,10 @@ impl SessionTimeline {
     /// filtering made that O([`TIMELINE_CAP`]), seeking makes it
     /// O(log n + matched). A watermark below the retained low-water still yields
     /// everything (`partition_point` returns 0).
-    pub fn since(&self, after: Option<u64>) -> impl DoubleEndedIterator<Item = &TimelineEvent> {
+    pub fn since(
+        &self,
+        after: Option<u64>,
+    ) -> impl DoubleEndedIterator<Item = &TimelineEvent> + ExactSizeIterator {
         let start = match after {
             None => 0,
             Some(a) => self.events.partition_point(|e| e.id <= a),

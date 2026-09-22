@@ -102,6 +102,10 @@ pub mod flow;
 pub mod freespace;
 pub mod gate;
 pub mod gc;
+/// THE ONE HOME of the harness family (`docs/DESIGN-aterm-wrapper-2026-09-17.md`): the
+/// §3.8 row words and the §1.3/§4.4 paths, which were two homes — `state.rs` and
+/// `store.rs` — until 2026-09-22.
+pub mod harness;
 pub mod hooks;
 pub mod install;
 /// The `pkg` protocol's lane: a Developer-ID-signed macOS installer package, its

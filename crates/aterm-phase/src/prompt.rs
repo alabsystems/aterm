@@ -11,6 +11,30 @@
 //! that says `Esc to cancel` is a prompt of kind [`PromptKind::Other`] — the
 //! supervisor hands it to the manager rather than guess.
 //!
+//! **A `│`-LED DESCRIPTION.** Measured 2026-09-21 on Claude Code 2.1.278 in
+//! a live aterm tab ([`fixtures::bash_multi_row_with_note`]): when the
+//! command wraps over several `│` rows, the description row is led by `│`
+//! too (`│ Extract three trees to scratch, format them identically, and diff
+//! for real content changes`), where the earlier build drew it bare under
+//! the bars ([`fixtures::bash_multi_row`], `   Sync the checkout before
+//! verifying`). Both shapes are read: in a Bash block with several `│` rows,
+//! the LAST `│` row is the description when it is the last row of the block
+//! and reads as prose — no shell metacharacter (none of `|;&$(){}<>`), not
+//! led by `-` (a wrapped flag such as `│ -20`), at least three words, and an
+//! uppercase ASCII first letter. A last row that fails any of those is shell
+//! and stays in the command; a bare description row under the bars is the
+//! description as before. See [`reads_as_prose`].
+//!
+//! **NOTE ROWS** ([`Prompt::notes`]): the rows of a Bash box's later blocks —
+//! after the first blank-separated block (the command and its description)
+//! and before `Do you want to proceed?` or the first option row — are notes,
+//! one entry per row with a leading `│` and the surrounding whitespace
+//! stripped: the critical-path warning `│ Dangerous rm operation on
+//! possibly-empty variable path: …` (2.1.278), or the bare ` This command
+//! requires approval` of the earlier build. `Tip:` rows are never notes. An
+//! Edit/Write/Read box's later blocks are its diff or its contents, not
+//! notes, so `notes` is empty there.
+//!
 //! **A BOX IN THE TRANSCRIPT IS NOT A PROMPT** ([`live_cancel_row`]). A
 //! manager's screen shows its workers' boxes: a Monitor event or a tool's
 //! output that prints a worker's screen puts ` Esc to cancel · Tab to amend`
@@ -72,6 +96,10 @@ pub struct Prompt {
     /// The one-line description under the command; the workflow's description;
     /// the surrounding rows for [`PromptKind::Other`].
     pub description: String,
+    /// The note rows of a Bash box (module header, "NOTE ROWS"), one entry
+    /// per row, `│` and surrounding whitespace stripped; empty for every
+    /// other kind.
+    pub notes: Vec<String>,
     /// The numbered options as `(number, text)` — `(1, "Yes")`,
     /// `(2, "Yes, and don't ask again for: git log *")`, `(4, "No")`.
     pub options: Vec<(u8, String)>,
@@ -94,6 +122,7 @@ pub fn parse_prompt(rows: &[String]) -> Option<Prompt> {
             kind: PromptKind::Other,
             command: String::new(),
             description: rows[start..end].join("\n"),
+            notes: Vec::new(),
             options: options_in(&rows[start..esc]),
             has_cancel,
         });
@@ -112,6 +141,7 @@ pub fn parse_prompt(rows: &[String]) -> Option<Prompt> {
             kind,
             command: String::new(),
             description,
+            notes: Vec::new(),
             options,
             has_cancel,
         });
@@ -122,23 +152,30 @@ pub fn parse_prompt(rows: &[String]) -> Option<Prompt> {
         .position(|r| r.trim().starts_with("Do you want to proceed?") || option_row(r).is_some())
         .unwrap_or(body.len());
     // The first blank-separated block after the header, tips dropped, is the
-    // command and its description; later blocks are notes.
+    // command and its description; the rows of the later blocks are notes
+    // (module header, "NOTE ROWS") — read for a Bash box only.
     let mut block: Vec<&str> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut in_first = true;
     for r in &body[..stop] {
         let t = r.trim();
         if t.starts_with("Tip:") {
             continue;
         }
         if t.is_empty() {
-            if block.is_empty() {
-                continue;
+            if !block.is_empty() {
+                in_first = false;
             }
-            break;
+            continue;
         }
-        block.push(t);
+        if in_first {
+            block.push(t);
+        } else if kind == PromptKind::Bash {
+            notes.push(t.strip_prefix('│').map_or(t, str::trim).to_string());
+        }
     }
     let (command, description) = if kind == PromptKind::Bash {
-        let bars: Vec<&str> = block
+        let mut bars: Vec<&str> = block
             .iter()
             .filter_map(|r| r.strip_prefix('│'))
             .map(str::trim)
@@ -148,13 +185,21 @@ pub fn parse_prompt(rows: &[String]) -> Option<Prompt> {
             let desc = block.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
             (cmd, desc)
         } else {
-            let desc = block
+            let mut desc: Vec<&str> = block
                 .iter()
                 .filter(|r| !r.starts_with('│'))
                 .copied()
-                .collect::<Vec<_>>()
-                .join(" ");
-            (bars.join(" "), desc)
+                .collect();
+            // 2.1.278 leads the description of a wrapped command with `│` too
+            // (module header): the last bar row is the description when it
+            // closes the block and reads as prose.
+            if bars.len() >= 2
+                && block.last().is_some_and(|r| r.starts_with('│'))
+                && bars.last().is_some_and(|r| reads_as_prose(r))
+            {
+                desc.push(bars.pop().unwrap_or(""));
+            }
+            (bars.join(" "), desc.join(" "))
         }
     } else {
         (
@@ -166,9 +211,22 @@ pub fn parse_prompt(rows: &[String]) -> Option<Prompt> {
         kind,
         command,
         description,
+        notes,
         options,
         has_cancel,
     })
+}
+
+/// Whether a `│` row under a wrapped command is its description rather than
+/// more of the command (module header, "A `│`-LED DESCRIPTION"): no shell
+/// metacharacter (`|;&$(){}<>`), not led by `-`, at least three words, and an
+/// uppercase ASCII first letter.
+fn reads_as_prose(row: &str) -> bool {
+    const SHELL: &[char] = &['|', ';', '&', '$', '(', ')', '{', '}', '<', '>'];
+    !row.starts_with('-')
+        && !row.contains(SHELL)
+        && row.split_whitespace().count() >= 3
+        && row.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
 /// The inclusive row span of the box (`header..=Esc row`; for an unknown shape,
@@ -366,6 +424,38 @@ pub mod fixtures {
         r
     }
 
+    /// A multi-row Bash box from a workflow on Claude Code 2.1.278 (measured
+    /// 2026-09-21 in a live aterm tab; the command rows are shortened): the
+    /// description row is led by `│` like the command rows, and a `│`-led
+    /// note block (the critical-path removal warning) sits between the block
+    /// and the question. Bypass mode: two options.
+    #[must_use]
+    pub fn bash_multi_row_with_note() -> Vec<String> {
+        let mut r = rows(&[
+            " Bash command · from the \"trust-branch-assessment\" workflow",
+            "",
+            "   │ cd /work/trust-vc && S=/tmp/scratch &&",
+            "   │ grep -h edition <(git show origin/main:Cargo.toml) <(git show origin/main:crates/trust-vc-core/Cargo.toml) <(git show 630604f8:Cargo.toml) 2>/dev/null | sort",
+            "   │ | uniq -c; ED=$(git show origin/main:Cargo.toml | grep -m1 edition | grep -o '20[0-9][0-9]'); ED=${ED:-2021}; echo \"edition=$ED\"; for pair in \"t_mb 630604f8\"",
+            "   │ \"t_sv salvage/overlay-raw-20260721\" \"t_om origin/main\"; do set -- $pair; rm -rf $S/$1; mkdir -p $S/$1; git archive $2 | tar -x -C $S/$1; done; ls $S/t_sv |",
+            "   │ $S/fmt_sv_om.txt; wc -l $S/fmt_sv_om.txt; diff -rq t_mb t_sv | grep -v '^Only' | head; echo \"=== files semantically changed salvage vs MB (post-fmt) ===\"; sed",
+            "   │ 's/^Files \\(.*\\) and .* differ$/\\1/' $S/fmt_mb_sv.txt | sed 's#^t_mb/##'",
+            "   │ Extract three trees to scratch, format them identically, and diff for real content changes",
+            "",
+            " │ Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf $S/$1` (bind $1 and rewrite its $S as \"${S:?}\" or use a literal path)",
+            "",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. No",
+            "",
+            " Esc to cancel · Tab to amend",
+        ]);
+        r.extend(composer(
+            "  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+        ));
+        r
+    }
+
     #[must_use]
     pub fn workflow_box() -> Vec<String> {
         let mut r = rows(&[
@@ -425,14 +515,16 @@ mod tests {
         );
         assert!(p.options[2].1.starts_with("Yes, and switch to auto mode"));
         assert_eq!(p.options[3], (4, "No".to_string()));
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
         assert_eq!(prompt_box_span(&bash_one_row()), Some((2, 13)));
     }
 
-    /// `│`-led rows are ONE command joined with single spaces; the workflow
-    /// suffix on the header, the tip and the note rows are not content; auto
-    /// mode has three options.
+    /// `│`-led rows are ONE command joined with single spaces (the wrapped
+    /// `│ -20` is a flag, not a description); the workflow suffix on the
+    /// header and the tip are not content; the bare note row under the block
+    /// is a note; auto mode has three options.
     #[test]
-    fn a_multi_row_bash_box_joins_the_bars_and_skips_tips_and_notes() {
+    fn a_multi_row_bash_box_joins_the_bars_skips_tips_and_reads_the_note() {
         let p = parse_prompt(&bash_multi_row()).expect("a prompt");
         assert_eq!(p.kind, PromptKind::Bash);
         assert_eq!(
@@ -440,6 +532,7 @@ mod tests {
             "cd ~/ay && git status --short --branch && git pull 2>&1 | tail -20"
         );
         assert_eq!(p.description, "Sync the checkout before verifying");
+        assert_eq!(p.notes, vec!["This command requires approval".to_string()]);
         assert_eq!(
             p.options,
             vec![
@@ -448,6 +541,109 @@ mod tests {
                 (3, "No".to_string()),
             ]
         );
+    }
+
+    /// The 2.1.278 shape (module header): the `│`-led description row is the
+    /// description, not the command's tail; the `│`-led note block is one
+    /// note; bypass mode has two options.
+    #[test]
+    fn a_bar_led_description_and_a_bar_led_note_are_read_as_such() {
+        let p = parse_prompt(&bash_multi_row_with_note()).expect("a prompt");
+        assert_eq!(p.kind, PromptKind::Bash);
+        assert!(
+            p.command
+                .starts_with("cd /work/trust-vc && S="),
+            "{}",
+            p.command
+        );
+        assert!(p.command.ends_with("sed 's#^t_mb/##'"), "{}", p.command);
+        assert!(!p.command.contains("Extract three trees"), "{}", p.command);
+        assert_eq!(
+            p.description,
+            "Extract three trees to scratch, format them identically, and diff for real content changes"
+        );
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+        assert!(
+            p.notes[0].starts_with("Dangerous rm operation on possibly-empty variable path"),
+            "{}",
+            p.notes[0]
+        );
+        assert!(
+            p.notes[0].ends_with("or use a literal path)"),
+            "{}",
+            p.notes[0]
+        );
+        assert_eq!(
+            p.options,
+            vec![(1, "Yes".to_string()), (2, "No".to_string())]
+        );
+        assert!(p.has_cancel);
+        assert_eq!(prompt_box_span(&bash_multi_row_with_note()), Some((0, 16)));
+    }
+
+    /// A last `│` row that looks like shell stays in the command: a pipe, a
+    /// wrapped flag, a lowercase word, two words. A single `│` row is always
+    /// the command.
+    #[test]
+    fn a_last_bar_row_that_reads_as_shell_stays_in_the_command() {
+        let boxed = |last: &str| {
+            let mut r = rows(&[
+                " Bash command",
+                "",
+                "   │ cd ~/ay && git log --oneline",
+                "   │ -5 | sort",
+                &format!("   │ {last}"),
+                "",
+                " Do you want to proceed?",
+                " ❯ 1. Yes",
+                "   2. No",
+                "",
+                " Esc to cancel · Tab to amend",
+            ]);
+            r.extend(composer("  ? for shortcuts"));
+            parse_prompt(&r).expect("a prompt")
+        };
+        for shell in [
+            "| uniq -c",
+            "-20 | tail",
+            "echo Done with it",
+            "Two words",
+            "Three words $HERE",
+            "Ends the (command)",
+        ] {
+            let p = boxed(shell);
+            assert_eq!(
+                p.command,
+                format!("cd ~/ay && git log --oneline -5 | sort {shell}"),
+                "{shell}"
+            );
+            assert_eq!(p.description, "", "{shell}");
+        }
+        let p = boxed("Show the recent commits");
+        assert_eq!(p.command, "cd ~/ay && git log --oneline -5 | sort");
+        assert_eq!(p.description, "Show the recent commits");
+
+        assert!(reads_as_prose("Extract three trees to scratch"));
+        assert!(!reads_as_prose("-20"));
+        assert!(!reads_as_prose("extract three trees"));
+        assert!(!reads_as_prose("Extract trees"));
+        assert!(!reads_as_prose("Extract $S trees now"));
+
+        let mut one = rows(&[
+            " Bash command",
+            "",
+            "   │ Make the thing now",
+            "",
+            " Do you want to proceed?",
+            " ❯ 1. Yes",
+            "   2. No",
+            "",
+            " Esc to cancel · Tab to amend",
+        ]);
+        one.extend(composer("  ? for shortcuts"));
+        let p = parse_prompt(&one).expect("a prompt");
+        assert_eq!(p.command, "Make the thing now");
+        assert_eq!(p.description, "");
     }
 
     #[test]
@@ -469,6 +665,7 @@ mod tests {
         let p = parse_prompt(&edit_box()).expect("a prompt");
         assert_eq!(p.kind, PromptKind::Edit);
         assert_eq!(p.command, "crates/ay-test-support/src/lib.rs");
+        assert!(p.notes.is_empty(), "a diff is not a note: {:?}", p.notes);
         assert_eq!(p.options.len(), 3);
     }
 

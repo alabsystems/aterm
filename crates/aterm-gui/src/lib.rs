@@ -404,6 +404,10 @@ mod packages_screen;
 mod pane;
 mod platform;
 mod settings_preview;
+/// THE AUDIBILITY ORACLE: one table that decides whether a keypress makes a
+/// sound, and names the gate when it does not. The `tone` verb's `seam=`
+/// field and the key path's own push decision are both projections of it.
+mod sound_seam;
 /// Tone-of-typing tracker (typed-provenance seam → `aterm_effects::tone`
 /// classifier → the cached [`Tone`] the trail sound events carry).
 mod tone_infer;
@@ -3464,7 +3468,9 @@ enum PhysicalPressOwner {
 /// M1 smooth scroll: an in-flight wheel glide bound to the exact engine it
 /// drives. The `Arc` pin means a pane/tab switch (or even a close) mid-glide
 /// cannot redirect the eased tail onto a different session; the engine stays
-/// alive for the remaining ≤ [`scroll_motion::GLIDE_MS`] ms.
+/// alive for the remaining ease — ≤ [`scroll_motion::GLIDE_MS`] for a notch
+/// glide, ≤ `TRACK_REST_MS + TRACK_SETTLE_MS` after the last delta of a
+/// tracked (trackpad) one.
 struct ScrollGlideState {
     /// The eased position curve (absolute viewport-offset px).
     glide: scroll_motion::Glide,
@@ -3473,6 +3479,55 @@ struct ScrollGlideState {
     /// Cell height (px) at arm time — the decomposition unit for this glide
     /// (`rows = decompose(px, cell_h).0`; a mid-glide font zoom re-arms).
     cell_h: i64,
+    /// The engine row (`display_offset`) this glide LAST SET: the row the
+    /// seam's facts reported at arm time, then the ceil offset of every apply
+    /// (`App::apply_scroll_glide_sample`). Two jobs. (1) An apply whose pairing
+    /// lands on this same row takes NO terminal lock — a trackpad's 120 Hz
+    /// sub-row deltas inside one row cost the engine nothing (the tick used to
+    /// lock every frame). (2) An engine row that is NOT this one is MACHINE
+    /// motion — SCR-1's re-pin after an output batch (`prev_offset +
+    /// lines_added`, `Grid` scroll.rs) — and the glide's frame shifts by it
+    /// (`Glide::shift`) instead of scrolling the reader's content back toward
+    /// live on every wake, which a flooding session made visible as jumps.
+    engine_row: i64,
+    /// `Grid::scrollback_lines()` as the seam (or the gesture-start probe) last
+    /// reported it — the clamp bound a chained PRECISE delta of this engine
+    /// reuses, so a sub-row delta inside one row takes NO engine lock (the
+    /// census in `a_sub_row_precise_delta_moves_the_band_before_a_whole_row_banks`).
+    /// Refreshed by every seam-fed call (each banked whole row), so it is at
+    /// most one row stale; the engine's live clamp stays authoritative in
+    /// `apply_scroll_glide_sample` (`landed`).
+    max_rows: i64,
+    /// The glide's next frame-paced tick — an ANCHOR, not a re-derivation
+    /// (2026-09-22, "scrolling has become blocky in a large Codex session").
+    /// Set at arm time one panel period out (a parked tracked band: at its
+    /// rest-settle start), and advanced ONLY by `App::apply_scroll_glide_sample`,
+    /// phase-locked to the slot that fired. A park re-reads it and never
+    /// re-derives it.
+    ///
+    /// It used to be `Instant::now() + frame_interval`, computed afresh in
+    /// `about_to_wait` on EVERY park, and `new_events` ticked the glide only on
+    /// a `ResumeTimeReached` wake — which winit grants iff the loop woke at or
+    /// after the instant it armed. Every wake that landed BEFORE that instant
+    /// (the trackpad's next `PixelDelta` at up to 120/s, a PTY burst of the
+    /// program being scrolled through, a control request) was `WaitCancelled`,
+    /// and the park after it armed a FRESH `now + interval`. With wakes closer
+    /// together than one period plus a redraw, the tick never came due: the
+    /// glide sat frozen until its 180 ms end and landed in one jump — the
+    /// whole-gesture steps the owner saw. Even alone, `now` was sampled after
+    /// the redraw, so the cadence was `interval + redraw cost`, beating against
+    /// vsync. The anchor is judged on EVERY wake (`App::service_due_scroll_motion`).
+    next_tick: Instant,
+}
+
+impl ScrollGlideState {
+    /// The one wake this glide owes `about_to_wait`: its anchored next tick,
+    /// capped at the ease's end (the last wake it ever needs). Stored state
+    /// only — nothing here reads the clock, so a park cannot move it.
+    #[must_use]
+    fn wake_deadline(&self) -> Instant {
+        self.glide.end().min(self.next_tick)
+    }
 }
 
 /// One `fx` control-socket operation ([`Wake::FxControl`] payload): the read
@@ -7410,7 +7465,11 @@ pub struct SessionCtx {
     /// event loop (`status`'s `hold=`) with no store lock on any hot path. A LEAF
     /// lock with one sanctioned nesting, fabric -> [`Self::timeline`], never
     /// reversed. Empty and free for a session nobody ever messages.
-    pub(crate) fabric: crate::fabric::SessionFabric,
+    /// The session's fabric state. An `Arc` because the `subscribe … mail`
+    /// push loop holds one per watched target, the same narrow clone-then-
+    /// release handle it holds for the terminal, the turn ledger and the
+    /// timeline — never the whole `SessionCtx`.
+    pub(crate) fabric: std::sync::Arc<crate::fabric::SessionFabric>,
 }
 
 struct Session {
@@ -9456,14 +9515,16 @@ struct WindowState {
     /// Only ever drained toward a `WheelDir::Left`/`Right` report.
     scroll_residual_x: f64,
     /// Set by `on_mouse_wheel` for exactly the duration of the seam call it
-    /// makes: whether the wheel event being routed was a PRECISE (`PixelDelta`,
-    /// trackpad / Magic Mouse) delta rather than a notch. Read by the glide
-    /// arm to choose how a chained delta joins an in-flight ease — a notch
-    /// RETARGETS (the M1 180 ms brief, written for notch wheels), a precise
-    /// delta EXTENDS without pushing the deadline out (`Glide::extend_target`).
+    /// makes: the SIGNED VERTICAL PIXEL delta (+ = into history) of the wheel
+    /// event being routed when it is a PRECISE (`PixelDelta`, trackpad / Magic
+    /// Mouse) delta; `None` for a notch. Read by the glide arm to choose how
+    /// the delta moves the local band — a notch RETARGETS the M1 180 ms ease,
+    /// a precise delta TRACKS 1:1 with no ease (`Glide::track`, 2026-09-22),
+    /// its sub-row remainder riding the glide rather than the seam's bytes.
     /// Cleared again before the handler returns, so a controller wheel (which
-    /// never passes through the handler) always reads a notch.
-    wheel_precise: bool,
+    /// never passes through the handler) always reads a notch — the `mouse`
+    /// verb's grammar has no pixel field and its bytes are untouched.
+    wheel_precise_px: Option<f64>,
     /// Whether the OS cursor is currently the link "pointer" (Cmd-hovering a link),
     /// so `set_cursor` is only called on a state change, not every mouse move.
     hover_pointer: bool,
@@ -10407,6 +10468,12 @@ struct WindowState {
     /// next present). See the arming site in `App::input` for why a deadline, rather
     /// than the first content present, is the honest correlation.
     input_hot_until: Option<std::time::Instant>,
+    /// The registration instant of this window's last present that registered
+    /// a compositor presented handler (`aterm_gpu::present_glass`), of ANY kind,
+    /// on the registration clock (`CACurrentMediaTime`, nanoseconds) — the
+    /// instant the next present's "within one refresh" tag is decided against.
+    /// `None` before the first, and always on a path that registers no handler.
+    last_registration_ns: Option<u64>,
     /// When a human last pressed a key in this window. Distinct from
     /// `input_hot_until` (a short present-pacing deadline): this is the plain
     /// stamp the session classifier needs to tell live typing from ambient
@@ -10485,21 +10552,6 @@ struct WindowState {
     /// between the old probe/extract locks from pairing A effects with B cells,
     /// without adding a steady-state allocation.
     composed_focus_scratch: RenderInput,
-    /// THE CAPTURE'S CONSOLE FACTS, read under the SAME terminal lock as the
-    /// cells the capture just extracted, and consumed by the decoration pass
-    /// that ticks the resident pet.
-    ///
-    /// Without it the capture path ticked the pet brain having never called
-    /// `observe_console`, so every console-layer verdict — the resident, its
-    /// attention, its perch, the clear-space veto on its body — was computed
-    /// against a world the capture had never looked at (a stale one on a
-    /// windowed instance, and NO world at all on a headless one, where the
-    /// capture is the only thing that ticks the brain). That is why `image`,
-    /// `window` and `trail status` were structurally blind to this entire
-    /// layer, and why no automated check could ever see a defect in it.
-    /// `None` when the resident pet does not own the trail — the off path
-    /// must not build console perception.
-    pub(crate) capture_pet_world: Option<aterm_effects::pet_world::PetWorldFacts>,
     /// One PERSISTENT snapshot buffer per UNFOCUSED visible pane, keyed by its
     /// pane index in the frame's canonical order. A session may have multiple
     /// visible views, so session identity alone cannot own a snapshot. The
@@ -12217,7 +12269,7 @@ impl WindowState {
             last_mouse_px_off: crate::input::PixelOffset::CELL_ORIGIN,
             scroll_residual: 0.0,
             scroll_residual_x: 0.0,
-            wheel_precise: false,
+            wheel_precise_px: None,
             hover_pointer: false,
             native_text_cursor: false,
             link_hover: None,
@@ -12370,6 +12422,7 @@ impl WindowState {
             bootstrap_present_retry_available: true,
             input_hot: false,
             input_hot_until: None,
+            last_registration_ns: None,
             last_key_at: None,
             pending_input: crate::metrics::PendingInputStamp::default(),
             frame_interval: None,
@@ -12384,7 +12437,6 @@ impl WindowState {
             pred_row_scratch: Vec::new(),
             pane_scratch: RenderInput::empty(),
             composed_focus_scratch: RenderInput::empty(),
-            capture_pet_world: None,
             unfocused_pane_scratch: std::collections::BTreeMap::new(),
             composed_pane_stage_meta: Vec::new(),
             composed_retain: crate::app_render::ComposedRetain::default(),
@@ -12525,12 +12577,15 @@ struct AutoApplyIntent {
 /// (`native_update_auto_intent::apply_phase` turns the age into the phase).
 ///
 /// Kept beside the intent rather than inside it because the intent does not
-/// live as long as the ladder: an attempt consumes the intent, and an
-/// activity-revoked completion re-arms a fresh one. Anchored here, a busy
-/// terminal can only DELAY the landing inside the bound — never restart the
-/// clock. Replaced when a different build arms; cleared when a physical-failure
-/// latch lapses, so the retry after a genuine failure prefers a quiet moment
-/// again rather than landing on the first poll.
+/// live as long as the ladder: an attempt consumes the intent, an
+/// activity-revoked completion re-arms a fresh one, and a physical-failure
+/// latch drops it and re-arms it again when the latch lapses. Anchored here, a
+/// busy terminal or an unlucky handoff can only DELAY the landing — never
+/// restart the clock: the bound is per artifact and counts from the FIRST
+/// arming. Replaced only when a different build arms. (Until 2026-09-21 a
+/// lapsing latch cleared it "so the retry prefers a quiet moment again", which
+/// on a never-quiet terminal turned one transient dial timeout into a 600 s
+/// latch plus a fresh fifteen-minute ladder.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AutoApplyLadder {
     build: u64,
@@ -13500,7 +13555,8 @@ struct HandoffPrelaunch {
     park_retry_at: Option<Instant>,
     /// How many times this attempt's park has missed its freeze budget. Each
     /// miss re-parks on the ladder's next rung without giving the booted
-    /// successor back; past `PRELAUNCH_MAX_PARK_MISSES` it stands down.
+    /// successor back; past `PRELAUNCH_MAX_PARK_MISSES` it stands down as a
+    /// busy-machine fact (`ActivityRevoked`), never as a physical failure.
     park_misses: u8,
     /// Set once this thread told the worker to stand down; the completion is
     /// then the only thing left to wait for.
@@ -14984,6 +15040,9 @@ struct App {
     /// (turning off aurora/comet/sparkle/scene/stream-fade AND re-engaging the content
     /// early-out) and the GPU bloom pass is gated off. Debounced by [`Self::perf_run`]
     /// over `PERF_HYSTERESIS_FRAMES` frames each way; toggled on the EDGE only.
+    /// FUNCTIONAL motion — the wheel glide and the scroll pill — is exempt
+    /// ([`App::effect_policy`]): the latch sheds decoration, never the
+    /// terminal's response to the user's own scrolling.
     perf_reduced: bool,
     /// Time of the most recent [`Self::perf_reduced`] flip (either direction):
     /// the anchor for the anti-flap dwell gate and the soft shed envelope in
@@ -20728,6 +20787,17 @@ impl ApplicationHandler<Wake> for App {
                 window.request_redraw();
             }
         }
+        // M1 glide / M1b bounce: their anchored ticks are LEVELS judged on EVERY
+        // wake, like the cursor-effects clock above. A `WaitCancelled` turn (the
+        // trackpad's next delta, a PTY burst) that lands after the slot must
+        // consume it HERE: left in place, `about_to_wait` would arm a past
+        // instant — winit fires it as an extra empty turn, and `record_deadline`
+        // books a past arm that at ≥29/32 clamps this owner to a 60 Hz frame —
+        // and under the old `ResumeTimeReached`-only tick the slot was simply
+        // never served while such wakes kept coming (`ScrollGlideState::next_tick`).
+        // Each tick locks the glide's own engine, so this runs after the
+        // lock-free judges above and before the borrow loop below.
+        self.service_due_scroll_motion(Instant::now());
         // A `WaitUntil` deadline fired: a bell-flash end and/or a blink tick. On a
         // single `ResumeTimeReached` wake, several windows' deadlines may have
         // passed at once, so service EVERY window (not just the frontmost).
@@ -20736,14 +20806,14 @@ impl ApplicationHandler<Wake> for App {
             let mut to_redraw: Vec<WindowId> = Vec::new();
             let mut autoscroll_due: Vec<WindowId> = Vec::new();
             let mut resize_due: Vec<WindowId> = Vec::new();
-            let mut glide_due: Vec<WindowId> = Vec::new();
-            let mut overscroll_due: Vec<WindowId> = Vec::new();
             let mut native_preview_due: Vec<WindowId> = Vec::new();
             let native_recording_window = self.video_rec.as_ref().map(|rec| rec.window);
             // M1: whether the scroll-pill fade ramp animates (focused term folded
-            // per window below) — mirrors `about_to_wait`'s arming exactly.
+            // per window below) — mirrors `about_to_wait`'s arming exactly. The
+            // pill is functional motion: `effect_policy` keeps the load-shed
+            // latch out of it, like the glide it accompanies.
             let pill_fade_full = self
-                .motion_policy(true)
+                .effect_policy(crate::motion::MotionEffect::ScrollPill, true)
                 .animate(crate::motion::MotionEffect::ScrollPill);
             // The config-warning banner is GLOBAL (App-level), not per-window: expire it
             // HERE, before the `&mut self.windows` loop, then (after the loop) redraw every
@@ -20923,18 +20993,9 @@ impl ApplicationHandler<Wake> for App {
                 if ws.kitty_tenure.poll(now) {
                     dirty = true;
                 }
-                // M1 smooth-scroll glide in flight: queue this window — the tick
-                // locks the glide's own engine (scroll + repaint), so it is
-                // serviced AFTER the borrow loop, like the autoscroll ticks.
-                if ws.scroll_glide.is_some() {
-                    glide_due.push(*id);
-                }
-                // M1b elastic-overscroll bounce in flight: queue this window — the
-                // tick advances the spring's signed sub-cell displacement (display
-                // only; no engine lock) and disarms once it settles.
-                if ws.overscroll.is_some() {
-                    overscroll_due.push(*id);
-                }
+                // M1 smooth-scroll glide / M1b bounce: serviced on EVERY wake by
+                // `service_due_scroll_motion` above (their anchored ticks are
+                // levels, not timer edges), so nothing to queue here.
                 // M1 scroll pill: while it shows (or showed last frame), repaint on
                 // its wakes so the fade advances — and the frame after the alpha
                 // hits 0 ERASES the last painted pill (`pill_shown`, the
@@ -21031,16 +21092,6 @@ impl ApplicationHandler<Wake> for App {
             }
             for id in resize_due {
                 self.flush_pending_resize(id);
-            }
-            // M1: advance every in-flight smooth-scroll glide one eased step (each
-            // locks its own pinned engine; drops itself once the sample lands).
-            for id in glide_due {
-                self.tick_scroll_glide(id, now);
-            }
-            // M1b: advance every in-flight elastic-overscroll bounce one decay step
-            // (display-only; drops itself once the spring settles below ε).
-            for id in overscroll_due {
-                self.tick_overscroll(id, now);
             }
         }
     }
@@ -21387,11 +21438,21 @@ impl ApplicationHandler<Wake> for App {
         // steady/unfocused/hidden/headless sessions).
         //
         // Reconcile retained scroll state before folding any deadline. This is
-        // the scheduler's defensive edge for every policy source (including
-        // adaptive shedding): Reduced motion lands the pinned target and drops
-        // the glide/residual here, so the loop can never arm a Reduced-policy
-        // ScrollGlide deadline.
+        // the scheduler's defensive edge for every SmoothScroll policy source
+        // (config `motion`, OS Reduce Motion, focus — NOT the load-shed latch,
+        // which `App::effect_policy` keeps out of functional motion): Reduced
+        // motion lands the pinned target and drops the glide/residual here, so
+        // the loop can never arm a Reduced-policy ScrollGlide deadline.
         self.settle_reduced_scroll_motion(Instant::now());
+        // An anchored glide/bounce tick that came due while this turn's redraw
+        // ran (a dense frame outlasting the panel slot): tick it HERE, before the
+        // fold, so the fold never arms an instant already behind `now`.
+        // `record_deadline` books such an arm as `past_deadline_arms`, and past
+        // 90% of an owner's last 32 arms clamps the re-arm to a 60 Hz frame
+        // (`PAST_ARM_STREAK_CLAMP`) — the sliding law never armed the past, and
+        // the anchored one must not start. The tick re-phases `next_tick`
+        // strictly ahead of `now` (`phase_locked_effect_deadline`).
+        self.service_due_scroll_motion(Instant::now());
         let mut deadline: Option<Instant> = None;
         let mut deadline_owner = metrics::DeadlineOwner::None;
         if let Some(candidate) = self.boot_health_confirmation_retry_at {
@@ -21454,8 +21515,9 @@ impl ApplicationHandler<Wake> for App {
         // M1: whether the scroll-pill fade RAMP may animate for a FOCUSED window
         // (per-window focus is folded in below — `resolve`'s focus term — so an
         // unfocused window's pill hides binary, exactly like its render path).
+        // Functional motion: resolved WITHOUT the load-shed latch, like the glide.
         let pill_fade_full = self
-            .motion_policy(true)
+            .effect_policy(crate::motion::MotionEffect::ScrollPill, true)
             .animate(crate::motion::MotionEffect::ScrollPill);
         // PHOSPHOR rain cadence: the configured tick interval (1000/fps ms),
         // floored below by the per-window frame interval + AURORA cap. Read
@@ -21882,11 +21944,17 @@ impl ApplicationHandler<Wake> for App {
             // state once the sample lands → disarmed (0% idle). The prepass above
             // has already landed/dropped every Reduced-policy glide, including a
             // focus-loss transition, so no accessibility-disabled tail is armed.
+            //
+            // The deadline is the glide's STORED anchor, never `now + interval`:
+            // this arm runs on every park, and a `WaitCancelled` turn (the next
+            // trackpad delta, a PTY burst) that re-derived the tick from `now`
+            // pushed it out again and again — the tick starved for the whole
+            // ease (see `ScrollGlideState::next_tick`). A tracked (trackpad)
+            // glide PARKED at the finger's position holds a constant frame until
+            // its rest-settle begins, so its anchor IS that boundary: ONE wake
+            // there (the pill's hold-boundary discipline), then frame-paced.
             if let Some(st) = &ws.scroll_glide {
-                let d = st
-                    .glide
-                    .end()
-                    .min(Instant::now() + ws.frame_interval.unwrap_or(frame_interval));
+                let d = st.wake_deadline();
                 fold_owned_deadline(
                     &mut deadline,
                     &mut deadline_owner,
@@ -21898,9 +21966,8 @@ impl ApplicationHandler<Wake> for App {
             // capped at its settle bound; `new_events` ticks it and DROPS it once the
             // displacement decays below ε → disarmed (0% idle), like the glide.
             if let Some(sp) = &ws.overscroll {
-                let d = sp
-                    .end()
-                    .min(Instant::now() + ws.frame_interval.unwrap_or(frame_interval));
+                // The same stored anchor as the glide's (`OverscrollSpring::next_tick`).
+                let d = sp.wake_deadline();
                 fold_owned_deadline(
                     &mut deadline,
                     &mut deadline_owner,
@@ -24777,7 +24844,11 @@ impl ApplicationHandler<Wake> for App {
                 // app exits only when that was the last window), exactly like Cmd-W.
                 self.escalate_pending_close(el);
             }
-            WindowEvent::MouseWheel { delta, .. } => self.on_mouse_wheel(wid, delta),
+            // The PHASE rides along: a trackpad's `Ended` is the gesture end
+            // that starts the tracked band's rest-settle at once.
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                self.on_mouse_wheel_phased(wid, delta, phase);
+            }
             // A file/image dragged from Finder / a file manager / a browser and
             // dropped onto the window. winit delivers ONE `DroppedFile` per file
             // (no position, no batch boundary), so — exactly like iTerm2 — each
@@ -27265,6 +27336,36 @@ fn launch_pass_park(
     launch_pass_park_from(Some(age), interval)
 }
 
+/// The park a launch takes before its FIRST update pass: [`launch_pass_park`],
+/// except that the first launch of a NEW APP BUILD owes its pass now
+/// (2026-09-22). `just_updated` is [`JUST_UPDATED`] — this process is an update
+/// apply's successor on a different build, the fact every update lane stamps
+/// (`ATERM_UPDATED_FROM`). The record-keyed park exists so a handoff does not
+/// restart the six-hour cadence (a successor re-did ~14 s of lock work on a store
+/// its predecessor had just checked); but a successor's predecessor last passed on
+/// the OLD build, possibly hours ago, so a pin published since then — a new
+/// managed Claude Code or Codex — would wait out the rest of that interval behind
+/// the very update that shipped to bring it. The cost is one full pass per
+/// successor even when nothing moved (an index fetch and ~14 s under the store
+/// lock, measured 2026-09-18) — and it IS paid behind a predecessor's pass still in
+/// flight: the launch seed is the child that queues behind it, so the update child
+/// that follows finds the lock free and never reaches `atpkg`'s
+/// `pass_finished_while_we_waited`. Kept on purpose: that pass also rewrites the
+/// shell hook with THIS build's atpkg, which an old-build orphan's pass would not.
+/// Detected through the update lanes' `ATERM_UPDATED_FROM` stamp only, so a first
+/// launch after a manual install still parks on the record.
+fn launch_update_park(
+    just_updated: bool,
+    layout: Option<&atpkg::store::Layout>,
+    interval: u64,
+    now_unix: u64,
+) -> Option<Duration> {
+    if just_updated {
+        return None;
+    }
+    launch_pass_park(layout, interval, now_unix)
+}
+
 #[cfg(test)]
 mod launch_pass_park_tests {
     use super::*;
@@ -27278,7 +27379,8 @@ mod launch_pass_park_tests {
         assert_eq!(
             launch_pass_park_from(Some(20), six_hours),
             Some(Duration::from_secs(six_hours - 20)),
-            "a successor seconds after its predecessor's pass owes nothing"
+            "a relaunch seconds after the last pass owes nothing (an update's successor is \
+             `launch_update_park`'s case)"
         );
         assert_eq!(
             launch_pass_park_from(Some(six_hours - 1), six_hours),
@@ -27347,6 +27449,36 @@ mod launch_pass_park_tests {
         )
         .unwrap();
         assert_eq!(launch_pass_park(Some(&layout), 100, 1_700_000_060), None);
+    }
+
+    /// The first launch of a new app build runs its update pass NOW, over a record
+    /// fresh enough to park any other launch — the negative control is the same
+    /// record parking the launch that is not an update's successor.
+    #[test]
+    fn an_update_successor_runs_its_pass_now_whatever_the_record_says() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let layout = atpkg::store::Layout {
+            prefix: dir.path().join("pkg"),
+        };
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        std::fs::write(
+            layout.status(),
+            "schema = 1\nupdated_at = \"2023-11-14T22:13:20Z\"\nenabled = true\n\
+             last_success_at = \"2023-11-14T22:13:20Z\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            launch_update_park(false, Some(&layout), 100, 1_700_000_030),
+            Some(Duration::from_secs(70)),
+            "an ordinary launch parks for the remainder of the interval"
+        );
+        assert_eq!(
+            launch_update_park(true, Some(&layout), 100, 1_700_000_030),
+            None,
+            "an update's successor updates at once: its predecessor passed on the old build"
+        );
+        assert_eq!(launch_update_park(true, None, 100, 1_700_000_030), None);
+        assert_eq!(launch_update_park(false, None, 100, 1_700_000_030), None);
     }
 }
 
@@ -27472,12 +27604,22 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // checked, or checked longer ago than the interval, updates at once
             // as before; the once-pass knob (`interval == 0`) always runs; a seed
             // still owed (it stood aside at the lock) runs ahead of the update
-            // regardless.
+            // regardless. The FIRST LAUNCH OF A NEW APP BUILD updates at once
+            // (2026-09-22, [`launch_update_park`]): its predecessor's record is the
+            // old build's, and the pins published since are what it must fetch.
+            let just_updated = JUST_UPDATED.get().copied().unwrap_or(false);
+            if just_updated {
+                aterm_log::info!(
+                    "atpkg launch update runs now: this is the first launch of a new app \
+                     build, so the managed programs move to the published pins at once"
+                );
+            }
             let mut bump_watch = BumpWatch::default();
             let mut failure_backoff = Backoff::FAILURE;
             if !seed_pending
                 && !lane.seed_announced_work
-                && let Some(park) = launch_pass_park(layout.as_ref(), interval, pkg_unix_now())
+                && let Some(park) =
+                    launch_update_park(just_updated, layout.as_ref(), interval, pkg_unix_now())
             {
                 aterm_log::info!(
                     "atpkg launch update skipped: the store's last successful pass is younger \
@@ -27545,8 +27687,12 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                             seed_pending = false;
                             lane.seed_announced_work = run.seen.saw_start;
                             if !lane.seed_announced_work
-                                && let Some(park) =
-                                    launch_pass_park(layout.as_ref(), interval, pkg_unix_now())
+                                && let Some(park) = launch_update_park(
+                                    just_updated,
+                                    layout.as_ref(),
+                                    interval,
+                                    pkg_unix_now(),
+                                )
                             {
                                 aterm_log::info!(
                                     "atpkg launch update skipped after the retried seed: the \
@@ -32427,7 +32573,7 @@ fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
-        fabric: crate::fabric::SessionFabric::default(),
+        fabric: std::sync::Arc::default(),
     });
     Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),
@@ -36860,6 +37006,68 @@ mod multi_window_tests {
             "a deferred background tab marks the window panes_stale"
         );
         assert!(app.structural_invariants_ok());
+    }
+
+    /// AN EARLY-OUT CLOSES THE STAMPS IT PROVED IDLE (2026-09-21). A burst that
+    /// arrived before a compose which then found nothing to present moved no
+    /// pixels, so its stamp is discarded and the next real present books
+    /// nothing for the idle stretch. A burst that lands AFTER the compose
+    /// began is the next frame's real edge and survives the discard.
+    #[test]
+    fn an_early_out_discards_stamps_that_predate_its_compose_and_keeps_later_ones() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, stub_session(1));
+        app.switch_tab_in(wid, 0); // session 0 is what this glass shows
+        // Age the epoch so a stamp 10 ms in the past is non-zero (a zero stamp
+        // reads as UNARMED — see the sibling test).
+        while (app.lat_epoch.elapsed().as_nanos() as u64) <= 20_000_000 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let stamp_of = |app: &App| {
+            app.pool
+                .get(0)
+                .expect("the visible pane's session")
+                .last_output_ns
+                .clone()
+        };
+        // Establish the visible set with one present-time walk.
+        assert_eq!(app.present_latency_ns(wid), 0, "nothing armed");
+
+        // A burst 10 ms ago, then a compose NOW that finds nothing to present:
+        // the stamp is closed, and the next present books nothing for it.
+        let ten_ms_ago = app.lat_epoch.elapsed().as_nanos() as u64 - 10_000_000;
+        stamp_of(&app).store(ten_ms_ago, Relaxed);
+        app.discard_unpresented_output_stamps(wid, Instant::now());
+        assert_eq!(
+            stamp_of(&app).load(Relaxed),
+            0,
+            "a stamp older than the idle compose is closed"
+        );
+        assert_eq!(
+            app.present_latency_ns(wid),
+            0,
+            "so the next present books nothing for the idle stretch"
+        );
+
+        // A burst that lands AFTER the compose began is the next frame's edge:
+        // it survives the discard and the next present books it.
+        let composed_at = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let later = app.lat_epoch.elapsed().as_nanos() as u64;
+        stamp_of(&app).store(later, Relaxed);
+        app.discard_unpresented_output_stamps(wid, composed_at);
+        assert_eq!(
+            stamp_of(&app).load(Relaxed),
+            later,
+            "an edge after the compose began is kept"
+        );
+        assert!(
+            app.present_latency_ns(wid) > 0,
+            "and the next present books it"
+        );
     }
 
     /// MPT-3 HONESTY: a `Wake::Output` stamp armed while its pane was OFF this
@@ -42917,7 +43125,7 @@ mod session_pool_tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
-            fabric: crate::fabric::SessionFabric::default(),
+            fabric: std::sync::Arc::default(),
         });
         Session {
             child_reaped: std::sync::atomic::AtomicBool::new(false),
@@ -44763,8 +44971,13 @@ mod spec_xref_gate {
         // 2026-09-21: `NativeUpdateApplyLadder` (`native_update_apply_ladder_model`,
         // the automatic-update ladder's bound and its stand-down mutant) adds
         // one — 153 → 154.
+        // 2026-09-22: `TccIdentityClaimExclusivity`
+        // (`tcc_identity_claim_exclusivity_model`, the app's TCC identity is
+        // exclusive — a second bundle claiming it can destroy the grant for
+        // every copy, so a conflict is never silent and nothing is retired
+        // unnamed) adds one — 154 → 155.
         assert_eq!(
-            total, 154,
+            total, 155,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -47255,6 +47468,8 @@ mod tab_strip_math_tests {
             color: 0,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0,
+            alpha2: 0,
         });
         // A second glow quad INSIDE the grid (y=40 ≥ 16): pixel y still untouched,
         // but its row TAG shifts with the splice like the grid content it lights.
@@ -47267,6 +47482,8 @@ mod tab_strip_math_tests {
             color: 0,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0,
+            alpha2: 0,
         });
         frame.cursor_trail.push(aterm_render::TrailCell {
             row: 1,
@@ -47406,6 +47623,8 @@ mod tab_strip_math_tests {
                 color: 0,
                 // ADDITIVE light (see `GlowQuad::alpha`).
                 alpha: 0,
+                color2: 0,
+                alpha2: 0,
             });
         }
         prepend_strip_rows(&mut frame, &strip, 16, 0, &mut Vec::new());

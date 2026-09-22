@@ -2256,6 +2256,8 @@ fn push_fx(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32, 
             // ADDITIVE light — this emitter has no other mode (see
             // [`GlowQuad::alpha`]).
             alpha: 0,
+            color2: premul,
+            alpha2: 0,
         });
         yy = band_end;
     }

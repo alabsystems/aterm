@@ -236,7 +236,41 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// read through aterm-ctl on the headless live try of 2026-09-19): two bytes
 /// under 10 240, so the next row raises it again. Same accounting, same
 /// shape.
-pub const SHORT_CATALOG_MAX_BYTES: usize = 10240;
+///
+/// RAISED AGAIN FROM 10 240 on 2026-09-22, the raise the line above predicted.
+/// Round 23's `topic` row (110 bytes: a 28-wide name, one space, an
+/// 80-character summary, the newline) takes the table from 106 entries to 107,
+/// and the `post` summary grew by 10 to spell `say[:<topic>]`: 120 bytes of
+/// growth, and 10 238 + 120 = 10 358 is what aterm-gui's
+/// `help_short_form_is_bounded_and_is_the_summary_catalog` MEASURED on the
+/// wire reply. Note which test that is: the rows alone sum to 9 986 and
+/// aterm-types' `summaries_fit_the_short_catalog_budget` sums ONLY rows, so it
+/// holds under the old bound; the wire reply adds the `OK 110 …` status line
+/// and the `#` framing lines, and only the gui test measures those. 10 496
+/// leaves 138 bytes, about one more row. Same accounting as the six raises
+/// above: rewording unrelated verbs' prose to make room is the drift a
+/// generated golden exists to catch.
+pub const SHORT_CATALOG_MAX_BYTES: usize = 10496;
+
+/// THE ONE `subscribe` STREAM VOCABULARY.
+///
+/// Frame sources first, then the two modifiers. Four hand-written copies of
+/// this list existed after round 22 — the catalog row, the `ERR usage`
+/// refusal, `Requested::parse`'s fold table, and the installed drive skill —
+/// and the refusal spent a round telling operators that `mail` did not exist
+/// in the build that had it. Everything that enumerates streams now derives
+/// from here or is tested against it.
+pub const SUBSCRIBE_STREAMS: &[&str] = &[
+    "screen",
+    "cursor",
+    "events",
+    "cells",
+    "bytes",
+    "mail",
+    "sessions",
+    "timestamps",
+    "trim",
+];
 /// The column a catalog row's text starts in: a 28-wide name plus one space.
 pub const CATALOG_TEXT_COLUMN: usize = 29;
 /// The width a `help <verb>` entry is wrapped to.
@@ -424,12 +458,13 @@ pub const VERBS: &[VerbSpec] = &[
          instance answers it. `OK <n>` then n lines — `schema=1`, the platform, the code-signing \
          identity macOS keys a grant to (`bundle_id= signing= team= dr= grant_stable=`), \
          `full_disk_access=` with the probe that read it, the `covers=`/`uncovered=`/`unmeasured=` service \
-         split, one `folder` line, `prompt_possible=`, one `session` line per LIVE session (never \
+         split, one `folder` line, the `claimants=` census, `prompt_possible=`, one `session` line per LIVE session (never \
          truncated, so `sessions_total=` always equals the number of `session` lines), then \
          `containment`, `warmup=`, `observer`, `remediate` and a closing `note`. Free text is \
          pct-encoded and `-` is unset. A background check in flight reports `full_disk_access=unknown` \
          and `probe=pending`, with no sample age (`-`, or null in JSON). Reading this verb raises NO dialog: the probe reads state \
-         that already exists, and no value here is inferred from another. Per-folder state \
+         that already exists, and the ONE value derived from another is `covers=app-data`, which \
+         follows the completed grant by Apple's documented rule and nothing else. Per-folder state \
          defaults to `unknown` BY CONSTRUCTION — the only way to learn whether a folder is \
          readable is to read it, which is the very act that raises the prompt — and a `folder` \
          value leaves `unknown` for exactly two reasons: aterm itself observed an access (its \
@@ -447,6 +482,23 @@ pub const VERBS: &[VerbSpec] = &[
          it spawned falls back to asking — and they earn their own `note` row, because \
          `running=` follows the vnode and therefore reads healthy in exactly that state, and \
          `full_disk_access=granted` can be true at the same moment and mean nothing. \
+         `claimants=` is the ONE row here that is about the TCC ROW rather than about \
+         this process: every other token describes the code that is asking, and on \
+         2026-09-21 every one of them read healthy while a second copy of the app on the \
+         same disk destroyed the owner's grant twice in 55 seconds. macOS keeps ONE code \
+         requirement per bundle identifier and, when a copy that does not satisfy it asks, \
+         REPLACES the stored requirement with that copy's own and resets the grant — for \
+         every copy that shares the identifier. So the row reads \
+         `claimants=<n> conflicting=<n> census=<complete|partial|unavailable> sole=<yes|no>`, \
+         and each CONFLICTING copy earns a `claimant path= signing= dr= team= conflicts=yes` \
+         line of its own; a copy that shares the running requirement cannot cause the \
+         destructive resolution and is counted but not listed. `census=partial` means a \
+         candidate directory could not be read, so absence is NOT established and `sole=no` \
+         — only a COMPLETE look may say nothing else claims the id. `claimants=-` with \
+         `census=pending` is a census still out; `census=off` is one that was never asked \
+         (a headless or non-macOS instance). The verb REPORTS; it never moves or deletes a \
+         bundle, because retiring one is a destructive act on the human's disk and belongs \
+         to an owner gesture, not to a verb an agent inside a session can reach. \
          `unavailable` on an \
          `observer` row is a THIRD value, distinct from `off` and from `false`: the observer \
          could not be consulted, which is not the same as its having answered no. \
@@ -886,7 +938,12 @@ pub const VERBS: &[VerbSpec] = &[
          fabric=<connected|stalled|disconnected|absent> fabric_rtt_ms=<n|-> \
          fabric_link_age_ms=<n|-> identity=<name|-> \
          hand=<-|turn:<id>[:<holder>]|lease:<holder>|driving:<sid>> \
-         level=<quiet|note|story|driving|driven|attention|limited|hold> story=<n>. \
+         level=<quiet|note|story|driving|driven|attention|limited|hold> story=<n> \
+         seq=<n|-> hash=<hex16|->. `seq=`/`hash=` STAMP THE LIVE SCREEN: the terminal's \
+         content_seq and FNV-1a-64 of the UNTRIMMED visible screen, the same pair `turn` \
+         returns and `history` keeps per turn id, so work built from a screen read can be \
+         matched against the ledger rather than believed (`aterm-link hook --report-to` \
+         carries them into its report). `-`/`-` when the terminal lock was contended. \
          `attribution=`/`fs_consent=` are this \
          session's consent posture (see `privacy` and `await consent`). \
          Read-only. `observed=false` means never classified, which is NOT `phase=unknown` \
@@ -1382,19 +1439,41 @@ pub const VERBS: &[VerbSpec] = &[
          its current bar, `cooldown_ms` the wait before the next arm is admitted)",
     ),
     // Read-only observability for an effect that is otherwise audible-only: the
-    // tone-of-typing mood steering the trail synth's melody. No write form —
-    // the knob is durable config (`settings set tone_melody`).
+    // tone-of-typing mood steering the trail synth's melody, AND the
+    // AUDIBILITY ORACLE — the one verb that must be able to refute "sound is
+    // broken" without a second reading. No write form — the knob is durable
+    // config (`settings set tone_melody`).
     v(
         "tone",
         Read,
         Status,
         App,
         "tone [status]: tone-of-typing state for the focused window",
-        "(prints tone= effective= knob= sounds= volume= audio=live|wedged|inert active= \
-         window_chars= inferences= dropped=; `effective` is what the synth is stamping, \
+        "(prints tone= effective= knob= sounds= volume= audio= active= \
+         window_chars= inferences= dropped= seam= engine_sound= trail= focused= \
+         serious_sound= motion_stage= shed= revives= reopens_left=; `effective` is what the synth is \
+         stamping, \
          `inferences` separates \"the model ran and said technical\" from \"the model never \
-         ran\", audio=wedged means the audio worker is stuck inside one platform call and cues \
-         are being dropped (dropped= counts them). The typed window's TEXT is never reported)",
+         ran\". `seam=open` means a keypress makes a sound RIGHT NOW; `seam=closed:<reason>` \
+         names the gate that stops it, one of sounds-off volume-zero trail-off serious-mode \
+         unfocused host-inert host-wedged resize-quiet engine-silent — so a silent session is \
+         one reading, not a bisection of six settings. The seven fields after it are the \
+         witnesses that verdict was computed from, including the pair that used to need a \
+         second verb: motion_stage= and shed= (a dark trail under load shed or Reduce Motion \
+         still sounds its keys — a key-time click costs no GPU — so motion_stage=reduced \
+         shed=0.00 beside seam=open is CORRECT, not a contradiction). audio= is the audio \
+         worker's own state, not merely that a channel exists: opening = ingress open and no \
+         device opened yet (it opens lazily on the first cue, so this is a fresh process, not \
+         a fault), live = the platform queue actually started, paused/stopped = parked, \
+         failed = a platform call failed, reopening = a fault was seen and the next cue \
+         opens a fresh device inside the reopen budget (recoverable, not a verdict), \
+         wedged = stuck inside one platform call and \
+         dropping cues (dropped= counts them, revives= counts the worker restarts that reset \
+         that counter), inert = it can never sound. reopens_left= is the DEVICE reopen \
+         budget: a transient CoreAudio fault (a device switch, a coreaudiod restart, a wake \
+         from sleep) now costs one reopen and the next key sounds, where it used to be \
+         terminal for the process; reopens_left=0 beside audio=failed is the one honestly \
+         permanent reading. The typed window's TEXT is never reported)",
     ),
     // The cursor cat's COLLECTION, and the direct way to put one on. `Write`
     // rather than `Read` because the wear form changes what the user sees and
@@ -1464,6 +1543,7 @@ pub const VERBS: &[VerbSpec] = &[
          licensed + declined is the number of cursor deltas the seam has judged. \
          `trail status`: one standing-state row instead — `trail style= resolved= \
          config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
+         sound_seam= \
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
          ribbon_segments= ribbon_hue_bands= ribbon_drawn= ribbon_curtain_ms= \
          field= sparks= momentum= \
@@ -1476,7 +1556,13 @@ pub const VERBS: &[VerbSpec] = &[
          from the config knob to the glass, in the order the frame path walks them, plus \
          the cumulative tally the ring has forgotten — `licensed=0 declined>0` blames the \
          licence and names why, `licensed>0` over a dark screen blames everything \
-         downstream of it). `ribbon_drawn=` is THE FACT BESIDE THE CLAIM, and \
+         downstream of it). `sound_seam=` is the KEY-TIME CLICK, adjudicated \
+         beside the light rather than inferred from it: `shed=0.00 \
+         intensity=0.00 sound_seam=true` is a window whose trail is dark for a \
+         performance or accessibility reason and whose TYPING IS STILL HEARD (a \
+         key-time click costs no GPU), while `sound_seam=false` beside \
+         `focused=false` is the one dark case that is supposed to be silent. \
+         `ribbon_drawn=` is THE FACT BESIDE THE CLAIM, and \
          `ribbon_curtain_ms=` is why the two can differ: `ribbon_segments=` counts the \
          planned boundaries the row is willing to CLAIM are lit, floored once for the \
          arc's dimmest stop, while `ribbon_drawn=` counts the last frame's own quads \
@@ -1539,16 +1625,22 @@ pub const VERBS: &[VerbSpec] = &[
          driver that reads `flow=1.00` is looking at a human mid-flow and can hold its \
          turn. The three are 0 on every style but rainbow kitty, whose spine prices them. \
          While rainbow kitty owns the frame the row ends with `v2_quads= v2_halos= v2_stars= \
-         v2_meteors= v2_bridged= ribbon_retired=` — the frame's quads, halos, live stars and \
-         meteors; `v2_bridged=`, the cells the engine's echo ledger relit for a late echo the \
-         ring scored `declined`; and `ribbon_retired=`, the window's cumulative count of ribbon \
-         cells taken off by CONTENT: the host saw the glyph under a cell change (an input box \
-         re-laid a row up, or elsewhere with the same text — the band melts in 120 ms) or go \
-         (a submit that cleared the composer, a row cleared and not put back — the band is \
-         released to its own swoosh, drawn into the hand over 0.64 s) — the number that says \
-         a band went out because its text moved or went, as against expiring (a redraw that \
+         v2_meteors= v2_bridged= ribbon_retired= ribbon_followed=` — the frame's quads, halos, \
+         live stars and meteors; `v2_bridged=`, the cells the engine's echo ledger relit for a \
+         late echo the ring scored `declined`; `ribbon_retired=`, the window's cumulative count \
+         of ribbon cells taken off by CONTENT: the host saw the glyph under a cell change (a row \
+         rewritten with other text — the band melts in 120 ms) or go (a submit that cleared \
+         the composer, a row cleared and not put back — the band is released to its own \
+         swoosh, drawn into the hand over 0.64 s) — the number that says a band went out \
+         because its text moved out from under it or went, as against expiring (a redraw that \
          puts the same text back counts nothing, and a caret relocation the gate declined \
-         over a row whose text still stands retires nothing: only the mirror moves). \
+         over a row whose text still stands retires nothing: only the mirror moves); and \
+         `ribbon_followed=`, its twin: the cumulative count of ribbon cells the FOLLOW PASS \
+         carried to another row WITH their text (an input box re-laid one or two rows up or \
+         down with the same glyphs at the same columns — Claude Code's bottom-anchored \
+         composer growing a row without a scroll), clocks intact, nothing melted; a run \
+         carried off the caret's row (the box grew under a typing hand) then flows into the \
+         fold and is gone 1.34 s after the fold. \
          In a `--headless` instance the engine ticks only while a capture drives its clock (`image` \
          after each key, or a `video`), and a caret on ROW 0 has no sky band there (no chrome \
          head band above the grid), so `v2_stars=0` on row 0 is the geometry, not a dark trail \
@@ -1731,7 +1823,7 @@ pub const VERBS: &[VerbSpec] = &[
         Push,
         Session,
         "subscribe @<sel>[,...] <streams> [since=][every-frame]: push DELTA/EVENT/GAP/BYTES;",
-        "streams=screen,cursor,cells,bytes,events,sessions, at least one of them (a modifier-only \
+        "streams=screen,cursor,cells,bytes,events,mail,sessions, at least one of them (a modifier-only \
          list is `ERR usage`); events = the per-target digest (`EVENT <local> turn|block-complete|\
          meta|title|bell …`, then, as the session is retired, `EVENT <local> closing reason= by=` \
          — the `exits` row, and this watch is the only wire path that carries it — before its \
@@ -1749,7 +1841,17 @@ pub const VERBS: &[VerbSpec] = &[
          session frames and `*` for `sessions` events, so the second token is not always numeric; \
          add `trim` INSIDE <streams> too (`screen,trim`; trailing is `ERR unknown subscribe arg`) \
          to stop each screen DELTA after its last non-blank row — `screen <nrows>` is then the \
-         count sent (inert without screen)",
+         count sent (inert without screen); mail = one `MAIL <local> id=<n> off=<n> from=<p> \
+         kind=<k>[ re=<n>]` line per row DELIVERED into that session's inbox, METADATA ONLY (no \
+         body, ever — read the words with `inbox get`), preceded by `GAP <local> mail-dropped=<n>` \
+         when the ring evicted rows the subscriber had not been shown; it is a LIVE stream seeded \
+         to the ring's high, so it replays no backlog (`await inbox` is what reads history), and \
+         it narrows with `mail:kinds=<k,..>`, `mail:from=<class|principal>` and/or \
+         `mail:topic=<t>` (broadcast rows on that topic only) — class is \
+         human|agent|service|other by the sender's `h-`/`s-`/`a-` prefix, and an unknown kind or \
+         key is `ERR usage`, never a subscription that silently matches nothing. `mail` needs no \
+         authority beyond this verb's: it is the push face of `inbox`, which is the same \
+         `ReadScreen`",
     ),
     // fabric messaging — the per-session INBOX RING, this session's outbound posts,
     // the halt, and the BRIDGE-plane verbs. `inbox`/`inbox get`/`inbox seen`/`post`
@@ -1757,6 +1859,30 @@ pub const VERBS: &[VerbSpec] = &[
     // `outbox`/`outbox sent` are `BridgeOnly`, so no token reaches them (see
     // [`Access::BridgeOnly`]); `hold` is `OwnerOnly` — the local owner's halt from
     // the Owner token, the fleet's from the bridge, told apart in the handler.
+    va(
+        "topic",
+        Owner,
+        Lines,
+        Session,
+        OwnerOnly,
+        "topic add <t> [since=head|@<off>] | topic drop <t> | topic ls: broadcast opt-ins",
+        "RECEIVER-SIDE OPT-IN for `post to=say:<topic>`. A record on `say/<topic>` reaches \
+         this session only because this session asked for the topic, so a fleet-wide \
+         broadcast cannot put a word in front of an agent that did not want it; the set is \
+         EMPTY by default and an empty set receives nothing. `ls` (and the bare form) answers `OK <n>` then one \
+         `topic <t> since=<head|@<off>> serial=<n>` row each (the serial is the add's, so the \
+         bridge tells a `drop` and a re-`add` under one name apart); `add` and `drop` answer ONE STATUS LINE \
+         (see `framing_of`). `add` answers `OK <t> since=<head|@<off>> added=<0|1>` — \
+         `since=head` (the default) takes only records published from now on, `since=@<off>` \
+         replays the topic from that broker offset so a session joining late can read what \
+         it missed. `drop` answers `OK <t> dropped=<0|1>`. The topic is \
+         `[a-z0-9][a-z0-9._-]{0,31}`; anything else is `ERR usage`. A delivered broadcast is \
+         an ordinary inbox row — same ring, same per-sender quota, `task`/`control` still demoted \
+         from a principal this session does not accept — carrying `topic=<t>`, and it is \
+         pushed on `subscribe … mail` with `topic=<t>` too. OWNER, not Read: adding a topic \
+         changes what reaches an agent's inbox, which is the halt's authority class rather \
+         than a read's. The set survives a bridge restart and a seamless update.",
+    ),
     v(
         "inbox",
         Read,
@@ -1861,8 +1987,18 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         Session,
-        "post to=<@<sid>[@<node>]|<principal>|say> kind=<k> [opts] <text>: send a message",
-        "kind is `ask|answer|task|report|note|ack|control`; `re=<n>` names the offset being \
+        "post to=<@<sid>[@<node>]|<principal>|say[:<topic>]> kind=<k> [opts] <text>: send a message",
+        "`to=say[:<topic>]` BROADCASTS: ONE record on `/f/<F>/pub/<node>/<sid>/say/<topic>` \
+         whatever the number of receivers, and every session on any node that ran `topic \
+         add <topic>` gets one ordinary `deliver` from it — same ring, same per-sender \
+         quota, `task`/`control` still demoted from a principal that node does not accept, \
+         with `topic=<t>` on the inbox row and on the `subscribe … mail` push line. \
+         The topic is `[a-z0-9][a-z0-9._-]{0,31}` and anything else is `ERR usage`; bare \
+         `to=say` is the topic `say`. The KIND rides in the body for a broadcast (the \
+         subject's last segment is the topic), so `say/<topic>` costs one subject per \
+         topic rather than one per topic and kind. A sender does not receive its own \
+         broadcast unless it added the topic itself. \
+         kind is `ask|answer|task|report|note|ack|control`; `re=<n>` names the offset being \
          answered, `dl=<ms>` is an advisory deadline, `via=<p>` marks a relay, and `--wait[=<ms>]` \
          (ON by default for `ask` and `task`) blocks until the bridge reports the record landed \
          and answers `OK <id> off=<n>` — the broker-assigned offset is the correlation id an \
@@ -2537,6 +2673,15 @@ pub fn framing_of(verb: &str, request: &str) -> Framing {
     if verb == "identities" && sub == Some("forget") {
         return Status;
     }
+    // `topic add <t> …` / `topic drop <t>` answer ONE status line
+    // (`OK <t> since=<..> added=<0|1>`, `OK <t> dropped=<0|1>`), not the
+    // `OK <n>` + `topic <t> since=<..>` rows the bare form and `topic ls`
+    // answer. The same flip as `inbox seen`, and the same hazard: under Lines
+    // framing the client reads the TOPIC as a row count and reports a malformed
+    // header — which is what `identities forget` measured on 2026-09-17.
+    if verb == "topic" && matches!(sub, Some("add" | "drop")) {
+        return Status;
+    }
     // `video frames [count=N]` lists the newest recording's top-delta frames as
     // `OK <n>\n` + n rows — Lines-framed, unlike the base `video <secs>` capture
     // (a single Status `OK …` dump line) and `video status`/`video stop`.
@@ -3198,6 +3343,10 @@ mod tests {
                 // The presence band's write face (round 19): the watcher tells the
                 // window what it decided; a child edge may not.
                 "story",
+                // Receiver-side broadcast opt-in. Owner-class because adding a topic
+                // changes what lands in a session's inbox — the halt's authority
+                // class, not a read's.
+                "topic",
                 // The drive halt. Owner-class so the LOCAL owner can halt its own
                 // drivers; the handler keeps the FLEET hold (set, replace, lift)
                 // bridge-issued only — see `Access::OwnerOnly`'s doc.
@@ -3308,6 +3457,7 @@ mod tests {
             ("inbox", Read, Lines, Session, Scoped),
             ("inbox get", Read, Bytes, Session, Scoped),
             ("inbox seen", Write, Status, Session, Scoped),
+            ("topic", Owner, Lines, Session, OwnerOnly),
             ("post", Write, Status, Session, Scoped),
             ("deliver", Write, Status, Meta, BridgeOnly),
             ("link", Write, Status, Meta, BridgeOnly),

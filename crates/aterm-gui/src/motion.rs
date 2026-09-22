@@ -30,6 +30,25 @@
 //!   the COMPLETE 3×2×2 input domain × the full [`MotionEffect::ALL`] set —
 //!   with finite inputs the exhaustive test is a complete proof over the
 //!   shipping resolver itself.
+//!
+//! # Functional motion vs the load-shed latch
+//!
+//! `App::motion_policy` has a FOURTH input the proof above does not model: the
+//! load-adaptive shedding latch (`perf_reduced`), a RENDER-COST heuristic that
+//! forces `Reduced` for a 1.5–30 s dwell once presents run over budget. That
+//! latch exists to shed DECORATION. Two governed effects are not decoration but
+//! the terminal's response to the user's own hand — the wheel/trackpad glide
+//! ([`MotionEffect::SmoothScroll`]) and the scroll-position pill's fade
+//! ([`MotionEffect::ScrollPill`]) — and shedding them turns manual scrolling
+//! into whole-row snapping for the dwell (the owner's 2026-09-22 report of
+//! blocky scrolling in a large Codex session is the case this closes off;
+//! whether the latch actually tripped there was not measured — read
+//! `perf_reduced`/`shed_transitions` on that instance). [`MotionEffect::load_shed_exempt`]
+//! names that functional set; `App::effect_policy` resolves an exempt effect
+//! from the three ACCESSIBILITY facts alone. The exemption never touches this
+//! module's invariant: under a `Reduced` policy — OS Reduce Motion, `motion =
+//! "reduced"`, or an unfocused window — an exempt effect's amplitude is still
+//! exactly 0, as `reduced_motion_totality` proves over the full effect set.
 
 /// The `motion` config value: how aterm decides whether decorative animations
 /// run. `Auto` (the default and the value for any unknown string) consumes the
@@ -169,6 +188,35 @@ impl MotionEffect {
             Self::OutputStreak => 9,
             Self::UpgradeSurge => 10,
             Self::PresenceRipple => 11,
+        }
+    }
+
+    /// Whether this effect is FUNCTIONAL motion the load-adaptive shedding
+    /// latch must never demote (see the module doc): the terminal answering
+    /// the user's hand rather than decorating the glass. The same line
+    /// [`SeriousModePolicy`] draws — serious mode removes decorative output
+    /// and "must not demote functional motion such as smooth scrolling or the
+    /// scroll position pill". EXHAUSTIVE on purpose (no `_`): a new
+    /// [`MotionEffect`] fails to compile until its class is decided, exactly
+    /// as [`MotionPolicy::amplitude`] forces its Reduced amplitude.
+    ///
+    /// Accessibility is NOT exemptable: this classifies only what the render
+    /// cost heuristic may shed. OS Reduce Motion, `motion = "reduced"` and the
+    /// unfocused demotion still zero an exempt effect through `resolve`.
+    #[must_use]
+    pub(crate) const fn load_shed_exempt(self) -> bool {
+        match self {
+            Self::SmoothScroll | Self::ScrollPill => true,
+            Self::CursorGlow
+            | Self::WordSparkles
+            | Self::SettingsDemo
+            | Self::StreamFade
+            | Self::MatrixRain
+            | Self::NoticePill
+            | Self::Robi
+            | Self::OutputStreak
+            | Self::UpgradeSurge
+            | Self::PresenceRipple => false,
         }
     }
 }
@@ -348,6 +396,123 @@ mod tests {
 
     use super::{MotionEffect, MotionMode, MotionPolicy, SeriousEffect, SeriousModePolicy};
 
+    /// REDUCE MOTION IS A MOTION SETTING, NOT AN AUDIO SETTING (2026-09-22).
+    ///
+    /// The visual law above is left exactly as it is — under `Reduced` every
+    /// governed amplitude is still EXACTLY 0. This states that the AUDIO
+    /// verdict is a DIFFERENT total function of the same domain: it depends
+    /// on focus and on the person's own brightness knob, never on the motion
+    /// policy — so `Reduce Motion` (and the load-shed envelope, which rides
+    /// the same scalar) dims the light without closing the key seam. Before
+    /// the split, a `Reduce Motion` session had no typing sound at all — an
+    /// accessibility setting deleting an audio feature over a click that
+    /// costs no GPU.
+    ///
+    /// IT DRIVES THE REAL ENGINE, over the real policy, on purpose. An
+    /// earlier draft of this test computed `let audible = focused;` and then
+    /// asserted `audible == focused` — a local against itself, green through
+    /// the exact re-subordination it names. Here the policy's own amplitude
+    /// folds `GlowConfig::intensity` the way `tick_cursor_fx` folds it, the
+    /// shipping `CursorGlow::tick` runs, and the assertion reads the engine's
+    /// `sound_seam_open()`. If the seam ever goes back to reading the folded
+    /// scalar, every `Reduced`-and-focused row here fails.
+    #[test]
+    fn reduce_motion_never_mutes_typing() {
+        use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
+        use std::time::{Duration, Instant};
+
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        };
+        let base = GlowConfig {
+            classic_mono: false,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            enabled: true,
+            dark_theme: true,
+            theme_fg: 0x00C8_D3F5,
+            theme_bg: 0x001A_1B26,
+            style: GlowStyle::RainbowKitty,
+            color: 0x0050_FA7B,
+            accent: 0x007A_A2F7,
+            duration: Duration::from_millis(240),
+            length: 18,
+            intensity: 0.7,
+            audible: true,
+            radius: 0.6,
+            ring: true,
+            beam: false,
+            head_dx: 0.5,
+            pack: None,
+        };
+        let t0 = Instant::now();
+        let mut seen_dark_and_heard = false;
+
+        for mode in [MotionMode::Auto, MotionMode::Full, MotionMode::Reduced] {
+            for system_reduce in [false, true] {
+                for focused in [false, true] {
+                    let p = MotionPolicy::resolve(mode, system_reduce, focused);
+                    // EXACTLY the host's fold in `tick_cursor_fx`: the motion
+                    // amplitude scales the VISUAL scalar, and `audible` is
+                    // focus and the user's own brightness knob (nonzero here)
+                    // — it reads nothing from `p`.
+                    let cfg = GlowConfig {
+                        intensity: base.intensity * p.amplitude(MotionEffect::CursorGlow),
+                        audible: focused,
+                        ..base
+                    };
+                    let mut glow = CursorGlow::default();
+                    let mut out = Vec::new();
+                    glow.tick(Some((2, 0)), t0, &base, geom, &mut out);
+                    out.clear();
+                    let t1 = t0 + Duration::from_millis(16);
+                    glow.tick(Some((2, 1)), t1, &cfg, geom, &mut out);
+
+                    let case = format!("{mode:?}, sys={system_reduce}, focused={focused}");
+                    assert_eq!(
+                        glow.sound_seam_open(),
+                        focused,
+                        "audibility must depend on focus alone ({case})"
+                    );
+                    if !focused {
+                        assert!(
+                            !glow.cue_keystroke_kind(
+                                t1,
+                                aterm_effects::trail_sound::SoundKind::Typed
+                            ),
+                            "an unfocused window must stay silent ({case})"
+                        );
+                    }
+                    // NON-VACUITY: there really is a point where the light is
+                    // dark and the keys are heard, which is the whole fix.
+                    if focused && p == MotionPolicy::Reduced {
+                        assert_eq!(cfg.intensity, 0.0, "the light is folded dark ({case})");
+                        assert!(
+                            glow.cue_keystroke_kind(
+                                t1,
+                                aterm_effects::trail_sound::SoundKind::Typed
+                            ),
+                            "a reduced-motion focused window is still heard ({case})"
+                        );
+                        seen_dark_and_heard = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            seen_dark_and_heard,
+            "the dark-and-heard case must be reachable, or this proves nothing"
+        );
+    }
+
     /// REDUCED-MOTION TOTALITY (the W11 PROVE bullet): `resolve` is total over
     /// the full `(config, system_flag, focus)` domain, its truth table is
     /// exactly "animate ⟺ focused ∧ (full ∨ (auto ∧ ¬system))", and under a
@@ -400,6 +565,39 @@ mod tests {
         // Non-vacuity: both branches genuinely occur in the domain.
         assert!(saw_full, "the Full policy must be reachable");
         assert!(saw_reduced, "the Reduced policy must be reachable");
+    }
+
+    /// The load-shed exemption is EXACTLY the functional-motion pair (the
+    /// wheel glide and the scroll pill) and nothing else — a decorative effect
+    /// that slipped into the exempt set would keep painting under overload,
+    /// which is the one thing the latch exists to stop. And the exemption
+    /// weakens nothing the proof above pins: every exempt effect's amplitude
+    /// is still exactly 0 under a `Reduced` policy.
+    #[test]
+    fn load_shed_exemption_is_exactly_functional_motion() {
+        for e in MotionEffect::ALL {
+            let functional = matches!(e, MotionEffect::SmoothScroll | MotionEffect::ScrollPill);
+            assert_eq!(
+                e.load_shed_exempt(),
+                functional,
+                "{e:?}: only functional motion may be exempt from load shedding"
+            );
+            if functional {
+                assert_eq!(
+                    MotionPolicy::Reduced.amplitude(e),
+                    0.0,
+                    "{e:?}: the exemption must not weaken the Reduced-motion proof"
+                );
+            }
+        }
+        assert_eq!(
+            MotionEffect::ALL
+                .iter()
+                .filter(|e| e.load_shed_exempt())
+                .count(),
+            2,
+            "non-vacuity: the exempt set is populated, and by exactly the pair"
+        );
     }
 
     /// NEGATIVE CONTROL (the pre-W11 defect, the ty model's `Buggy=1` twin):

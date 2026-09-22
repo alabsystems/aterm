@@ -6437,7 +6437,13 @@ fn sky_ground<'a>(
     let mut ground = bg & 0x00FF_FFFF;
     for q in laid {
         if quad_covers(q, x, y) {
-            ground = add_sat(ground, q.color);
+            // The quad's colour AT THIS COLUMN — a ribbon slab ramps between
+            // its two ends (`GlowQuad::color2`); a flat quad is `q.color`.
+            let i = (x - i32::from(q.x)) as u32;
+            ground = add_sat(
+                ground,
+                aterm_render::glow_lerp_rgb(q.color, q.color2, i, u32::from(q.w)),
+            );
         }
     }
     for h in sky {
@@ -6534,6 +6540,7 @@ fn settle_under_ceiling(
     }
     for q in &mut frame.out[q0..] {
         q.color = premul_rgb(q.color, k);
+        q.color2 = premul_rgb(q.color2, k);
     }
     for h in &mut frame.halos[h0..] {
         h.color = premul_rgb(h.color, k);
@@ -10838,6 +10845,8 @@ mod tests {
             h: 3,
             color: 0x0010_2030,
             alpha: 0,
+            color2: 0x0010_2030,
+            alpha2: 0,
         };
         assert_eq!(
             sky_ground(SHIPPED_GROUND, &[quad], &[], 94, 105),
@@ -10852,7 +10861,11 @@ mod tests {
         assert_eq!(
             sky_ground(
                 SHIPPED_GROUND,
-                &[GlowQuad { alpha: 255, ..quad }],
+                &[GlowQuad {
+                    alpha: 255,
+                    alpha2: 255,
+                    ..quad
+                }],
                 &[],
                 94,
                 105
@@ -14648,6 +14661,8 @@ mod tests {
             h: 4,
             color: 0x0010_2030,
             alpha: 0,
+            color2: 0x0010_2030,
+            alpha2: 0,
         });
         let mut index = SkyIndex::default();
         index.open(gm, (0, 0));
@@ -14689,6 +14704,8 @@ mod tests {
             h: 2,
             color: 0x0020_3040,
             alpha: 0,
+            color2: 0x0020_3040,
+            alpha2: 0,
         });
         let mut index = SkyIndex::default();
         index.open(gm, (0, 0));

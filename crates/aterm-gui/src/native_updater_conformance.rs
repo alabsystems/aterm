@@ -1015,6 +1015,106 @@ fn real_apply_ladder_admits_exactly_the_model_s_park() {
     assert!(!buggy.check_invariant("ActivityNeverLatchesManualOnly", &wedge));
 }
 
+/// THE 2026-09-21 AUDIT, bound to the model steps that describe it.
+///
+/// `Lapse`: a physical-failure latch lapsing resumes the ladder where the clock
+/// is. The shipping `lapse_expired_auto_apply_manual_only` releases the latch
+/// and leaves `App::auto_apply_ladder` alone, so `automatic_apply_phase` after
+/// the lapse is the model's post-`Lapse` phase — `Land`, when the latch held
+/// past the bound — and never `PreferIdle` again.
+///
+/// `ParkMissed`: a park that missed every freeze rung stands its successor
+/// down as ACTIVITY. The shipping `park_miss_disposition` answers
+/// `ActivityRevoked`, and the shipping `HandoffFailureLane::classify` keeps
+/// that outcome out of every physical shape — so the model's `manual_only`
+/// stays 0, exactly as the real lane's latch does.
+#[cfg(unix)]
+#[test]
+fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
+    use crate::app_native::HandoffFailureLane;
+    use crate::app_update_handoff::{
+        PRELAUNCH_MAX_PARK_MISSES, ParkMissDisposition, park_miss_disposition,
+    };
+    use crate::native_update_auto_intent::LANDS_WITHIN;
+    let model = native_update_apply_ladder_model();
+
+    // The model: KeysOnly, a physical failure, the clock reaches Land under
+    // the latch, and the lapse keeps Land.
+    let mut keys_only = model.init_state();
+    for _ in 0..2 {
+        keys_only = model.successors("Advance", &keys_only)[0].clone();
+    }
+    let latched = model.successors("PhysicalFailure", &keys_only)[0].clone();
+    assert_exact_model_action(&model, "PhysicalFailure", &keys_only, &latched);
+    let aged = model.successors("Advance", &latched)[0].clone();
+    assert_exact_model_action(&model, "Advance", &latched, &aged);
+    let lapsed = model.successors("Lapse", &aged)[0].clone();
+    assert_exact_model_action(&model, "Lapse", &aged, &lapsed);
+    assert_eq!(lapsed["phase"], 3);
+
+    // The shipping App on the same arc: anchored 930 s ago, latched with a
+    // deadline that has passed.
+    let mut app = crate::App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    let now = std::time::Instant::now();
+    let armed_at = now - LANDS_WITHIN - std::time::Duration::from_secs(30);
+    app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+        build,
+        armed_at,
+        announced: ApplyPhase::KeysOnly,
+    });
+    app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+        build,
+        dmg_sha256: [0xab; 32],
+        retry_at: Some(now - std::time::Duration::from_secs(1)),
+    });
+    assert!(
+        app.lapse_expired_auto_apply_manual_only(),
+        "the latch lapses"
+    );
+    assert!(app.auto_apply_manual_only.is_none());
+    assert_eq!(
+        app.auto_apply_ladder.map(|ladder| ladder.armed_at),
+        Some(armed_at),
+        "the lapse keeps the anchor"
+    );
+    assert_eq!(
+        app.automatic_apply_phase(now),
+        ApplyPhase::Land,
+        "the real phase after the lapse is the model's: {}",
+        lapsed["phase"]
+    );
+
+    // The park miss: the model keeps the lane; the shipping disposition and
+    // classifier keep it in the activity lane. From a QUIET terminal, so the
+    // miss is its own transition (a machine that was already busy would leave
+    // the state where `Busy` leaves it).
+    let quiet = model.successors("Quiet", &keys_only)[0].clone();
+    let missed = model.successors("ParkMissed", &quiet)[0].clone();
+    assert_exact_model_action(&model, "ParkMissed", &quiet, &missed);
+    assert_eq!(missed["manual_only"], 0);
+    assert_eq!(missed["latched"], 0);
+    assert_eq!(missed["phase"], keys_only["phase"]);
+    let ParkMissDisposition::StandDown(stand_down) = park_miss_disposition(
+        PRELAUNCH_MAX_PARK_MISSES,
+        "the last rung missed".to_string(),
+    ) else {
+        panic!("past the last rung the attempt stands down");
+    };
+    for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+        assert_eq!(
+            HandoffFailureLane::classify(
+                mode,
+                stand_down.outcome,
+                crate::ChildDeathEvidence::Unobserved,
+                false
+            ),
+            HandoffFailureLane::ActivityRevoked,
+            "{mode:?}: a park miss never reaches a physical shape"
+        );
+    }
+}
+
 /// The hold cap and the re-park, bound to the model steps that describe them:
 /// a terminal that never goes quiet stands the attempt down with its intent
 /// retained and no reader ever stopped, and a park that missed its budget

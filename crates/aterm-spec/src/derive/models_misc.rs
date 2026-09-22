@@ -25,6 +25,25 @@ use super::*;
 /// platform while enqueuing, blocks and omits drop accounting on a full queue,
 /// and a cue applied to an already-running device retains the pre-cue silence
 /// threshold.
+/// KNOWN PARTIAL, 2026-09-22. The shipping worker no longer treats one
+/// device fault as terminal: a failed open, a failed start/enqueue, a faulted
+/// callback or a stalled one now spends one of `REOPEN_BUDGET` device
+/// reopens, and only EXHAUSTION latches `STATE_FAILED` and seals ingress
+/// (`aterm-gui/src/trail_audio.rs`, D5). This machine still describes only
+/// the terminal half — `StartFailureIsExplicitAndTerminal` remains TRUE of
+/// the shipping code, because the state it names is still reached and is
+/// still terminal — but it does not yet MODEL the bounded recovery in
+/// between, so a green run here says nothing about whether the budget is
+/// respected. The reopen ladder is covered at Tier-1 instead, by
+/// `worker_device_failure_is_retried_with_backoff_then_terminal_at_budget`
+/// `reopen_attempts_respect_their_backoff_window` and
+/// `a_device_that_opens_but_never_plays_spends_the_budget_and_stops` (the
+/// ladder resets on a device that PLAYED for a healthy window, never on one
+/// that merely opened). Extending this
+/// machine with `DeviceFaults` / `ReopenSucceeds` / `ReopenExhausted` and a
+/// `RecoveryIsBounded` invariant is the outstanding work; per the recorded
+/// vacuous-guard-conjunct lesson, `ReopenSucceeds`'s guard must leave
+/// `ReopenExhausted` reachable or the new invariant proves nothing.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn trail_audio_lifecycle_model() -> Model {

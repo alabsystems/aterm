@@ -13,11 +13,13 @@
 //! parent has exited (atpkg's orphan watch re-points its stdio at
 //! `orphan-pass.log`, 2026-09-14 — it used to die at its next print), so it holds
 //! the store lock for the whole of its pass, and the successor's own launch lanes
-//! `--wait-lock` behind it. The successor owes no pass of its own while the
-//! store's last pass is fresh (`crate::spawn_pkg_update_check`'s due gate,
-//! 2026-09-18), stands down after a waited acquisition when the holder finished a
-//! pass (`atpkg::cli`), and paints NO row for the wait (`Wake::PkgLockWaiting` is
-//! a log line). A REJECTED candidate is the one shape that is not covered: its
+//! `--wait-lock` behind it. A successor on a NEW build runs one full update pass
+//! after its seed whatever the store's record says (`crate::launch_update_park`,
+//! 2026-09-22 — the seed absorbs the wait, so that pass is not the one that stands
+//! down); a same-build relaunch owes no pass while the store's last pass is fresh
+//! (the due gate, 2026-09-18); an update child that itself waited stands down when
+//! the holder finished a pass (`atpkg::cli`); and NO row is painted for the wait
+//! (`Wake::PkgLockWaiting` is a log line). A REJECTED candidate is the one shape that is not covered: its
 //! sweep SIGKILLs the candidate's process group, atpkg child included (the store
 //! is crash-consistent), and the parked parent's loop picks the remainder up at
 //! its next tick or bump.
@@ -116,6 +118,7 @@ pub(crate) struct HandoffTransferJob {
 /// The main thread's typed reason for standing a held successor down before the
 /// park delivered anything: which outcome the completion should carry and why.
 #[cfg(unix)]
+#[derive(Debug)]
 pub(crate) struct HandoffStandDown {
     pub(crate) outcome: crate::UpdateHandoffOutcome,
     pub(crate) detail: String,
@@ -3817,10 +3820,12 @@ fn try_lock_by<T>(
 /// deadline — same 20 ms, same five sessions, and nothing about either would ever
 /// change while the compiler ran. The module's own rule for the scrollback carry is
 /// "the failure mode is less scrollback, never the update did not apply"; this is that
-/// rule applied to time. A retry after a physical failure widens the window (80 ms,
-/// then a quarter second — one such freeze, once per update), and an EXPLICIT apply
-/// gets the widest window at once: the user asked for the update, not for a
-/// sub-frame swap.
+/// rule applied to time. A miss widens the window (80 ms, then a quarter second),
+/// and the widening happens INSIDE one attempt — a park that missed re-parks on the
+/// next rung 500 ms later with the successor still holding
+/// (`PRELAUNCH_MAX_PARK_MISSES`) — as well as across attempts after a physical
+/// failure. An EXPLICIT apply gets the widest window at once: the user asked for
+/// the update, not for a sub-frame swap.
 pub(crate) fn handoff_freeze_budget(
     mode: crate::native_updater_service::ApplyMode,
     prior_physical_failures: u8,
@@ -5508,8 +5513,11 @@ impl App {
             // The readers are back (nothing was granted, so the rollback is
             // exact), the successor is still booted and holding, and the only
             // thing that went wrong is that a 20 ms window was not enough on a
-            // busy machine. Re-park once on the ladder's next rung rather than
-            // throwing away a whole relaunch to buy the same rung later.
+            // busy machine. Re-park on the ladder's next rung rather than
+            // throwing away a whole relaunch to buy the same rung later — and
+            // once every rung has been tried, stand down as what it is: a busy
+            // machine, retried on the activity spacing, never a latch
+            // (`park_miss_disposition`).
             ParkAttempt::Missed(reason) => {
                 // EVERY MISS IS PRE-RECORD. The parked attempt is stored at the
                 // very end of the park half, after the last thing that can miss,
@@ -5524,18 +5532,21 @@ impl App {
                     .update_handoff_prelaunch
                     .as_ref()
                     .map_or(u8::MAX, |prelaunch| prelaunch.park_misses);
-                if misses >= PRELAUNCH_MAX_PARK_MISSES {
-                    self.stand_down_prelaunched_successor(HandoffStandDown {
-                        outcome: crate::UpdateHandoffOutcome::PreparationFailed,
-                        detail: reason,
-                    });
-                } else if let Some(prelaunch) = self.update_handoff_prelaunch.as_mut() {
-                    prelaunch.park_misses = prelaunch.park_misses.saturating_add(1);
-                    prelaunch.park_retry_at = Some(now + PRELAUNCH_REPARK_DELAY);
-                    aterm_log::warn!(
-                        "update apply: the park missed its budget ({reason}); the successor \
-                         keeps holding and the park retries once on the next rung"
-                    );
+                match park_miss_disposition(misses, reason) {
+                    ParkMissDisposition::StandDown(stand_down) => {
+                        self.stand_down_prelaunched_successor(stand_down);
+                    }
+                    ParkMissDisposition::Repark { misses, reason } => {
+                        if let Some(prelaunch) = self.update_handoff_prelaunch.as_mut() {
+                            prelaunch.park_misses = misses;
+                            prelaunch.park_retry_at = Some(now + PRELAUNCH_REPARK_DELAY);
+                            aterm_log::warn!(
+                                "update apply: the park missed its budget ({reason}); the \
+                                 successor keeps holding and the park retries on the next \
+                                 rung (miss {misses} of {PRELAUNCH_MAX_PARK_MISSES})"
+                            );
+                        }
+                    }
                 }
             }
             ParkAttempt::Failed(stand_down) => self.stand_down_prelaunched_successor(stand_down),
@@ -7122,13 +7133,66 @@ const PRELAUNCH_PARK_RETRY: std::time::Duration = std::time::Duration::from_mill
 const PRELAUNCH_REPARK_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How many times one prelaunched attempt re-parks before it stands its
-/// successor down. ONE: the first miss retries on the ladder's next rung (20 ms
-/// -> 80 ms), which is the rung a physical failure would have bought the NEXT
-/// attempt anyway — at the cost of a whole relaunch. A second miss is a machine
-/// that is not going to make this budget, and the ledger's own rung widening
-/// (written by the completion) is the right place for it.
+/// successor down. TWO: the whole freeze ladder (20 ms -> 80 ms -> 250 ms,
+/// [`handoff_freeze_budget`]) is climbed INSIDE one attempt, 500 ms apart, with
+/// the successor still booted and holding — three parks cost the user at most
+/// 350 ms of stalled echo across a second, against a whole relaunch per rung.
+///
+/// It used to be ONE, with the second miss handed to "the ledger's own rung
+/// widening": the stand-down was filed as `PreparationFailed`, which
+/// [`crate::app_native::PhysicalFailureShape::of_outcome`] charges as
+/// STRUCTURAL — a verdict about the BYTES, with a two-attempt lifetime. Two
+/// busy moments ten minutes apart therefore converged the automatic lane to a
+/// deadline-less manual-only latch for the artifact (2026-09-21, the second
+/// finding of the ladder audit). A miss is the parent's scheduling failure and
+/// says nothing about the candidate, so the ledger is exactly the wrong place
+/// for it; the attempt climbs the rungs itself and, past the last one, stands
+/// down as a busy-machine fact ([`park_miss_disposition`]).
 #[cfg(unix)]
-const PRELAUNCH_MAX_PARK_MISSES: u8 = 1;
+pub(crate) const PRELAUNCH_MAX_PARK_MISSES: u8 = 2;
+
+/// What one park that missed its freeze budget costs the prelaunched attempt.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum ParkMissDisposition {
+    /// Re-park after [`PRELAUNCH_REPARK_DELAY`] on the ladder's next rung;
+    /// `misses` is the attempt's new miss count, which is also the rung the
+    /// re-park widens to.
+    Repark { misses: u8, reason: String },
+    /// Every rung was tried. Stand the successor down.
+    StandDown(HandoffStandDown),
+}
+
+/// A PARK MISS IS A FACT ABOUT THE MACHINE'S MOMENT, NEVER ABOUT THE BYTES.
+///
+/// The readers came back, nothing was granted, no artifact was written; the only
+/// thing that happened is that a busy machine did not stop its readers (or
+/// capture its screens) inside a comfort budget. That is the same kind of fact
+/// as a keystroke or the prelaunch hold cap — a scheduling fact about this
+/// terminal — so past the last rung the successor stands down as
+/// `ActivityRevoked`: retried on the activity spacing, the ladder's anchor
+/// untouched, no physical budget spent, never a manual-only latch. The design's
+/// law (docs/DESIGN-auto-apply-ladder-2026-09-21.md, law 2) reserves the latch
+/// for a successor that died or a proof that did not match; a stopwatch the
+/// parent missed is neither.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn park_miss_disposition(misses: u8, reason: String) -> ParkMissDisposition {
+    if misses >= PRELAUNCH_MAX_PARK_MISSES {
+        ParkMissDisposition::StandDown(HandoffStandDown {
+            outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
+            detail: format!(
+                "the park missed its budget on every rung ({reason}); the machine is busy, \
+                 the candidate is not in question, and the ladder retries"
+            ),
+        })
+    } else {
+        ParkMissDisposition::Repark {
+            misses: misses.saturating_add(1),
+            reason,
+        }
+    }
+}
 
 /// How long a dialled successor is held for a quiet moment before the attempt
 /// stands down (activity-revoked: no physical budget spent, retried later). The
@@ -8230,29 +8294,93 @@ mod park_gate_tests {
     }
 
     /// WHAT A RE-PARK BUYS. A park that missed its 20 ms budget re-parks on the
-    /// ladder's next rung with the successor still booted and holding — the rung
-    /// a physical failure would have bought the NEXT attempt, at the cost of a
-    /// whole relaunch. One re-park, because a second miss is a machine that is
-    /// not going to make this budget and the ledger is the right place for that.
+    /// ladder's next rung with the successor still booted and holding, and the
+    /// attempt climbs the WHOLE freeze ladder that way — 20, 80, 250 ms — before
+    /// it gives the successor back. Past the last rung it stands down as a
+    /// busy-machine fact, in the ACTIVITY lane: no physical budget, no latch.
+    ///
+    /// THE DEAD MUTANT (2026-09-21): the second miss used to stand down as
+    /// `PreparationFailed`, which the shape classifier files as STRUCTURAL — a
+    /// verdict about the bytes with a two-attempt lifetime — so two busy moments
+    /// ten minutes apart converged the automatic lane to a deadline-less
+    /// manual-only latch. Every rung of that sequence is pinned here: the
+    /// disposition at every miss count, the outcome it stands down with, and the
+    /// lane the shipping classifier puts that outcome in.
     #[test]
     fn a_park_miss_buys_the_ladders_next_rung_without_a_relaunch() {
-        use super::{PRELAUNCH_MAX_PARK_MISSES, PRELAUNCH_REPARK_DELAY, handoff_freeze_budget};
+        use super::{
+            PRELAUNCH_MAX_PARK_MISSES, PRELAUNCH_REPARK_DELAY, ParkMissDisposition,
+            handoff_freeze_budget, park_miss_disposition,
+        };
+        use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
+
         let rung = |misses: u8| handoff_freeze_budget(ApplyMode::Automatic, misses);
         assert_eq!(rung(0), std::time::Duration::from_millis(20));
         assert_eq!(rung(1), std::time::Duration::from_millis(80));
+        assert_eq!(rung(2), std::time::Duration::from_millis(250));
         assert_eq!(
-            PRELAUNCH_MAX_PARK_MISSES, 1,
-            "one re-park: the second miss belongs to the ledger"
+            PRELAUNCH_MAX_PARK_MISSES, 2,
+            "the attempt climbs every rung itself; nothing is left for the ledger"
         );
+        // Every miss short of the last rung re-parks one rung wider.
+        for misses in 0..PRELAUNCH_MAX_PARK_MISSES {
+            match park_miss_disposition(misses, "a PTY reader missed the deadline".into()) {
+                ParkMissDisposition::Repark {
+                    misses: next,
+                    reason,
+                } => {
+                    assert_eq!(next, misses + 1, "the re-park is the next rung");
+                    assert!(rung(next) > rung(misses), "and the next rung is wider");
+                    assert_eq!(reason, "a PTY reader missed the deadline");
+                }
+                ParkMissDisposition::StandDown(stand_down) => panic!(
+                    "miss {misses} of {PRELAUNCH_MAX_PARK_MISSES} must re-park, not stand \
+                     down ({})",
+                    stand_down.detail
+                ),
+            }
+        }
+        // The last rung missed: the successor is stood down as ACTIVITY, and the
+        // shipping classifier keeps it out of every physical shape.
+        let ParkMissDisposition::StandDown(stand_down) =
+            park_miss_disposition(PRELAUNCH_MAX_PARK_MISSES, "capture exceeded 250 ms".into())
+        else {
+            panic!("past the last rung the attempt must stand down");
+        };
+        assert_eq!(
+            stand_down.outcome,
+            crate::UpdateHandoffOutcome::ActivityRevoked,
+            "a stopwatch the parent missed is a fact about the machine's moment, never \
+             about the bytes"
+        );
+        assert!(stand_down.detail.contains("capture exceeded 250 ms"));
+        for mode in [ApplyMode::Automatic, ApplyMode::AutomaticPastGrace] {
+            let lane = HandoffFailureLane::classify(
+                mode,
+                stand_down.outcome,
+                crate::ChildDeathEvidence::Unobserved,
+                false,
+            );
+            assert_eq!(lane, HandoffFailureLane::ActivityRevoked, "{mode:?}");
+            assert_ne!(
+                lane,
+                HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
+                "{mode:?}: the two-attempt structural lifetime is the mutant"
+            );
+        }
         // A prior physical failure of the same bytes still compounds: an attempt
-        // that already failed once and then misses its park gets the widest rung.
+        // that already failed once starts one rung wider and saturates at 250 ms.
         assert_eq!(
             handoff_freeze_budget(ApplyMode::Automatic, 1 + 1),
             std::time::Duration::from_millis(250)
         );
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::Automatic, 1 + PRELAUNCH_MAX_PARK_MISSES),
+            std::time::Duration::from_millis(250)
+        );
         assert!(
-            PRELAUNCH_REPARK_DELAY < PRELAUNCH_HOLD_MAX,
-            "a re-park must fit inside the hold it is spending"
+            PRELAUNCH_REPARK_DELAY * u32::from(PRELAUNCH_MAX_PARK_MISSES) < PRELAUNCH_HOLD_MAX,
+            "every re-park must fit inside the hold it is spending"
         );
     }
 
@@ -10783,6 +10911,65 @@ mod returned_handoff_completion_lane_tests {
             transient > std::time::Duration::from_secs(1700)
                 && transient <= std::time::Duration::from_secs(1800),
             "the transient lane must be on its second rung (~1800s), got {transient:?}"
+        );
+    }
+
+    /// THE WHOLE SEQUENCE OF THE 2026-09-21 PARK-MISS FINDING, driven through
+    /// the production reducer: an automatic attempt whose park missed every rung
+    /// comes back with the outcome `park_miss_disposition` stands it down with,
+    /// and the lane treats it as activity — a live retry intent on the spaced
+    /// schedule, no manual-only latch, no physical budget spent, and the ladder's
+    /// anchor exactly where it was. Twice, because two of them ten minutes apart
+    /// was the pair that used to converge the artifact to `retry_at: None`.
+    #[test]
+    fn a_park_that_missed_every_rung_is_retried_as_activity_and_never_latches() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let armed_at = std::time::Instant::now() - std::time::Duration::from_secs(400);
+        app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+            build,
+            armed_at,
+            announced: crate::native_update_auto_intent::ApplyPhase::KeysOnly,
+        });
+        for miss_pair in 1..=2 {
+            let super::ParkMissDisposition::StandDown(stand_down) = super::park_miss_disposition(
+                super::PRELAUNCH_MAX_PARK_MISSES,
+                "a PTY reader missed the 250 ms handoff park deadline".to_string(),
+            ) else {
+                panic!("past the last rung the attempt stands down");
+            };
+            reduce_one_returned_failure(
+                &mut app,
+                ApplyMode::AutomaticPastGrace,
+                build,
+                &"ab".repeat(32),
+                stand_down.outcome,
+                crate::ChildDeathEvidence::Unobserved,
+            );
+            assert!(
+                app.auto_apply_manual_only.is_none(),
+                "miss pair {miss_pair}: a busy machine never latches the lane manual-only"
+            );
+            assert!(
+                app.auto_apply_intent.is_some(),
+                "miss pair {miss_pair}: the lane keeps a live retry intent"
+            );
+            assert!(
+                app.auto_apply_physical_retry.is_none(),
+                "miss pair {miss_pair}: no physical budget is spent on a stopwatch"
+            );
+            assert_eq!(
+                app.auto_apply_ladder.map(|ladder| ladder.armed_at),
+                Some(armed_at),
+                "miss pair {miss_pair}: the ladder's anchor is untouched"
+            );
+        }
+        assert_eq!(
+            app.auto_overlap_retry.map(|retry| retry.cycles),
+            Some(2),
+            "each stood-down attempt costs one rung of the ACTIVITY spacing, which \
+             saturates and never ends the lane"
         );
     }
 

@@ -1895,6 +1895,50 @@ fn combining_marks_gpu_match_cpu() {
     );
 }
 
+/// Sparse marks keep their column order across wide gaps and changing frames.
+/// A host-built duplicate must use the accessor's chosen entry only once;
+/// entries beyond the viewport or the materialized row have no base to paint.
+#[test]
+fn sparse_combining_columns_and_duplicates_match_cpu() {
+    let Some((mut cpu, mut gpu)) = backends(18.0, Theme::default()) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    let (rows, cols) = (2usize, 96usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process("\x1b[?25le\u{0301}\x1b[1;49Hn\u{0303}\x1b[1;95Ha\u{030a}".as_bytes());
+    let mut input = term.cell_frame(rows, cols);
+    assert_eq!(
+        input.combining[0]
+            .iter()
+            .map(|(c, _)| *c)
+            .collect::<Vec<_>>(),
+        [0, 48, 94]
+    );
+    input.combining[0].insert(2, (48, vec!['\u{0323}'].into_boxed_slice()));
+    input.combining[0].push((cols, vec!['\u{0301}'].into_boxed_slice()));
+    assert!(input.cells[1].get(24).is_none());
+    input.combining[1].push((24, vec!['\u{0301}'].into_boxed_slice()));
+    let mut bare = input.clone();
+    for row in &mut bare.combining {
+        row.clear();
+    }
+    let cpu_bare = cpu.render_input(&bare);
+    let mut win = aterm_gpu::WindowGpu::new();
+    for phase in ["sparse duplicates", "middle marks removed"] {
+        let cpu_frame = cpu.render_input(&input);
+        let gpu_frame = gpu.render_input(&mut win, &input, None);
+        let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+        assert!(delta <= 8, "{phase}: sparse mark parity delta {delta} > 8");
+        assert_ne!(
+            cpu_frame.pixels, cpu_bare.pixels,
+            "{phase}: no visible marks"
+        );
+        input.combining[0].retain(|(col, _)| *col != 48);
+    }
+}
+
 /// W8 (g)/(h) CPU/GPU parity for the CONDENSED symbol-tier raster.
 ///
 /// The bug this pins: U+27F5..U+27FC are one STIX Two Math design (advance
@@ -2932,6 +2976,8 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
         h: 4,
         color: 0x0018_0c04,
         alpha: 0,
+        color2: 0x0018_0c04,
+        alpha2: 0,
     }];
     input_glow.glow_halo = vec![aterm_render::RainHalo {
         row: 1,

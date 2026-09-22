@@ -17,7 +17,8 @@
 //! Each winit `ApplicationHandler` root calls [`beat`] on entry with a
 //! [`Breadcrumb`] naming where the main thread is. `beat` bumps a monotonic
 //! [`HEARTBEAT`] counter and stamps the [`BREADCRUMB`]. A background sampler
-//! thread (started by [`start`]) wakes every [`SAMPLE_INTERVAL`]; if the
+//! thread (started by [`start`]) wakes every [`sample_interval`] (half this
+//! build's stall bar); if the
 //! heartbeat has not advanced for longer than [`STALL_THRESHOLD`] *and* the last
 //! breadcrumb is a WORK root (not the idle park point), the main thread is wedged
 //! inside bounded event handling — it logs (and optionally aborts) with the last
@@ -119,19 +120,35 @@
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// How often the sampler thread wakes to inspect the heartbeat.
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+/// How often the sampler thread wakes to inspect the heartbeat: HALF the bar
+/// this build judges a stall against ([`threshold`]), so two consecutive
+/// samples always straddle it.
+///
+/// DERIVED, NOT CONSTANT (2026-09-22 efficiency audit). It was a flat 250 ms
+/// while the bar it serves is 500 ms in a debug build and
+/// [`RELEASE_STALL_THRESHOLD`] (5 s) in a shipped one — so a release binary woke
+/// 4 times a second, twenty samples per threshold window, to answer a question
+/// that needs two. Measured on the owner's idle machine: the watchdog was the
+/// single largest source of aterm's kernel wakeups at rest (4.0 of ~6.3 raw
+/// wakes/s, before macOS coalescing), on a fanless laptop where deep-idle
+/// residency is the whole battery story. Halving the threshold keeps the
+/// detection property exactly — a wedge is still caught within 1.5 thresholds —
+/// and the DEBUG lane is byte-identical at 250 ms, so nothing a developer
+/// watches changes.
+fn sample_interval() -> Duration {
+    threshold() / 2
+}
 
 /// How long the heartbeat may stay frozen at a WORK breadcrumb before it counts
-/// as a stall, in a DEBUG build or under an explicit `$ATERM_WATCHDOG`. Two
-/// sample intervals, so a genuine wedge is caught within ~750 ms while a single
-/// slow-but-progressing frame never trips.
+/// as a stall, in a DEBUG build or under an explicit `$ATERM_WATCHDOG`. The
+/// sampler wakes at half this ([`sample_interval`]), so a genuine wedge is
+/// caught within ~750 ms while a single slow-but-progressing frame never trips.
 const STALL_THRESHOLD: Duration = Duration::from_millis(500);
 
 /// The same bar for a SHIPPED release binary, where the reader is a user's
 /// `aterm.log` rather than a developer's terminal.
 ///
-/// Ten sample intervals. The trade is deliberate and one-directional: 500 ms of
+/// The trade is deliberate and one-directional: 500 ms of
 /// main-thread work is unusual but not impossible in the field (a cold font
 /// catalog, a very large paste, a first-frame pipeline build), and an error line
 /// for one of those is noise that teaches a reader to ignore the guard. Five
@@ -898,9 +915,15 @@ fn abort_on_stall() -> bool {
 }
 
 /// Spawn the background stall sampler. Call once from `main` just before
-/// `run_app`. A no-op (spawns nothing) when [`enabled`] is false, so release
-/// binaries pay nothing. No self-terminate handshake is needed — the process is
-/// exiting when this thread would otherwise notice, and it is a daemon by nature.
+/// `run_app`. A no-op (spawns nothing) only when [`enabled`] is false — and
+/// [`enabled`] defaults TRUE, so a shipped binary DOES run this thread; what it
+/// pays is one wake per [`sample_interval`], which in a release build is half of
+/// [`RELEASE_STALL_THRESHOLD`] = 2.5 s. (This doc said "release binaries pay
+/// nothing" while the sampler woke four times a second in every shipped build;
+/// the 2026-09-22 efficiency audit measured it as the largest single source of
+/// aterm's kernel wakeups at rest.) No self-terminate handshake is needed — the
+/// process is exiting when this thread would otherwise notice, and it is a
+/// daemon by nature.
 pub fn start() {
     if !enabled() {
         return;
@@ -910,14 +933,15 @@ pub fn start() {
     let builder = std::thread::Builder::new().name("aterm-watchdog".into());
     // A spawn failure is non-fatal: the app runs fine without the tripwire.
     let _ = builder.spawn(move || {
+        let sample = sample_interval();
         aterm_log::info!(
-            "main-thread stall watchdog armed (sample {SAMPLE_INTERVAL:?}, threshold \
+            "main-thread stall watchdog armed (sample {sample:?}, threshold \
              {threshold:?}, repeat {STALL_REPEAT_INTERVAL:?}, abort={abort})"
         );
         let mut sampler =
             Sampler::with_threshold(Instant::now(), HEARTBEAT.load(Ordering::Relaxed), threshold);
         loop {
-            std::thread::sleep(SAMPLE_INTERVAL);
+            std::thread::sleep(sample);
             let now = Instant::now();
             let cur = HEARTBEAT.load(Ordering::Relaxed);
             let bc = Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed));
@@ -944,6 +968,31 @@ pub fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE SAMPLER'S CADENCE IS DERIVED FROM THE BAR IT SERVES (2026-09-22).
+    ///
+    /// Two consecutive samples must always straddle the threshold, or a wedge
+    /// could sit undetected for longer than the bar promises; and the sampler
+    /// must not wake more often than that, because on a fanless laptop at rest
+    /// every one of those wakes is charged to deep-idle residency and nothing
+    /// else. Half is the one ratio that satisfies both, and it keeps the debug
+    /// lane byte-identical at the 250 ms it has always used.
+    #[test]
+    fn the_sample_interval_is_half_the_stall_threshold() {
+        assert_eq!(
+            sample_interval(),
+            threshold() / 2,
+            "the sampler's cadence is derived from the bar, never set beside it"
+        );
+        assert!(
+            sample_interval() * 2 <= threshold(),
+            "two samples must straddle the threshold"
+        );
+        // The two bars this build can have, checked by construction so the
+        // arithmetic is pinned even in the build that does not take that arm.
+        assert_eq!(STALL_THRESHOLD / 2, Duration::from_millis(250));
+        assert_eq!(RELEASE_STALL_THRESHOLD / 2, Duration::from_millis(2_500));
+    }
 
     /// [`BREADCRUMB`] and [`HEARTBEAT`] are process-global and the tests in this
     /// binary run in parallel, so every test that BEATS takes this first. Without

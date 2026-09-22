@@ -984,6 +984,20 @@ mod tests {
         out
     }
 
+    /// Pack FLAT `GlowInstance`s (tight 16 bytes: `[u16;4]` rect + the
+    /// `[u8;4]` colour at BOTH ends of the ramp) for the glow-family rows.
+    fn glow_stream(instances: &[([u16; 4], [u8; 4])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (rect, colour) in instances {
+            for v in rect {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(colour);
+            out.extend_from_slice(colour);
+        }
+        out
+    }
+
     /// One `GlyphInstance` fixture: rect, uv, colour, bg.
     type GlyphFixture = ([f32; 4], [f32; 4], [u8; 4], [u8; 4]);
 
@@ -1200,7 +1214,7 @@ mod tests {
         );
         let s_glow = shared_buffer(
             &dev,
-            &bg_stream(&[
+            &glow_stream(&[
                 ([0, 0, 16, 16], [30, 60, 20, 255]),
                 ([6, 6, 6, 6], [90, 10, 50, 180]),
             ]),

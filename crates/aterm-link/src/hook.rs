@@ -64,14 +64,16 @@
 //! because a regression on the other side of the socket would otherwise be a
 //! prompt-injection hole rather than a wrong-looking line.
 //!
-//! ## The four hooks
+//! ## The hooks (five by default, six with --gate-tools)
 //!
 //! | Event | What it does | Exit |
 //! |---|---|---|
 //! | `session-start` | prints the metadata block as plain stdout | 0 |
 //! | `user-prompt-submit` | prints it as `hookSpecificOutput.additionalContext` | 0 |
-//! | `pre-tool-use` | blocks the tool call while the session is halted (§5.3) | 2 when held |
-//! | `stop` | blocks on `await inbox`, wakes the agent for accepted mail | 2 on a wake |
+//! | `pre-tool-use` | with `--gate-tools`: blocks the tool call while the session is halted (§5.3); without it, nothing | 2 when held |
+//! | `permission-request` | in bypassPermissions only: allows a Bash removal whose variable targets it guards as `${NAME:?}` (`permission.rs`), through `updatedInput`; every other box is left to the human | 0 |
+//! | `notification` | for a box or dialog waiting on a human: sets the session's `attention` (`claude needs approval: …`) and, with `--report-to`, one `kind=ask` | 0 |
+//! | `stop` | reports the screen; with `--keep-alive`, then blocks on `await inbox` | 2 on a wake |
 //!
 //! Exit 2 means "block" on all three of `PreToolUse`, `Stop` and
 //! `UserPromptSubmit`, with stderr shown to the model; `UserPromptSubmit` is
@@ -105,42 +107,40 @@
 //! command, and it runs BEFORE the wait: the agent's LAST message is posted
 //! to `<sid>` as `kind=report`, so a manager parked on `aterm drive watch
 //! --mail` learns what the worker said the moment it stopped — without the
-//! worker being told to post it, and without a screen read. The message is
-//! the turn's final DISPLAYED message, taken from the transcript the vendor
-//! hands the hook (`transcript_path` in the stdin JSON, a JSONL file, read
-//! from its tail): the last assistant message after the turn's prompt — or
-//! after the wake that kept the turn alive, the `Stop` feedback line — that
-//! showed anything, its `text` blocks and its NARRATION joined in order
-//! ([`scan_turn`]). This Claude Code build stores the `⏺` narration it shows
-//! between tool calls as `thinking` blocks, told from hidden reasoning by a
-//! kind stamped in the block's signature ([`is_narration`]); a `thinking`
-//! block without that mark is never posted, and a turn whose last message is
-//! only that posts nothing and says so. The transcript LAGS the turn (the
-//! vendor flushes it on a timer and runs `Stop` at once), so the read waits
-//! for it to catch up ([`settle`]), with the vendor's own
-//! `last_assistant_message` as the fallback ([`displayed_message`]) — a hook
-//! that read at once posted a stale one-liner from before the turn's end
-//! (round 16 addendum, observed live on 0.86.0). It is trimmed to
-//! [`REPORT_MAX`] with a marker; it
-//! carries `re=<off>` of the newest `task` in the agent's own inbox that is
-//! unhandled or newer than its last report ([`report_task`]) when there is
-//! one; it is posted ONCE per message — the content key ([`report_key`]) of
-//! the last post is kept in the state dir, so a re-fired `Stop` (a retry, or
-//! the line landing after its fallback was posted) posts nothing twice, while
-//! a reply after a wake, even in the same words, is a message of its own;
-//! and once it lands or is
-//! queued it is charged to the wake budget like a wake, so a thrashing agent
-//! cannot flood its manager either. Everything about it fails open: no
-//! `transcript_path` and no vendor text, a transcript that is not Claude
-//! Code's, a file that cannot be read, a turn that displayed nothing, a
-//! budget that is spent, a recipient the instance does not
-//! host, a post the endpoint refused — the reason on stderr, nothing posted,
-//! no exit code of its own, and the wait below unchanged.
+//! worker being told to post it, and without the manager reading a screen of
+//! its own. The message is
+//! what the SCREEN says, read through the control socket: `status` names the
+//! settled screen's `seq=` and `hash=`, `text` hands over its rows, the rows
+//! are hashed here and checked against that stamp (three tries, because the
+//! screen is live), and the body is the rows from the last `⏺` row down to
+//! where the live zone begins — or the last six non-blank rows above it, when
+//! the screen has no such row. THE STAMP RIDES THE BODY, on its own first
+//! line, so a manager can hold the report against `history` instead of
+//! believing it — and when the screen was still BUSY on every try, that line
+//! carries ` busy=1`, because the stamp is then of a mid-turn screen and will
+//! not match the ledger. Until round 22 this was read from the vendor's transcript
+//! instead — 543 lines of JSONL walking, base64 and protobuf, classifying
+//! thinking blocks by an undocumented signature — and what it posted was text
+//! nobody watching the terminal ever saw.
 //!
-//! THE BODY THIS HOOK POSTS IS THE AGENT'S OWN WORDS, and they go OUT, to a
-//! peer that reads them through its own `inbox get` — the one path the rule
-//! at the top of this module was written for. Nothing of the transcript is
-//! put in front of THIS agent.
+//! It is trimmed to [`REPORT_MAX`] with a marker; it carries `re=<off>` of the
+//! newest `task` in the agent's own inbox that is unhandled or newer than its
+//! last report ([`report_task`]) when there is one; it is posted ONCE per
+//! SCREEN — that screen's own `hash=` is the key ([`already_reported`]), kept
+//! in the state dir, so a re-fired `Stop` reads the same screen and posts
+//! nothing twice while a turn that moved the screen by a row is a report of
+//! its own; and once it lands or is queued it is charged to the wake budget
+//! like a wake, so a thrashing agent cannot flood its manager either.
+//! Everything about it fails open: an instance whose `status` carries no
+//! stamp, a screen that moves under the two reads three times running, a
+//! budget that is spent, a recipient the instance does not host, a post the
+//! endpoint refused — the reason on stderr, nothing posted, no exit code of
+//! its own, and the wait below (when `--keep-alive` asks for one) unchanged.
+//!
+//! THE BODY THIS HOOK POSTS IS THE AGENT'S OWN SCREEN, and it goes OUT, to a
+//! peer that reads it through its own `inbox get` — the one path the rule at
+//! the top of this module was written for. Nothing is put in front of THIS
+//! agent.
 //!
 //! ## Finding aterm
 //!
@@ -157,7 +157,10 @@
 //!
 //! `hook run <event> --check` performs exactly that resolution plus one
 //! `status`, prints `ok session=<sid> sock=<path>` or `not ok <reason>`, and
-//! exits 0 either way. It is what [`install_claude`] runs, per generated
+//! exits 0 either way. With no session at all it asks the INSTANCE
+//! ([`connect_instance`]: `--sock`, then `$ATERM_CONTROL_SOCK`, then the
+//! `latest` alias or the newest live instance) and prints
+//! `ok instance sock=<path>`. It is what [`install_claude`] runs, per generated
 //! command, BEFORE it prints or writes anything: a command that does not answer
 //! `ok` is a hook that would not have worked, and the installer refuses (exit
 //! 2, nothing touched) rather than install it.
@@ -216,8 +219,12 @@ const OPEN: &str = "[aterm fabric] inbox metadata — ids, senders, kinds and si
 const USAGE: &str = "\
 aterm-link hook — the zero-residency wake (DESIGN-aterm-fabric.md §9.1)
 
-  aterm-link hook install claude [--merge] [--dry-run] [--rewake] [--settings <path>] [options]
-  aterm-link hook run <session-start|user-prompt-submit|pre-tool-use|stop> [--check] [options]
+  aterm-link hook install claude [--merge] [--keep-flags] [--dry-run] [--rewake] [--gate-tools]
+                                 [--keep-alive] [--settings <path>] [options]
+  aterm-link hook status  claude [--settings <path>] [--exe <path>]
+  aterm-link hook remove  claude [--settings <path>]
+  aterm-link hook run <session-start|user-prompt-submit|pre-tool-use|permission-request|notification|stop>
+                      [--check] [options]
 
   --session @<sid>       the session to speak for (default: $ATERM_PARENT_SESSION_ID)
   --sock <path>          aterm's control socket (default: found the way `aterm ctl` finds
@@ -229,25 +236,50 @@ aterm-link hook — the zero-residency wake (DESIGN-aterm-fabric.md §9.1)
   --accept-from <p>,...  principals whose rows may wake a `stop`, beside every `h-*`
   --wake-budget <n>/<m>  at most <n> stop-wakes per <m> minutes (default 6/min)
   --timeout <s>          how long `stop` waits for mail (default 15; decimals allowed)
-  --report-to @<sid>     stop: BEFORE the wait, post the agent's LAST message — the turn's
-                         final displayed message, its text and its narration (never a
-                         thinking block without Claude Code's narration mark: hidden
-                         reasoning is not posted), from the transcript the vendor hands
-                         the hook (transcript_path, a regular file or nothing) once it
-                         has caught up (at most 2 s; else the vendor's
-                         last_assistant_message) — to <sid> as
-                         kind=report, re= the newest task in the agent's inbox that is
-                         unhandled or newer than its last report, trimmed to 4 KiB; once
-                         per message (a re-fired Stop posts nothing twice); the recipient
-                         asked `status` first (not hosted: nothing posted) and the post
-                         waited on for its landing (1.5 s): landed, charged to the wake
-                         budget and silent; queued (a bridge whose link is down) charged
-                         and said; in a dead outbox (no bridge) said, not charged; every
-                         failure is the reason on stderr and no exit code of its own (the
-                         wait below decides it, as without the flag)
+  --report-to @<sid>     stop: post what the agent's SCREEN says to <sid> as kind=report.
+                         The body is `seq=<n> hash=<hex16>` then the rows from the last
+                         `⏺` row down to where the live zone begins, or the last 6
+                         non-blank rows above it when the screen has no such row — read
+                         through the control socket (`status` for the stamp, `text` for
+                         the rows, the rows hashed here and checked against it, three
+                         tries), so a manager can hold the report against `history`
+                         rather than believe it. A `status` that answers seq=- (the
+                         terminal lock was contended) is one more reason to retry inside
+                         those tries, never a dropped report; and a screen still BUSY on
+                         every try (`esc to interrupt`, or a live spinner row) is posted
+                         anyway with ` busy=1` on the stamp line — its stamp is of a
+                         mid-turn screen and will NOT match `history`, which is what the
+                         token says. re= the newest task in the agent's inbox
+                         that is unhandled or newer than its last report, trimmed to
+                         4 KiB; once per SCREEN (a re-fired Stop posts nothing twice, and
+                         the screen's own hash is the key); the recipient asked `status`
+                         first (not hosted: nothing posted) and the post waited on for
+                         its landing (1.5 s): landed, charged to the wake budget and
+                         silent; queued (a bridge whose link is down) charged and said;
+                         in a dead outbox (no bridge) said, not charged; every failure is
+                         the reason on stderr and no exit code of its own
+  --gate-tools           OPT-IN, off by default. install: write the PreToolUse hook too,
+                         so a held session (`hold=1`) REFUSES the agent's tool calls;
+                         run pre-tool-use: do that gating. Without it the event does
+                         nothing at all and the installer writes five hooks, not six —
+                         a hook that fails blocks the agent, and this is the one whose
+                         failure leaves a worker unable to do anything. The structural
+                         half of the halt is the drive hold at the socket and needs no
+                         hook
+  --keep-alive           OPT-IN, off by default. stop: after the report, park on
+                         `await inbox` for --timeout and exit 2 when accepted mail
+                         arrives, keeping the turn alive. Without it `stop` reports and
+                         returns — a turn a hook holds open is a turn a human watching
+                         the terminal did not see end
   --check                `run`: resolve the session, the socket and the token, ask
                          `status`, print `ok session=<sid> sock=<path>` or `not ok <why>`,
-                         and exit 0 — the line the installer's self-test reads; with
+                         and exit 0 — the line the installer's self-test reads; with no
+                         session at all (aterm's own auto-prime pass runs the installer
+                         from the window, before any session exists) the instance is
+                         asked `version` instead, found through --sock, then
+                         $ATERM_CONTROL_SOCK, then the `latest` alias or, when that is
+                         dead, the newest live instance (the way a flagless `aterm ctl`
+                         finds one), and the line is `ok instance sock=<path>`; with
                          --report-to the recipient is asked `status` too and the line
                          ends `report-to=<sid>` (a recipient that does not exist, or an
                          instance with no bridge and none coming — `fabric status`
@@ -261,6 +293,14 @@ aterm-link hook — the zero-residency wake (DESIGN-aterm-fabric.md §9.1)
                          replaced, the original copied to <file>.bak-<unix> first; a
                          symlink stays a symlink (its target is merged into, and keeps
                          its mode, backup included)
+  --keep-flags           install --merge: the --state, --accept-from, --report-to,
+                         --wake-budget, --timeout and --keep-alive of the Stop hook
+                         already in the file, its async/asyncRewake, and a --gate-tools
+                         PreToolUse entry of ours, are kept unless this command line
+                         sets them (a round-21 PreToolUse entry with no --gate-tools
+                         word is not a gate anyone asked for, and is dropped) — the
+                         auto-prime pass re-installs a stale block this way, so an
+                         operator's flags survive an aterm update that adds an event
   --dry-run              install: self-test and print the document; write nothing
   --exe <path>           install: the executable the hooks run (default: this one; a
                          relative path is made absolute, a bare name found on $PATH)
@@ -270,12 +310,57 @@ aterm-link hook — the zero-residency wake (DESIGN-aterm-fabric.md §9.1)
 prints or writes anything: a command that does not answer `ok` refuses the install
 (exit 2, nothing touched). Claude Code loads a hook edit into the RUNNING session and
 reads a failing hook as a block, so a hook that does not run stops the agent the
-moment it is saved. `run` exits 2 for two verdicts only — pre-tool-use under hold=1,
-and stop with accepted mail; every failure of its own (no aterm, no token, a bad
-reply, a bad stdin) is exit 0 with the reason on stderr.
+moment it is saved. `run` exits 2 for two verdicts only — pre-tool-use under
+hold=1 with --gate-tools, and stop with accepted mail under --keep-alive; neither is on
+by default, so a default installation never exits 2 at all. Every failure of its own (no
+aterm, no token, a bad reply, a bad stdin) is exit 0 with the reason on stderr.
+
+`status` prints ONE verdict for the block in the settings file and exits 0 either
+way; `aterm agents` and the auto-prime pass read it. The block's events are the five
+a default install writes (SessionStart, UserPromptSubmit, PermissionRequest,
+Notification, Stop); PreToolUse is checked only where --gate-tools put it. Checked in
+this order, the first that holds is printed:
+  absent                       no file, or no aterm entry in it
+  unreadable: <why>            the file cannot be read, or is not JSON
+  stale: <path> is not there to run
+                               an aterm entry runs an executable that does not exist
+  stale: missing <Event>,...   a default event has no aterm entry at all
+  stale: <Event> does not run <form> <event>
+                               an entry not spelled for its own executable (`hook run`
+                               for one named aterm-link, else `link hook run`)
+  installed                    every default event, every entry run by the SAME FILE as
+                               --exe (a symlink to it, or it to one, is the same file)
+  installed-by <path>          every default event, but run by another executable that
+                               exists (the first such path, as the file writes it)
+`remove` takes aterm's entries out (a backup at <file>.bak-<unix> first) and keeps
+everything else. `install --merge` and `remove` keep the newest 8 of those backups
+and delete the older ones.
+
+`permission-request` is the hook that answers Claude Code's approval box when aterm
+can make the request safe and nobody has to be asked: in a bypass-permissions session
+(the human's own \"do not ask me\"), a Bash command whose `rm`/`rmdir` targets carry
+shell variables — the vendor's \"possibly-empty variable path\" circuit breaker, which
+no permission rule can allow — is allowed with every such variable GUARDED
+(`$S/$1` becomes `${S:?}/${1:?}`, the amendment the box itself asks for), the
+window told `story approved`, and one line appended to <state>/decisions/<sid>.log —
+but only when every value those variables can take on the line (its assignments,
+`for` lists, `set --`, a `mktemp` directory, the environment) renders to a path
+outside the critical classes after `..`, globs and symlinks are resolved. Every
+other request is left alone: nothing is printed, so the box appears exactly as it
+would have, and the decision log says why. The ESCALATION is `notification`'s: when
+the vendor reports it is waiting on a human (`permission_prompt`, an elicitation
+dialog — about six seconds after the box appears with no keystroke), the session's
+`attention` meta is set (`claude needs approval: …` — the menu bar badges it, `ls`
+shows meta=1, `status` reads level=attention) and a `--report-to` recipient is posted
+a kind=ask. Escalating on the vendor's own \"needs you\" and not on the request is what
+keeps a box another hook answered (`aterm harness`'s rm policy, an owner's own hook)
+from ever lighting the badge. The next session-start, user-prompt-submit, stop or
+guarded allow — and pre-tool-use, where --gate-tools installed it — clears an
+attention these hooks set, and only one they set.
 ";
 
 /// The options every `run` and `install` shares.
+#[derive(Clone)]
 struct Opts {
     session: String,
     /// An explicit `--sock`. Empty means "resolve on every run" ([`resolve`]).
@@ -289,6 +374,16 @@ struct Opts {
     budget: (u32, u64),
     timeout: Duration,
     rewake: bool,
+    /// `--gate-tools`: OPT-IN. Install the `PreToolUse` hook, and let a `run
+    /// pre-tool-use` gate on `hold=1`. OFF by default since round 22: a hook
+    /// that fails BLOCKS the agent, and a tool gate is the one hook whose
+    /// failure mode is "the worker can do nothing at all".
+    gate_tools: bool,
+    /// `--keep-alive`: OPT-IN. Let `stop` park on `await inbox` and exit 2 when
+    /// accepted mail arrives, keeping the turn alive. OFF by default since
+    /// round 22: a turn a hook holds open is a turn a human watching the
+    /// terminal did not see end.
+    keep_alive: bool,
     /// `--report-to`: the session (`s-…`, no `@`) the `stop` hook posts the
     /// agent's last message to as `kind=report`. `None`: no report.
     report_to: Option<String>,
@@ -297,6 +392,11 @@ struct Opts {
     check: bool,
     /// `install --merge`: merge into an existing settings file.
     merge: bool,
+    /// `install --merge --keep-flags`: adopt the Stop flags already installed.
+    keep_flags: bool,
+    /// The flag names this command line set, so `--keep-flags` never
+    /// overrides one the operator spelled out.
+    explicit: Vec<String>,
     /// `install --dry-run`: self-test and print; write nothing.
     dry_run: bool,
     /// `install --exe`: the executable the hooks run, instead of this one.
@@ -320,6 +420,17 @@ pub fn main(args: &[String]) -> ExitCode {
                 other.unwrap_or("nothing")
             )),
         },
+        Some(verb @ ("status" | "remove")) => match args.get(1).map(String::as_str) {
+            Some("claude") => match parse(&args[2..]) {
+                Ok(opts) if verb == "status" => status_claude(&opts),
+                Ok(opts) => remove_claude(&opts),
+                Err(e) => usage(&e),
+            },
+            other => usage(&format!(
+                "hook {verb}: the only agent with a verified hook contract is `claude` (got {})",
+                other.unwrap_or("nothing")
+            )),
+        },
         Some("run") => {
             let Some(event) = args.get(1).map(String::as_str) else {
                 return usage("hook run: name the event");
@@ -330,7 +441,7 @@ pub fn main(args: &[String]) -> ExitCode {
             }
         }
         other => usage(&format!(
-            "hook: `install` or `run` (got {})",
+            "hook: `install`, `status`, `remove` or `run` (got {})",
             other.unwrap_or("nothing")
         )),
     }
@@ -351,19 +462,36 @@ fn usage(msg: &str) -> ExitCode {
 // The events
 // ---------------------------------------------------------------------------
 
-/// The `hook run` events, by their `hook run` spelling.
-const EVENTS: [&str; 4] = [
-    "session-start",
-    "user-prompt-submit",
-    "pre-tool-use",
-    "stop",
+/// The `hook run` events, by their `hook run` spelling, beside the vendor's
+/// name for each — ONE roster, read by the settings builder, the installer's
+/// self-test and `status`, so the events written, tested and checked for
+/// cannot be three lists.
+pub const EVENTS: [(&str, &str); 6] = [
+    ("session-start", "SessionStart"),
+    ("user-prompt-submit", "UserPromptSubmit"),
+    ("pre-tool-use", "PreToolUse"),
+    ("permission-request", "PermissionRequest"),
+    ("notification", "Notification"),
+    ("stop", "Stop"),
+];
+
+/// The events a DEFAULT install writes, in document order: every event but
+/// `pre-tool-use`, which only `--gate-tools` installs (round 22: the one hook
+/// whose failure leaves a worker unable to do anything is opt-in). What
+/// `status` requires for `installed`, and what the self-test proves.
+pub const DEFAULT_EVENTS: [(&str, &str); 5] = [
+    ("session-start", "SessionStart"),
+    ("user-prompt-submit", "UserPromptSubmit"),
+    ("permission-request", "PermissionRequest"),
+    ("notification", "Notification"),
+    ("stop", "Stop"),
 ];
 
 fn run(event: &str, opts: &Opts) -> ExitCode {
-    if !EVENTS.contains(&event) {
+    if !EVENTS.iter().any(|(run, _)| *run == event) {
         return usage(&format!(
             "hook run: unknown event {event:?} (session-start, user-prompt-submit, \
-             pre-tool-use, stop)"
+             pre-tool-use, permission-request, notification, stop)"
         ));
     }
     if opts.check {
@@ -390,6 +518,8 @@ fn run(event: &str, opts: &Opts) -> ExitCode {
             ExitCode::SUCCESS
         }
         "pre-tool-use" => pre_tool_use(opts),
+        "permission-request" => permission_request(opts),
+        "notification" => notification(opts),
         _ => stop(opts),
     }
 }
@@ -403,6 +533,28 @@ fn run(event: &str, opts: &Opts) -> ExitCode {
 /// exactly the thing the vendor acts on. The installer keys on the `ok ` prefix
 /// ([`self_test`]); a human keys on the words after `not ok`.
 fn check(opts: &Opts) -> ExitCode {
+    if opts.session.is_empty() {
+        // THE INSTANCE FORM. aterm's own auto-prime pass runs the installer
+        // from the window thread, where no session exists yet, with
+        // `$ATERM_CONTROL_SOCK` naming its socket: the command, its spelling,
+        // the executable and the socket are all still measured — only the
+        // `status` is the instance's own `version`.
+        match connect_instance(opts) {
+            Ok((mut ctl, sock)) => match ctl.request("version") {
+                Ok(reply) if reply.ok() => match recipient_check(&mut ctl, opts) {
+                    Ok(tail) => println!("ok instance sock={sock}{tail}"),
+                    Err(why) => println!("not ok instance sock={sock}: {why}"),
+                },
+                Ok(reply) => println!(
+                    "not ok instance sock={sock}: {}",
+                    safe_reason(reply.header())
+                ),
+                Err(e) => println!("not ok instance sock={sock}: {e}"),
+            },
+            Err(reason) => println!("not ok {reason}"),
+        }
+        return ExitCode::SUCCESS;
+    }
     match connect(opts) {
         Ok((mut ctl, found)) => {
             let at = format!("session={} sock={}", found.session, found.sock);
@@ -495,6 +647,16 @@ fn fabric_cannot_carry(header: &str) -> Option<String> {
 /// an aterm session at all. The structural half of the halt is the drive hold at
 /// the socket, which needs no hook to work.
 fn pre_tool_use(opts: &Opts) -> ExitCode {
+    // OPT-IN SINCE ROUND 22. Without `--gate-tools` this hook does nothing at
+    // all — no connection, no `status`, no verdict — so an installation that
+    // still carries the entry, or a hand-run of the event, cannot block a tool
+    // call. The structural half of the halt is the drive hold at the socket
+    // and needs no hook at all; this one only turns a held session into a
+    // REFUSAL THE AGENT READS, which is worth having and is not worth the risk
+    // of a failing hook standing between a worker and every tool it has.
+    if !opts.gate_tools {
+        return ExitCode::SUCCESS;
+    }
     let Some(mut ctl) = open(opts, "pre-tool-use") else {
         return ExitCode::SUCCESS;
     };
@@ -512,6 +674,9 @@ fn pre_tool_use(opts: &Opts) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
+    // A tool call is the agent moving again: an approval box an earlier
+    // notification escalated has been answered.
+    clear_attention(&mut ctl, opts);
     if !field(status.header(), "hold").is_some_and(|v| v == "1") {
         return ExitCode::SUCCESS;
     }
@@ -578,30 +743,469 @@ fn safe_reason(raw: &str) -> String {
 /// for both with margin — and a bound this file keeps whatever the endpoint does.
 const REASON_MAX: usize = 256;
 
+// ---------------------------------------------------------------------------
+// PermissionRequest and Notification — answer what can be made safe, escalate
+// the rest (see `permission.rs` for the rule)
+// ---------------------------------------------------------------------------
+
+/// The one string field `key` of the vendor's document, or empty.
+fn str_field<'a>(doc: &'a Json, key: &str) -> &'a str {
+    doc.get(key).and_then(Json::as_str).unwrap_or("")
+}
+
+/// `hook run permission-request` — the vendor is about to ask the human.
+///
+/// stdout is the decision or nothing: a `Guarded` verdict prints the
+/// `hookSpecificOutput` with `behavior: allow` and the guarded command as
+/// `updatedInput` (the vendor re-evaluates it against deny and ask rules, and
+/// runs it), plus a `systemMessage` the transcript shows so the human can see
+/// what was changed. An `Escalate` verdict prints NOTHING, so the box appears
+/// exactly as it would have, and the escalation goes out of band
+/// ([`escalate`]). Every failure of this hook's own — a stdin that is not the
+/// vendor's JSON, no aterm — is exit 0 with the reason on stderr and no
+/// decision, which is the box the human would have seen anyway.
+fn permission_request(opts: &Opts) -> ExitCode {
+    let input = read_stdin();
+    let doc = match Json::parse(&input) {
+        Ok(doc) => doc,
+        Err(e) => {
+            eprintln!("aterm-link hook: permission-request: stdin is not JSON ({e}); no decision");
+            return ExitCode::SUCCESS;
+        }
+    };
+    let tool = str_field(&doc, "tool_name");
+    let mode = str_field(&doc, "permission_mode");
+    let cwd = str_field(&doc, "cwd");
+    let tool_input = doc.get("tool_input");
+    let command = tool_input
+        .and_then(|t| t.get("command"))
+        .and_then(Json::as_str)
+        .unwrap_or("");
+    // What the attention names when there is no command: the path an Edit or
+    // Write asks about, or nothing.
+    let subject = if command.is_empty() {
+        tool_input
+            .and_then(|t| t.get("file_path"))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+    } else {
+        command
+    };
+    if harness_off("permission-request") {
+        return ExitCode::SUCCESS;
+    }
+    match crate::permission::decide(mode, tool, command, cwd) {
+        crate::permission::Verdict::Guarded {
+            command: guarded,
+            rewrites,
+        } => {
+            let Some(Json::Object(members)) = tool_input.cloned() else {
+                eprintln!(
+                    "aterm-link hook: permission-request: tool_input is not an object; no decision"
+                );
+                return ExitCode::SUCCESS;
+            };
+            let mut updated: Vec<(String, Json)> = members
+                .into_iter()
+                .filter(|(k, _)| k != "command")
+                .collect();
+            updated.insert(0, ("command".to_string(), Json::Str(guarded.clone())));
+            let changes: Vec<String> = rewrites
+                .iter()
+                .map(|(from, to)| format!("{from} -> {to}"))
+                .collect();
+            // THE DECISION ROW COMES FIRST, before the decision is printed: an
+            // allow that reached the vendor with no row behind it would be an
+            // approval nobody can audit. A log that cannot be written does not
+            // withhold the decision — the id is then a timestamp, and the
+            // decision is still printed ([`decision_log`]).
+            let id = decision_log(
+                opts,
+                &format!(
+                    "allow guarded {} :: {}",
+                    changes.join(" "),
+                    crate::permission::command_head(&guarded)
+                ),
+            );
+            // Attributed: `aterm harness` is byte-identical to the harness's
+            // `mark::STEM` (aterm-agent), and `link rm-guard` names THIS
+            // decider — never `rm policy`, which is `harness::rm_policy`'s
+            // rule name, a different decider with a different ledger.
+            let message = format!(
+                "aterm harness link rm-guard id={id}: guarded the removal so an empty variable \
+                 cannot make it `rm -rf /`: {} (the amendment the box asks for; bypass \
+                 permissions is on, so nobody was asked)",
+                changes.join(", ")
+            );
+            let out = Json::Object(vec![
+                (
+                    "hookSpecificOutput".to_string(),
+                    Json::Object(vec![
+                        (
+                            "hookEventName".to_string(),
+                            Json::Str("PermissionRequest".to_string()),
+                        ),
+                        (
+                            "decision".to_string(),
+                            Json::Object(vec![
+                                ("behavior".to_string(), Json::Str("allow".to_string())),
+                                ("updatedInput".to_string(), Json::Object(updated)),
+                            ]),
+                        ),
+                    ]),
+                ),
+                ("systemMessage".to_string(), Json::Str(message)),
+            ]);
+            println!("{}", out.render());
+            // The decision row comes first (above); the story, the attention
+            // and its clear come after the decision is on stdout, and each
+            // fails open: the window is told, and a stale attention (a box the
+            // human never saw answered) is cleared.
+            if let Some(mut ctl) = open(opts, "permission-request") {
+                clear_attention(&mut ctl, opts);
+                match ctl.request(&format!("@{} story approved guarded removal", opts.session)) {
+                    Ok(reply) if reply.ok() => {}
+                    Ok(reply) => eprintln!(
+                        "aterm-link hook: story answered {}; the window was not told",
+                        safe_reason(reply.header())
+                    ),
+                    Err(e) => eprintln!("aterm-link hook: story: {e}; the window was not told"),
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        crate::permission::Verdict::Escalate { why } => {
+            // NOT decided, and NOT escalated from here: another hook may yet
+            // answer this box (`aterm harness`'s rm policy, an owner's own), and
+            // an attention set now would badge a box nobody is waiting on. The
+            // vendor's own `permission_prompt` notification is the escalation —
+            // it fires only for a box that is actually up and unanswered.
+            eprintln!(
+                "aterm-link hook: permission-request not decided: {why}; the box is the human's"
+            );
+            decision_log(
+                opts,
+                &format!(
+                    "undecided {why} :: {tool} {}",
+                    crate::permission::command_head(subject)
+                ),
+            );
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Whether a value of `$ATERM_NO_HARNESS` (`None` = unset) switches the
+/// harness hooks off: engaged only by a value that is non-empty and not `"0"`.
+///
+/// THE SAME READING THE HARNESS MAKES, deliberately by the same function:
+/// [`aterm_types::control_socket::env_flag_engaged`] is the rule
+/// `harness::mark::env_engaged` (aterm-agent) states, and the bridge script's
+/// guard line `case "${ATERM_NO_HARNESS:-}" in ""|0) ;; *) exit 0 ;; esac`
+/// spells in shell. One variable read three ways would be three switches.
+///
+/// Only the environment is read — never the durable `[harness] enabled`
+/// switch, which the harness pins that its bridge never reads either
+/// (aterm-agent `harness/cli_tests.rs`); that switch reaches these hooks at
+/// install time.
+fn harness_vetoed(value: Option<&str>) -> bool {
+    aterm_types::control_socket::env_flag_engaged(value)
+}
+
+/// [`harness_vetoed`] on this process's `$ATERM_NO_HARNESS`, said on ONE
+/// stderr line when it is engaged. The caller then prints nothing and exits
+/// 0: no decision, no escalation — the box is the human's, exactly as if no
+/// hook were installed.
+fn harness_off(event: &str) -> bool {
+    let off = harness_vetoed(std::env::var("ATERM_NO_HARNESS").ok().as_deref());
+    if off {
+        eprintln!("aterm-link hook: {event}: $ATERM_NO_HARNESS is set; the harness is off here");
+    }
+    off
+}
+
+/// The notification types that mean the vendor is waiting on a human.
+const WAITING_NOTIFICATIONS: [&str; 3] = [
+    "permission_prompt",
+    "elicitation_dialog",
+    "elicitation_url_dialog",
+];
+
+/// `hook run notification` — the vendor's own "needs you" signal, which it
+/// sends about six seconds after a prompt or dialog appears and the human has
+/// not typed, and never for a box a hook already answered. THE ESCALATION: for
+/// the waiting kinds ([`WAITING_NOTIFICATIONS`]) it sets the session's
+/// attention and asks a `--report-to` manager ([`escalate`]); every other type
+/// is nothing to this hook. Never prints: the vendor discards a Notification
+/// hook's output.
+fn notification(opts: &Opts) -> ExitCode {
+    let input = read_stdin();
+    let doc = match Json::parse(&input) {
+        Ok(doc) => doc,
+        Err(e) => {
+            eprintln!("aterm-link hook: notification: stdin is not JSON ({e})");
+            return ExitCode::SUCCESS;
+        }
+    };
+    let kind = str_field(&doc, "notification_type");
+    if !WAITING_NOTIFICATIONS.contains(&kind) {
+        return ExitCode::SUCCESS;
+    }
+    if harness_off("notification") {
+        return ExitCode::SUCCESS;
+    }
+    let message = str_field(&doc, "message");
+    let title = str_field(&doc, "title");
+    let subject = if message.is_empty() { title } else { message };
+    escalate(opts, "notification", "", subject, kind);
+    ExitCode::SUCCESS
+}
+
+/// The attention marker for `session` under the state dir: exists exactly
+/// while an attention THESE hooks set may be standing. Read before the meta
+/// is asked, so the clear costs nothing on the common tool call.
+fn attention_marker(opts: &Opts) -> Option<std::path::PathBuf> {
+    (!opts.state_dir.is_empty() && !opts.session.is_empty()).then(|| {
+        std::path::Path::new(&opts.state_dir)
+            .join("attention")
+            .join(&opts.session)
+    })
+}
+
+/// Escalate to the human, out of band: the session's typed `attention` meta
+/// (the menu bar badges it; `ls` shows `meta=1`; `status` reads
+/// `level=attention`), and — with `--report-to` — one `kind=ask` to the
+/// recipient, so a manager parked on `aterm drive watch --mail` learns of the
+/// box the moment it appears, without a screen read.
+///
+/// THE MARKER IS WRITTEN FIRST, and the attention is set only once it is
+/// there: the marker is the only thing that lets a later event clear the
+/// attention ([`clear_attention`]), and an attention nothing can clear is
+/// worse than none — the menu bar would badge a box answered long ago. So a
+/// marker that cannot be written skips the set (said on stderr), and the box
+/// is still escalated by every other path: the ask, the decision log, the box
+/// itself. A marker left behind by a set that then failed is harmless: the
+/// next clear reads an attention that is not ours and drops it.
+fn escalate(opts: &Opts, event: &str, tool: &str, subject: &str, why: &str) {
+    let text = crate::permission::attention_text(tool, subject, why);
+    let Some(mut ctl) = open(opts, event) else {
+        return;
+    };
+    // An attention a human or an operator wrote is theirs: it is not written
+    // over, and the box is still escalated by every other path (the ask, the
+    // decision log, the box itself) — so only the meta set is skipped.
+    let foreign = ctl
+        .request(&format!("@{} meta", opts.session))
+        .ok()
+        .and_then(|meta| {
+            field(meta.header(), "attention")
+                .filter(|v| *v != "-")
+                .map(crate::pct::decode)
+        })
+        .filter(|standing| {
+            !standing.is_empty() && !standing.starts_with(crate::permission::ATTENTION_PREFIX)
+        });
+    if let Some(standing) = foreign {
+        eprintln!(
+            "aterm-link hook: attention already set by someone else ({}); left as it is",
+            safe_reason(&standing)
+        );
+    } else {
+        set_attention(&mut ctl, opts, &text);
+    }
+    ask_manager(&mut ctl, opts, &text);
+}
+
+/// The attention half of [`escalate`]: the marker FIRST, then the meta, so an
+/// attention is never standing without the marker that lets a later event
+/// clear it.
+fn set_attention(ctl: &mut Ctl, opts: &Opts, text: &str) {
+    let marked = match attention_marker(opts) {
+        None => Err("no state dir or no session to keep it under".to_string()),
+        Some(marker) => marker
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&marker, text))
+            .map_err(|e| format!("{}: {e}", marker.display())),
+    };
+    match marked {
+        Ok(()) => match ctl.request(&format!("@{} meta set attention {text}", opts.session)) {
+            Ok(reply) if reply.ok() => {}
+            Ok(reply) => eprintln!(
+                "aterm-link hook: meta set attention answered {}; not escalated",
+                safe_reason(reply.header())
+            ),
+            Err(e) => eprintln!("aterm-link hook: meta set attention: {e}; not escalated"),
+        },
+        Err(why) => eprintln!(
+            "aterm-link hook: the attention marker could not be written ({why}); the \
+             attention is not set, because nothing could clear it"
+        ),
+    }
+}
+
+/// The `--report-to` half of [`escalate`]: one `kind=ask` to the manager,
+/// charged to the wake budget.
+fn ask_manager(ctl: &mut Ctl, opts: &Opts, text: &str) {
+    let Some(to) = &opts.report_to else {
+        return;
+    };
+    let ledger = Ledger::new(opts);
+    if ledger.spent() {
+        eprintln!("aterm-link hook: ask to @{to}: the wake budget is spent; nothing posted");
+        return;
+    }
+    let body = format!(
+        "{text}\nThe approval box is on the session's screen; `aterm drive phase @{}` reads it.",
+        opts.session
+    );
+    let line = format!(
+        "@{} post to=@{to} kind=ask --wait={REPORT_WAIT_MS} len={}",
+        opts.session,
+        body.len()
+    );
+    match ctl.request_with_body(&line, body.as_bytes()) {
+        Ok(reply) => match Landing::of(reply.header()) {
+            Landing::Landed | Landing::Queued(_) => ledger.charge(),
+            Landing::Dead(why) => eprintln!(
+                "aterm-link hook: ask to @{to}: in the outbox of an instance with no bridge ({why})"
+            ),
+            Landing::Refused(why) => {
+                eprintln!("aterm-link hook: ask to @{to}: post answered {why}")
+            }
+        },
+        Err(e) => eprintln!("aterm-link hook: ask to @{to}: post: {e}"),
+    }
+}
+
+/// Clear an attention THESE hooks set, and only one they set: the marker says
+/// one may be standing; the meta is read; an `attention` that still starts
+/// with [`crate::permission::ATTENTION_PREFIX`] is unset. One the human or an
+/// operator wrote since is left exactly as it is. Without a marker nothing is
+/// asked — the common tool call costs no extra round trip.
+///
+/// THE MARKER GOES ONLY ONCE NOTHING OF OURS STANDS. It is the one record
+/// that an attention may need clearing, so it is dropped when the meta read
+/// says the standing attention is not ours (or there is none), or when the
+/// unset answered `OK` — and KEPT when the meta could not be read or the
+/// unset did not land, so the next event retries. Dropped first, as it once
+/// was, a lane that failed between the two left a badge no later event
+/// would ever look at.
+fn clear_attention(ctl: &mut Ctl, opts: &Opts) {
+    let Some(marker) = attention_marker(opts) else {
+        return;
+    };
+    if !marker.exists() {
+        return;
+    }
+    let meta = match ctl.request(&format!("@{} meta", opts.session)) {
+        Ok(meta) if meta.ok() => meta,
+        Ok(meta) => {
+            eprintln!(
+                "aterm-link hook: meta answered {}; the attention is cleared at a later event",
+                safe_reason(meta.header())
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("aterm-link hook: meta: {e}; the attention is cleared at a later event");
+            return;
+        }
+    };
+    let standing = field(meta.header(), "attention")
+        .map(crate::pct::decode)
+        .unwrap_or_default();
+    if !standing.starts_with(crate::permission::ATTENTION_PREFIX) {
+        // Nothing of ours stands: none at all, or one the human or an
+        // operator wrote since, which is theirs to clear.
+        let _ = std::fs::remove_file(&marker);
+        return;
+    }
+    match ctl.request(&format!("@{} meta unset attention", opts.session)) {
+        Ok(reply) if reply.ok() => {
+            let _ = std::fs::remove_file(&marker);
+        }
+        Ok(reply) => eprintln!(
+            "aterm-link hook: meta unset attention answered {}; it is cleared at a later event",
+            safe_reason(reply.header())
+        ),
+        Err(e) => {
+            eprintln!("aterm-link hook: meta unset attention: {e}; it is cleared at a later event")
+        }
+    }
+}
+
+/// One line per decision in `<state>/decisions/<sid>.log` — the audit trail
+/// of what this hook allowed and what it escalated, in the words the
+/// attention carries — as `<ms> id=<n> <line>`. Answers the row's id: the
+/// number of rows already in the log plus one, so the `id=` a transcript's
+/// `systemMessage` quotes finds its row. Best-effort, like the wake ledger:
+/// when there is no log to write (no state dir or session) or it cannot be
+/// written, the id is the timestamp instead, still unique enough to name the
+/// decision, and the caller's decision is not withheld.
+fn decision_log(opts: &Opts, line: &str) -> u64 {
+    let now = crate::now_ms();
+    if opts.state_dir.is_empty() || opts.session.is_empty() {
+        return now;
+    }
+    use std::io::Write as _;
+    let dir = std::path::Path::new(&opts.state_dir).join("decisions");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return now;
+    }
+    let path = dir.join(format!("{}.log", opts.session));
+    let rows = std::fs::read(&path).map_or(0, |bytes| {
+        bytes.iter().filter(|b| **b == b'\n').count() as u64
+    });
+    let id = rows + 1;
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| writeln!(f, "{now} id={id} {line}"));
+    if written.is_ok() {
+        id
+    } else {
+        now
+    }
+}
+
 /// `Stop` — the report (round 14), then the wake (§9.1). Exit 2 keeps the
 /// agent in the conversation.
 fn stop(opts: &Opts) -> ExitCode {
     let input = read_stdin();
     // The vendor's own loop breaker, read BEFORE anything else: a hook that
     // blocked a stop it had itself caused would spin the agent against the
-    // eight-in-a-row cap instead of finishing the turn. Without `--report-to`
-    // it returns here, before a connection is even opened — byte-identical to
-    // the round-12 hook. With the flag the report still goes out (a re-fired
-    // `Stop` follows a turn the wake kept alive, whose last message is new)
-    // and the flag is honoured right after it.
+    // eight-in-a-row cap instead of finishing the turn. With `--report-to` the
+    // report still goes out under it (a re-fired `Stop` follows a turn the wake
+    // kept alive, whose screen is new) and it is honoured right after.
+    //
+    // AND THE WAIT IS OPT-IN SINCE ROUND 22. Without `--keep-alive` there is no
+    // `await inbox`, so a hook with nothing to report returns here before a
+    // connection is even opened — byte-identical to the round-12 hook — and a
+    // turn ends when the agent ends it, not when its mail does.
     let active = stop_hook_active(&input);
-    if active && opts.report_to.is_none() {
+    if opts.report_to.is_none() && (active || !opts.keep_alive) {
+        // The turn ended: an approval box an earlier `notification` escalated
+        // is not waiting any more. The marker is read first, so a default
+        // install with nothing of ours standing still opens nothing.
+        if attention_marker(opts).is_some_and(|m| m.exists()) {
+            if let Some(mut ctl) = open(opts, "stop") {
+                clear_attention(&mut ctl, opts);
+            }
+        }
         return ExitCode::SUCCESS;
     }
     let deadline = Instant::now() + opts.timeout;
     let Some(mut ctl) = open(opts, "stop") else {
         return ExitCode::SUCCESS;
     };
+    clear_attention(&mut ctl, opts);
     let ledger = Ledger::new(opts);
     if let Some(to) = &opts.report_to {
-        report(&mut ctl, opts, to, &input, &ledger);
+        report(&mut ctl, opts, to, &ledger);
     }
-    if active {
+    if active || !opts.keep_alive {
         return ExitCode::SUCCESS;
     }
     // The budget is read before the first wait, so a session whose budget is
@@ -830,6 +1434,9 @@ fn listing(ctl: &mut Ctl, session: &str, listed: &[String], since: Option<u64>) 
 /// spending a line of the model's context on `0 messages`.
 fn metadata_block(opts: &Opts, event: &str) -> Option<String> {
     let mut ctl = open(opts, event)?;
+    // The human typed (user-prompt-submit), or a session began: an approval
+    // box an earlier permission-request escalated is theirs no longer.
+    clear_attention(&mut ctl, opts);
     let view = listing(&mut ctl, &opts.session, &opts.accept_from, None)?;
     if view.lines.is_empty() {
         return None;
@@ -1091,507 +1698,176 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 // The report (round 14)
 // ---------------------------------------------------------------------------
 
-/// How much of a transcript is read: its TAIL, because the message wanted is
-/// the last one and a session's transcript runs to tens of megabytes (48 MB
-/// measured on 2026-09-14). A last message further from the end than this is
-/// not found, and the hook says so and posts nothing.
-const TRANSCRIPT_TAIL_MAX: u64 = 16 << 20;
-
 /// The most of a message that is posted — the endpoint's own inline bound, and
 /// a size a manager reads in one `inbox get`. A longer message is cut on a
 /// character boundary and ends with a marker naming its full length, INSIDE
 /// the bound (the `safe_reason` rule).
 const REPORT_MAX: usize = 4096;
 
-/// The turn's final displayed message: its text; when the transcript
-/// carries one, the `uuid` of the last line that contributed to it; and the
-/// `uuid` of the line that OPENED its segment ([`Turn::anchor`]).
-struct LastMessage {
-    text: String,
-    uuid: Option<String>,
-    /// The prompt, or the `Stop` hook's feedback line, that the message
-    /// follows — what tells two segments that end in the same words apart
-    /// when the message's own `uuid` is not known yet ([`report_key`]).
-    anchor: Option<String>,
-}
+/// How many non-blank rows the report falls back to when the screen shows no
+/// row the worker SAID above the composer — a turn whose words scrolled off the
+/// top, or one that ended on tool output. Six is what a manager reads at a
+/// glance and what fits beside the stamp in one `inbox get`.
+const REPORT_ROWS: usize = 6;
 
-/// `transcript_path` from the vendor's hook input, parsed as the JSON document
-/// it is — never a substring search, for the reason [`stop_hook_active`] gives.
-/// `None` for a document without it, or one that does not parse (a hand-run
-/// hook's empty stdin).
-fn transcript_path(input: &str) -> Option<String> {
-    Json::parse(input)
-        .ok()?
-        .get("transcript_path")?
-        .as_str()
-        .map(str::to_string)
-}
+/// How many times [`settled_screen`] re-reads a screen that moved under it.
+const SETTLE_TRIES: usize = 3;
 
-/// `last_assistant_message` from the vendor's `Stop` input, trimmed — Claude
-/// Code's own reading of the turn's last assistant message, taken from the
-/// conversation IN MEMORY, so it is there before the transcript line is: its
-/// `text` blocks joined with a newline (measured in the 2.1.268 binary:
-/// `U=F?Pr(F.message.content,"\n").trim()||void 0`, where `F` is the last
-/// `assistant` entry and `Pr(e,n)` is `e.filter(type=="text").map(text)
-/// .join(n)`). Never a `thinking` block of any kind. `None` when the
-/// input has no such string (an older build, or a turn whose last message
-/// has no text).
-fn last_assistant_message(input: &str) -> Option<String> {
-    let doc = Json::parse(input).ok()?;
-    let text = doc.get("last_assistant_message")?.as_str()?.trim();
-    (!text.is_empty()).then(|| text.to_string())
-}
-
-/// What the tail of a transcript says about the turn that just ended.
-#[derive(Default)]
-struct Turn {
-    /// The turn's final displayed message, when it has one.
-    message: Option<LastMessage>,
-    /// The turn's last message with anything in it held only thinking
-    /// WITHOUT the narration mark ([`is_narration`]): it cannot be told from
-    /// hidden reasoning, so it is never posted — and neither is anything
-    /// older, which would be a stale report.
-    undisplayed: bool,
-    /// The turn's LAST assistant line read the way the vendor reads
-    /// `last_assistant_message` ([`vendor_text`]) — how [`settle`] knows the
-    /// file holds the message the vendor already handed the hook. Only a
-    /// line AFTER the segment's opening line counts ([`scan_turn`]): after a
-    /// wake, the message from before it is not the reply the vendor means.
-    tail_text: Option<String>,
-    /// The `uuid` of the line that opened the segment the scan read — the
-    /// prompt, or the `Stop` hook's feedback line ([`is_wake`]) — when the
-    /// tail holds it.
-    anchor: Option<String>,
-}
-
-/// A transcript's size and modification time: the two things that move when
-/// the vendor's writer appends to it.
-type Stamp = (u64, Option<std::time::SystemTime>);
-
-/// The [`Turn`] in the last `tail_max` bytes of the transcript at `path`
-/// ([`scan_turn`]; a live hook reads [`TRANSCRIPT_TAIL_MAX`], a test pins the
-/// tail read with a small file), with the file's [`Stamp`] as it was read.
-///
-/// # Errors
-///
-/// The path and the I/O error, when the file cannot be opened or read, or
-/// when it is not a regular file.
-///
-///
-/// A REGULAR FILE, OR NOTHING — judged by `stat` BEFORE the open. The path is
-/// the vendor's to hand over and the file the agent's own, and a FIFO at it
-/// parks `open(2)` until a writer comes (a symlink to `/dev/zero` reads for
-/// ever): nothing here is bounded by [`LANE_DEADLINE`], so the vendor's 600 s
-/// `Stop` timeout would be the only thing to end the hook. The read is capped
-/// at `tail_max` bytes besides, whatever the file has become since the `stat`.
-fn final_message_within(path: &str, tail_max: u64) -> Result<(Turn, Stamp), String> {
-    use std::io::{Seek, SeekFrom};
-    let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("{path}: not a regular file"));
-    }
-    let stamp = (meta.len(), meta.modified().ok());
-    let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
-    let len = meta.len();
-    let cut = len > tail_max;
-    if cut {
-        file.seek(SeekFrom::Start(len - tail_max))
-            .map_err(|e| format!("{path}: {e}"))?;
-    }
-    let mut bytes = Vec::new();
-    file.take(tail_max)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("{path}: {e}"))?;
-    let text = String::from_utf8_lossy(&bytes);
-    // A cut lands mid-line; the partial first line is nobody's message.
-    let text: &str = if cut {
-        text.find('\n').map_or("", |at| &text[at + 1..])
-    } else {
-        &text
-    };
-    Ok((scan_turn(text), stamp))
-}
-
-/// The turn that just ended, read from the END of a Claude Code transcript
-/// (JSONL, one object per line; this build writes each content block of an
-/// assistant message on a line of its own, the lines of one message sharing
-/// its `message.id`).
-///
-/// **THE TURN IS WHAT FOLLOWS THE LAST PROMPT — AND A WAKE OPENS A NEW
-/// SEGMENT OF IT.** Walking up from the end, a `user` line that is not a tool
-/// result and not `isMeta` is the prompt that opened the turn, and the walk
-/// stops there: a turn that displayed nothing reports nothing — never the
-/// previous turn's words, which is a stale report. The walk stops as well at
-/// the `Stop` hook's feedback line ([`is_wake`]): a `Stop` that blocked (this
-/// hook's own wake) keeps the TURN alive, and the reply the agent gives after
-/// it is a new message, reported by the next `Stop` — not the one before the
-/// wake, which the previous `Stop` already reported. Without this, a reply
-/// not yet flushed made the file's older message "the last one", and a
-/// reply in the same words as it was dropped as already reported.
-///
-/// **THE MESSAGE IS THE LAST ONE THAT DISPLAYED ANYTHING.** Messages that
-/// show nothing (a `tool_use`, empty text, an empty `thinking` block — hidden
-/// reasoning is stored with no text in this build) are walked past; the first
-/// message met with something in it is the one, all of its lines, and its
-/// DISPLAYED blocks are joined in order with `\n`: `text` blocks and
-/// narration ([`is_narration`]). A `thinking` block with text and no
-/// narration mark is hidden reasoning, and is never taken — when that is all
-/// the message holds, [`Turn::undisplayed`] says so and nothing is.
-///
-/// **AND THE LINE THAT OPENED THE SEGMENT IS ITS ANCHOR** ([`Turn::anchor`]):
-/// once the message is collected the walk goes on, parsing only the `user`
-/// lines that could open a segment, to the prompt or wake above it.
-///
-/// EVERY LINE IS PARSED, NEVER MATCHED. A tool result that quotes
-/// `"type":"assistant"` is a string VALUE inside a `user` line, and the parser
-/// steps over it whole; the cheap `contains` only skips lines that cannot
-/// qualify (a quote inside a string value is escaped, so the bare token
-/// `"type":"tool_result"` is structure, never text). A sidechain line (a
-/// subagent's, should one share the file) is not the agent's own.
-fn scan_turn(text: &str) -> Turn {
-    let mut turn = Turn::default();
-    // The message being collected, as its `message.id` — `Some(None)` for a
-    // line with no id, which is a message of its own — once one is found.
-    let mut group: Option<Option<String>> = None;
-    let mut parts: Vec<String> = Vec::new();
-    let mut uuid: Option<String> = None;
-    let mut hidden = false;
-    // The message is whole: the walk only looks for the segment's anchor.
-    let mut collected = false;
-    for line in text.lines().rev() {
-        if !line.contains("assistant") && !line.contains("\"user\"") {
-            continue;
-        }
-        if collected && (!line.contains("\"user\"") || line.contains("\"type\":\"tool_result\"")) {
-            continue;
-        }
-        let Ok(doc) = Json::parse(line) else {
-            continue;
-        };
-        if doc.get("isSidechain") == Some(&Json::Bool(true)) {
-            continue;
-        }
-        match doc.get("type").and_then(Json::as_str) {
-            Some("user") if is_prompt(&doc) || is_wake(&doc) => {
-                turn.anchor = doc.get("uuid").and_then(Json::as_str).map(str::to_string);
-                break;
-            }
-            Some("assistant") if !collected => {}
-            _ => continue,
-        }
-        let Some(message) = doc.get("message") else {
-            continue;
-        };
-        let Some(content) = message.get("content") else {
-            continue;
-        };
-        if turn.tail_text.is_none() {
-            turn.tail_text = Some(vendor_text(content));
-        }
-        let id = message.get("id").and_then(Json::as_str);
-        if let Some(current) = &group {
-            if current.is_none() || current.as_deref() != id {
-                collected = true;
-                continue;
-            }
-        }
-        let (shown, hides) = displayed(content);
-        if group.is_none() {
-            if shown.is_empty() && !hides {
-                continue;
-            }
-            group = Some(id.map(str::to_string));
-        }
-        hidden |= hides;
-        if !shown.is_empty() && uuid.is_none() {
-            uuid = doc.get("uuid").and_then(Json::as_str).map(str::to_string);
-        }
-        parts.extend(shown.into_iter().rev());
-    }
-    if parts.is_empty() {
-        turn.undisplayed = hidden;
-    } else {
-        parts.reverse();
-        turn.message = Some(LastMessage {
-            text: parts.join("\n"),
-            uuid,
-            anchor: turn.anchor.clone(),
-        });
-    }
-    turn
-}
-
-/// The words Claude Code opens a `Stop` hook's feedback line with.
-///
-/// MEASURED IN THE 2.1.268 BINARY: a `Stop` hook that blocks (exit 2, this
-/// hook's own wake) is answered with `Ce({content:eZe(blockingError),
-/// isMeta:!0})`, `eZe(e)` being `IIt("Stop",e.blockingError)` and
-/// `IIt(e,n)` `` `${e} hook feedback:\n${n}` ``: a `user` line, `isMeta`,
-/// whose content is a STRING that starts with these words. And on the live
-/// worker's transcript (structure only, 2026-09-15): 55 such lines, every one
-/// followed by an `attachment` line and the `stop_hook_summary`, and after
-/// the `Stop`'s final assistant line (51; a `permission-mode` line between
-/// them in 4); the agent's reply came next in 53.
-const STOP_FEEDBACK: &str = "Stop hook feedback:";
-
-/// Whether a `user` line is the `Stop` hook's FEEDBACK — the line a wake
-/// adds to the conversation ([`STOP_FEEDBACK`]). `isMeta` alone is not it:
-/// the vendor marks other lines `isMeta` in the middle of a turn (measured:
-/// a tool's images after its result, a local command's output, other
-/// injected text), and none of those opens a segment.
-fn is_wake(doc: &Json) -> bool {
-    doc.get("isMeta") == Some(&Json::Bool(true))
-        && matches!(
-            doc.get("message").and_then(|m| m.get("content")),
-            Some(Json::Str(s)) if s.starts_with(STOP_FEEDBACK)
-        )
-}
-
-/// Whether a `user` line is a PROMPT — the start of a turn — rather than a
-/// tool's result coming back or a line the vendor marks `isMeta`.
-fn is_prompt(doc: &Json) -> bool {
-    if doc.get("isMeta") == Some(&Json::Bool(true)) {
-        return false;
-    }
-    match doc.get("message").and_then(|m| m.get("content")) {
-        Some(Json::Str(_)) => true,
-        Some(Json::Array(blocks)) => !blocks
-            .iter()
-            .any(|b| b.get("type").and_then(Json::as_str) == Some("tool_result")),
-        _ => false,
-    }
-}
-
-/// The blocks of one line's `content` that Claude Code DISPLAYS, in order —
-/// non-empty `text`, and `thinking` that carries the narration mark — and
-/// whether the line also holds a `thinking` block with text and no mark
-/// (hidden reasoning, which is left out and reported as such). A bare-string
-/// `content` (the older shape) is displayed text.
-fn displayed(content: &Json) -> (Vec<String>, bool) {
-    let mut shown = Vec::new();
-    let mut hides = false;
-    match content {
-        Json::Str(s) if !s.trim().is_empty() => shown.push(s.clone()),
-        Json::Array(blocks) => {
-            for block in blocks {
-                match block.get("type").and_then(Json::as_str) {
-                    Some("text") => {
-                        if let Some(t) = block.get("text").and_then(Json::as_str) {
-                            if !t.trim().is_empty() {
-                                shown.push(t.to_string());
-                            }
-                        }
-                    }
-                    Some("thinking") => {
-                        let t = block.get("thinking").and_then(Json::as_str).unwrap_or("");
-                        if t.trim().is_empty() {
-                            continue;
-                        }
-                        let signature = block.get("signature").and_then(Json::as_str);
-                        if signature.is_some_and(is_narration) {
-                            shown.push(t.to_string());
-                        } else {
-                            hides = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-    (shown, hides)
-}
-
-/// A line's `content` read the way the vendor computes
-/// `last_assistant_message` ([`last_assistant_message`]): every `text`
-/// block's text joined with a newline, trimmed — the binary's `Pr(content,
-/// "\n").trim()`, byte for byte, so a line of two text blocks matches.
-fn vendor_text(content: &Json) -> String {
-    match content {
-        Json::Str(s) => s.trim().to_string(),
-        Json::Array(blocks) => blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(Json::as_str) == Some("text"))
-            .map(|b| b.get("text").and_then(Json::as_str).unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string(),
-        _ => String::new(),
-    }
-}
-
-/// The kind of a `thinking` block's signature that Claude Code DISPLAYS.
-const NARRATION: &[u8] = b"narration";
-
-/// Whether a `thinking` block's `signature` marks it as NARRATION — the `⏺`
-/// text this Claude Code build (2.1.267/2.1.268) shows between tool calls and
-/// stores as a `thinking` block — rather than hidden reasoning.
-///
-/// MEASURED ON STRUCTURE ONLY (2026-09-15, two real transcripts, 5,920
-/// `thinking` blocks, types, lengths and field numbers printed, never
-/// content): the signature is base64 of a protobuf whose payload (field 2)
-/// opens with a header (its field 1), and the header's field 8 is a string
-/// naming the block's kind — `narration` on every block Claude Code
-/// displayed, `thinking` on every other. The two sets split cleanly in both
-/// builds (2.1.220, whose header has more fields, and 2.1.267): every block
-/// with text in it was `narration`; every `thinking` block was empty (this
-/// build stores hidden reasoning with no text at all). The last few
-/// narration blocks were checked against the live screen, as booleans: each
-/// one was on it.
-///
-/// So the test is structural — field 2, then field 1, then field 8, equal to
-/// `narration` — never a search for the word, which could sit anywhere in
-/// the opaque rest of the payload. A signature that is not base64, not this
-/// protobuf, or of another kind is NOT narration: the rule fails closed, and
-/// a block it cannot place is hidden reasoning for the purpose of posting.
-fn is_narration(signature: &str) -> bool {
-    base64_decode(signature).is_some_and(|bytes| signature_kind(&bytes) == Some(NARRATION))
-}
-
-/// Field 8 of field 1 of field 2 of a decoded signature (see [`is_narration`]).
-fn signature_kind(bytes: &[u8]) -> Option<&[u8]> {
-    let payload = proto_field(bytes, 2)?;
-    let header = proto_field(payload, 1)?;
-    proto_field(header, 8)
-}
-
-/// The first length-delimited field numbered `want` in a protobuf message,
-/// every other field stepped over by its wire type. `None` for a message that
-/// does not parse (a wire type protobuf does not define, a length past the
-/// end) or lacks the field.
-fn proto_field(mut buf: &[u8], want: u64) -> Option<&[u8]> {
-    while !buf.is_empty() {
-        let (tag, rest) = varint(buf)?;
-        buf = match tag & 7 {
-            0 => varint(rest)?.1,
-            1 => rest.get(8..)?,
-            2 => {
-                let (len, rest) = varint(rest)?;
-                let len = usize::try_from(len).ok()?;
-                let value = rest.get(..len)?;
-                if tag >> 3 == want {
-                    return Some(value);
-                }
-                &rest[len..]
-            }
-            5 => rest.get(4..)?,
-            _ => return None,
-        };
-    }
-    None
-}
-
-/// One protobuf varint off the front of `buf`: the value and the rest.
-fn varint(buf: &[u8]) -> Option<(u64, &[u8])> {
-    let mut value = 0u64;
-    for (i, byte) in buf.iter().enumerate().take(10) {
-        value |= u64::from(byte & 0x7f) << (7 * i);
-        if byte & 0x80 == 0 {
-            return Some((value, &buf[i + 1..]));
-        }
-    }
-    None
-}
-
-/// Standard base64 (`+/`, or the URL-safe `-_`), padding optional — `None`
-/// for any other byte. The crate carries no base64 dependency, and this is
-/// the only place it needs one.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    for &c in s.as_bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((acc >> bits) & 0xff) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
-}
-
-/// How long the report waits for the transcript to hold the turn's end.
-///
-/// **THE TRANSCRIPT LAGS THE CONVERSATION.** Claude Code queues transcript
-/// lines and appends them on a timer (`FLUSH_INTERVAL_MS=100` in the 2.1.268
-/// binary, the `scheduleDrain` of its session writer), and runs the `Stop`
-/// hooks the moment the turn ends — nothing flushes the queue first. The
-/// vendor's own `stop_hook_summary` lines land 10-90 ms after the final
-/// message's timestamp: inside that window. A hook that reads the file at
-/// once can miss the turn's last message and walk back to an older one —
-/// the stale one-liner a live worker's report posted on 2026-09-15 while its
-/// real summary never went.
-struct Pace {
-    /// The longest the report waits, in all.
-    max: Duration,
-    /// With nothing to wait FOR, how long the file must hold still to count
-    /// as settled — past the vendor's flush interval with room for the write.
-    quiet: Duration,
-    /// How often the file's size and mtime are looked at.
-    poll: Duration,
-}
-
-/// The pace a live `Stop` hook uses. The report runs before the wait and the
-/// vendor's `Stop` timeout is 600 s: two seconds at most is nothing to it.
-const CATCH_UP: Pace = Pace {
-    max: Duration::from_secs(2),
-    quiet: Duration::from_millis(300),
-    poll: Duration::from_millis(20),
-};
-
-/// A [`Turn`] read once the transcript caught up — or once [`Pace::max`] ran
-/// out, `caught_up: false`.
+/// The settled screen a report is built from: the rows the manager will read,
+/// and the STAMP of the screen they came from.
 struct Settled {
-    turn: Turn,
-    caught_up: bool,
+    /// The report's body — see [`report_body`].
+    body: String,
+    /// `status`'s `seq=`: this screen's `content_seq`.
+    seq: u64,
+    /// `status`'s `hash=`: FNV-1a-64 of the untrimmed visible screen, 16 hex
+    /// digits, and the value `history` keeps for the turn that settled it — so
+    /// a manager can hold the report against the ledger instead of believing
+    /// it.
+    hash: String,
+    /// The screen was STILL BUSY on every read ([`SETTLE_TRIES`] of them): the
+    /// footer said `esc to interrupt`, or a spinner row was live. The report
+    /// goes out anyway, with `busy=1` on the stamp line, because a manager is
+    /// better served by a mid-turn screen it can SEE is mid-turn than by
+    /// silence — and its `seq=`/`hash=` will not match `history`'s settled
+    /// pair, which is precisely what the token warns about.
+    busy: bool,
 }
 
-/// Read the turn from the transcript at `path` once the vendor's writer has
-/// caught up with it ([`Pace`]).
+/// The report's BODY, read off the screen the way a human reads it: the rows
+/// from the last thing the worker SAID (`⏺`, or `●` where the platform
+/// draws that) down to where the live zone begins
+/// ([`aterm_phase::transcript_end`]) — and, when the screen has no such row,
+/// the last [`REPORT_ROWS`] non-blank rows above it.
 ///
-/// With `expect` — the vendor's `last_assistant_message` — the file has
-/// caught up when the turn's last assistant line reads the same
-/// ([`Turn::tail_text`]): then at once, and usually on the first read. Without
-/// it (an older build; a turn whose last message has no text, which is
-/// exactly the narration case) nothing says what is still to come, so the
-/// file must hold still for [`Pace::quiet`]. The file is re-read only when its
-/// size or mtime moved; the wait is bounded by [`Pace::max`] either way.
-///
-/// # Errors
-///
-/// The reason the transcript could not be read ([`final_message_within`]).
-fn settle(path: &str, expect: Option<&str>, tail_max: u64, pace: &Pace) -> Result<Settled, String> {
-    let start = Instant::now();
-    let (mut turn, mut stamp) = final_message_within(path, tail_max)?;
-    let mut still_since = Instant::now();
-    loop {
-        let caught_up = match expect {
-            Some(want) => turn.tail_text.as_deref() == Some(want),
-            None => still_since.elapsed() >= pace.quiet,
-        };
-        if caught_up || start.elapsed() >= pace.max {
-            return Ok(Settled { turn, caught_up });
-        }
-        std::thread::sleep(pace.poll);
-        let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-        if (meta.len(), meta.modified().ok()) != stamp {
-            (turn, stamp) = final_message_within(path, tail_max)?;
-            still_since = Instant::now();
-        }
+/// THE SCREEN, AND NOT THE TRANSCRIPT. Until round 22 this was a JSONL reader
+/// with a base64 decoder and a protobuf field walker in it, classifying the
+/// vendor's thinking blocks by a signature nobody promised us, so that the
+/// turn's last message could be reconstructed from a file on disk. It was 543
+/// lines tracking a format that is not ours, and what it posted was text a
+/// human watching the terminal never saw. The instance already serves the
+/// screen, the screen is what the human saw, and `seq=`/`hash=` say WHICH
+/// screen it was.
+fn report_body(rows: &[String]) -> String {
+    let end = aterm_phase::transcript_end(rows);
+    let from = rows[..end]
+        .iter()
+        .rposition(|r| r.starts_with(['\u{23fa}', '\u{25cf}']))
+        .unwrap_or_else(|| {
+            let mut seen = 0;
+            let mut i = end;
+            while i > 0 && seen < REPORT_ROWS {
+                i -= 1;
+                if !rows[i].trim().is_empty() {
+                    seen += 1;
+                }
+            }
+            i
+        });
+    let mut out: Vec<&str> = rows[from..end].iter().map(|r| r.trim_end()).collect();
+    while out.first().is_some_and(|r| r.is_empty()) {
+        out.remove(0);
     }
+    while out.last().is_some_and(|r| r.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// The settled screen, read from the instance THROUGH THE CONTROL SOCKET.
+///
+/// TWO READS AND A CHECK, because the screen is live. `status` names the
+/// screen's `seq` and `hash`; `text` hands over its rows; the rows are hashed
+/// HERE and compared with that stamp. Equal, the body and the stamp describe
+/// ONE screen and the manager can refuse a report whose stamp `history` does
+/// not know. Unequal, the screen moved between the two reads and the pair
+/// would be a lie, so it is read again — [`SETTLE_TRIES`] times, and then
+/// given up on WITH THE REASON, because the module header's rule is fail-open:
+/// a report that cannot be stamped is not posted, and the turn is not held up
+/// for it.
+/// What a `status` header says about the screen's stamp.
+#[derive(Debug, PartialEq, Eq)]
+enum Stamp {
+    /// `seq=<n> hash=<hex>` — a screen this reader can name.
+    Ok(u64, String),
+    /// `seq=-` (and `hash=-`): the terminal lock was CONTENDED
+    /// (`session_status.rs` takes it with `try_lock`), which is exactly what a
+    /// `Stop` racing Claude Code's repaint of the done row finds. One more
+    /// reason to loop, never a reason to drop the turn's only report.
+    Contended,
+    /// No `seq=`/`hash=` at all: an instance from before round 22. Looping
+    /// cannot help, so this one is fatal.
+    Absent,
+}
+
+fn read_stamp(header: &str) -> Stamp {
+    let (Some(seq), Some(hash)) = (field(header, "seq"), field(header, "hash")) else {
+        return Stamp::Absent;
+    };
+    match seq.parse::<u64>() {
+        Ok(seq) => Stamp::Ok(seq, hash.to_string()),
+        Err(_) => Stamp::Contended,
+    }
+}
+
+fn settled_screen(ctl: &mut Ctl, session: &str) -> Result<Settled, String> {
+    let mut why = "the screen never settled".to_string();
+    // A screen that is still BUSY is kept as the fallback: better a stamped
+    // mid-turn screen the manager can SEE is mid-turn than no report at all.
+    let mut busy_seen: Option<Settled> = None;
+    for _ in 0..SETTLE_TRIES {
+        let status = ctl
+            .request(&format!("@{session} status"))
+            .map_err(|e| format!("status: {e}"))?;
+        if !status.ok() {
+            return Err(format!("status answered {}", safe_reason(status.header())));
+        }
+        let stamp = read_stamp(status.header());
+        let (seq, hash) = match stamp {
+            Stamp::Ok(seq, hash) => (seq, hash),
+            Stamp::Contended => {
+                why = "`status` answered seq=- — the terminal lock was contended".to_string();
+                continue;
+            }
+            Stamp::Absent => {
+                return Err(
+                    "this instance's `status` carries no seq=/hash= — it predates round 22".into(),
+                );
+            }
+        };
+        let text = ctl
+            .request(&format!("@{session} text"))
+            .map_err(|e| format!("text: {e}"))?;
+        if !text.ok() {
+            return Err(format!("text answered {}", safe_reason(text.header())));
+        }
+        let rows = text.rows();
+        let mut screen = String::new();
+        for r in rows {
+            screen.push_str(r);
+            screen.push('\n');
+        }
+        let ours = format!("{:016x}", crate::bridge::fnv1a_64(screen.as_bytes()));
+        if ours != hash {
+            why =
+                format!("the screen moved between `status` (hash={hash}) and `text` (hash={ours})");
+            continue;
+        }
+        let settled = Settled {
+            body: report_body(rows),
+            seq,
+            hash,
+            busy: aterm_phase::worker_phase(rows) == aterm_phase::Phase::Busy,
+        };
+        if !settled.busy {
+            return Ok(settled);
+        }
+        // STILL RUNNING. Try again inside the same bound — a turn that ended
+        // while `Stop` was dispatched usually settles within a read or two.
+        why = "the screen was still busy on every read".to_string();
+        busy_seen = Some(settled);
+    }
+    busy_seen.ok_or(why)
 }
 
 /// The message as posted: whole when it fits [`REPORT_MAX`], else cut on a
@@ -1609,52 +1885,18 @@ fn trim_report(text: &str) -> String {
     format!("{}{marker}", &text[..cut])
 }
 
-/// The content key of one report: FNV-1a over the segment's anchor (the
-/// prompt or wake the message follows, [`Turn::anchor`]), the message's
-/// `uuid` (when the transcript gives one) and the body as posted, as 16 hex
-/// digits.
+/// Whether the screen `now` is the one `before` already reported.
 ///
-/// THE UUID IS PART OF IT ON PURPOSE. A re-fired `Stop` re-reads the SAME
-/// transcript line, so its key is the same and nothing is posted twice; an
-/// agent that ends two turns with the same words has written two lines, and
-/// the second is a report of its own. THE ANCHOR is what a message whose
-/// line is not on disk yet is known by — the vendor's own text, posted as
-/// the fallback ([`displayed_message`]) — and what keeps two segments that
-/// end in the same words apart then. With neither, the body alone is the
-/// key, which errs towards posting once.
-fn report_key(last: &LastMessage, body: &str) -> String {
-    let mut bytes = Vec::with_capacity(body.len() + 80);
-    if let Some(anchor) = &last.anchor {
-        bytes.extend_from_slice(anchor.as_bytes());
-    }
-    bytes.push(0);
-    if let Some(uuid) = &last.uuid {
-        bytes.extend_from_slice(uuid.as_bytes());
-    }
-    bytes.push(0);
-    bytes.extend_from_slice(body.as_bytes());
-    format!("{:016x}", crate::bridge::fnv1a_64(&bytes))
-}
-
-/// Whether `last` is the message `before` already reported: the same key —
-/// or, when `before` was the vendor's text posted as the FALLBACK (no uuid
-/// then), the same segment and the same words. A `Stop` that re-fires once
-/// the line has landed finds the uuid the fallback could not know; keyed on
-/// it alone, the same text went out twice.
-fn already_reported(before: &LastReport, last: &LastMessage, body: &str) -> bool {
-    if before.key == report_key(last, body) {
-        return true;
-    }
-    before.fallback
-        && before.key
-            == report_key(
-                &LastMessage {
-                    text: String::new(),
-                    uuid: None,
-                    anchor: last.anchor.clone(),
-                },
-                body,
-            )
+/// THE SCREEN'S OWN HASH IS THE KEY, and it needs nothing else. A re-fired
+/// `Stop` reads the SAME settled screen, so the same `hash=` comes back and
+/// nothing is posted twice; a turn that moved the screen by one row has a
+/// different hash and is a report of its own. The transcript-era key was FNV
+/// over a segment anchor, a line uuid and the body, with a second comparison
+/// for the case where the vendor's text had been posted before its line
+/// reached the disk — three inputs and a special case, all of them standing in
+/// for an identity the instance can simply state.
+fn already_reported(before: &LastReport, now: &Settled) -> bool {
+    before.key == now.hash
 }
 
 /// The last report this session posted — its content key, and the newest row
@@ -1666,9 +1908,10 @@ fn already_reported(before: &LastReport, last: &LastMessage, body: &str) -> bool
 /// "nothing posted yet", one that cannot be written costs the dedup and never
 /// the report — the alternative is a manager that hears nothing because a
 /// log line could not be written. Two lines, `<key>` then `high=<id>`, and
-/// a third, `fallback=1`, when the report was the vendor's text posted
-/// without its line's uuid ([`already_reported`]); a file from before the
-/// second line reads as `high=0`.
+/// Two lines, `<key>` then `high=<id>`; a file from before the second line
+/// reads as `high=0`. The key is the settled screen's `hash=`
+/// ([`already_reported`]); a `fallback=1` third line, written while the report
+/// came from the transcript, is read and ignored.
 struct Posted {
     path: Option<std::path::PathBuf>,
 }
@@ -1676,12 +1919,11 @@ struct Posted {
 /// What [`Posted`] holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LastReport {
+    /// The settled screen's `hash=` when the report went out.
     key: String,
     /// The newest `msg` row id in the inbox when it was posted: the tasks a
     /// later report may answer are the ones above it ([`report_task`]).
     high: u64,
-    /// The report was the FALLBACK — the vendor's text, keyed with no uuid.
-    fallback: bool,
 }
 
 impl Posted {
@@ -1708,12 +1950,7 @@ impl Posted {
             .find_map(|l| l.strip_prefix("high="))
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let fallback = rest.contains(&"fallback=1");
-        Some(LastReport {
-            key,
-            high,
-            fallback,
-        })
+        Some(LastReport { key, high })
     }
 
     fn record(&self, last: &LastReport) {
@@ -1724,8 +1961,7 @@ impl Posted {
             }
         }
         let tmp = path.with_extension("tmp");
-        let fallback = if last.fallback { "fallback=1\n" } else { "" };
-        let text = format!("{}\nhigh={}\n{fallback}", last.key, last.high);
+        let text = format!("{}\nhigh={}\n", last.key, last.high);
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
@@ -1801,87 +2037,20 @@ impl Landing {
     }
 }
 
-/// The message a `Stop` hook reports: the turn's final DISPLAYED message
-/// from the transcript, once the transcript has caught up with the turn
-/// ([`settle`]).
-///
-/// THE VENDOR'S `last_assistant_message` IS THE FALLBACK, never the first
-/// choice: it is the last message's text only (narration, which this build
-/// stores as `thinking`, is not in it), but it is in the hook's input before
-/// the transcript line is on disk. So when the transcript does not show it
-/// within [`Pace::max`], or cannot be read at all, the vendor's text is what
-/// is posted — `note` says so, with no uuid for the key — rather than a
-/// message the file still had from before. Everything that posts nothing
-/// goes through `say` with its reason: no transcript, a turn that displayed
-/// nothing, a turn whose last message is thinking without the narration mark
-/// (it cannot be told from hidden reasoning, and hidden reasoning is never
-/// posted).
-fn displayed_message(
-    input: &str,
-    pace: &Pace,
-    say: &dyn Fn(&str),
-    note: &dyn Fn(&str),
-) -> Option<LastMessage> {
-    let vendor = last_assistant_message(input);
-    let read = match transcript_path(input) {
-        Some(path) => {
-            settle(&path, vendor.as_deref(), TRANSCRIPT_TAIL_MAX, pace).map(|s| (path, s))
-        }
-        None => Err("no transcript_path in the hook input".to_string()),
-    };
-    // THE FALLBACK KEEPS THE SEGMENT'S ANCHOR: the prompt or wake the reply
-    // follows is on disk long before the reply is (it was flushed before the
-    // model answered), so a later `Stop` that finds the reply's own line keys
-    // it to the same segment ([`already_reported`]).
-    let fallback = |text: String, anchor: Option<String>, why: &str| {
-        note(&format!(
-            "{why}; posting the vendor's last_assistant_message (its text only)"
-        ));
-        Some(LastMessage {
-            text,
-            uuid: None,
-            anchor,
-        })
-    };
-    let (path, settled) = match (read, vendor) {
-        (Ok((_, settled)), Some(text)) if !settled.caught_up => {
-            let why = format!(
-                "the transcript did not show the turn's last message within {} ms",
-                pace.max.as_millis()
-            );
-            return fallback(text, settled.turn.anchor, &why);
-        }
-        (Ok(read), _) => read,
-        (Err(e), Some(text)) => return fallback(text, None, &e),
-        (Err(e), None) => {
-            say(&e);
-            return None;
-        }
-    };
-    let turn = settled.turn;
-    if turn.message.is_none() {
-        say(&if turn.undisplayed {
-            "the turn's last message is thinking without Claude Code's narration mark — it \
-             cannot be told from hidden reasoning, which is never posted"
-                .to_string()
-        } else {
-            format!("no displayed assistant message in the turn that ended, in {path}")
-        });
-    }
-    turn.message
-}
-
-/// `--report-to`: post the agent's last message to `to` as `kind=report`.
+/// `--report-to`: post what the agent's SCREEN says to `to` as `kind=report`.
 ///
 /// FAIL-OPEN AT EVERY STEP, and every step that stops says why on stderr —
 /// the module header's rule, and the only way an operator can tell "the
-/// worker had nothing to report" from "the transcript could not be read".
-/// Nothing here changes the exit code: the wait that follows decides it.
+/// worker had nothing to report" from "the screen could not be read".
+/// Nothing here changes the exit code: the wait that follows, when
+/// `--keep-alive` asks for one, decides it.
 ///
-/// The order is the cheap checks first: the transcript is read and keyed
-/// before the recipient is asked and the inbox is listed, so a re-fired
-/// `Stop` costs one file read and no control request beyond the connection
-/// it already has. Then THE RECIPIENT IS ASKED `status` BEFORE THE POST: a
+/// THE SCREEN IS READ FIRST, and it has to be: the screen's own `hash=` is
+/// the dedup key ([`already_reported`]), so there is nothing to compare a
+/// re-fired `Stop` against until it has been read. That costs two control
+/// requests on a connection the hook already holds — cheaper than the
+/// recipient check it precedes, which is a request to ANOTHER session, and
+/// far cheaper than the post. Then THE RECIPIENT IS ASKED `status` BEFORE THE POST: a
 /// session the instance no longer hosts (the manager closed after the
 /// install) is a post the endpoint accepts and the bridge retires as
 /// undeliverable onto the WORKER's lane — `OK <id>` to the hook, a charge
@@ -1894,21 +2063,30 @@ fn displayed_message(
 /// bridge at all), the key is recorded so nothing is posted twice and the
 /// budget is not charged for a wake that cannot come, and stderr names the
 /// remedy; refused, neither, and the endpoint's words.
-fn report(ctl: &mut Ctl, opts: &Opts, to: &str, input: &str, ledger: &Ledger) {
+fn report(ctl: &mut Ctl, opts: &Opts, to: &str, ledger: &Ledger) {
     let say = |why: &str| eprintln!("aterm-link hook: report to @{to}: {why}; nothing posted");
-    let note = |what: &str| eprintln!("aterm-link hook: report to @{to}: {what}");
-    let Some(last) = displayed_message(input, &CATCH_UP, &say, &note) else {
-        return;
+    let screen = match settled_screen(ctl, &opts.session) {
+        Ok(screen) => screen,
+        Err(e) => return say(&e),
     };
-    let body = trim_report(&last.text);
-    let key = report_key(&last, &body);
+    // THE STAMP RIDES THE BODY, on its own first line, because a manager that
+    // cannot tell WHICH screen a report describes has to believe it. `seq=` and
+    // `hash=` are `status`'s, and `history` reports the same pair per turn id.
+    // `busy=1` when the screen never settled: the stamp is of a MID-TURN
+    // screen, so it will not match `history`, and the manager must be told
+    // which of those two things it is looking at.
+    let busy = if screen.busy { " busy=1" } else { "" };
+    let body = trim_report(&format!(
+        "seq={} hash={}{busy}\n{}",
+        screen.seq, screen.hash, screen.body
+    ));
     let posted = Posted::new(opts);
     let before = posted.last();
     if before
         .as_ref()
-        .is_some_and(|b| already_reported(b, &last, &body))
+        .is_some_and(|b| already_reported(b, &screen))
     {
-        return say("this message was already reported (a re-fired Stop)");
+        return say("this screen was already reported (a re-fired Stop)");
     }
     if ledger.spent() {
         return say("the wake budget is spent");
@@ -1937,9 +2115,8 @@ fn report(ctl: &mut Ctl, opts: &Opts, to: &str, input: &str, ledger: &Ledger) {
         Err(e) => return say(&format!("post: {e}")),
     };
     let last = LastReport {
-        key,
+        key: screen.hash,
         high,
-        fallback: last.uuid.is_none(),
     };
     match Landing::of(reply.header()) {
         Landing::Landed => {
@@ -2110,8 +2287,8 @@ const SELF_TEST_DEADLINE: Duration = Duration::from_secs(10);
 /// and keeps everything else.
 const OWN_MARK: &str = " hook run ";
 
-/// `hook install claude` — write the four command hooks, having PROVED each
-/// one runs here.
+/// `hook install claude` — write the command hooks (five by default, six with
+/// `--gate-tools`), having PROVED each one runs here.
 ///
 /// THE COMMAND IT WRITES IS THE COMMAND IT TESTED. On 2026-09-14 this installer
 /// wrote `<exe> hook run <event>` with `<exe>` the multiplexed `aterm` binary,
@@ -2162,6 +2339,14 @@ fn install_claude(opts: &Opts) -> ExitCode {
             eprintln!("aterm-link hook install: {why}; nothing was written");
             return ExitCode::from(2);
         }
+    };
+    let mut kept;
+    let opts = if opts.merge && opts.keep_flags {
+        kept = opts.clone();
+        keep_flags(&mut kept, std::path::Path::new(&path));
+        &kept
+    } else {
+        opts
     };
     let doc = claude_settings_for(&exe, opts);
 
@@ -2550,12 +2735,111 @@ fn merged_document(path: &std::path::Path, ours: &Json) -> Result<Merged, String
 /// whole document, and the original outlives the merge whatever happens
 /// after it. Both are created WITH THE ORIGINAL'S MODE — never through a
 /// default-mode create that is chmod'ed afterwards, because a `0600` file
-/// holding an API key would then have spent an instant world-readable.
+/// holding an API key would then have spent an instant world-readable. Once
+/// the backup is down, the older ones beyond [`BACKUPS_KEPT`] are pruned
+/// ([`prune_backups`]).
+///
+/// A FILE THAT CHANGED UNDER THE MERGE IS MERGED AGAIN ([`land_merged`]):
+/// the file is re-read immediately before the rename, and a document that
+/// is no longer the one merged into is read, merged and written afresh, up
+/// to [`MERGE_TRIES`] times, then refused naming the file. Another writer —
+/// `aterm harness install`, the vendor's own `/permissions` edits, a second
+/// primer pass — would otherwise lose whatever it wrote in between.
 fn merge_into(path: &std::path::Path, ours: &Json) -> Result<std::path::PathBuf, String> {
-    let merged = merged_document(path, ours)?;
+    for _ in 0..MERGE_TRIES {
+        let merged = merged_document(path, ours)?;
+        if let Some(backup) = land_merged(path, &merged)? {
+            return Ok(backup);
+        }
+    }
+    Err(changed_under_us(path))
+}
+
+/// How many times a merge or a removal re-reads, re-merges and re-writes a
+/// settings file that another writer changed while it was being merged,
+/// before it refuses.
+const MERGE_TRIES: usize = 3;
+
+/// The refusal once [`MERGE_TRIES`] merges each found the file changed.
+fn changed_under_us(path: &std::path::Path) -> String {
+    format!(
+        "{} changed under each of {MERGE_TRIES} merges (another writer is editing it); \
+         refused rather than overwrite what it wrote — run the command again",
+        path.display()
+    )
+}
+
+/// Land one [`Merged`] document at `path`: the backup of the original first
+/// (the older ones pruned), then [`write_atomic_if_unchanged`]. Answers the
+/// backup's path, or `None` when the file no longer holds `merged.original`
+/// by the time of the rename — nothing replaced, and the caller merges the
+/// file afresh.
+fn land_merged(
+    path: &std::path::Path,
+    merged: &Merged,
+) -> Result<Option<std::path::PathBuf>, String> {
     let backup = write_backup(path, &merged.original, merged.mode)?;
-    write_atomic(path, &merged.text, Some(merged.mode)).map_err(|e| format!("write: {e}"))?;
-    Ok(backup)
+    prune_backups(path, &backup);
+    let landed = write_atomic_if_unchanged(
+        path,
+        &merged.text,
+        Some(merged.mode),
+        Some(&merged.original),
+    )
+    .map_err(|e| format!("write: {e}"))?;
+    Ok(landed.then_some(backup))
+}
+
+/// How many `<file>.bak-*` backups a merge or a removal leaves beside the
+/// settings file. The auto-prime pass re-installs a stale block after every
+/// aterm update that changes it, and each re-install is a backup: unpruned,
+/// a long-lived settings file collects one per update for ever.
+const BACKUPS_KEPT: usize = 8;
+
+/// Delete the backups of `path` older than the newest [`BACKUPS_KEPT`], never
+/// `just_written`. Best-effort: a directory that cannot be read, or a file
+/// that cannot be removed, is left as it is.
+///
+/// ONLY THE NAMES [`write_backup`] WRITES are candidates — `<file>.bak-<s>`
+/// and `<file>.bak-<s>-<n>`, all digits — ordered by the stamp and then the
+/// same-second counter, as numbers (a name sort would put `-10` before `-9`,
+/// and a stamp that gained a digit before every older one). A
+/// `<file>.bak-manual` an operator made by hand is theirs.
+fn prune_backups(path: &std::path::Path, just_written: &std::path::Path) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let prefix = format!("{name}.bak-");
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let order = |suffix: &str| -> Option<(u64, u32)> {
+        let (stamp, n) = suffix.split_once('-').unwrap_or((suffix, "0"));
+        if !digits(stamp) || !digits(n) {
+            return None;
+        }
+        Some((stamp.parse().ok()?, n.parse().ok()?))
+    };
+    let mut ours: Vec<((u64, u32), std::ffi::OsString)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file = entry.file_name();
+            let key = order(file.to_str()?.strip_prefix(&prefix)?)?;
+            Some((key, file))
+        })
+        .collect();
+    ours.sort();
+    let excess = ours.len().saturating_sub(BACKUPS_KEPT);
+    for (_, file) in ours.into_iter().take(excess) {
+        if Some(file.as_os_str()) != just_written.file_name() {
+            let _ = std::fs::remove_file(dir.join(&file));
+        }
+    }
 }
 
 /// Write `bytes` to a NEW file `<path>.bak-<unix seconds>` with `mode`, and
@@ -2610,6 +2894,24 @@ fn create_with_mode(path: &std::path::Path, mode: u32) -> std::io::Result<std::f
 /// is created with it ([`create_with_mode`]) so the document that lands has
 /// the mode of the one it replaces; without, the process's default.
 fn write_atomic(path: &std::path::Path, text: &str, mode: Option<u32>) -> std::io::Result<()> {
+    write_atomic_if_unchanged(path, text, mode, None).map(|_| ())
+}
+
+/// [`write_atomic`], and with `expect` the file at `path` is READ AGAIN
+/// immediately before the rename: when it no longer holds exactly `expect`
+/// (or cannot be read), the temporary file is removed, `path` is left
+/// untouched, and the answer is `false`. `true` means the document landed.
+///
+/// The window this closes is the merge's own: a settings file read, merged
+/// and then replaced wholesale drops every edit another writer made in
+/// between. It narrows the race to the instant between this read and the
+/// rename — the smallest a rename-based write can make it.
+fn write_atomic_if_unchanged(
+    path: &std::path::Path,
+    text: &str,
+    mode: Option<u32>,
+    expect: Option<&[u8]>,
+) -> std::io::Result<bool> {
     use std::io::Write;
     let tmp = std::path::PathBuf::from(format!("{}.tmp-{}", path.display(), std::process::id()));
     let done = (|| {
@@ -2620,7 +2922,13 @@ fn write_atomic(path: &std::path::Path, text: &str, mode: Option<u32>) -> std::i
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path)
+        if let Some(expect) = expect {
+            if std::fs::read(path).ok().as_deref() != Some(expect) {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(false);
+            }
+        }
+        std::fs::rename(&tmp, path).map(|()| true)
     })();
     done.inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -2703,10 +3011,22 @@ fn claude_settings_for(exe: &str, opts: &Opts) -> Json {
         " --wake-budget {n}/{m} --timeout {}",
         opts.timeout.as_secs_f64()
     );
-    // On the `Stop` command only: the report is that event's, and the other
-    // three self-test the flag for nothing.
+    // On `Stop` (the report) and `Notification` (the escalation's ask) only:
+    // those are the two events that post to the recipient, and the others
+    // would self-test the flag for nothing. The Notification command carries
+    // the wake budget too, because its ask is charged to it ([`ask_manager`]).
+    let mut notify_tail = String::new();
     if let Some(to) = &opts.report_to {
-        stop_tail.push_str(&format!(" --report-to {}", sh_word(&format!("@{to}"))));
+        let to = sh_word(&format!("@{to}"));
+        stop_tail.push_str(&format!(" --report-to {to}"));
+        notify_tail = format!(" --wake-budget {n}/{m} --report-to {to}");
+    }
+    // The opt-ins ride the commands they govern, so the settings file SAYS what
+    // this installation does: no `--keep-alive` on the `Stop` command means the
+    // turn is never held open, and no `PreToolUse` group at all means no tool
+    // is ever gated.
+    if opts.keep_alive {
+        stop_tail.push_str(" --keep-alive");
     }
     let object = |members: Vec<(&str, Json)>| {
         Json::Object(
@@ -2740,7 +3060,14 @@ fn claude_settings_for(exe: &str, opts: &Opts) -> Json {
         stop.push(("asyncRewake", Json::Bool(true)));
     }
     stop.push(("timeout", num(600)));
-    let hooks = object(vec![
+    // THE DEFAULT IS [`DEFAULT_EVENTS`] (round 22's three, and since
+    // 2026-09-21 the approval box's two): two that write metadata, one that
+    // reports, one that answers what it can make safe, one that escalates.
+    // `PreToolUse` is the sixth, it is the only one whose failure leaves a
+    // worker unable to do ANYTHING, and it is written only when
+    // `--gate-tools` asks for it by name — in its historical position, so a
+    // settings file that has it reads as it always did.
+    let mut members = vec![
         (
             "SessionStart",
             Json::Array(vec![group(
@@ -2762,19 +3089,486 @@ fn claude_settings_for(exe: &str, opts: &Opts) -> Json {
                 ]),
             )]),
         ),
-        (
+    ];
+    if opts.gate_tools {
+        members.push((
             "PreToolUse",
             Json::Array(vec![group(
                 Some("*"),
                 object(vec![
                     ("type", text("command")),
-                    ("command", cmd("pre-tool-use", "")),
+                    ("command", cmd("pre-tool-use", " --gate-tools")),
                 ]),
             )]),
-        ),
-        ("Stop", Json::Array(vec![group(None, object(stop))])),
-    ]);
-    object(vec![("hooks", hooks)])
+        ));
+    }
+    // The approval box: answered when it can be made safe (`permission.rs`),
+    // left alone otherwise — no matcher, because the decision is for Bash
+    // alone and that is the hook's rule, not the matcher's. Bounded well under
+    // the vendor's 600 s default: a hook that could not reach aterm in
+    // [`LANE_DEADLINE`] has nothing more to wait for, and a stalled one would
+    // hold the box.
+    members.push((
+        "PermissionRequest",
+        Json::Array(vec![group(
+            None,
+            object(vec![
+                ("type", text("command")),
+                ("command", cmd("permission-request", "")),
+                ("timeout", num(20)),
+            ]),
+        )]),
+    ));
+    // The vendor's own "needs you" — sent about six seconds after a box or
+    // dialog appears with no keystroke, and never for one a hook answered —
+    // for the kinds that mean a human is waited on: the ESCALATION. The
+    // matcher is the vendor's notification type.
+    members.push((
+        "Notification",
+        Json::Array(vec![group(
+            Some("permission_prompt|elicitation_dialog|elicitation_url_dialog"),
+            object(vec![
+                ("type", text("command")),
+                ("command", cmd("notification", &notify_tail)),
+                ("timeout", num(10)),
+            ]),
+        )]),
+    ));
+    members.push(("Stop", Json::Array(vec![group(None, object(stop))])));
+    object(vec![("hooks", object(members))])
+}
+
+// ---------------------------------------------------------------------------
+// status / remove — what `aterm agents` and the auto-prime pass read
+// ---------------------------------------------------------------------------
+
+/// The executable and the rest of one of our hook commands, split the way
+/// [`sh_word`] joined them: a single-quoted executable (a path with a space —
+/// `…/Application Support/…`) is read to its closing quote, an unquoted one
+/// to the first space.
+fn split_command(cmd: &str) -> Option<(String, &str)> {
+    if let Some(rest) = cmd.strip_prefix('\'') {
+        let mut exe = String::new();
+        let mut it = rest.char_indices();
+        while let Some((i, c)) = it.next() {
+            if c == '\'' {
+                if rest[i + 1..].starts_with("\\''") {
+                    exe.push('\'');
+                    it.nth(2);
+                    continue;
+                }
+                return Some((exe, rest[i + 1..].trim_start()));
+            }
+            exe.push(c);
+        }
+        None
+    } else {
+        let (exe, rest) = cmd.split_once(' ')?;
+        Some((exe.to_string(), rest))
+    }
+}
+
+/// Whether two executable paths name the SAME FILE: equal as written, or
+/// equal once every symlink in both is resolved. `~/.local/bin/aterm` is a
+/// link to `/Applications/aterm.app/Contents/MacOS/aterm`, and the CLI and the
+/// window — each naming the binary by the path it was started through — must
+/// agree about whose block a settings file holds.
+fn same_executable(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// The verdict of `hook status claude`, computed for `path` against the
+/// executable `exe`. Checked in this order, first match wins:
+///
+/// * `absent` — no file, or no aterm entry ([`OWN_MARK`]) in it;
+/// * `unreadable: <why>` — not readable, or not JSON;
+/// * `stale: <path> is not there to run` — an aterm entry's executable does
+///   not exist, so that hook is inert;
+/// * `stale: missing <Vendor>,…` — a default event ([`DEFAULT_EVENTS`]) has no aterm
+///   entry at all, by any executable, named in roster order;
+/// * `stale: <Vendor> does not run <form> <event>` (or `… has a command that
+///   does not parse`) — an entry under a roster event that is not spelled the
+///   way [`command_form`] spells it for ITS OWN executable, which is a hook
+///   that does not run whoever installed it;
+/// * `installed` — every entry's executable is the same file as `exe`
+///   ([`same_executable`]);
+/// * `installed-by <path>` — the block is whole and runnable, but some entry
+///   is run by another executable; `<path>` is the first such, as the file
+///   writes it.
+///
+/// An entry under an event this build does not write (a newer build's, or an
+/// older one's a merge has not yet swept) is held to the existence and
+/// identity checks only: this build cannot know how it should be spelled.
+fn status_of(path: &std::path::Path, exe: &str) -> String {
+    let target = link_target(path);
+    if !target.exists() {
+        return "absent".to_string();
+    }
+    let text = match std::fs::read_to_string(&target) {
+        Ok(text) => text,
+        Err(e) => return format!("unreadable: {e}"),
+    };
+    let doc = match Json::parse(&text) {
+        Ok(doc) => doc,
+        Err(e) => return format!("unreadable: not JSON ({e})"),
+    };
+    let ours: Vec<(String, String)> = commands_of(&doc)
+        .into_iter()
+        .filter(|(_, cmd)| cmd.contains(OWN_MARK))
+        .collect();
+    if ours.is_empty() {
+        return "absent".to_string();
+    }
+    let split: Vec<(&str, Option<(String, &str)>)> = ours
+        .iter()
+        .map(|(event, cmd)| (event.as_str(), split_command(cmd)))
+        .collect();
+    if let Some(gone) = split
+        .iter()
+        .filter_map(|(_, parts)| parts.as_ref().map(|(cmd_exe, _)| cmd_exe))
+        .find(|cmd_exe| !std::path::Path::new(cmd_exe).exists())
+    {
+        return format!("stale: {gone} is not there to run");
+    }
+    let missing: Vec<&str> = DEFAULT_EVENTS
+        .iter()
+        .map(|(_, vendor)| *vendor)
+        .filter(|vendor| !ours.iter().any(|(event, _)| event == vendor))
+        .collect();
+    if !missing.is_empty() {
+        return format!("stale: missing {}", missing.join(","));
+    }
+    for (event, parts) in &split {
+        let Some((run, _)) = EVENTS.iter().find(|(_, vendor)| vendor == event) else {
+            continue;
+        };
+        let Some((cmd_exe, rest)) = parts else {
+            return format!("stale: {event} has a command that does not parse");
+        };
+        let head = format!("{} {run}", command_form(cmd_exe));
+        if *rest != head && !rest.starts_with(&format!("{head} ")) {
+            return format!("stale: {event} does not run {head}");
+        }
+    }
+    match split
+        .iter()
+        .filter_map(|(_, parts)| parts.as_ref().map(|(cmd_exe, _)| cmd_exe))
+        .find(|cmd_exe| !same_executable(cmd_exe, exe))
+    {
+        None => "installed".to_string(),
+        Some(other) => format!("installed-by {other}"),
+    }
+}
+
+/// `hook status claude` — one line, exit 0 ([`status_of`]).
+fn status_claude(opts: &Opts) -> ExitCode {
+    let path = opts
+        .settings
+        .clone()
+        .unwrap_or_else(|| ".claude/settings.json".to_string());
+    let exe = opts.exe.clone().unwrap_or_else(|| {
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "aterm-link".to_string())
+    });
+    let exe = absolute_exe(&exe).unwrap_or(exe);
+    println!("{}", status_of(std::path::Path::new(&path), &exe));
+    ExitCode::SUCCESS
+}
+
+/// `hook remove claude` — take aterm's entries out of the settings file and
+/// keep everything else: the removal half of [`merge_hooks`] (a merge with an
+/// EMPTY block), then every event left with no group and a `hooks` left with
+/// no event are dropped, so a file that held only our block goes back to the
+/// shape it had before the install. A backup is written first, as for a
+/// merge, and the older ones pruned ([`prune_backups`]). Prints `removed <n>`
+/// or `nothing to remove`; exit 0, or 2 when the file could not be read or
+/// written, or kept changing under the removal ([`MERGE_TRIES`]). A removal
+/// that wrote says on stderr how to keep the hooks off ([`REMOVE_NOTE`]).
+fn remove_claude(opts: &Opts) -> ExitCode {
+    let path = opts
+        .settings
+        .clone()
+        .unwrap_or_else(|| ".claude/settings.json".to_string());
+    let target = link_target(std::path::Path::new(&path));
+    if !target.exists() {
+        println!("nothing to remove");
+        return ExitCode::SUCCESS;
+    }
+    let empty = Json::Object(vec![("hooks".to_string(), Json::Object(Vec::new()))]);
+    // Re-read before the rename and merged afresh when another writer changed
+    // the file meanwhile ([`land_merged`]), up to [`MERGE_TRIES`] times.
+    for _ in 0..MERGE_TRIES {
+        match remove_once(&path, &target, &empty) {
+            Removed::Again => continue,
+            Removed::Done(code) => return code,
+        }
+    }
+    eprintln!(
+        "aterm-link hook remove: {path}: {}; nothing was written",
+        changed_under_us(&target)
+    );
+    ExitCode::from(2)
+}
+
+/// One attempt of [`remove_claude`].
+enum Removed {
+    /// The file changed under the attempt: nothing written, merge again.
+    Again,
+    /// Finished, with this exit code (its lines printed).
+    Done(ExitCode),
+}
+
+/// The off switch a removal is told about: `hook remove claude` takes the
+/// block out, and aterm's own primer pass (aterm-primer's `HookLane`, run by
+/// every aterm window) installs it again on its next pass, BY DEFAULT — the
+/// owner's instruction of 2026-09-21, "claude code harness for aterm must be
+/// BATTERIES INCLUDED ON BY DEFAULT for features", is that default's consent.
+/// So a removal says which switch keeps it off, in the words aterm-primer's
+/// `AUTO_PRIME_NOTE` uses.
+const REMOVE_NOTE: &str = "aterm's primer pass installs these hooks again on its next pass \
+    (every aterm window runs it) unless `agents_auto_prime = false` or `[harness] enabled = \
+    false` is set in ~/.config/aterm/aterm.toml";
+
+fn remove_once(path: &str, target: &std::path::Path, empty: &Json) -> Removed {
+    let mut merged = match merged_document(target, empty) {
+        Ok(merged) => merged,
+        Err(e) => {
+            eprintln!("aterm-link hook remove: {path}: {e}; nothing touched");
+            return Removed::Done(ExitCode::from(2));
+        }
+    };
+    let before = std::str::from_utf8(&merged.original)
+        .ok()
+        .and_then(|t| Json::parse(t).ok())
+        .map(|doc| {
+            commands_of(&doc)
+                .iter()
+                .filter(|(_, cmd)| cmd.contains(OWN_MARK))
+                .count()
+        })
+        .unwrap_or(0);
+    if before == 0 {
+        println!("nothing to remove");
+        return Removed::Done(ExitCode::SUCCESS);
+    }
+    let mut doc = match Json::parse(&merged.text) {
+        Ok(doc) => doc,
+        Err(e) => {
+            eprintln!("aterm-link hook remove: {path}: {e}; nothing touched");
+            return Removed::Done(ExitCode::from(2));
+        }
+    };
+    prune_empty_events(&mut doc);
+    merged.text = format!("{}\n", doc.render());
+    match land_merged(target, &merged) {
+        Ok(Some(backup)) => {
+            // The last stdout line is the answer (aterm-primer reads it); the
+            // off-switch note goes to stderr beside the backup's path.
+            println!("removed {before}");
+            eprintln!(
+                "aterm-link hook remove: {path}: the original is at {}",
+                backup.display()
+            );
+            eprintln!("aterm-link hook remove: {REMOVE_NOTE}");
+            Removed::Done(ExitCode::SUCCESS)
+        }
+        Ok(None) => Removed::Again,
+        Err(e) => {
+            eprintln!("aterm-link hook remove: {path}: {e}; nothing was written");
+            Removed::Done(ExitCode::from(2))
+        }
+    }
+}
+
+/// Drop every `hooks.<event>` that is an empty array, and `hooks` itself once
+/// it has no event left — the shape a removal leaves behind.
+fn prune_empty_events(doc: &mut Json) {
+    let Some(members) = doc.as_object_mut() else {
+        return;
+    };
+    if let Some((_, hooks)) = members.iter_mut().find(|(k, _)| k == "hooks") {
+        if let Some(events) = hooks.as_object_mut() {
+            events.retain(|(_, groups)| groups.as_array().is_none_or(|g| !g.is_empty()));
+        }
+    }
+    members.retain(|(k, v)| k != "hooks" || v.as_object().is_none_or(|e| !e.is_empty()));
+}
+
+/// `--keep-flags`: the flags the Stop hook already in `path` carries, adopted
+/// into `opts` where this command line did not set them — `--state`,
+/// `--accept-from`, `--report-to`, `--wake-budget`, `--timeout`,
+/// `--keep-alive`, and the async/asyncRewake form — plus `--gate-tools` when
+/// a PreToolUse entry of ours carries that word. A file that cannot be read
+/// or has no Stop entry of ours changes nothing.
+///
+/// `--state` is read back as [`sh_word`] wrote it ([`installed_value`]): a
+/// state dir under `…/Application Support/…` is single-quoted in the file, and
+/// a whitespace split would adopt `'…/Application` — a ledger, a decision log
+/// and attention markers under a directory nobody chose. A value quoted any
+/// other way (a hand edit) is not adopted, and the state dir this command line
+/// resolved stands.
+fn keep_flags(opts: &mut Opts, path: &std::path::Path) {
+    let target = link_target(path);
+    let Ok(text) = std::fs::read_to_string(&target) else {
+        return;
+    };
+    let Ok(doc) = Json::parse(&text) else {
+        return;
+    };
+    let Some(groups) = doc
+        .get("hooks")
+        .and_then(|h| h.get("Stop"))
+        .and_then(Json::as_array)
+    else {
+        return;
+    };
+    let stop = groups
+        .iter()
+        .flat_map(|g| {
+            g.get("hooks")
+                .and_then(Json::as_array)
+                .unwrap_or(&[])
+                .iter()
+        })
+        .find(|e| {
+            e.get("command")
+                .and_then(Json::as_str)
+                .is_some_and(|c| c.contains(OWN_MARK))
+        });
+    let Some(stop) = stop else {
+        return;
+    };
+    let set = |flag: &str| opts.explicit.iter().any(|f| f == flag);
+    let cmd = stop.get("command").and_then(Json::as_str).unwrap_or("");
+    if !set("--state") {
+        if let Some(dir) = installed_value(cmd, "--state").filter(|d| !d.is_empty()) {
+            opts.state_dir = dir;
+        }
+    }
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let value = |flag: &str| {
+        words
+            .iter()
+            .position(|w| *w == flag)
+            .and_then(|i| words.get(i + 1).copied())
+    };
+    if !set("--accept-from") {
+        if let Some(v) = value("--accept-from") {
+            opts.accept_from = v
+                .split(',')
+                .filter(|p| crate::subject::is_principal(p))
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    if !set("--report-to") {
+        if let Some(v) = value("--report-to") {
+            let sid = v.trim_matches('\'').trim_start_matches('@');
+            if sid.starts_with("s-") && crate::subject::is_principal(sid) {
+                opts.report_to = Some(sid.to_string());
+            }
+        }
+    }
+    if !set("--wake-budget") {
+        if let Some(Ok(b)) = value("--wake-budget").map(parse_budget) {
+            opts.budget = b;
+        }
+    }
+    if !set("--timeout") {
+        if let Some(Ok(secs)) = value("--timeout").map(str::parse::<f64>) {
+            if secs.is_finite() && secs >= 0.0 {
+                opts.timeout = Duration::from_secs_f64(secs.min(600.0));
+            }
+        }
+    }
+    if !set("--rewake") && stop.get("asyncRewake") == Some(&Json::Bool(true)) {
+        opts.rewake = true;
+    }
+    // Round 22's two opt-ins, as the installed block has them: a `--keep-alive`
+    // on its Stop, and a PreToolUse entry of ours that carries the word
+    // `--gate-tools`. An update that adds an event must not quietly turn either
+    // off. The WORD is the test, not the entry: before round 22 every install
+    // wrote a PreToolUse entry of ours with no such word (round 21 gated
+    // unconditionally), and reading that as an opt-in would turn a gate back
+    // on that nobody ever asked for.
+    if !set("--keep-alive") && words.contains(&"--keep-alive") {
+        opts.keep_alive = true;
+    }
+    let gated = doc
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(Json::as_array)
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .flat_map(|g| {
+                    g.get("hooks")
+                        .and_then(Json::as_array)
+                        .unwrap_or(&[])
+                        .iter()
+                })
+                .any(|e| {
+                    e.get("command").and_then(Json::as_str).is_some_and(|c| {
+                        c.contains(OWN_MARK) && c.split_whitespace().any(|w| w == "--gate-tools")
+                    })
+                })
+        });
+    if !set("--gate-tools") && gated {
+        opts.gate_tools = true;
+    }
+}
+
+/// The value after `flag` in one of our hook commands, read word by word the
+/// way [`sh_word`] wrote them: a bare word of its safe set, or `'…'` with an
+/// embedded quote as `'\''`. `None` when the flag is not there, or when a word
+/// up to its value is quoted any other way — a hand edit this reader does not
+/// guess at.
+fn installed_value(cmd: &str, flag: &str) -> Option<String> {
+    let (_, mut rest) = split_command(cmd)?;
+    loop {
+        let (word, after) = sh_word_back(rest)?;
+        if word == flag {
+            return sh_word_back(after).map(|(value, _)| value);
+        }
+        rest = after;
+    }
+}
+
+/// One [`sh_word`] off the front of `s` (leading spaces skipped), and what
+/// follows it. `None` at the end of the line or for a word `sh_word` would
+/// not have written.
+fn sh_word_back(s: &str) -> Option<(String, &str)> {
+    let s = s.trim_start_matches(' ');
+    if s.is_empty() {
+        return None;
+    }
+    let ends = |rest: &str| rest.is_empty() || rest.starts_with(' ');
+    if let Some(quoted) = s.strip_prefix('\'') {
+        let mut word = String::new();
+        let mut it = quoted.char_indices();
+        while let Some((i, c)) = it.next() {
+            if c != '\'' {
+                word.push(c);
+                continue;
+            }
+            let after = &quoted[i + 1..];
+            if after.starts_with("\\''") {
+                word.push('\'');
+                it.nth(2);
+                continue;
+            }
+            return ends(after).then_some((word, after));
+        }
+        return None;
+    }
+    let end = s.find(' ').unwrap_or(s.len());
+    let word = &s[..end];
+    (sh_word(word) == word).then(|| (word.to_string(), &s[end..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -2792,15 +3586,20 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         budget: DEFAULT_BUDGET,
         timeout: Duration::from_secs_f64(DEFAULT_TIMEOUT_S),
         rewake: false,
+        gate_tools: false,
+        keep_alive: false,
         report_to: None,
         settings: None,
         check: false,
         merge: false,
+        keep_flags: false,
+        explicit: Vec::new(),
         dry_run: false,
         exe: None,
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
+        opts.explicit.push(flag.clone());
         let mut value = || {
             it.next()
                 .cloned()
@@ -2813,8 +3612,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--state" => opts.state_dir = value()?,
             "--settings" => opts.settings = Some(value()?),
             "--rewake" => opts.rewake = true,
+            "--gate-tools" => opts.gate_tools = true,
+            "--keep-alive" => opts.keep_alive = true,
             "--check" => opts.check = true,
             "--merge" => opts.merge = true,
+            "--keep-flags" => opts.keep_flags = true,
             "--dry-run" => opts.dry_run = true,
             "--exe" => opts.exe = Some(value()?),
             "--accept-from" => opts
@@ -2982,6 +3784,42 @@ fn connect(opts: &Opts) -> Result<(Ctl, Resolved), String> {
     Ok((ctl, found))
 }
 
+/// One authenticated connection to an INSTANCE, with no session: `--sock`,
+/// then `$ATERM_CONTROL_SOCK`, then [`aterm_ctl::resolve_sock_for`] with no
+/// session — the `latest` alias, or the newest live instance when the alias
+/// is dead, as a flagless `aterm ctl` resolves — and the token beside it. For
+/// `--check` from a context that has no session (the auto-prime pass).
+///
+/// # Errors
+///
+/// No socket resolvable, no token, or the connect itself.
+fn connect_instance(opts: &Opts) -> Result<(Ctl, String), String> {
+    let sock = if !opts.sock.is_empty() {
+        opts.sock.clone()
+    } else if let Ok(env) = std::env::var("ATERM_CONTROL_SOCK") {
+        // `0`/`off`/empty is the variable's documented "no socket", never a path.
+        if matches!(env.trim(), "" | "0" | "off") {
+            return Err("the control socket is disabled ($ATERM_CONTROL_SOCK)".to_string());
+        }
+        env
+    } else {
+        aterm_ctl::resolve_sock_for(None).map_err(|e| format!("no aterm control socket: {e}"))?
+    };
+    let token = if let Some(path) = &opts.token_file {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("--token-file {path}: {e}"))?
+            .trim()
+            .to_string()
+    } else if !opts.token.is_empty() {
+        opts.token.clone()
+    } else {
+        aterm_ctl::read_token_beside(&sock).map_err(|e| format!("no instance token: {e}"))?
+    };
+    let ctl = Ctl::connect_within(&aterm_uds::latest::resolve(&sock), &token, LANE_DEADLINE)
+        .map_err(|e| format!("cannot connect to {sock}: {e}"))?;
+    Ok((ctl, sock))
+}
+
 /// How long one control reply may take before a hook gives up on it and
 /// carries on un-gated. `aterm ctl` bounds its own probes at 2 s and its
 /// forwarded verbs at 10 s; a hook runs before EVERY tool call, so the bound
@@ -3013,17 +3851,6 @@ fn open(opts: &Opts, event: &str) -> Option<Ctl> {
 mod tests {
     use super::*;
 
-    /// The turn's final displayed message in the transcript at `path`, read
-    /// whole ([`final_message_within`] at the live bound).
-    fn read_final(path: &str) -> Result<Option<LastMessage>, String> {
-        read_final_within(path, TRANSCRIPT_TAIL_MAX)
-    }
-
-    /// [`read_final`] over the last `tail_max` bytes.
-    fn read_final_within(path: &str, tail_max: u64) -> Result<Option<LastMessage>, String> {
-        final_message_within(path, tail_max).map(|(turn, _)| turn.message)
-    }
-
     /// An `Opts` with nothing set, for the tests that set one or two fields.
     fn bare() -> Opts {
         Opts {
@@ -3032,6 +3859,8 @@ mod tests {
             token: String::new(),
             token_file: None,
             state_dir: String::new(),
+            gate_tools: false,
+            keep_alive: false,
             accept_from: Vec::new(),
             budget: DEFAULT_BUDGET,
             timeout: Duration::from_secs_f64(DEFAULT_TIMEOUT_S),
@@ -3040,6 +3869,8 @@ mod tests {
             settings: None,
             check: false,
             merge: false,
+            keep_flags: false,
+            explicit: Vec::new(),
             dry_run: false,
             exe: None,
         }
@@ -3311,13 +4142,59 @@ mod tests {
             ..bare()
         };
         let doc = claude_settings_for("/usr/local/bin/aterm-link", &opts).render();
-        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
+        // FIVE HOOKS BY DEFAULT (`DEFAULT_EVENTS`): the two that write
+        // metadata, the approval box's two (the answer and the escalation),
+        // and the one that reports. `PreToolUse` is opt-in, and so is the wait
+        // the `Stop` command would park on.
+        for (_, event) in DEFAULT_EVENTS {
             assert!(doc.contains(&format!("\"{event}\"")), "{event}: {doc}");
         }
+        assert!(
+            !doc.contains("PreToolUse"),
+            "the tool gate is opt-in: {doc}"
+        );
+        assert!(!doc.contains("pre-tool-use"), "{doc}");
+        assert!(!doc.contains("--gate-tools"), "{doc}");
+        assert!(!doc.contains("--keep-alive"), "{doc}");
         assert!(doc.contains("hook run stop"));
         assert!(doc.contains("--wake-budget 6/1"));
         assert!(doc.contains("--accept-from h-andrew"));
         assert!(!doc.contains("asyncRewake"));
+        // And each opt-in writes exactly its own half, nothing else.
+        let gated = claude_settings_for(
+            "/usr/local/bin/aterm-link",
+            &Opts {
+                gate_tools: true,
+                ..opts.clone()
+            },
+        )
+        .render();
+        assert!(gated.contains("\"PreToolUse\""), "{gated}");
+        assert!(gated.contains("hook run pre-tool-use"), "{gated}");
+        assert!(
+            gated.contains("--gate-tools"),
+            "the installed command carries the flag it needs: {gated}"
+        );
+        assert!(!gated.contains("--keep-alive"), "{gated}");
+        let alive = claude_settings_for(
+            "/usr/local/bin/aterm-link",
+            &Opts {
+                keep_alive: true,
+                ..opts.clone()
+            },
+        )
+        .render();
+        assert!(alive.contains("hook run stop"), "{alive}");
+        assert!(alive.contains("--keep-alive"), "{alive}");
+        assert!(!alive.contains("PreToolUse"), "{alive}");
+        let doc = claude_settings_for(
+            "/usr/local/bin/aterm-link",
+            &Opts {
+                gate_tools: true,
+                ..opts.clone()
+            },
+        )
+        .render();
         // The vendor's nesting, re-read by this crate's own parser: every event
         // is an array of groups, every group carries a `hooks` array of
         // `type: command` entries, and only `PreToolUse` carries a matcher.
@@ -3390,14 +4267,19 @@ mod tests {
             ),
         ] {
             let cmds = commands_of(&claude_settings_for(exe, &opts));
-            assert_eq!(cmds.len(), 4, "{exe}");
+            assert_eq!(
+                cmds.len(),
+                DEFAULT_EVENTS.len(),
+                "the default events: {exe}"
+            );
             for (event, cmd) in &cmds {
                 assert!(cmd.starts_with(want), "{event}: {cmd}");
                 assert!(cmd.contains(OWN_MARK), "{event}: {cmd}");
             }
             assert_eq!(
                 cmds.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(),
-                ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"]
+                DEFAULT_EVENTS.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                "the document's events are the default roster's, in its order"
             );
         }
     }
@@ -3425,6 +4307,9 @@ mod tests {
     ],
     "Notification": [
       {"hooks": [{"type": "command", "command": "/old/aterm hook run notification"}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "/old/aterm hook run subagent-stop"}]}
     ],
     "PostToolUse": [
       {"hooks": [{"type": "command", "command": "/usr/local/bin/format-it"}]}
@@ -3464,14 +4349,14 @@ mod tests {
                 .map(|(_, c)| c.as_str())
                 .collect()
         };
-        // Foreign hooks kept, under both kinds of event.
-        assert_eq!(
-            of("PreToolUse"),
-            [
-                "/usr/local/bin/lint-it",
-                "/new/aterm link hook run pre-tool-use --state /s"
-            ]
-        );
+        // Foreign hooks kept, under both kinds of event — and AN UPGRADE TURNS
+        // THE OLD TOOL GATE OFF. The file being merged into carries aterm's
+        // round-21 `PreToolUse` entry; this installer does not write one, and
+        // the merge strips every command bearing `OWN_MARK` before it adds its
+        // own, so the stale gate goes and the foreign hook stays. Without that
+        // an upgrade would leave a worker still gated by a hook its own
+        // settings no longer claim.
+        assert_eq!(of("PreToolUse"), ["/usr/local/bin/lint-it"]);
         assert_eq!(of("PostToolUse"), ["/usr/local/bin/format-it"]);
         assert_eq!(
             of("Stop"),
@@ -3480,11 +4365,18 @@ mod tests {
                 "/new/aterm link hook run stop --state /s --wake-budget 6/1 --timeout 15"
             ]
         );
+        // An old aterm entry under an event this build writes is REPLACED by
+        // this build's — the old spelling is gone, not doubled.
+        assert_eq!(
+            of("Notification"),
+            ["/new/aterm link hook run notification --state /s"],
+            "{cmds:?}"
+        );
         // An old aterm entry under an event this build does not write is gone,
         // and the group it emptied with it.
-        assert!(of("Notification").is_empty(), "{cmds:?}");
+        assert!(of("SubagentStop").is_empty(), "{cmds:?}");
         assert_eq!(
-            doc.get("hooks").unwrap().get("Notification"),
+            doc.get("hooks").unwrap().get("SubagentStop"),
             Some(&Json::Array(vec![])),
             "the key stays, empty; the group is gone"
         );
@@ -3499,7 +4391,7 @@ mod tests {
         // refused with the document untouched.
         let mut fresh = Json::parse(r#"{"permissions": {}}"#).unwrap();
         merge_hooks(&mut fresh, &ours).expect("merge into a file with no hooks");
-        assert_eq!(commands_of(&fresh).len(), 4);
+        assert_eq!(commands_of(&fresh).len(), DEFAULT_EVENTS.len());
         for bad in [r#"{"hooks": 1}"#, r#"{"hooks": {"Stop": {}}}"#, "[]"] {
             let mut doc = Json::parse(bad).unwrap();
             let before = doc.clone();
@@ -3582,13 +4474,12 @@ mod tests {
         };
         let doc = claude_settings_for(exe, &opts).render();
         let cmds = commands(&doc);
-        assert_eq!(cmds.len(), 4, "four events: {doc}");
-        for (cmd, event) in cmds.iter().zip([
-            "session-start",
-            "user-prompt-submit",
-            "pre-tool-use",
-            "stop",
-        ]) {
+        assert_eq!(
+            cmds.len(),
+            DEFAULT_EVENTS.len(),
+            "the default events: {doc}"
+        );
+        for (cmd, (event, _)) in cmds.iter().zip(DEFAULT_EVENTS) {
             // The JSON escaping is still in the file; undo it the way a reader
             // of the settings document would before handing the string to sh.
             let line = cmd.replace("\\\"", "\"").replace("\\\\", "\\");
@@ -3685,670 +4576,126 @@ mod tests {
         dir
     }
 
-    /// A SYNTHETIC transcript in the vendor's JSONL shape — one object per
-    /// line, a turn's text, `tool_use` and `thinking` blocks each on a line of
-    /// their own, a `user` line quoting the assistant marker inside a tool
-    /// result — ending in `last` as the final assistant text. Never a real one.
-    fn transcript(dir: &std::path::Path, name: &str, last: &str) -> String {
-        let path = dir.join(name);
-        let text = crate::json::string(last);
-        let lines = [
-            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"run the suite"}}"#.to_string(),
-            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"On it."}]}}"#.to_string(),
-            r#"{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"targo test"}}]}}"#.to_string(),
-            r#"{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"QUOTED\"}]}} 3 passed"}]}}"#.to_string(),
-            r#"{"type":"assistant","uuid":"a3","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private"}]}}"#.to_string(),
-            format!(r#"{{"type":"assistant","uuid":"a4","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"text","text":{text}}}]}}}}"#),
-            r#"{"type":"system","subtype":"turn_duration","uuid":"s1","durationMs":1200}"#.to_string(),
-        ];
-        std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
-        path.display().to_string()
+    // ---- the report's body, read off the SCREEN (round 22) ----------------
+
+    /// A Claude Code screen: `body` above the composer frame, then the frame
+    /// and a footer — the shape [`aterm_phase::transcript_end`] reads.
+    fn screen(body: &[&str]) -> Vec<String> {
+        let rule = "\u{2500}".repeat(60);
+        let mut rows: Vec<String> = body.iter().map(|r| (*r).to_string()).collect();
+        rows.push(rule.clone());
+        rows.push("\u{276f}".to_string());
+        rows.push(rule);
+        rows.push("  \u{23f5}\u{23f5} auto mode on \u{b7} ? for shortcuts".to_string());
+        rows
     }
 
-    /// **THE LAST ASSISTANT TEXT, BY PARSING.** The final text line wins over
-    /// the `thinking` and `tool_use` lines after the earlier text, over the
-    /// `system` line after it, and over a tool result that QUOTES an assistant
-    /// line — a string value, stepped over whole. A sidechain line is skipped;
-    /// several text blocks on one line are joined; a bare-string `content`
-    /// (the older shape) is read too.
+    /// The body is what the worker SAID: from the last `⏺` row down to where
+    /// the live zone begins, blank rows at either end dropped, and NOT the
+    /// transcript above it.
     #[test]
-    fn the_last_assistant_text_is_taken_from_the_transcript() {
-        let dir = scratch("last");
-        let path = transcript(&dir, "t.jsonl", "All 248 tests pass.\nDone.");
-        let last = read_final(&path)
-            .expect("the file reads")
-            .expect("a message");
-        assert_eq!(last.text, "All 248 tests pass.\nDone.");
-        assert_eq!(last.uuid.as_deref(), Some("a4"));
-
-        // A prompt that QUOTES an assistant line opens the turn: the real
-        // answer under it is the message, never the quoted one.
-        let path = dir.join("quoted.jsonl");
-        std::fs::write(
-            &path,
-            concat!(
-                r#"{"type":"user","uuid":"u1","message":{"content":"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"QUOTED\"}]}}"}}"#,
-                "\n",
-                r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"real"}]}}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        let last = read_final(&path.display().to_string()).unwrap().unwrap();
-        assert_eq!(last.text, "real");
-
-        // Sidechain skipped, blocks joined, the older string shape read, an
-        // empty text block not a message.
-        let path = dir.join("shapes.jsonl");
-        std::fs::write(
-            &path,
-            concat!(
-                r#"{"type":"assistant","uuid":"s0","message":{"content":"older shape"}}"#,
-                "\n",
-                r#"{"type":"assistant","uuid":"s1","message":{"content":[{"type":"text","text":"one"},{"type":"text","text":"two"}]}}"#,
-                "\n",
-                r#"{"type":"assistant","uuid":"s2","isSidechain":true,"message":{"content":[{"type":"text","text":"a subagent's"}]}}"#,
-                "\n",
-                r#"{"type":"assistant","uuid":"s3","message":{"content":[{"type":"text","text":"   "}]}}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        let last = read_final(&path.display().to_string()).unwrap().unwrap();
-        assert_eq!(last.text, "one\ntwo");
-        assert_eq!(last.uuid.as_deref(), Some("s1"));
-        let path = dir.join("older.jsonl");
-        std::fs::write(
-            &path,
-            "{\"type\":\"assistant\",\"message\":{\"content\":\"older shape\"}}\n",
-        )
-        .unwrap();
-        let last = read_final(&path.display().to_string()).unwrap().unwrap();
-        assert_eq!(last.text, "older shape");
-        assert_eq!(last.uuid, None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A transcript that is not Claude Code's — no file, an empty file, prose,
-    /// JSONL with no assistant line, a JSONL whose only assistant line has no
-    /// text — yields nothing to post, and only the missing file is an error.
-    #[test]
-    fn a_transcript_that_is_not_claudes_yields_nothing() {
-        let dir = scratch("none");
-        let missing = dir.join("missing.jsonl").display().to_string();
-        assert!(read_final(&missing).is_err());
-        for (name, body) in [
-            ("empty.jsonl", ""),
-            ("prose.txt", "an assistant said hello\nand that was all\n"),
-            ("nomsg.jsonl", "{\"type\":\"user\",\"message\":{\"content\":\"assistant?\"}}\n"),
-            (
-                "notext.jsonl",
-                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}\n",
-            ),
-            ("broken.jsonl", "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"unterminated\n"),
-        ] {
-            let path = dir.join(name);
-            std::fs::write(&path, body).unwrap();
-            let got = read_final(&path.display().to_string()).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(got.is_none(), "{name} must yield nothing");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The tail read: a file longer than the bound is read from its end, the
-    /// partial first line of the tail is dropped, and the last message is
-    /// still found when it sits inside the tail.
-    #[test]
-    fn a_long_transcript_is_read_from_its_tail() {
-        let dir = scratch("tail");
-        let path = dir.join("long.jsonl");
-        let filler = format!(
-            "{{\"type\":\"assistant\",\"uuid\":\"old\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
-            "x".repeat(300)
-        );
-        let last = "{\"type\":\"assistant\",\"uuid\":\"new\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the end\"}]}}\n";
-        std::fs::write(&path, format!("{filler}{filler}{last}")).unwrap();
-        let p = path.display().to_string();
-        // A tail that holds the last line and a torn piece of the one before.
-        let got = read_final_within(&p, (last.len() + 40) as u64)
-            .unwrap()
-            .expect("the last line is inside the tail");
-        assert_eq!(got.text, "the end");
-        assert_eq!(got.uuid.as_deref(), Some("new"));
-        // A tail too short for even the last line: nothing, not a torn message.
-        assert!(read_final_within(&p, 20).unwrap().is_none());
-        // The whole file: the same answer.
-        assert_eq!(read_final(&p).unwrap().unwrap().text, "the end");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ---- what the worker DISPLAYED (round 16 addendum) --------------------
-
-    /// Standard padded base64 — the test side of [`base64_decode`].
-    fn b64(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let b = [
-                chunk[0],
-                chunk.get(1).copied().unwrap_or(0),
-                chunk.get(2).copied().unwrap_or(0),
-            ];
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            for i in 0..4 {
-                if i <= chunk.len() {
-                    out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
-                } else {
-                    out.push('=');
-                }
-            }
-        }
-        out
-    }
-
-    /// One length-delimited protobuf field.
-    fn proto(number: u8, value: &[u8]) -> Vec<u8> {
-        let mut out = vec![(number << 3) | 2];
-        let mut len = value.len();
-        loop {
-            let byte = (len & 0x7f) as u8;
-            len >>= 7;
-            if len == 0 {
-                out.push(byte);
-                break;
-            }
-            out.push(byte | 0x80);
-        }
-        out.extend_from_slice(value);
-        out
-    }
-
-    /// A SYNTHETIC signature in the shape measured on this Claude Code build
-    /// — field numbers and wire types only, every byte made up here: a
-    /// varint; the payload (a header whose field 8 is `kind`, two 12-byte
-    /// fields, a 48-byte one, an opaque tail with `tail` at its end); a varint.
-    fn signature_with(kind: &str, tail: &[u8]) -> String {
-        let mut header = vec![0x08, 0x01, 0x18, 0x02, 0x38, 0x01];
-        header.extend(proto(8, kind.as_bytes()));
-        let mut payload = proto(1, &header);
-        payload.extend(proto(2, &[0xa5; 12]));
-        payload.extend(proto(3, &[0x5a; 12]));
-        payload.extend(proto(4, &[0x3c; 48]));
-        let mut opaque: Vec<u8> = (0..96u8).map(|i| i.wrapping_mul(37)).collect();
-        opaque.extend_from_slice(tail);
-        payload.extend(proto(5, &opaque));
-        let mut top = vec![0x08, 0x02];
-        top.extend(proto(2, &payload));
-        top.extend([0x18, 0x01]);
-        b64(&top)
-    }
-
-    fn signature(kind: &str) -> String {
-        signature_with(kind, &[])
-    }
-
-    /// The lines of a SYNTHETIC transcript in this build's shape — one content
-    /// block per line, the lines of one API message sharing its `message.id`.
-    fn prompt_line(uuid: &str, text: &str) -> String {
-        format!(
-            r#"{{"type":"user","uuid":"{uuid}","isSidechain":false,"message":{{"role":"user","content":{}}}}}"#,
-            crate::json::string(text)
-        )
-    }
-
-    fn result_line(uuid: &str) -> String {
-        format!(
-            r#"{{"type":"user","uuid":"{uuid}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"ok"}}]}}}}"#
-        )
-    }
-
-    fn block_line(uuid: &str, id: &str, block: &str) -> String {
-        format!(
-            r#"{{"type":"assistant","uuid":"{uuid}","isSidechain":false,"message":{{"id":"{id}","role":"assistant","content":[{block}]}}}}"#
-        )
-    }
-
-    fn text_block(text: &str) -> String {
-        format!(r#"{{"type":"text","text":{}}}"#, crate::json::string(text))
-    }
-
-    fn thinking_block(text: &str, signature: Option<&str>) -> String {
-        let text = crate::json::string(text);
-        match signature {
-            Some(sig) => format!(
-                r#"{{"type":"thinking","thinking":{text},"signature":{}}}"#,
-                crate::json::string(sig)
-            ),
-            None => format!(r#"{{"type":"thinking","thinking":{text}}}"#),
-        }
-    }
-
-    fn tool_block() -> String {
-        r#"{"type":"tool_use","id":"t","name":"Bash","input":{"command":"true"}}"#.to_string()
-    }
-
-    fn write_lines(dir: &std::path::Path, name: &str, lines: &[String]) -> String {
-        let path = dir.join(name);
-        std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
-        path.display().to_string()
-    }
-
-    fn append_lines(path: &str, lines: &[String]) {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .expect("open to append");
-        f.write_all((lines.join("\n") + "\n").as_bytes())
-            .expect("append");
-    }
-
-    /// The head of a turn the vendor had written when `Stop` fired, and the
-    /// final message it had not: the live 2026-09-15 shape, words made up.
-    fn lagging_turn() -> (Vec<String>, Vec<String>) {
-        let narr = signature("narration");
-        let hid = signature("thinking");
-        let head = vec![
-            prompt_line("u1", "run the rehearsal"),
-            block_line("a1", "m1", &thinking_block("", Some(&hid))),
-            block_line("a2", "m1", &text_block("Starting the rehearsal.")),
-            block_line("a3", "m1", &tool_block()),
-            result_line("u2"),
-            block_line("a4", "m2", &thinking_block("", Some(&hid))),
-            block_line(
-                "a5",
-                "m2",
-                &thinking_block("The rehearsal finished; checking its outcome:", Some(&narr)),
-            ),
-            block_line("a6", "m2", &tool_block()),
-            result_line("u3"),
-        ];
-        let tail = vec![
-            block_line("a7", "m3", &thinking_block("", Some(&hid))),
-            block_line(
-                "a8",
-                "m3",
-                &text_block("Done: 12 of 12 cases pass; merged."),
-            ),
-        ];
-        (head, tail)
-    }
-
-    /// **NARRATION IS WHAT THE WORKER SAID.** A turn whose last message is
-    /// narration — a `thinking` block with the mark, beside an empty hidden
-    /// one — reports that narration, with its line's uuid; the earlier text
-    /// block (what the round-14 reader took, the stale one-liner) is not it.
-    /// The decoder reads the measured shape, and the kind is structural.
-    #[test]
-    fn a_turn_that_ends_in_narration_reports_the_narration() {
-        let dir = scratch("narr");
-        let narr = signature("narration");
-        let hid = signature("thinking");
-        let (mut lines, _) = lagging_turn();
-        lines.push(block_line("a7", "m3", &thinking_block("", Some(&hid))));
-        lines.push(block_line(
-            "a8",
-            "m3",
-            &thinking_block("All 12 cases pass; the branch is merged.", Some(&narr)),
-        ));
-        lines.push(r#"{"type":"system","subtype":"stop_hook_summary","uuid":"s1"}"#.to_string());
-        let path = write_lines(&dir, "t.jsonl", &lines);
-        let last = read_final(&path)
-            .unwrap()
-            .expect("the narration is the message");
-        assert_eq!(last.text, "All 12 cases pass; the branch is merged.");
-        assert_eq!(last.uuid.as_deref(), Some("a8"));
-
-        assert!(is_narration(&narr));
-        assert!(!is_narration(&hid));
-        let decoded = base64_decode(&narr).expect("base64");
-        assert_eq!(b64(&decoded), narr, "the decoder inverts the encoder");
-        assert_eq!(signature_kind(&decoded), Some(&b"narration"[..]));
-        // Unpadded and URL-safe spellings decode to the same bytes.
-        let unpadded = narr.trim_end_matches('=');
-        assert_eq!(base64_decode(unpadded), Some(decoded.clone()));
-        let url = narr.replace('+', "-").replace('/', "_");
-        assert_eq!(base64_decode(&url), Some(decoded));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **HIDDEN REASONING IS NEVER POSTED.** A `thinking` block with text is
-    /// hidden unless its signature's header says `narration`: the kind
-    /// `thinking`, no signature, an empty one, one that is not base64, the
-    /// bare word base64-encoded (not the protobuf), and the marker's very
-    /// bytes planted in the opaque payload under a `thinking` kind. As the
-    /// turn's last message alone it posts NOTHING — not the older narration
-    /// under it either — and `undisplayed` says why; beside displayed blocks
-    /// of the same message, those are posted and it is not.
-    #[test]
-    fn hidden_reasoning_is_never_posted() {
-        const SECRET: &str = "HIDDEN-REASONING-SENTINEL";
-        let narr = signature("narration");
-        let hid = signature("thinking");
-        let planted = signature_with("thinking", b"\x42\x09narration");
-        let word = b64(b"narration");
-        let summary = signature("summary");
-        for (name, sig) in [
-            ("kind thinking", Some(hid.as_str())),
-            ("no signature", None),
-            ("an empty signature", Some("")),
-            ("not base64", Some("not base64 at all!")),
-            ("the word, not the field", Some(word.as_str())),
-            ("the bytes planted in the payload", Some(planted.as_str())),
-            ("another kind", Some(summary.as_str())),
-        ] {
-            let block = thinking_block(SECRET, sig);
-            let alone = [
-                prompt_line("u1", "go"),
-                block_line(
-                    "a1",
-                    "m1",
-                    &thinking_block("Earlier narration.", Some(&narr)),
-                ),
-                block_line("a2", "m1", &tool_block()),
-                result_line("u2"),
-                block_line("a3", "m2", &block),
-            ];
-            let turn = scan_turn(&alone.join("\n"));
-            assert!(turn.message.is_none(), "{name}");
-            assert!(turn.undisplayed, "{name}");
-
-            let beside = [
-                prompt_line("u1", "go"),
-                block_line("a1", "m1", &block),
-                block_line("a2", "m1", &thinking_block("Shown narration.", Some(&narr))),
-                block_line("a3", "m1", &text_block("Shown text.")),
-            ];
-            let turn = scan_turn(&beside.join("\n"));
-            let message = turn.message.expect(name);
-            assert_eq!(message.text, "Shown narration.\nShown text.", "{name}");
-            assert!(!message.text.contains(SECRET), "{name}");
-            assert_eq!(message.uuid.as_deref(), Some("a3"), "{name}");
-        }
-        assert!(!is_narration(&planted));
-        assert!(!is_narration(&word));
-        assert_eq!(base64_decode("no!"), None);
+    fn the_body_is_the_rows_from_the_last_said_row_to_the_live_zone() {
+        let rows = screen(&[
+            "\u{23fa} An earlier answer nobody asked to hear again.",
+            "",
+            "\u{23fa} The parser is gone; the screen is the report now.",
+            "  Two crates build clean and the suite is green.",
+            "",
+        ]);
         assert_eq!(
-            signature_kind(b"\x0a\x05abc"),
-            None,
-            "a length past the end"
+            report_body(&rows),
+            "\u{23fa} The parser is gone; the screen is the report now.\n  Two crates build \
+             clean and the suite is green."
+        );
+    }
+
+    /// The body stops where [`aterm_phase::transcript_end`] says it does, and
+    /// that reader KEEPS a done row: `\u{273b} Cogitated for 2m 54s \u{b7} done 2:41 PM`
+    /// ends the turn, so only what hangs UNDER it — the `\u{23bf}  Tip:` row, the
+    /// blanks — is the live zone. A manager reading the report wants the done
+    /// row: it is what says the turn ended, and how long it took.
+    #[test]
+    fn the_live_zone_under_a_done_row_is_not_in_the_body() {
+        let rows = screen(&[
+            "\u{23fa} Merged and pushed.",
+            "",
+            "\u{273b} Cogitated for 2m 54s \u{b7} done 2:41 PM",
+            "  \u{23bf}  Tip: Use /clear to start fresh when switching topics",
+            "",
+        ]);
+        assert_eq!(
+            report_body(&rows),
+            "\u{23fa} Merged and pushed.\n\n\u{273b} Cogitated for 2m 54s \u{b7} done 2:41 PM",
+            "the done row is transcript; the tip and the blanks under it are not"
+        );
+    }
+
+    /// With no `⏺` row on the screen — a turn whose words scrolled off, or
+    /// one that ended on tool output — the body is the last [`REPORT_ROWS`]
+    /// NON-BLANK rows above the live zone, blanks between them kept.
+    #[test]
+    fn a_screen_with_no_said_row_falls_back_to_six_non_blank_rows() {
+        let mut body: Vec<String> = (1..=9).map(|n| format!("  row {n}")).collect();
+        body.insert(5, String::new());
+        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        let rows = screen(&refs);
+        let got = report_body(&rows);
+        let kept: Vec<&str> = got.lines().collect();
+        assert_eq!(
+            kept.iter().filter(|r| !r.trim().is_empty()).count(),
+            REPORT_ROWS,
+            "{got}"
+        );
+        assert_eq!(kept.first(), Some(&"  row 4"), "{got}");
+        assert_eq!(kept.last(), Some(&"  row 9"), "{got}");
+    }
+
+    /// The dedup key is the SCREEN'S OWN HASH and nothing else: the same
+    /// screen twice is one report, a screen that moved is another.
+    #[test]
+    fn the_same_screen_is_reported_once_and_a_moved_one_again() {
+        // A named constant, not a `key: "<hex>"` literal: the public export's
+        // secret scan reads that shape as an API key.
+        const SCREEN: &str = "0123456789abcdef";
+        let settled = |seq: u64, hash: &str| Settled {
+            busy: false,
+            body: "\u{23fa} done".to_string(),
+            seq,
+            hash: hash.to_string(),
+        };
+        let before = LastReport {
+            key: SCREEN.to_string(),
+            high: 7,
+        };
+        assert!(already_reported(&before, &settled(4, SCREEN)));
+        // A re-fired `Stop` at a LATER seq on the same screen is still the
+        // same screen: the hash, not the seq, is the identity.
+        assert!(already_reported(&before, &settled(9, SCREEN)));
+        assert!(!already_reported(&before, &settled(4, "fedcba9876543210")));
+    }
+
+    /// **A CONTENDED `status` IS A RETRY, NOT A LOST REPORT.** `seq=-`/`hash=-`
+    /// is what `session_status.rs` answers while the PTY reader holds the
+    /// terminal — the state a `Stop` firing during Claude Code's repaint of the
+    /// done row lands in. Reading it as a fatal error threw away the turn's
+    /// only report; it is one more reason to loop inside `SETTLE_TRIES`. An
+    /// instance with no stamp at all is still fatal: looping cannot grow one.
+    #[test]
+    fn a_contended_stamp_retries_and_a_missing_one_does_not() {
+        assert_eq!(
+            read_stamp("OK schema=1 sid=7 phase=idle seq=12 hash=0123456789abcdef"),
+            Stamp::Ok(12, "0123456789abcdef".to_string())
         );
         assert_eq!(
-            signature_kind(b"\x0f"),
-            None,
-            "a wire type protobuf does not define"
-        );
-    }
-
-    /// **MIXED: THE TEXT AND THE NARRATION, IN ORDER, AND NOTHING ELSE.** One
-    /// API message over several lines (this build) and the same blocks on
-    /// ONE line (the older multi-block shape) read the same: hidden
-    /// reasoning with text, then narration, then text → narration and text.
-    /// The message before it — another `message.id` — is not part of it.
-    #[test]
-    fn a_mixed_final_message_posts_its_text_and_narration_only() {
-        const SECRET: &str = "HIDDEN-REASONING-SENTINEL";
-        let narr = signature("narration");
-        let hid = signature("thinking");
-        let lines = [
-            prompt_line("u1", "go"),
-            block_line("a1", "m1", &text_block("Looking at the suite first.")),
-            block_line("a2", "m1", &tool_block()),
-            result_line("u2"),
-            block_line("a3", "m2", &thinking_block(SECRET, Some(&hid))),
-            block_line(
-                "a4",
-                "m2",
-                &thinking_block("The suite is green.", Some(&narr)),
-            ),
-            block_line("a5", "m2", &text_block("Merged; 248 tests pass.")),
-        ];
-        let message = scan_turn(&lines.join("\n")).message.expect("a message");
-        assert_eq!(message.text, "The suite is green.\nMerged; 248 tests pass.");
-        assert_eq!(message.uuid.as_deref(), Some("a5"));
-
-        let one_line = format!(
-            r#"{{"type":"assistant","uuid":"b1","message":{{"role":"assistant","content":[{},{},{}]}}}}"#,
-            thinking_block(SECRET, Some(&hid)),
-            thinking_block("The suite is green.", Some(&narr)),
-            text_block("Merged; 248 tests pass."),
-        );
-        let lines = [prompt_line("u1", "go"), one_line];
-        let message = scan_turn(&lines.join("\n")).message.expect("a message");
-        assert_eq!(message.text, "The suite is green.\nMerged; 248 tests pass.");
-        assert!(!message.text.contains(SECRET));
-        assert_eq!(message.uuid.as_deref(), Some("b1"));
-    }
-
-    /// **THE TURN STARTS AT ITS PROMPT.** A turn that displayed nothing
-    /// reports nothing — never the previous turn's words — while a tool
-    /// result and an `isMeta` user line are inside the turn, not its start.
-    /// An empty `thinking` block and an empty text are nothing displayed.
-    #[test]
-    fn the_turn_ends_at_the_last_prompt_and_a_quiet_turn_reports_nothing() {
-        let hid = signature("thinking");
-        let lines = [
-            block_line("a1", "m1", &text_block("The previous turn's words.")),
-            prompt_line("u1", "next"),
-            block_line("a2", "m2", &thinking_block("", Some(&hid))),
-            block_line("a3", "m2", &tool_block()),
-            result_line("u2"),
-            block_line("a4", "m3", &text_block("   ")),
-        ];
-        let turn = scan_turn(&lines.join("\n"));
-        assert!(turn.message.is_none());
-        assert!(!turn.undisplayed);
-        assert_eq!(turn.tail_text.as_deref(), Some(""));
-
-        let meta = r#"{"type":"user","uuid":"m","isMeta":true,"message":{"role":"user","content":"a caveat"}}"#;
-        let lines = [
-            prompt_line("u1", "go"),
-            block_line("a1", "m1", &text_block("Said before the meta line.")),
-            meta.to_string(),
-            result_line("u2"),
-            block_line("a2", "m2", &tool_block()),
-        ];
-        let message = scan_turn(&lines.join("\n"))
-            .message
-            .expect("inside the turn");
-        assert_eq!(message.text, "Said before the meta line.");
-    }
-
-    /// `last_assistant_message` is read from the parsed `Stop` input, trimmed;
-    /// empty, absent, not a string, or a document that does not parse: none.
-    #[test]
-    fn the_vendors_last_message_is_read_from_the_stop_input() {
-        assert_eq!(
-            last_assistant_message(
-                r#"{"transcript_path":"/t","last_assistant_message":" Done. \n"}"#
-            ),
-            Some("Done.".to_string())
+            read_stamp("OK schema=1 sid=7 phase=idle seq=- hash=-"),
+            Stamp::Contended,
+            "a contended try_lock must be retried, not fatal"
         );
         assert_eq!(
-            last_assistant_message(r#"{"last_assistant_message":"  "}"#),
-            None
+            read_stamp("OK schema=1 sid=7 phase=idle"),
+            Stamp::Absent,
+            "an instance that predates round 22 cannot be waited out"
         );
-        assert_eq!(
-            last_assistant_message(r#"{"last_assistant_message":7}"#),
-            None
-        );
-        assert_eq!(
-            last_assistant_message(r#"{"a":{"last_assistant_message":"x"}}"#),
-            None
-        );
-        assert_eq!(last_assistant_message("{{{"), None);
-        assert_eq!(last_assistant_message(""), None);
-    }
-
-    /// **THE TRANSCRIPT LAGS; THE READ WAITS FOR IT.** Read at once, the file
-    /// the vendor had written when `Stop` fired says the stale narration.
-    /// With the vendor's `last_assistant_message`, [`settle`] waits until the
-    /// file's last assistant line reads the same; without it, until the file
-    /// held still for the quiet window; a message that never lands ends the
-    /// wait at `max` with `caught_up: false`; one already there costs no wait.
-    #[test]
-    fn the_report_waits_for_the_transcript_to_catch_up() {
-        let dir = scratch("settle");
-        let (head, tail) = lagging_turn();
-        let fin = "Done: 12 of 12 cases pass; merged.";
-        let stale = scan_turn(&head.join("\n")).message.expect("the stale one");
-        assert_eq!(stale.text, "The rehearsal finished; checking its outcome:");
-
-        let later = |path: &str, after: Duration| {
-            let (path, tail) = (path.to_string(), tail.clone());
-            std::thread::spawn(move || {
-                std::thread::sleep(after);
-                append_lines(&path, &tail);
-            })
-        };
-
-        let path = write_lines(&dir, "vendor.jsonl", &head);
-        let writer = later(&path, Duration::from_millis(150));
-        let pace = Pace {
-            max: Duration::from_secs(20),
-            quiet: Duration::from_millis(300),
-            poll: Duration::from_millis(5),
-        };
-        let got = settle(&path, Some(fin), TRANSCRIPT_TAIL_MAX, &pace).expect("reads");
-        writer.join().expect("the writer");
-        assert!(got.caught_up);
-        let message = got.turn.message.expect("the final message");
-        assert_eq!(message.text, fin);
-        assert_eq!(message.uuid.as_deref(), Some("a8"));
-
-        let path = write_lines(&dir, "quiet.jsonl", &head);
-        let writer = later(&path, Duration::from_millis(20));
-        let pace = Pace {
-            max: Duration::from_secs(20),
-            quiet: Duration::from_millis(1500),
-            poll: Duration::from_millis(5),
-        };
-        let got = settle(&path, None, TRANSCRIPT_TAIL_MAX, &pace).expect("reads");
-        writer.join().expect("the writer");
-        assert!(got.caught_up);
-        assert_eq!(got.turn.message.expect("final").text, fin);
-
-        let path = write_lines(&dir, "never.jsonl", &head);
-        let t0 = Instant::now();
-        let pace = Pace {
-            max: Duration::from_millis(200),
-            quiet: Duration::from_millis(300),
-            poll: Duration::from_millis(5),
-        };
-        let got = settle(&path, Some("never written"), TRANSCRIPT_TAIL_MAX, &pace).expect("reads");
-        assert!(!got.caught_up);
-        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
-
-        let whole: Vec<String> = head.iter().chain(&tail).cloned().collect();
-        let path = write_lines(&dir, "there.jsonl", &whole);
-        let t0 = Instant::now();
-        let got = settle(&path, Some(fin), TRANSCRIPT_TAIL_MAX, &CATCH_UP).expect("reads");
-        assert!(got.caught_up);
-        assert!(t0.elapsed() < CATCH_UP.max, "{:?}", t0.elapsed());
-        assert_eq!(got.turn.message.expect("final").text, fin);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **THE VENDOR'S TEXT IS THE FALLBACK, NEVER THE FIRST CHOICE.** Caught
-    /// up, the transcript's message is posted (narration included, its uuid
-    /// for the key). Not caught up in time, or no transcript at all, the
-    /// vendor's `last_assistant_message` is — with a note, no uuid. Without
-    /// it, the reason goes to `say` and nothing is returned: no
-    /// `transcript_path`, and a last message that is hidden reasoning.
-    #[test]
-    fn the_displayed_message_falls_back_to_the_vendors_text() {
-        use std::cell::RefCell;
-        let dir = scratch("fallback");
-        let (head, tail) = lagging_turn();
-        let fin = "Done: 12 of 12 cases pass; merged.";
-        let pace = Pace {
-            max: Duration::from_millis(100),
-            quiet: Duration::from_millis(50),
-            poll: Duration::from_millis(5),
-        };
-        let run = |input: &str| {
-            let said = RefCell::new(Vec::new());
-            let noted = RefCell::new(Vec::new());
-            let got = displayed_message(
-                input,
-                &pace,
-                &|w: &str| said.borrow_mut().push(w.to_string()),
-                &|w: &str| noted.borrow_mut().push(w.to_string()),
-            );
-            (got, said.into_inner(), noted.into_inner())
-        };
-        let input = |path: &str, vendor: Option<&str>| {
-            let mut doc = format!(
-                r#"{{"hook_event_name":"Stop","stop_hook_active":false,"transcript_path":{}"#,
-                crate::json::string(path)
-            );
-            if let Some(v) = vendor {
-                doc.push_str(&format!(
-                    r#","last_assistant_message":{}"#,
-                    crate::json::string(v)
-                ));
-            }
-            doc + "}"
-        };
-
-        let whole: Vec<String> = head.iter().chain(&tail).cloned().collect();
-        let there = write_lines(&dir, "there.jsonl", &whole);
-        let (got, said, noted) = run(&input(&there, Some(fin)));
-        let got = got.expect("a message");
-        assert_eq!((got.text.as_str(), got.uuid.as_deref()), (fin, Some("a8")));
-        assert!(said.is_empty() && noted.is_empty(), "{said:?} {noted:?}");
-
-        let lagging = write_lines(&dir, "lagging.jsonl", &head);
-        let (got, said, noted) = run(&input(&lagging, Some(fin)));
-        let got = got.expect("the vendor's text");
-        assert_eq!((got.text.as_str(), got.uuid), (fin, None));
-        assert!(said.is_empty(), "{said:?}");
-        assert_eq!(noted.len(), 1, "{noted:?}");
-        assert!(
-            noted[0].contains("did not show the turn's last message within 100 ms"),
-            "{noted:?}"
-        );
-
-        let (got, _, noted) = run(&format!(
-            r#"{{"last_assistant_message":{}}}"#,
-            crate::json::string(fin)
-        ));
-        assert_eq!(got.map(|m| m.text).as_deref(), Some(fin));
-        assert!(
-            noted[0].starts_with("no transcript_path in the hook input; posting"),
-            "{noted:?}"
-        );
-
-        let (got, said, _) = run("{}");
-        assert!(got.is_none());
-        assert_eq!(
-            said,
-            vec!["no transcript_path in the hook input".to_string()]
-        );
-
-        let hid = signature("thinking");
-        let hidden = write_lines(
-            &dir,
-            "hidden.jsonl",
-            &[
-                prompt_line("u1", "go"),
-                block_line(
-                    "a1",
-                    "m1",
-                    &thinking_block("HIDDEN-REASONING-SENTINEL", Some(&hid)),
-                ),
-            ],
-        );
-        let (got, said, noted) = run(&input(&hidden, None));
-        assert!(got.is_none());
-        assert!(noted.is_empty());
-        assert!(
-            said[0].contains("cannot be told from hidden reasoning"),
-            "{said:?}"
-        );
-        assert!(!said[0].contains("SENTINEL"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The body is bounded at [`REPORT_MAX`] WITH its marker, cut on a
@@ -4371,310 +4718,6 @@ mod tests {
         );
     }
 
-    /// The key tells a re-fire (the same transcript line) from a repeat (a new
-    /// line with the same words), keys a message with no uuid on its segment
-    /// and body, and on the body alone with neither.
-    #[test]
-    fn the_report_key_tells_a_re_fire_from_a_repeat() {
-        let msg = |uuid: Option<&str>, anchor: Option<&str>| LastMessage {
-            text: "Done.".into(),
-            uuid: uuid.map(str::to_string),
-            anchor: anchor.map(str::to_string),
-        };
-        let a = msg(Some("a1"), Some("u1"));
-        assert_eq!(
-            report_key(&a, "Done."),
-            report_key(&msg(Some("a1"), Some("u1")), "Done.")
-        );
-        let repeat = msg(Some("a2"), Some("u1"));
-        assert_ne!(report_key(&a, "Done."), report_key(&repeat, "Done."));
-        let bare = msg(None, None);
-        assert_ne!(report_key(&a, "Done."), report_key(&bare, "Done."));
-        assert_eq!(report_key(&bare, "Done."), report_key(&bare, "Done."));
-        assert_ne!(report_key(&bare, "Done."), report_key(&bare, "Done!"));
-        // No uuid: the segment tells two turns' same words apart.
-        assert_ne!(
-            report_key(&msg(None, Some("u1")), "Done."),
-            report_key(&msg(None, Some("u9")), "Done.")
-        );
-        // The two halves of the key cannot be traded for each other.
-        assert_ne!(
-            report_key(&msg(Some("x"), None), "Done."),
-            report_key(&msg(None, Some("x")), "Done.")
-        );
-        assert_eq!(report_key(&a, "Done.").len(), 16);
-    }
-
-    /// **REVIEW DEFECT C: THE FALLBACK AND THE LINE ARE ONE REPORT.** A `Stop`
-    /// whose transcript never caught up posts the vendor's text with no uuid;
-    /// a `Stop` that re-fires once the line has landed reads the same words
-    /// WITH the line's uuid. Keyed on that uuid, which the fallback could not
-    /// know (the review measured `k1=ac80…` against `k2=cb3f…`), the same text
-    /// went out twice. Now the
-    /// fallback is recorded as one, and the line is that report — in the same
-    /// segment and words only: the next turn's same words are a report of
-    /// their own, and so is a reply after a wake.
-    #[test]
-    fn a_fallback_and_the_line_that_lands_later_are_one_report() {
-        use std::cell::RefCell;
-        let dir = scratch("fallback-once");
-        let (head, tail) = lagging_turn();
-        let fin = "Done: 12 of 12 cases pass; merged.";
-        let pace = Pace {
-            max: Duration::from_millis(100),
-            quiet: Duration::from_millis(50),
-            poll: Duration::from_millis(5),
-        };
-        let read = |path: &str| {
-            let noted = RefCell::new(Vec::new());
-            let input = format!(
-                r#"{{"hook_event_name":"Stop","stop_hook_active":false,"transcript_path":{},"last_assistant_message":{}}}"#,
-                crate::json::string(path),
-                crate::json::string(fin)
-            );
-            let got = displayed_message(&input, &pace, &|_: &str| {}, &|w: &str| {
-                noted.borrow_mut().push(w.to_string());
-            });
-            (got.expect("a message"), noted.into_inner())
-        };
-        let path = write_lines(&dir, "lagging.jsonl", &head);
-        let (first, noted) = read(&path);
-        assert_eq!(noted.len(), 1, "the fallback says so: {noted:?}");
-        assert_eq!(
-            (first.uuid.as_deref(), first.anchor.as_deref()),
-            (None, Some("u1")),
-            "the vendor's text, in the segment the prompt opened"
-        );
-        let body = trim_report(&first.text);
-        let posted = LastReport {
-            key: report_key(&first, &body),
-            high: 0,
-            fallback: first.uuid.is_none(),
-        };
-        // The line lands; a re-fired Stop reads it, uuid and all.
-        append_lines(&path, &tail);
-        let (again, noted) = read(&path);
-        assert!(noted.is_empty(), "{noted:?}");
-        assert_eq!(again.uuid.as_deref(), Some("a8"));
-        assert_ne!(
-            report_key(&again, &body),
-            posted.key,
-            "the review's two keys"
-        );
-        assert!(
-            already_reported(&posted, &again, &body),
-            "the same message, posted twice"
-        );
-        // Not a fallback: the uuid decides, as before.
-        let exact = LastReport {
-            fallback: false,
-            ..posted.clone()
-        };
-        assert!(!already_reported(&exact, &again, &body));
-        // The next turn ends in the same words: a report of its own.
-        let mut next = head.iter().chain(&tail).cloned().collect::<Vec<_>>();
-        next.push(prompt_line("u9", "and again"));
-        next.push(block_line("a9", "m9", &text_block(fin)));
-        let path = write_lines(&dir, "next.jsonl", &next);
-        let (later, _) = read(&path);
-        assert_eq!(later.anchor.as_deref(), Some("u9"));
-        assert!(!already_reported(&posted, &later, &body));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The `Stop` hook's feedback line in the vendor's shape (measured, words
-    /// made up): a `user` line, `isMeta`, a STRING content opening with
-    /// [`STOP_FEEDBACK`].
-    fn wake_line(uuid: &str) -> String {
-        format!(
-            r#"{{"type":"user","uuid":"{uuid}","isMeta":true,"message":{{"role":"user","content":{}}}}}"#,
-            crate::json::string(
-                "Stop hook feedback:\n[aterm fabric] 1 new message for s-x past seen=0."
-            )
-        )
-    }
-
-    /// What the vendor writes after a `Stop` hook's feedback line, in the order
-    /// measured on the live transcript: an attachment, then the summary.
-    fn after_wake(n: u8) -> Vec<String> {
-        vec![
-            format!(r#"{{"type":"attachment","uuid":"at{n}"}}"#),
-            format!(r#"{{"type":"system","subtype":"stop_hook_summary","uuid":"ss{n}"}}"#),
-        ]
-    }
-
-    /// **REVIEW DEFECT A: A REPLY AFTER A WAKE IS A NEW MESSAGE, EVEN IN THE
-    /// SAME WORDS.** A `Stop` that woke the agent keeps the turn alive; the
-    /// vendor adds its feedback line (`isMeta`, not a prompt) and the agent
-    /// replies. When the second `Stop` fires, that reply may not be on disk
-    /// yet — and the file's newest assistant line is the message from BEFORE
-    /// the wake. When the reply repeats those words (`last_assistant_message`
-    /// equal to them), the read "caught up" at once on the old line, the key
-    /// was the one already recorded, and the reply was dropped as a re-fire
-    /// (the review's `455b0748…` twice). Now the feedback line opens a segment:
-    /// the read waits for the reply's own line, reports it with its own uuid,
-    /// and a post-wake segment that displayed nothing reports nothing — never
-    /// the pre-wake message again. An `isMeta` line that is NOT the feedback
-    /// (a tool's image, an attachment's text) opens nothing.
-    #[test]
-    fn a_reply_after_a_wake_is_a_new_message_even_in_the_same_words() {
-        let dir = scratch("wake");
-        let w = "Idle; waiting for the next task.";
-        let mut lines = vec![
-            prompt_line("u1", "go"),
-            block_line("a2", "m2", &text_block(w)),
-        ];
-        let path = write_lines(&dir, "wake.jsonl", &lines);
-        // Stop #1: the message before the wake, reported.
-        let first = settle(&path, Some(w), TRANSCRIPT_TAIL_MAX, &CATCH_UP).expect("reads");
-        let first = first.turn.message.expect("the first message");
-        assert_eq!(
-            (first.uuid.as_deref(), first.anchor.as_deref()),
-            (Some("a2"), Some("u1"))
-        );
-        let posted = LastReport {
-            key: report_key(&first, w),
-            high: 0,
-            fallback: false,
-        };
-        // The wake: feedback, attachment, summary — then Stop #2 fires with the
-        // reply, in the SAME words, not yet on disk.
-        lines.push(wake_line("u3"));
-        lines.extend(after_wake(3));
-        let path = write_lines(&dir, "wake.jsonl", &lines);
-        let writer = {
-            let path = path.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(150));
-                append_lines(&path, &[block_line("a3", "m3", &text_block(w))]);
-            })
-        };
-        let t0 = Instant::now();
-        let second = settle(&path, Some(w), TRANSCRIPT_TAIL_MAX, &CATCH_UP).expect("reads");
-        writer.join().expect("the writer");
-        assert!(second.caught_up, "the reply's own line landed");
-        assert!(
-            t0.elapsed() >= Duration::from_millis(100),
-            "it waited for the reply, not the old line: {:?}",
-            t0.elapsed()
-        );
-        let reply = second.turn.message.expect("the reply");
-        assert_eq!(
-            (reply.uuid.as_deref(), reply.anchor.as_deref()),
-            (Some("a3"), Some("u3"))
-        );
-        assert!(!already_reported(&posted, &reply, w), "the review's drop");
-
-        // The reviewer's order (summary before the feedback line) reads the same.
-        let mut other = vec![
-            prompt_line("u1", "go"),
-            block_line("a2", "m2", &text_block(w)),
-        ];
-        other.extend(after_wake(3).into_iter().rev());
-        other.push(wake_line("u3"));
-        let turn = scan_turn(&other.join("\n"));
-        assert!(turn.message.is_none() && turn.tail_text.is_none());
-        assert_eq!(turn.anchor.as_deref(), Some("u3"));
-
-        // A post-wake segment that displayed nothing reports nothing — never
-        // the message from before the wake.
-        let hid = signature("thinking");
-        let mut quiet = lines.clone();
-        quiet.push(block_line("a4", "m4", &thinking_block("", Some(&hid))));
-        quiet.push(block_line("a5", "m4", &tool_block()));
-        quiet.push(result_line("u5"));
-        let turn = scan_turn(&quiet.join("\n"));
-        assert!(turn.message.is_none(), "{:?}", turn.message.map(|m| m.text));
-
-        // An isMeta line that is NOT the feedback opens nothing: a tool's
-        // images after the final text, and a string that says something else.
-        let images = r#"{"type":"user","uuid":"u6","isMeta":true,"message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}}"#;
-        let caveat = format!(
-            r#"{{"type":"user","uuid":"u7","isMeta":true,"message":{{"role":"user","content":{}}}}}"#,
-            crate::json::string("Caveat: Stop hook feedback: is quoted here, not opened")
-        );
-        let tail = [
-            prompt_line("u1", "go"),
-            block_line("a2", "m2", &text_block("the final words")),
-            images.to_string(),
-            caveat,
-        ];
-        let turn = scan_turn(&tail.join("\n"));
-        let m = turn.message.expect("the final message");
-        assert_eq!(
-            (m.text.as_str(), m.anchor.as_deref()),
-            ("the final words", Some("u1"))
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **REVIEW DEFECT B: THE VENDOR JOINS TEXT BLOCKS WITH A NEWLINE.** The
-    /// 2.1.268 binary computes `last_assistant_message` as `Pr(content,
-    /// "\n").trim()`; the reader joined with `.`, so a line of two text blocks
-    /// never matched it — the read waited the whole 2 s and posted the
-    /// vendor's text without the narration and without a uuid. A line of
-    /// narration and two text blocks now catches up at once.
-    #[test]
-    fn a_line_of_two_text_blocks_reads_the_way_the_vendor_joins_them() {
-        let two = format!(
-            r#"{{"type":"assistant","uuid":"a1","message":{{"id":"m1","role":"assistant","content":[{},{}]}}}}"#,
-            text_block("Part one."),
-            text_block("Part two.")
-        );
-        let doc = Json::parse(&two).expect("json");
-        let content = doc
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .expect("content");
-        assert_eq!(vendor_text(content), "Part one.\nPart two.");
-
-        let dir = scratch("two-texts");
-        let narr = signature("narration");
-        let line = format!(
-            r#"{{"type":"assistant","uuid":"a2","message":{{"id":"m2","role":"assistant","content":[{},{},{}]}}}}"#,
-            thinking_block("Checking the two parts:", Some(&narr)),
-            text_block("Part one."),
-            text_block("Part two.")
-        );
-        let path = write_lines(&dir, "two.jsonl", &[prompt_line("u1", "go"), line]);
-        let t0 = Instant::now();
-        let got = settle(
-            &path,
-            Some("Part one.\nPart two."),
-            TRANSCRIPT_TAIL_MAX,
-            &CATCH_UP,
-        )
-        .expect("reads");
-        assert!(got.caught_up, "the vendor's text matched the line");
-        assert!(t0.elapsed() < CATCH_UP.max, "{:?}", t0.elapsed());
-        let m = got.turn.message.expect("the message");
-        assert_eq!(
-            (m.text.as_str(), m.uuid.as_deref()),
-            ("Checking the two parts:\nPart one.\nPart two.", Some("a2"))
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `transcript_path` is read as a top-level key of a parsed document —
-    /// not from a nested value, not from a document that does not parse.
-    #[test]
-    fn transcript_path_is_read_from_the_hook_input() {
-        assert_eq!(
-            transcript_path(
-                r#"{"session_id":"x","transcript_path":"/t/s.jsonl","stop_hook_active":false}"#
-            ),
-            Some("/t/s.jsonl".to_string())
-        );
-        assert_eq!(transcript_path("{}"), None);
-        assert_eq!(transcript_path(""), None);
-        assert_eq!(transcript_path("{{{{"), None);
-        assert_eq!(
-            transcript_path(r#"{"a":{"transcript_path":"/nested"}}"#),
-            None
-        );
-        assert_eq!(transcript_path(r#"{"transcript_path":7}"#), None);
-    }
-
     /// The dedup file remembers exactly the last key, and an unwritable path
     /// costs nothing but the dedup.
     #[test]
@@ -4690,17 +4733,19 @@ mod tests {
         let aa = LastReport {
             key: "00aa".into(),
             high: 7,
-            fallback: false,
         };
         posted.record(&aa);
         assert_eq!(posted.last(), Some(aa));
         let bb = LastReport {
             key: "00bb".into(),
             high: 9,
-            fallback: true,
         };
         posted.record(&bb);
-        assert_eq!(posted.last(), Some(bb), "the fallback mark survives");
+        assert_eq!(
+            posted.last(),
+            Some(bb),
+            "the newer screen's hash replaces it"
+        );
         assert!(dir.join("report").join("s-x").exists());
         // A file from before the watermark line: the key alone, high=0.
         assert_eq!(
@@ -4708,7 +4753,6 @@ mod tests {
             Some(LastReport {
                 key: "00cc".into(),
                 high: 0,
-                fallback: false,
             })
         );
         assert_eq!(Posted::parse("\n"), None);
@@ -4718,54 +4762,7 @@ mod tests {
         none.record(&LastReport {
             key: "zz".into(),
             high: 0,
-            fallback: false,
         });
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A transcript that is not a regular file is refused BEFORE it is
-    /// opened: a FIFO at `transcript_path` used to park the Stop hook in
-    /// `open(2)` until the vendor's 600 s timeout (a symlink to `/dev/zero`
-    /// read for ever); nothing bounded the file read.
-    #[test]
-    fn a_transcript_that_is_not_a_regular_file_is_refused_at_once() {
-        let dir = scratch("fifo");
-        let fifo = dir.join("t.jsonl");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(made, "mkfifo {}", fifo.display());
-        let p = fifo.display().to_string();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(read_final(&p).map(|m| m.map(|m| m.text)));
-        });
-        match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(got) => {
-                let why = got.expect_err("a FIFO is not a transcript");
-                assert!(why.ends_with("not a regular file"), "{why}");
-            }
-            Err(_) => panic!(
-                "the transcript read blocked for 2 s on a FIFO at {}: the Stop hook would \
-                 hang until the vendor's 600 s Stop timeout",
-                fifo.display()
-            ),
-        }
-        // A directory is not one either; a regular file still reads.
-        let why = read_final(&dir.display().to_string())
-            .map(|m| m.map(|m| m.text))
-            .expect_err("a directory");
-        assert!(why.ends_with("not a regular file"), "{why}");
-        let plain = dir.join("plain.jsonl");
-        std::fs::write(
-            &plain,
-            "{\"type\":\"assistant\",\"uuid\":\"a\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
-        )
-        .unwrap();
-        let got = read_final(&plain.display().to_string()).expect("reads");
-        assert_eq!(got.map(|m| m.text).as_deref(), Some("hi"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4818,9 +4815,10 @@ mod tests {
     }
 
     /// `--report-to` names a session and nothing else, with or without the
-    /// `@`, and the installed document carries it on the `Stop` command ONLY.
+    /// `@`, and the installed document carries it on the `Stop` command (the
+    /// report) and the `Notification` command (the escalation's ask) ONLY.
     #[test]
-    fn report_to_is_a_session_and_rides_the_stop_command_only() {
+    fn report_to_rides_stop_and_notification() {
         let sid = |args: &[&str]| parse(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
         assert_eq!(
             sid(&["--report-to", "@s-abc12"])
@@ -4859,14 +4857,22 @@ mod tests {
             ..bare()
         };
         let cmds = commands_of(&claude_settings_for("/x/aterm-link", &opts));
-        assert_eq!(cmds.len(), 4);
+        assert_eq!(cmds.len(), DEFAULT_EVENTS.len(), "the default events");
         for (event, cmd) in &cmds {
             assert_eq!(
                 cmd.contains("--report-to @s-mgr"),
-                event == "Stop",
+                event == "Stop" || event == "Notification",
                 "{event}: {cmd}"
             );
         }
+        let notify = &cmds.iter().find(|(e, _)| e == "Notification").unwrap().1;
+        let words = sh_split(&notify.replace("\\\"", "\"").replace("\\\\", "\\"));
+        let at = words.iter().position(|w| w == "--report-to").unwrap();
+        assert_eq!(words[at + 1], "@s-mgr", "{notify}");
+        assert!(
+            words.iter().any(|w| w == "--wake-budget"),
+            "the ask is charged to the budget the command names: {notify}"
+        );
         let stop = &cmds.iter().find(|(e, _)| e == "Stop").unwrap().1;
         let words = sh_split(&stop.replace("\\\"", "\"").replace("\\\\", "\\"));
         let at = words.iter().position(|w| w == "--report-to").unwrap();
@@ -4919,6 +4925,506 @@ mod tests {
                 format!("{one:?}"),
                 "{args:?} must be a usage error, not a block"
             );
+        }
+    }
+
+    /// **`status` reads the block the way `install` writes it** — and
+    /// compares executables as FILES. `~/.local/bin/aterm` is a link to the
+    /// app bundle's binary, so the CLI and the window name one executable by
+    /// two paths, and a string compare had them each call the other's block
+    /// stale. Absent, unreadable, not there to run, missing, misspelled,
+    /// installed (through a link in either direction), installed-by — one
+    /// verdict each, for `aterm agents` and the auto-prime pass.
+    #[test]
+    fn status_of_names_installed_stale_absent_and_unreadable() {
+        let dir = std::env::temp_dir().join(format!("aterm-hook-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("settings.json");
+        // `/bin/sh` stands in for the binary: a file that exists, named
+        // `sh`, so the spelling is `link hook run` as it is for `aterm`. The
+        // link to it lives under a directory with a space, so the block
+        // written through it carries a single-quoted executable.
+        let spaced = dir.join("Application Support");
+        std::fs::create_dir_all(&spaced).expect("spaced dir");
+        let link = spaced.join("aterm");
+        std::os::unix::fs::symlink("/bin/sh", &link).expect("symlink");
+        let link = link.display().to_string();
+        // Another executable that exists and is not `/bin/sh`.
+        let other = dir.join("aterm");
+        std::fs::write(&other, "").expect("another file");
+        let other = other.display().to_string();
+        assert_eq!(status_of(&path, "/bin/sh"), "absent", "no file");
+
+        let opts = Opts {
+            session: "s-x".into(),
+            state_dir: "/s".into(),
+            ..bare()
+        };
+        let write = |doc: &Json| {
+            std::fs::write(&path, format!("{}\n", doc.render())).expect("write");
+        };
+
+        write(&claude_settings_for("/bin/sh", &opts));
+        assert_eq!(status_of(&path, "/bin/sh"), "installed", "the same path");
+        assert_eq!(
+            status_of(&path, &link),
+            "installed",
+            "read through a link to the same file"
+        );
+        write(&claude_settings_for(&link, &opts));
+        assert!(
+            commands_of(&claude_settings_for(&link, &opts))[0]
+                .1
+                .starts_with('\''),
+            "the link's path is quoted in the file"
+        );
+        assert_eq!(
+            status_of(&path, "/bin/sh"),
+            "installed",
+            "written through the link, read for the file it names"
+        );
+        assert_eq!(status_of(&path, &link), "installed");
+
+        // A whole block by another executable that exists.
+        write(&claude_settings_for("/bin/sh", &opts));
+        assert_eq!(status_of(&path, &other), "installed-by /bin/sh");
+        // An entry of a future build's event, by this file, changes nothing;
+        // by another file, the block is that file's.
+        let entry = Json::Object(vec![
+            ("type".to_string(), Json::Str("command".to_string())),
+            (
+                "command".to_string(),
+                Json::Str(format!("{} link hook run future-event", sh_word(&other))),
+            ),
+        ]);
+        let group = Json::Object(vec![("hooks".to_string(), Json::Array(vec![entry]))]);
+        let mut future = claude_settings_for("/bin/sh", &opts);
+        future
+            .get_mut("hooks")
+            .and_then(Json::as_object_mut)
+            .unwrap()
+            .push(("FutureEvent".to_string(), Json::Array(vec![group])));
+        write(&future);
+        assert_eq!(status_of(&path, &other), "installed-by /bin/sh");
+        assert_eq!(status_of(&path, "/bin/sh"), format!("installed-by {other}"));
+
+        // An executable that is not there to run: the block is inert, even
+        // read for that very path.
+        let gone = "/nowhere/aterm";
+        write(&claude_settings_for(gone, &opts));
+        assert_eq!(
+            status_of(&path, "/bin/sh"),
+            "stale: /nowhere/aterm is not there to run"
+        );
+        assert_eq!(
+            status_of(&path, gone),
+            "stale: /nowhere/aterm is not there to run"
+        );
+
+        // Four of six events (an older build's block), by any executable.
+        let mut four = claude_settings_for("/bin/sh", &opts);
+        let hooks = four.get_mut("hooks").and_then(Json::as_object_mut).unwrap();
+        hooks.retain(|(k, _)| k != "PermissionRequest" && k != "Notification");
+        write(&four);
+        for exe in ["/bin/sh", other.as_str()] {
+            assert_eq!(
+                status_of(&path, exe),
+                "stale: missing PermissionRequest,Notification",
+                "{exe}"
+            );
+        }
+
+        // Spelled for an `aterm-link` when the executable is not one: the
+        // 2026-09-14 command, which ran the wrong parser.
+        let misspelled = claude_settings_for("/bin/sh", &opts)
+            .render()
+            .replace(" link hook run ", " hook run ");
+        std::fs::write(&path, misspelled).expect("write");
+        assert_eq!(
+            status_of(&path, "/bin/sh"),
+            "stale: SessionStart does not run link hook run session-start"
+        );
+
+        std::fs::write(&path, "{\"hooks\": {\"Stop\": []}}\n").expect("write");
+        assert_eq!(
+            status_of(&path, "/bin/sh"),
+            "absent",
+            "a file with no entry of ours"
+        );
+        std::fs::write(&path, "not json").expect("write");
+        assert!(status_of(&path, "/bin/sh").starts_with("unreadable: not JSON"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The executable is read back out of a command the way [`sh_word`]
+    /// wrote it, quoted or bare, with an embedded quote unescaped.
+    #[test]
+    fn split_command_reads_a_quoted_and_a_bare_executable() {
+        assert_eq!(
+            split_command("'/Users//a/Application Support/aterm' link hook run stop --x"),
+            Some((
+                "/Users//a/Application Support/aterm".to_string(),
+                "link hook run stop --x"
+            ))
+        );
+        assert_eq!(
+            split_command("/x/aterm-link hook run stop"),
+            Some(("/x/aterm-link".to_string(), "hook run stop"))
+        );
+        assert_eq!(
+            split_command("'/it'\\''s/aterm' link hook run stop"),
+            Some(("/it's/aterm".to_string(), "link hook run stop"))
+        );
+        assert_eq!(split_command("'unterminated"), None);
+    }
+
+    /// **`--keep-flags` carries an operator's Stop flags across a re-install**
+    /// — the auto-prime pass re-installs a stale block, and the state dir,
+    /// the allowlist, the report recipient, the budget, the timeout and the
+    /// async form must come through unless this command line set them. The
+    /// state dir is read back through [`sh_word`]'s quoting: one with a space
+    /// is single-quoted in the file.
+    #[test]
+    fn keep_flags_adopts_the_installed_stop_flags_unless_set_here() {
+        let dir = std::env::temp_dir().join(format!("aterm-hook-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("settings.json");
+        let installed = Opts {
+            session: "s-x".into(),
+            state_dir: "/Users//a/Library/Application Support/aterm-link".into(),
+            accept_from: vec!["h-andrew".into(), "s-mgr".into()],
+            report_to: Some("s-mgr".into()),
+            budget: (9, 2),
+            timeout: Duration::from_secs(20),
+            rewake: true,
+            ..bare()
+        };
+        let doc = claude_settings_for("/x/aterm", &installed);
+        std::fs::write(&path, format!("{}\n", doc.render())).expect("write");
+
+        let mut fresh = Opts {
+            session: "s-x".into(),
+            state_dir: "/s".into(),
+            ..bare()
+        };
+        keep_flags(&mut fresh, &path);
+        assert_eq!(
+            fresh.state_dir, "/Users//a/Library/Application Support/aterm-link",
+            "the installed state dir, unquoted"
+        );
+        assert_eq!(fresh.accept_from, ["h-andrew", "s-mgr"]);
+        assert_eq!(fresh.report_to.as_deref(), Some("s-mgr"));
+        assert_eq!(fresh.budget, (9, 2));
+        assert_eq!(fresh.timeout, Duration::from_secs(20));
+        assert!(fresh.rewake);
+
+        // A flag this command line set wins over the installed one.
+        let mut set = Opts {
+            session: "s-x".into(),
+            state_dir: "/mine".into(),
+            budget: (1, 1),
+            explicit: vec!["--wake-budget".into(), "--timeout".into(), "--state".into()],
+            ..bare()
+        };
+        keep_flags(&mut set, &path);
+        assert_eq!(set.state_dir, "/mine", "--state set here, kept");
+        assert_eq!(set.budget, (1, 1), "set here, kept");
+        assert_eq!(
+            set.timeout,
+            Duration::from_secs_f64(DEFAULT_TIMEOUT_S),
+            "set here (to the default), kept"
+        );
+        assert_eq!(
+            set.report_to.as_deref(),
+            Some("s-mgr"),
+            "not set here, adopted"
+        );
+
+        // An embedded quote survives the round trip (`'\''`), and a bare
+        // state dir is read as it stands.
+        for state in ["/s/it's here", "/s/plain"] {
+            let doc = claude_settings_for(
+                "/x/aterm",
+                &Opts {
+                    state_dir: state.into(),
+                    ..installed.clone()
+                },
+            );
+            std::fs::write(&path, format!("{}\n", doc.render())).expect("write");
+            let mut again = Opts {
+                session: "s-x".into(),
+                state_dir: "/s".into(),
+                ..bare()
+            };
+            keep_flags(&mut again, &path);
+            assert_eq!(again.state_dir, state);
+        }
+
+        // A state dir quoted some other way (a hand edit) is not guessed at:
+        // the one this command line resolved stands.
+        std::fs::write(
+            &path,
+            r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/x/aterm link hook run stop --state \"/q/x y\" --wake-budget 9/2"}]}]}}"#,
+        )
+        .expect("write");
+        let mut hand = Opts {
+            session: "s-x".into(),
+            state_dir: "/s".into(),
+            ..bare()
+        };
+        keep_flags(&mut hand, &path);
+        assert_eq!(hand.state_dir, "/s", "a double-quoted value is not adopted");
+        assert_eq!(hand.budget, (9, 2), "the other flags still are");
+
+        // No block of ours: nothing changes.
+        std::fs::write(&path, "{\"hooks\": {}}\n").expect("write");
+        let mut none = Opts {
+            session: "s-x".into(),
+            state_dir: "/s".into(),
+            ..bare()
+        };
+        keep_flags(&mut none, &path);
+        assert_eq!(none.state_dir, "/s");
+        assert!(none.accept_from.is_empty());
+        assert_eq!(none.report_to, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every word [`sh_word`] writes is read back whole by [`sh_word_back`],
+    /// and a word quoted any other way is refused rather than guessed at.
+    #[test]
+    fn an_installed_word_is_read_back_the_way_sh_word_wrote_it() {
+        for word in [
+            "/plain/path",
+            "/Users//a/Library/Application Support/aterm-link",
+            "/it's/here",
+            "''",
+            "a b'c'd e",
+            "$(touch /tmp/x)",
+            "",
+        ] {
+            let line = format!("{} --next x", sh_word(word));
+            let (back, rest) = sh_word_back(&line).expect(word);
+            assert_eq!(back, word);
+            assert_eq!(rest, " --next x", "{word:?}");
+        }
+        assert_eq!(sh_word_back("\"/q/x y\" --n"), None);
+        assert_eq!(sh_word_back("'unterminated"), None);
+        assert_eq!(sh_word_back("'a'b"), None, "a quote joined to more");
+        assert_eq!(sh_word_back(""), None);
+        assert_eq!(
+            installed_value(
+                "'/A B/aterm' link hook run stop --state '/s t' --x",
+                "--state"
+            ),
+            Some("/s t".to_string())
+        );
+        assert_eq!(
+            installed_value("/x/aterm link hook run stop --x", "--state"),
+            None
+        );
+    }
+
+    /// **Backups are bounded.** Every merge writes one, and the auto-prime
+    /// pass merges after every update that changes the block: 11 merges leave
+    /// [`BACKUPS_KEPT`], the newest holding the document from before the last
+    /// merge, and a backup an operator named by hand is never touched.
+    #[test]
+    fn a_merge_keeps_only_the_newest_backups() {
+        let dir = scratch("backups");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"model\": \"opus\"}\n").expect("write");
+        let mine = dir.join("settings.json.bak-mine");
+        std::fs::write(&mine, "hand-made").expect("write");
+        let mut before_last = String::new();
+        let mut last = std::path::PathBuf::new();
+        for i in 0..11 {
+            before_last = std::fs::read_to_string(&path).expect("read");
+            let ours = claude_settings_for(
+                "/x/aterm-link",
+                &Opts {
+                    state_dir: format!("/s{i}"),
+                    ..bare()
+                },
+            );
+            last = merge_into(&path, &ours).expect("merge");
+        }
+        let order = |name: &str| -> (u64, u32) {
+            let suffix = name.strip_prefix("settings.json.bak-").unwrap();
+            let (stamp, n) = suffix.split_once('-').unwrap_or((suffix, "0"));
+            (stamp.parse().unwrap(), n.parse().unwrap())
+        };
+        let mut backups: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("settings.json.bak-") && n != "settings.json.bak-mine")
+            .collect();
+        backups.sort_by_key(|n| order(n));
+        assert_eq!(backups.len(), BACKUPS_KEPT, "{backups:?}");
+        assert!(mine.exists(), "a hand-made backup is the operator's");
+        let newest = backups.last().unwrap();
+        assert_eq!(
+            Some(newest.as_str()),
+            last.file_name().and_then(|n| n.to_str()),
+            "the last merge's backup is the newest"
+        );
+        let held = std::fs::read_to_string(dir.join(newest)).expect("read backup");
+        assert_eq!(held, before_last);
+        assert!(held.contains("--state /s9"), "{held}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A removal leaves a file that held only our block with no `hooks` key
+    /// at all, and one that held foreign entries with exactly those.
+    #[test]
+    fn prune_drops_empty_events_and_an_empty_hooks_object() {
+        let mut only_ours =
+            Json::parse(r#"{"model": "opus", "hooks": {"Stop": [], "PreToolUse": []}}"#).unwrap();
+        prune_empty_events(&mut only_ours);
+        assert_eq!(
+            only_ours.render(),
+            Json::parse(r#"{"model": "opus"}"#).unwrap().render()
+        );
+        let mut mixed = Json::parse(
+            r#"{"hooks": {"Stop": [], "PostToolUse": [{"hooks": [{"type": "command", "command": "/x"}]}]}}"#,
+        )
+        .unwrap();
+        prune_empty_events(&mut mixed);
+        let events: Vec<&str> = mixed
+            .get("hooks")
+            .and_then(Json::as_object)
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(events, ["PostToolUse"]);
+    }
+
+    /// **An update never turns an operator's opt-in off.** A block installed
+    /// with `--gate-tools` (a PreToolUse entry of ours) and `--keep-alive` (on
+    /// the Stop) re-installs with both under `--keep-flags`, unless this
+    /// command line names the flag itself.
+    #[test]
+    fn keep_flags_carries_the_two_round_22_opt_ins() {
+        let dir = std::env::temp_dir().join(format!("aterm-hook-optin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("settings.json");
+        let installed = Opts {
+            session: "s-x".into(),
+            state_dir: "/s".into(),
+            gate_tools: true,
+            keep_alive: true,
+            ..bare()
+        };
+        let doc = claude_settings_for("/x/aterm", &installed);
+        assert!(
+            commands_of(&doc).iter().any(|(e, _)| e == "PreToolUse"),
+            "--gate-tools writes the PreToolUse entry"
+        );
+        std::fs::write(&path, format!("{}\n", doc.render())).expect("write");
+        let mut fresh = Opts {
+            session: "s-x".into(),
+            state_dir: "/s".into(),
+            ..bare()
+        };
+        keep_flags(&mut fresh, &path);
+        assert!(fresh.gate_tools, "the tool gate survives the update");
+        assert!(fresh.keep_alive, "the keep-alive survives the update");
+
+        // A default block turns neither on.
+        let default = claude_settings_for("/x/aterm", &fresh_default());
+        std::fs::write(&path, format!("{}\n", default.render())).expect("write");
+        let mut plain = fresh_default();
+        keep_flags(&mut plain, &path);
+        assert!(!plain.gate_tools && !plain.keep_alive);
+
+        // A ROUND-21 block: a PreToolUse entry of ours with no `--gate-tools`
+        // word (round 21 gated unconditionally). That is not an opt-in, and
+        // `--keep-flags` must not turn the gate back on from it.
+        let mut round21 = claude_settings_for("/x/aterm", &fresh_default());
+        let Some(Json::Object(members)) = round21
+            .as_object_mut()
+            .and_then(|m| m.iter_mut().find(|(k, _)| k == "hooks").map(|(_, v)| v))
+        else {
+            panic!("the document has a hooks object");
+        };
+        members.push((
+            "PreToolUse".to_string(),
+            Json::parse(
+                r#"[{"matcher":"*","hooks":[{"type":"command","command":"/old/aterm hook run pre-tool-use --state /s"}]}]"#,
+            )
+            .expect("round-21 group"),
+        ));
+        std::fs::write(&path, format!("{}\n", round21.render())).expect("write");
+        let mut fresh = fresh_default();
+        keep_flags(&mut fresh, &path);
+        assert!(
+            !fresh.gate_tools,
+            "a round-21 PreToolUse entry (no --gate-tools word) is not an opt-in"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `$ATERM_NO_HARNESS` is read the ONE way every harness surface reads
+    /// it: unset, empty and `"0"` leave the hooks on; anything else is off.
+    #[test]
+    fn no_harness_reads_unset_empty_and_zero_as_on() {
+        assert!(!harness_vetoed(None), "unset");
+        assert!(!harness_vetoed(Some("")), "empty");
+        assert!(!harness_vetoed(Some("0")), "\"0\"");
+        assert!(harness_vetoed(Some("1")), "\"1\"");
+        assert!(harness_vetoed(Some("yes")), "any other value");
+    }
+
+    /// A settings file another writer changed between the merge's read and
+    /// its rename is NOT replaced: the landing answers `None`, the other
+    /// writer's document stands, and no temporary file is left behind. An
+    /// unchanged file lands, and [`merge_into`] then retries its way through
+    /// to a merge of the NEW document.
+    #[test]
+    fn a_file_changed_under_a_merge_is_merged_again_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("aterm-hook-reread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"a\": 1}\n").expect("write");
+        let ours = claude_settings_for("/x/aterm", &fresh_default());
+        let merged = merged_document(&path, &ours).expect("merge");
+        // Another writer lands between the read and the rename.
+        std::fs::write(&path, "{\"b\": 2}\n").expect("the other writer");
+        assert!(
+            land_merged(&path, &merged).expect("no I/O error").is_none(),
+            "a changed file is not replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "{\"b\": 2}\n",
+            "the other writer's document stands"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("list")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // merge_into reads the NEW document and keeps what the other writer wrote.
+        merge_into(&path, &ours).expect("the retry merges the new document");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"b\""), "{text}");
+        assert!(!text.contains("\"a\""), "{text}");
+        assert!(text.contains("PermissionRequest"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fresh_default() -> Opts {
+        Opts {
+            session: "s-x".into(),
+            state_dir: "/s".into(),
+            ..bare()
         }
     }
 }

@@ -16071,8 +16071,27 @@ impl Renderer {
             // all-additive stream pays one predictable test per rect and the
             // inner loop is the historical `add_sat` walk verbatim.
             // `over_premul(dst, c, 0) == add_sat(dst, c)`, so the split is a
-            // pure specialization rather than two laws.
-            if q.alpha == 0 {
+            // pure specialization rather than two laws. The GRADIENT branch
+            // (2026-09-21, [`GlowQuad::color2`]) is the third specialization
+            // of the same law: per column, the colour and the opacity are
+            // [`glow_lerp`]'d between the quad's two edges and composited
+            // source-over — which IS `add_sat` wherever the opacity is 0. A
+            // flat quad never enters it, so the two branches above are the
+            // historical rasterizer byte for byte.
+            if !q.is_flat() {
+                let (c0, c1) = (q.color, q.color2);
+                let (a0, a1) = (u32::from(q.alpha), u32::from(q.alpha2));
+                let qw = u32::from(q.w);
+                for y in y0..(y0 + q.h as usize).min(h) {
+                    let row = &mut pixels[y * w..y * w + w];
+                    for (i, px) in row[x0..xend].iter_mut().enumerate() {
+                        let i = i as u32;
+                        let a = glow_lerp(a0, a1, i, qw) as u8;
+                        let c = glow_lerp_rgb(c0, c1, i, qw);
+                        *px = over_premul(*px, c, a);
+                    }
+                }
+            } else if q.alpha == 0 {
                 for y in y0..(y0 + q.h as usize).min(h) {
                     let row = &mut pixels[y * w..y * w + w];
                     for px in &mut row[x0..xend] {
@@ -16834,18 +16853,18 @@ impl Renderer {
             // (parity).
             let cursor_cov = (self.cursor_opacity * 255.0).round() as u8;
             if cursor_cov < 255 {
-                for [rx, ry, rw, rh] in cursor_rects(style, x0, y0, cur_w, self.cell_h) {
+                for_each_cursor_rect(style, x0, y0, cur_w, self.cell_h, |[rx, ry, rw, rh]| {
                     if let Some((fx, fw)) = clip_span_to_run(rx, rw, run_lo, run_hi) {
                         self.blend_rect(pixels, w, h, fx, ry, fw, rh, cursor_fill, cursor_cov);
                     }
-                }
+                });
                 return;
             }
-            for [rx, ry, rw, rh] in cursor_rects(style, x0, y0, cur_w, self.cell_h) {
+            for_each_cursor_rect(style, x0, y0, cur_w, self.cell_h, |[rx, ry, rw, rh]| {
                 if let Some((fx, fw)) = clip_span_to_run(rx, rw, run_lo, run_hi) {
                     self.fill_rect(pixels, w, h, fx, ry, fw, rh, cursor_fill);
                 }
-            }
+            });
             // The drawability guard is unchanged from pre-W4: a blank cursor cell
             // is never ligated and has no glyph (nothing to cut out), and a wide
             // CONTINUATION cell keeps its pre-W4 single-cell fill — so the plan
@@ -17966,27 +17985,52 @@ pub fn cursor_rects(
     cell_w: usize,
     cell_h: usize,
 ) -> Vec<[usize; 4]> {
+    let count = match style {
+        CursorStyle::BlinkingBlock
+        | CursorStyle::SteadyBlock
+        | CursorStyle::BlinkingUnderline
+        | CursorStyle::SteadyUnderline
+        | CursorStyle::BlinkingBar
+        | CursorStyle::SteadyBar => 1,
+        CursorStyle::HollowBlock => 4,
+        CursorStyle::Bolt => cell_h,
+        _ => 0,
+    };
+    let mut rects = Vec::with_capacity(count);
+    for_each_cursor_rect(style, x0, y0, cell_w, cell_h, |rect| rects.push(rect));
+    rects
+}
+
+/// Visit the rectangles described by [`cursor_rects`] in paint order without
+/// allocating a temporary list. CPU and GPU painters consume each rectangle
+/// immediately, including each scanline of the Bolt cursor.
+pub fn for_each_cursor_rect(
+    style: CursorStyle,
+    x0: usize,
+    y0: usize,
+    cell_w: usize,
+    cell_h: usize,
+    mut visit: impl FnMut([usize; 4]),
+) {
     match style {
         CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock => {
-            vec![[x0, y0, cell_w, cell_h]]
+            visit([x0, y0, cell_w, cell_h]);
         }
         CursorStyle::BlinkingUnderline | CursorStyle::SteadyUnderline => {
             let t = (cell_h / 8).max(2).min(cell_h);
-            vec![[x0, y0 + cell_h - t, cell_w, t]]
+            visit([x0, y0 + cell_h - t, cell_w, t]);
         }
         CursorStyle::BlinkingBar | CursorStyle::SteadyBar => {
             let t = (cell_w / 8).max(2).min(cell_w);
-            vec![[x0, y0, t, cell_h]]
+            visit([x0, y0, t, cell_h]);
         }
         CursorStyle::HollowBlock => {
             let t = (cell_h / 16).max(1).min(cell_w.min(cell_h));
             let mid = cell_h.saturating_sub(2 * t);
-            vec![
-                [x0, y0, cell_w, t],
-                [x0, y0 + cell_h - t, cell_w, t],
-                [x0, y0 + t, t, mid],
-                [x0 + cell_w - t, y0 + t, t, mid],
-            ]
+            visit([x0, y0, cell_w, t]);
+            visit([x0, y0 + cell_h - t, cell_w, t]);
+            visit([x0, y0 + t, t, mid]);
+            visit([x0 + cell_w - t, y0 + t, t, mid]);
         }
         CursorStyle::Bolt => {
             // LIGHTNING BOLT ⚡: one horizontal strip per pixel row tracing the
@@ -17998,7 +18042,6 @@ pub fn cursor_rects(
             // pixel once. A pure function of the cell box, like every shape here,
             // so CPU and GPU derive identical geometry.
             let (wf, hf) = (cell_w as f32, cell_h as f32);
-            let mut v = Vec::with_capacity(cell_h);
             for y in 0..cell_h {
                 let u = (y as f32 + 0.5) / hf;
                 let (l, r) = if u < 0.52 {
@@ -18016,13 +18059,12 @@ pub fn cursor_rects(
                 };
                 let lx = ((l * wf) as usize).min(cell_w.saturating_sub(1));
                 let rx = ((r * wf).ceil() as usize).clamp(lx + 1, cell_w.max(lx + 1));
-                v.push([x0 + lx, y0 + y, rx - lx, 1]);
+                visit([x0 + lx, y0 + y, rx - lx, 1]);
             }
-            v
         }
         // Hidden (and, fail-safe, any future variant: the enum is
         // non-exhaustive) paints nothing.
-        _ => Vec::new(),
+        _ => {}
     }
 }
 
@@ -22216,6 +22258,42 @@ pub fn premul_rgb(rgb: u32, a: u8) -> u32 {
     (m((rgb >> 16) & 0xff) << 16) | (m((rgb >> 8) & 0xff) << 8) | m(rgb & 0xff)
 }
 
+/// THE GRADIENT LAW of a [`GlowQuad`] (see [`GlowQuad::color2`]): the value
+/// column `i` (0-based) of a `w`-wide quad carries for ONE channel — or for
+/// the opacity — ramping from `c0` at the quad's left EDGE to `c1` at its
+/// right EDGE, sampled at the column's CENTRE, in unsigned integer arithmetic
+/// with round-half-up:
+///
+/// ```text
+/// c(i) = (c0·(2w − m) + c1·m + w) / (2w),   m = 2i + 1
+/// ```
+///
+/// Properties (pinned by `glow_lerp_is_the_identity_on_a_flat_pair_and_a_monotone_ramp_otherwise`):
+/// `c0 == c1` ⇒ `c(i) == c0` for every `i` (bit-exact identity, which is what
+/// keeps every flat emitter and every parity pin byte-unchanged); `c(0)` and
+/// `c(w − 1)` are within half a step of `c0` / `c1`; monotone in `i`; `w == 1`
+/// gives `(c0 + c1 + 1) / 2`. The CPU rasterizer ([`Renderer::draw_flat_add`])
+/// and both GPU fragment shaders (`fs_glow`, `fs_hdr_glow`/`fs_sdr_glow`)
+/// evaluate exactly this, never the rasterizer's float interpolant, so the
+/// backends stay byte-exact. `i` is clamped to `w − 1`; `w == 0` is treated
+/// as `1`.
+#[must_use]
+#[inline]
+pub fn glow_lerp(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
+    let w = w.max(1);
+    let m = 2 * i.min(w - 1) + 1;
+    (c0 * (2 * w - m) + c1 * m + w) / (2 * w)
+}
+
+/// [`glow_lerp`] over a packed `0x00RRGGBB` word, per channel. The top byte is
+/// dropped (it is zero on every premultiplied light colour).
+#[must_use]
+#[inline]
+pub fn glow_lerp_rgb(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
+    let ch = |sh: u32| glow_lerp((c0 >> sh) & 0xff, (c1 >> sh) & 0xff, i, w);
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
 /// Saturating per-channel ADD of a premultiplied light colour `premul` onto a
 /// destination pixel `dst` (`min(255, dst_c + premul_c)`) — the integer twin of
 /// the GPU's `One`/`One` additive blend over the linear `Rgba8Unorm` target. For
@@ -22476,6 +22554,8 @@ fn push_glow_rect(
             h: (band_end - yy) as u16,
             color: premul,
             alpha,
+            color2: premul,
+            alpha2: alpha,
         });
         yy = band_end;
     }
@@ -23002,6 +23082,21 @@ pub fn ribbon_lift_profile(d: f32, lift_span: f32, dn: f32) -> f32 {
 /// vertices at fractional x freely; integer vertices tile exactly as they
 /// always have.
 ///
+/// **EVERY SLAB IS A GRADIENT QUAD** (2026-09-21, [`GlowQuad::color2`]): the
+/// COLOUR is sampled at the slab's LEFT and RIGHT edges and carried as the
+/// quad's two ends, so the hue ramps continuously inside the slab and a
+/// whole-cell slab (the budget's one-slab-per-cell density) is no longer a
+/// flat block of one colour. The COVERAGE — and with it the opacity byte, the
+/// lift and the whole transverse profile — is still sampled ONCE per slab at
+/// its centre, exactly as before: the producers state coverage per slab
+/// boundary under laws of their own (the ribbon's "brighter side owns the
+/// boundary"), and ramping it inside the slab exposed those boundary values
+/// per column — measured 2026-09-21 on the retract fade, half a slab
+/// brightening 24 levels in one frame where the centre sample moved 1.5 — so
+/// the coverage stays the slab's one level and only the hue ramps. A slab
+/// whose two colours agree emits the flat quad it always did, bit for bit,
+/// so every single-colour producer is unchanged.
+///
 /// `blend` picks the compositing mode of every quad the mark emits (see
 /// [`GlowQuad::alpha`]). [`GlowBlend::Add`] is the historical additive light and
 /// is byte-identical to the pre-`blend` rasterizer. [`GlowBlend::Over`] stamps
@@ -23051,8 +23146,12 @@ pub fn ribbon_beam(
         let mut p = start;
         while p < end {
             let len = step.min(end - p).max(1);
-            // The slab's CENTRE on the segment: sampling at the leading edge
-            // would bias every ramp half a slab toward the tail.
+            // The slab's CENTRE on the segment, for the SHAPE terms (spine,
+            // reach, core, lift), the coverage and the admission gate:
+            // sampling at the leading edge would bias every ramp half a slab
+            // toward the tail. The transverse profile and the coverage are
+            // ONE per slab — the accepted approximation; the colour is not
+            // (below).
             let t = ((p as f32 + len as f32 * 0.5 - a.x) / span).clamp(0.0, 1.0);
             let lerp = |u: f32, v: f32| u + (v - u) * t;
             let spine = lerp(a.spine, b.spine);
@@ -23066,7 +23165,6 @@ pub fn ribbon_beam(
             let top = spine - up;
             let bot = spine + dn;
             if !top.is_nan() && !bot.is_nan() && bot > top && cov >= 1.0 {
-                let color = lerp_rgb_f(a.color, b.color, t);
                 let y0 = top.floor() as i32;
                 let y1 = bot.ceil() as i32;
                 let dither_x = p.div_euclid(step).rem_euclid(4) as usize;
@@ -23076,6 +23174,23 @@ pub fn ribbon_beam(
                 // of ~6,600 hot rows through the generic rectangle splitter.
                 let rect_x0 = p.max(clip.x0);
                 let rect_x1 = (p + len).min(clip.x1);
+                // THE COLOUR RAMPS INSIDE THE SLAB (2026-09-21,
+                // [`GlowQuad::color2`]): sampled at the emitted quad's LEFT and
+                // RIGHT edges — `rect_x0`/`rect_x1`, which are the slab's own
+                // edges except where the clip trims it, so the ramp always
+                // spans exactly the columns the quad owns — and carried as the
+                // quad's two ends. Every column in between then composites the
+                // straight line through them ([`glow_lerp`]), so a whole-cell
+                // slab is a smooth ramp rather than a 37–95-level block on the
+                // blue legs. The coverage is the slab's ONE centre level (see
+                // the function doc for why), so both ends carry the same
+                // opacity byte and the quad's mode is never in doubt. A slab
+                // whose two colours agree (a single-colour producer) emits
+                // the flat quad it always did, bit for bit.
+                let t0 = ((rect_x0 as f32 - a.x) / span).clamp(0.0, 1.0);
+                let t1 = ((rect_x1 as f32 - a.x) / span).clamp(0.0, 1.0);
+                let col0 = lerp_rgb_f(a.color, b.color, t0);
+                let col1 = lerp_rgb_f(a.color, b.color, t1);
                 let mut row_rel = (y0 - clip.origin_y).div_euclid(clip.cell_h);
                 let mut band_end = clip.origin_y + (row_rel + 1) * clip.cell_h;
                 for y in y0..y1 {
@@ -23118,30 +23233,44 @@ pub fn ribbon_beam(
                     //
                     // INDEXED BY THE SLAB'S ORDINAL, NOT ITS PIXEL X, and that
                     // is the difference between a 4x4 dither and a 1x4 one. A
-                    // slab is ONE flat quad, so there is no sub-slab x for the
-                    // pattern to vary over; and the stride is normally a
-                    // multiple of four, so `p` alone lands on the SAME matrix
-                    // column at every slab and three quarters of the matrix goes
-                    // unused. The ordinal walks all four. It is still
+                    // slab is ONE quad with ONE coverage — its colour now RAMPS
+                    // across it ([`GlowQuad::color2`]), but the coverage and
+                    // its dither are the slab's — so there is no sub-slab x
+                    // for the pattern to vary over; and the stride is normally
+                    // a multiple of four, so `p` alone lands on the SAME matrix
+                    // column at every slab and three quarters of the matrix
+                    // goes unused. The ordinal walks all four. It is still
                     // screen-anchored rather than mark-anchored — the slab grid
-                    // is pinned to cell boundaries — so the pattern cannot crawl
-                    // as the mark moves, which is the artifact ordered dithering
-                    // exists to avoid.
+                    // is pinned to cell boundaries — so the pattern cannot
+                    // crawl as the mark moves, which is the artifact ordered
+                    // dithering exists to avoid.
                     let c = (level * cover + BAYER4[y.rem_euclid(4) as usize][dither_x]) as u8;
                     if c > 0 {
-                        let premul = premul_rgb(color, c);
-                        if premul != 0 && rect_x1 > rect_x0 && y >= clip.y0 && y < clip.y1 {
+                        // Both ends premultiplied by the slab's ONE coverage:
+                        // the hue ramps, the light level does not, and the
+                        // quad's mode (`alpha == 0 ⇔ alpha2 == 0`) is one byte
+                        // at both ends.
+                        let premul0 = premul_rgb(col0, c);
+                        let premul1 = premul_rgb(col1, c);
+                        if (premul0 != 0 || premul1 != 0)
+                            && rect_x1 > rect_x0
+                            && y >= clip.y0
+                            && y < clip.y1
+                        {
+                            let alpha = match blend {
+                                GlowBlend::Add => 0,
+                                GlowBlend::Over => c,
+                            };
                             out.push(GlowQuad {
                                 row: row_rel.max(0) as u16,
                                 x: rect_x0 as u16,
                                 y: y as u16,
                                 w: (rect_x1 - rect_x0) as u16,
                                 h: 1,
-                                color: premul,
-                                alpha: match blend {
-                                    GlowBlend::Add => 0,
-                                    GlowBlend::Over => c,
-                                },
+                                color: premul0,
+                                alpha,
+                                color2: premul1,
+                                alpha2: alpha,
                             });
                         }
                     }
@@ -23195,6 +23324,18 @@ pub fn ribbon_beam(
 /// has exactly one owning segment, the transpose of the x-major column-owner
 /// law), and the same sub-pixel transverse edges — a band edge landing 0.3 px
 /// into a column emits 0.3 of that column's coverage.
+///
+/// **THE TWIN EMITS FLAT QUADS.** The gradient a [`GlowQuad`] can carry
+/// ([`GlowQuad::color2`]) runs along X only — a horizontal ramp is meaningless
+/// inside a one-column quad — so every quad here has `color2 == color` and
+/// `alpha2 == alpha`, its colour sampled at the slab's centre as the x-major
+/// twin's was before 2026-09-21 (the coverage is centre-sampled on both twins
+/// still). Along the flight the colour therefore still steps once per slab.
+/// That is the one place the two twins are no longer exact transposes:
+/// `the_two_ribbon_axes_are_exact_transposes_of_each_other` pins the geometry
+/// exactly, the flat colour against the x-major ramp's centre within
+/// `TRANSPOSE_CENTRE_TOL` levels, the opacity byte exactly, and a
+/// single-colour path byte for byte.
 ///
 /// **THE DITHER IS INDEXED THE SAME WAY, WHICH TRANSPOSES THE PATTERN.** The
 /// x-major twin reads `BAYER4[transverse device coordinate][slab ordinal]`; so
@@ -23370,6 +23511,8 @@ pub fn ribbon_beam_v(
                                     h: (band_end - yy) as u16,
                                     color: premul,
                                     alpha,
+                                    color2: premul,
+                                    alpha2: alpha,
                                 });
                                 yy = band_end;
                             }
@@ -25039,6 +25182,8 @@ mod tests {
             color: 0x0010_2030,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0010_2030,
+            alpha2: 0,
         }];
         cur.cursor_glow_add = vec![GlowQuad {
             row: r2,
@@ -25049,6 +25194,8 @@ mod tests {
             color: 0x0010_2030,
             // ADDITIVE light (see `GlowQuad::alpha`).
             alpha: 0,
+            color2: 0x0010_2030,
+            alpha2: 0,
         }];
 
         let mut dirty = Vec::new();
@@ -26098,6 +26245,8 @@ mod tests {
             h: 16,
             color: 0x0020_4060,
             alpha: 0,
+            color2: 0x0020_4060,
+            alpha2: 0,
         });
         prev.refresh_cursor_effect_damage();
         let mut cached = RenderInput::empty();
@@ -33694,9 +33843,14 @@ mod ribbon_beam_tests {
         let mut px = std::collections::BTreeMap::new();
         for q in quads {
             for y in q.y..q.y + q.h {
-                for x in q.x..q.x + q.w {
+                for (i, x) in (q.x..q.x + q.w).enumerate() {
                     let slot = px.entry((i32::from(y), i32::from(x))).or_insert(0u32);
-                    *slot = super::add_sat(*slot, q.color);
+                    // The same per-column law `draw_flat_add` composites: the
+                    // ramp between the quad's two ends, additive here (the
+                    // tests read additive light; a flat quad is the historical
+                    // `add_sat` of `q.color`).
+                    let c = super::glow_lerp_rgb(q.color, q.color2, i as u32, u32::from(q.w));
+                    *slot = super::add_sat(*slot, c);
                 }
             }
         }
@@ -33705,6 +33859,171 @@ mod ribbon_beam_tests {
 
     fn peak(c: u32) -> i32 {
         (((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff)) as i32
+    }
+
+    /// **THE GRADIENT LAW** ([`super::glow_lerp`], 2026-09-21), property by
+    /// property, exhaustively over every width the ribbon emits and beyond.
+    ///
+    /// The IDENTITY is the load-bearing clause: `c0 == c1 ⇒ c(i) == c0` for
+    /// every column is what lets every flat emitter and every parity pin in
+    /// the workspace stay byte-unchanged while the quad grew two fields — a
+    /// law that was "close" on a flat pair would have moved every golden.
+    #[test]
+    fn glow_lerp_is_the_identity_on_a_flat_pair_and_a_monotone_ramp_otherwise() {
+        use super::{glow_lerp, glow_lerp_rgb};
+        const LEVELS: [u32; 8] = [0, 1, 7, 100, 128, 200, 254, 255];
+        for w in 1..=64u32 {
+            for &c in &LEVELS {
+                for i in 0..w {
+                    assert_eq!(glow_lerp(c, c, i, w), c, "identity at {c} w={w} i={i}");
+                }
+            }
+            for &c0 in &LEVELS {
+                for &c1 in &LEVELS {
+                    let step = |i: u32| i64::from(glow_lerp(c0, c1, i, w));
+                    let (lo, hi) = (i64::from(c0.min(c1)), i64::from(c0.max(c1)));
+                    let delta = hi - lo;
+                    // Both ends land within HALF A STEP (`|c1 − c0| / (2w)`, plus
+                    // the rounding half) of the edge they sample toward.
+                    assert!(
+                        (step(0) - i64::from(c0)).abs() * 2 * i64::from(w)
+                            <= delta + 2 * i64::from(w),
+                        "left end {c0}->{c1} w={w}: c(0)={}",
+                        step(0)
+                    );
+                    assert!(
+                        (step(w - 1) - i64::from(c1)).abs() * 2 * i64::from(w)
+                            <= delta + 2 * i64::from(w),
+                        "right end {c0}->{c1} w={w}: c(w-1)={}",
+                        step(w - 1)
+                    );
+                    // Monotone in `i`, in the ramp's own direction, and never
+                    // outside the pair.
+                    for i in 0..w {
+                        let v = step(i);
+                        assert!((lo..=hi).contains(&v), "{c0}->{c1} w={w} i={i} gives {v}");
+                        if i + 1 < w {
+                            let n = step(i + 1);
+                            if c0 <= c1 {
+                                assert!(v <= n, "{c0}->{c1} w={w}: c({i})={v} > c({})={n}", i + 1);
+                            } else {
+                                assert!(v >= n, "{c0}->{c1} w={w}: c({i})={v} < c({})={n}", i + 1);
+                            }
+                        }
+                    }
+                    if w == 1 {
+                        assert_eq!(
+                            step(0),
+                            i64::from((c0 + c1).div_ceil(2)),
+                            "w=1 is the rounded mean"
+                        );
+                    }
+                }
+            }
+        }
+        // The packed form is the per-channel law, channel by channel, and the
+        // column index clamps to the last column.
+        let (a, b) = (0x00FF_4020u32, 0x0020_40FFu32);
+        for w in [1u32, 2, 15, 40] {
+            for i in 0..w + 3 {
+                let want = (glow_lerp(0xFF, 0x20, i, w) << 16)
+                    | (glow_lerp(0x40, 0x40, i, w) << 8)
+                    | glow_lerp(0x20, 0xFF, i, w);
+                assert_eq!(glow_lerp_rgb(a, b, i, w), want, "w={w} i={i}");
+            }
+        }
+        // Non-vacuity: a real ramp really moves, and moves by about a step.
+        assert_eq!(glow_lerp(0, 255, 0, 15), 9);
+        assert_eq!(glow_lerp(0, 255, 14, 15), 247);
+    }
+
+    /// **A SLAB IS NO LONGER A BLOCK** (2026-09-21). Two vertices, red to blue
+    /// across 120 px, painted at ONE slab per 15-px cell — the density the
+    /// budget drops the ribbon to right after a wrap at the owner's geometry,
+    /// which used to make the band a run of eight 15-px flat blocks with a
+    /// ~32-level step between neighbours. Now every emitted slab is a
+    /// gradient quad and the painted surface is CONTINUOUS along x: adjacent
+    /// lit columns on every row differ by no more than
+    /// `ceil(vertex delta / slab width) + 1` per channel.
+    ///
+    /// The negative control paints the SAME quads flat (their left colour
+    /// only — the pre-gradient rasterizer) and shows the steps come back, so
+    /// the bound is a real one.
+    #[test]
+    fn a_one_slab_per_cell_ribbon_paints_a_continuous_ramp() {
+        const SLAB: usize = 15;
+        let verts = [
+            vert(0.0, 60.0, 12.0, 4.0, 0x00FF_0000, 200.0),
+            vert(120.0, 60.0, 12.0, 4.0, 0x0000_00FF, 200.0),
+        ];
+        let mut quads = Vec::new();
+        assert!(ribbon_beam(
+            &mut quads,
+            clip(),
+            &verts,
+            1.0,
+            SLAB,
+            100_000,
+            crate::GlowBlend::Add
+        ));
+        assert!(
+            quads.iter().any(|q| q.w as usize == SLAB && !q.is_flat()),
+            "non-vacuous: whole-cell slabs were emitted, as gradients"
+        );
+        let bound = (255 + SLAB as i32 - 1) / SLAB as i32 + 1;
+        let max_adjacent = |px: &std::collections::BTreeMap<(i32, i32), u32>| {
+            let mut worst = 0i32;
+            for (&(y, x), &c) in px {
+                if let Some(&n) = px.get(&(y, x + 1)) {
+                    for sh in [16, 8, 0] {
+                        let d = (((c >> sh) & 0xff) as i32 - ((n >> sh) & 0xff) as i32).abs();
+                        worst = worst.max(d);
+                    }
+                }
+            }
+            worst
+        };
+        let smooth = max_adjacent(&paint(&quads));
+        assert!(
+            smooth <= bound,
+            "adjacent lit columns differ by up to {smooth} levels; the bound is {bound}"
+        );
+        // NEGATIVE CONTROL: the same slabs painted FLAT are the old blocks.
+        let flat: Vec<GlowQuad> = quads
+            .iter()
+            .map(|q| GlowQuad {
+                color2: q.color,
+                alpha2: q.alpha,
+                ..*q
+            })
+            .collect();
+        let blocky = max_adjacent(&paint(&flat));
+        assert!(
+            blocky > bound,
+            "the flat control must step by more than {bound} (measured {blocky}), or \
+             the continuity bound proves nothing"
+        );
+        // And a single-colour, single-coverage ribbon is FLAT quads only — the
+        // historical emission, bit for bit.
+        let same = [
+            vert(0.0, 60.0, 12.0, 4.0, 0x0040_C0FF, 200.0),
+            vert(120.0, 60.0, 12.0, 4.0, 0x0040_C0FF, 200.0),
+        ];
+        let mut flat_only = Vec::new();
+        assert!(ribbon_beam(
+            &mut flat_only,
+            clip(),
+            &same,
+            1.0,
+            SLAB,
+            100_000,
+            crate::GlowBlend::Add
+        ));
+        assert!(!flat_only.is_empty());
+        assert!(
+            flat_only.iter().all(|q| q.is_flat()),
+            "a producer with one colour and one coverage emits flat quads"
+        );
     }
 
     /// **THE PROFILE'S CONTRACT**, stated on the function rather than inferred
@@ -34262,23 +34581,140 @@ mod ribbon_beam_tests {
                 // Mirror the x-major set about the diagonal and compare as
                 // multisets — the emission ORDER transposes as well, so the
                 // comparison is order-free by construction.
-                let mut mirrored: Vec<(u16, u16, u16, u16, u32, u8)> = major_x
-                    .iter()
-                    .map(|q| (q.y, q.x, q.h, q.w, q.color, q.alpha))
-                    .collect();
-                let mut got: Vec<(u16, u16, u16, u16, u32, u8)> = major_y
-                    .iter()
-                    .map(|q| (q.x, q.y, q.w, q.h, q.color, q.alpha))
-                    .collect();
-                mirrored.sort_unstable();
-                got.sort_unstable();
-                assert_eq!(
-                    mirrored, got,
-                    "the y-major twin is not the transpose of the x-major one \
-                     ({blend:?})"
-                );
+                assert_transposed(&major_x, &major_y, &format!("{blend:?}"));
             }
         }
+        // …and a path of ONE colour and ONE coverage, where the x-major twin
+        // emits flat quads too: there the two sets are exact transposes,
+        // colour and coverage included, bit for bit.
+        let plain = [
+            vert(20.0, 20.0, 14.0, 5.0, 0x0040_C0FF, 180.0),
+            vert(56.5, 56.5, 14.0, 5.0, 0x0040_C0FF, 180.0),
+            vert(96.0, 96.0, 14.0, 5.0, 0x0040_C0FF, 180.0),
+        ];
+        for blend in [GlowBlend::Add, GlowBlend::Over] {
+            let mut major_x = Vec::new();
+            let mut major_y = Vec::new();
+            assert!(ribbon_beam(
+                &mut major_x,
+                clip,
+                &plain,
+                0.55,
+                4,
+                100_000,
+                blend
+            ));
+            assert!(ribbon_beam_v(
+                &mut major_y,
+                clip,
+                &plain,
+                0.55,
+                4,
+                100_000,
+                blend
+            ));
+            assert!(!major_x.is_empty() && major_x.iter().all(|q| q.is_flat()));
+            let mut mirrored: Vec<(u16, u16, u16, u16, u32, u8)> = major_x
+                .iter()
+                .map(|q| (q.y, q.x, q.h, q.w, q.color, q.alpha))
+                .collect();
+            let mut got: Vec<(u16, u16, u16, u16, u32, u8)> = major_y
+                .iter()
+                .map(|q| (q.x, q.y, q.w, q.h, q.color, q.alpha))
+                .collect();
+            mirrored.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(
+                mirrored, got,
+                "on a single-colour path the twins are exact transposes ({blend:?})"
+            );
+        }
+    }
+
+    /// The tolerance, in levels, between the y-major twin's FLAT colour and
+    /// the x-major slab's ramp read at the slab's centre. The twin samples
+    /// `premul(colour(t), cov(t))` once at the centre; the x-major slab carries
+    /// `premul(colour, cov)` at its two EDGES and a straight line between them
+    /// (`glow_lerp`), and the product of two ramps is not a line — so over a
+    /// 4-px slab on a path whose colour, coverage and reach all vary the two
+    /// readings differ by a level or two of rounding, never more.
+    const TRANSPOSE_CENTRE_TOL: i32 = 2;
+
+    /// **THE TRANSPOSE, WITH ONE AXIS CARRYING A GRADIENT** (2026-09-21,
+    /// [`GlowQuad::color2`]). The x-major twin's slabs ramp colour and
+    /// coverage between their two ends; the y-major twin's columns are flat
+    /// at the slab centre (the gradient runs along X only). So the two sets
+    /// are exact transposes in GEOMETRY — same count, every `(x, y, w, h)`
+    /// reflected — and, quad for mirrored quad, the y-major's flat colour and
+    /// opacity sit within [`TRANSPOSE_CENTRE_TOL`] of the x-major ramp read at
+    /// its centre column(s). An x-major quad that is itself flat must match
+    /// bit for bit.
+    fn assert_transposed(major_x: &[GlowQuad], major_y: &[GlowQuad], label: &str) {
+        use std::collections::BTreeMap;
+        let mut mirrored: BTreeMap<(u16, u16, u16, u16), &GlowQuad> = BTreeMap::new();
+        for q in major_x {
+            assert!(
+                mirrored.insert((q.y, q.x, q.h, q.w), q).is_none(),
+                "the x-major set emits one quad per (row, slab) ({label})"
+            );
+        }
+        let mut got: BTreeMap<(u16, u16, u16, u16), &GlowQuad> = BTreeMap::new();
+        for q in major_y {
+            assert!(
+                got.insert((q.x, q.y, q.w, q.h), q).is_none(),
+                "the y-major set emits one quad per (column, slab) ({label})"
+            );
+        }
+        assert_eq!(
+            mirrored.keys().collect::<Vec<_>>(),
+            got.keys().collect::<Vec<_>>(),
+            "the y-major twin is not the geometric transpose of the x-major one ({label})"
+        );
+        let mut worst = 0i32;
+        for (key, x) in &mirrored {
+            let y = got[key];
+            let w = u32::from(x.w);
+            // The ramp at the slab's centre: the mean of its two central
+            // columns (one column, read twice, when `w` is odd).
+            let centre = |c0: u32, c1: u32| -> i32 {
+                let (lo, hi) = ((w - 1) / 2, w / 2);
+                (super::glow_lerp(c0, c1, lo, w) + super::glow_lerp(c0, c1, hi, w)).div_ceil(2)
+                    as i32
+            };
+            if x.is_flat() {
+                assert_eq!(
+                    (x.color, x.alpha),
+                    (y.color, y.alpha),
+                    "a flat x-major quad transposes bit for bit ({label}, {key:?})"
+                );
+                continue;
+            }
+            let mut check = |name: &str, c0: u32, c1: u32, twin: u32| {
+                let d = (centre(c0, c1) - twin as i32).abs();
+                worst = worst.max(d);
+                assert!(
+                    d <= TRANSPOSE_CENTRE_TOL,
+                    "{label}, {key:?}: {name} reads {twin} on the y-major twin but the \
+                     x-major ramp {c0}->{c1} over {w} px is {} at its centre",
+                    centre(c0, c1)
+                );
+            };
+            for (name, sh) in [("r", 16u32), ("g", 8), ("b", 0)] {
+                check(
+                    name,
+                    (x.color >> sh) & 0xff,
+                    (x.color2 >> sh) & 0xff,
+                    (y.color >> sh) & 0xff,
+                );
+            }
+            check(
+                "alpha",
+                u32::from(x.alpha),
+                u32::from(x.alpha2),
+                u32::from(y.alpha),
+            );
+        }
+        eprintln!("transpose {label}: y-major flat vs x-major centre, worst {worst} level(s)");
     }
 
     /// **A VERTICAL FLIGHT PAINTS THROUGH THE TWIN AND NOWHERE ELSE** — the
@@ -34416,20 +34852,10 @@ mod ribbon_beam_tests {
                 && major_y.iter().map(|q| q.y).min() == Some(clip.y0 as u16),
             "the witness must actually reach the near edges it is clipped at"
         );
-        let mut mirrored: Vec<(u16, u16, u16, u16, u32, u8)> = major_x
-            .iter()
-            .map(|q| (q.y, q.x, q.h, q.w, q.color, q.alpha))
-            .collect();
-        let mut got: Vec<(u16, u16, u16, u16, u32, u8)> = major_y
-            .iter()
-            .map(|q| (q.x, q.y, q.w, q.h, q.color, q.alpha))
-            .collect();
-        mirrored.sort_unstable();
-        got.sort_unstable();
-        assert_eq!(
-            mirrored, got,
-            "the two axes disagree about what the clip kept"
-        );
+        // What the clip kept is the same set on both axes — the geometry an
+        // exact transpose, the colour within the ramp-vs-centre tolerance
+        // (see `assert_transposed`).
+        assert_transposed(&major_x, &major_y, "clip");
     }
 
     /// **A TRANSPOSED COLUMN NEVER STRADDLES A CELL ROW.** The x-major twin's

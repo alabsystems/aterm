@@ -17,10 +17,13 @@ exception: if you run it, say in your reply that you did and why.
 |---|---|---|
 | `cargo` | `targo` | the build driver — the Trust cargo |
 | `rustc` | `trustc` | the compiler; it proves as it compiles |
-| `cargo clippy` | `tippy` | the linter |
+| `cargo clippy` | `targo tippy` / `tippy` | the linter |
 | `rustfmt` / `cargo fmt` | `trustfmt` / `targo fmt` | the formatter |
 | `rustdoc` | `trustdoc` | the doc tool |
 | — | `ty`, `ay`, `clean` | model checker · SMT solver · theorem prover |
+
+The right column is the tool's name — use it in your replies too (`tippy`, not
+"clippy"); the stock name is for a run that really used stock Rust, said with why.
 
 They live in `$ATPKG_BIN` and are on PATH in every shell. That is the copy
 `aterm pkg update` keeps current, and it is the one to use: it keeps working
@@ -37,16 +40,25 @@ aterm help rust                  # which toolchain THIS directory gets, and why
 
 ## Name the lane — a bare `targo build` is refused ON PURPOSE
 
-`targo` will not choose a verification lane for you. Two lanes, both explicit:
+`targo` will not quietly pick a verification lane for a build. Two lanes, both
+explicit:
 
 ```sh
-targo trust <cmd> …          # VERIFIED: fail-closed by default; --allow-l0-gaps = advisory survey;
-                             # writes an authenticated per-unit proof report (--report-dir)
-targo --unverified <cmd> …   # UNVERIFIED: proof pipeline off, one non-suppressible notice, no proof claim
+targo trust <cmd> …          # VERIFIED: fail-closed by default; --allow-l0-gaps leaves verifier gaps
+                             # as warnings; authenticated per-unit proof report (--report-dir)
+targo --unverified <cmd> …   # UNVERIFIED: proof pipeline off; warns that the run carries no proof
+                             # claim, and `-q` does not silence that
 ```
 
 The refusal you get from a bare `targo build` is that rule, not a broken tool.
 Do not fall back to stock `cargo` because of it — add the lane.
+
+Which verbs take a lane is not uniform, so measure rather than assume: `build`,
+`check` and `test` REFUSE a bare call; `run` and `doc` have no verified lane at
+all, so a bare one proceeds unverified and says so (*nobody was asked*); and
+`fmt`, `tippy` and `metadata` take no lane — `--unverified` there is refused
+(*`--unverified` is valid only for a Targo compilation command*), so run those
+bare.
 
 Inside an aterm session, typing a bare `cargo …` prints the `targo` spelling of
 your exact command in both lanes and then runs upstream. Two verbs are the

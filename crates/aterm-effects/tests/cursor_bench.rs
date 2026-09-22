@@ -47,6 +47,7 @@ fn config(style: GlowStyle) -> GlowConfig {
         duration: Duration::from_millis(650),
         length: usize::MAX,
         intensity: 1.0,
+        audible: true,
         radius: 0.4,
         ring: true,
         beam: false,

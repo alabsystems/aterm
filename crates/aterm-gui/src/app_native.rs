@@ -5447,10 +5447,16 @@ impl App {
             );
             self.auto_apply_manual_only = None;
             self.auto_overlap_retry = None;
-            // The retry after a genuine failure starts a fresh ladder: it
-            // prefers a quiet moment again instead of landing on its first poll
-            // because the clock ran out while the latch held.
-            self.auto_apply_ladder = None;
+            // `auto_apply_ladder` is deliberately NOT cleared either (2026-09-21).
+            // It used to be, "so the retry after a genuine failure prefers a
+            // quiet moment again" — which handed every physical failure a
+            // fresh fifteen minutes on top of its 600 s latch, and on a
+            // terminal that is never quiet meant a landing no earlier than
+            // ~20 min after the FIRST arming for one unlucky dial. The bound
+            // is per artifact, stated once, and counts from the first arming;
+            // the latch's own spacing is all the quiet-moment preference a
+            // physical retry gets. The anchor survives, the phase resumes
+            // where the clock is, and a lapse at `Land` lands at the next poll.
             // `auto_apply_physical_retry` is deliberately NOT cleared. It is the
             // budget deciding how many physical retries remain, and since a
             // physical latch now lapses too, clearing it here would hand out fresh
@@ -5816,12 +5822,13 @@ impl App {
                 let now = std::time::Instant::now();
                 // THE LADDER STARTS NOW — once per build. A re-arm of the same
                 // build (a duplicate stage wake, a superseded intent for the same
-                // bytes) keeps the anchor, so a busy terminal can only delay the
-                // landing inside the bound, never restart the clock.
-                if self
+                // bytes, a physical-failure latch lapsing) keeps the anchor, so
+                // a busy terminal or an unlucky handoff can only delay the
+                // landing, never restart the clock.
+                let ladder = self
                     .auto_apply_ladder
-                    .is_none_or(|ladder| ladder.build != build)
-                {
+                    .filter(|ladder| ladder.build == build);
+                if ladder.is_none() {
                     self.auto_apply_ladder = Some(crate::AutoApplyLadder {
                         build,
                         armed_at: now,
@@ -5832,16 +5839,32 @@ impl App {
                 // its first blocked attempt used to be debug-only, so an operator
                 // reading aterm.log could not tell an armed-and-waiting lane from a
                 // dead one (2026-08-19: twenty minutes staring at a stage that never
-                // applied, until a control apply exposed the reason).
-                aterm_log::info!(
-                    "update auto-apply armed for build {build} ({}…): lands at the first \
-                     quiet moment, and no later than {} s after arming whatever the \
-                     terminal is doing (idle preferred for {} s, then a gap in output, \
-                     then a gap in typing, then unconditionally)",
-                    &digest[..digest.len().min(12)],
-                    crate::native_update_auto_intent::LANDS_WITHIN.as_secs(),
-                    crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE.as_secs()
-                );
+                // applied, until a control apply exposed the reason). A re-arm on
+                // a retained anchor says where the ladder already stands rather
+                // than promising the bound a second time.
+                match ladder {
+                    Some(ladder) => aterm_log::info!(
+                        "update auto-apply re-armed for build {build} ({}…): {} s since it \
+                         was first armed, in the {} phase; the bound still counts from that \
+                         first arming (it lands no later than {} s after it)",
+                        &digest[..digest.len().min(12)],
+                        now.saturating_duration_since(ladder.armed_at).as_secs(),
+                        crate::native_update_auto_intent::apply_phase(
+                            now.saturating_duration_since(ladder.armed_at)
+                        )
+                        .as_str(),
+                        crate::native_update_auto_intent::LANDS_WITHIN.as_secs()
+                    ),
+                    None => aterm_log::info!(
+                        "update auto-apply armed for build {build} ({}…): lands at the first \
+                         quiet moment, and no later than {} s after arming whatever the \
+                         terminal is doing (idle preferred for {} s, then a gap in output, \
+                         then a gap in typing, then unconditionally)",
+                        &digest[..digest.len().min(12)],
+                        crate::native_update_auto_intent::LANDS_WITHIN.as_secs(),
+                        crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE.as_secs()
+                    ),
+                }
                 self.auto_apply_intent = Some(crate::AutoApplyIntent {
                     build,
                     dmg_sha256,
@@ -7323,8 +7346,7 @@ impl App {
             .is_none_or(|ladder| ladder.build != build)
         {
             // A revocation with no anchor for this build (the attempt was armed
-            // before this process learned the ladder, or the anchor was cleared
-            // by a lapse in between): the ladder starts here.
+            // before this process learned the ladder): the ladder starts here.
             self.auto_apply_ladder = Some(crate::AutoApplyLadder {
                 build,
                 armed_at: now,
@@ -12737,6 +12759,114 @@ fn apply(c: &mut Command) {
             app.auto_overlap_retry.map(|retry| retry.cycles),
             Some(ACTIVITY_REVOKED_LADDER_RUNGS + 4),
             "the spacing keeps counting past the last rung"
+        );
+    }
+
+    /// THE SECOND FINDING OF THE 2026-09-21 LADDER AUDIT, as a dead mutant: a
+    /// physical-failure latch lapsing used to clear the ladder's anchor, so one
+    /// transient dial timeout cost its 600 s latch PLUS a fresh fifteen-minute
+    /// ladder — on a never-quiet terminal, admitted at KeysOnly (~300 s), failed
+    /// at ~330 s, latched to ~930 s, then refused again until a NEW KeysOnly at
+    /// ~1230 s. The bound is per artifact and counts from the first arming; the
+    /// lapse re-arms the intent and resumes the ladder where the clock is.
+    ///
+    /// Driven through the real completion lane and the real re-arm (the Refresh
+    /// reconcile's `arm_native_auto_apply`, which lapses the latch first).
+    #[test]
+    fn a_physical_latch_lapse_resumes_the_ladder_where_the_clock_left_it() {
+        use crate::native_update_auto_intent::{ApplyPhase, LANDS_WITHIN};
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let digest = "ab".repeat(32);
+        assert!(
+            app.arm_native_auto_apply(build, &digest),
+            "PRECONDITION: automatic apply is enabled and armable for these bytes"
+        );
+        // The incident's machine: admitted at KeysOnly, ~330 s after arming.
+        let now = std::time::Instant::now();
+        let armed_at = now - std::time::Duration::from_secs(330);
+        app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+            build,
+            armed_at,
+            announced: ApplyPhase::KeysOnly,
+        });
+        assert_eq!(app.automatic_apply_phase(now), ApplyPhase::KeysOnly);
+
+        // One transient physical failure (the rendezvous dial never arrived).
+        let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &digest,
+        );
+        ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        app.abort_reaped_native_apply_before_reconcile(
+            &ticket,
+            "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+            HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+        );
+        let latch = app
+            .auto_apply_manual_only
+            .expect("a returned physical failure latches manual-only");
+        let wait = latch
+            .retry_at
+            .expect("a first transient failure schedules a retry")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > std::time::Duration::from_secs(590)
+                && wait <= std::time::Duration::from_secs(600),
+            "the physical schedule's first rung is 600 s, got {wait:?}"
+        );
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "the intent is dropped under the latch"
+        );
+        assert_eq!(
+            app.auto_apply_ladder.map(|ladder| ladder.armed_at),
+            Some(armed_at),
+            "a physical failure does not touch the anchor"
+        );
+
+        // The latch lapses. The wall clock is now past the bound measured from
+        // the FIRST arming (330 s + 600 s > 900 s): age the anchor with it and
+        // expire the deadline, then take the re-arm the Refresh reconcile takes.
+        let now = std::time::Instant::now();
+        let armed_at = now - LANDS_WITHIN - std::time::Duration::from_secs(30);
+        app.auto_apply_ladder = Some(crate::AutoApplyLadder {
+            build,
+            armed_at,
+            announced: ApplyPhase::KeysOnly,
+        });
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            retry_at: Some(now - std::time::Duration::from_secs(1)),
+            ..latch
+        });
+        assert!(
+            app.arm_native_auto_apply(build, &digest),
+            "the lapsed latch re-arms the intent for the same bytes"
+        );
+        assert!(
+            app.auto_apply_manual_only.is_none(),
+            "the latch is released"
+        );
+        assert!(app.auto_apply_intent.is_some(), "a live intent again");
+        assert_eq!(
+            app.auto_apply_ladder.map(|ladder| ladder.armed_at),
+            Some(armed_at),
+            "THE MUTANT: a lapse that clears the anchor starts a second fifteen \
+             minutes for the same artifact"
+        );
+        assert_eq!(
+            app.automatic_apply_phase(now),
+            ApplyPhase::Land,
+            "930 s after the first arming the lane is past its bound: the next poll \
+             attempts whatever the terminal is doing, not a fresh PreferIdle"
+        );
+        assert_eq!(
+            app.auto_apply_ladder.map(|ladder| ladder.announced),
+            Some(ApplyPhase::KeysOnly),
+            "the announced phase rides with the anchor, so the log carries one line \
+             per phase change and never re-announces an earlier phase"
         );
     }
 

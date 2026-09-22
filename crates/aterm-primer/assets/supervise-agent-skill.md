@@ -49,7 +49,7 @@ Two ways in:
   for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
   SID=$(aterm ctl --sock "$SOCK" spawn identity=worker | cut -d' ' -f2)  # its OWN agent login
   aterm ctl --sock "$SOCK" "@$SID" turn 'cd <workdir> && exec claude'   # launch the worker
-  aterm ctl --sock "$SOCK" "@$SID" status                   # expect detail=claude, identity=worker last
+  aterm ctl --sock "$SOCK" "@$SID" status                   # expect detail=claude and identity=worker
   ```
   `identity=worker` gives the worker its own agent identity: `CLAUDE_CONFIG_DIR`/`CODEX_HOME`
   point into `<state>/identities/worker/` (created once, 0700, primed with these skills),
@@ -113,7 +113,9 @@ of the watcher's own decisions).
 
 **Mail is your channel; the screen is the safety net.** With the fabric on (`aterm
 fabric`) and the worker's wake hooks installed (`aterm link hook install claude
---report-to "@$ME" --accept-from "$ME"` — round 12's hooks, round 14's flag; `$ME` is
+--report-to "@$ME" --accept-from "$ME"` — add `--keep-alive` if you want its `Stop`
+hook to WAIT for your mail and wake on it; without it (the round-22 default) the hook
+reports and returns, so your task needs the nudge. `$ME` is
 your own sid, `$ATERM_PARENT_SESSION_ID`; `--accept-from` is who may wake it beside
 every human, so it must name YOUR sid, `s-…` — the node id the bridge's own
 `--accept-from` lists is a different list, and without yours a `task` from you is
@@ -121,7 +123,7 @@ delivered but never woken for), the whole loop is four commands:
 
 ```sh
 aterm drive watch "@$SID" --mail --auto-reads --journal "$JOURNAL" --resume "$RULES"   # under ONE Monitor: one line per worker turn
-aterm drive task "@$SID" --no-nudge 'run the suite and report'       # assign: the body goes by mail (the hook wakes it)
+aterm drive task "@$SID" 'run the suite and report'                  # assign: body by mail + a one-line nudge
 aterm ctl @self inbox get <id>                                       # read the report the EVENT turn line names
 aterm drive ledger "@$SID" --journal "$JOURNAL"                      # replay the run
 ```
@@ -180,14 +182,34 @@ The steps below are the same loop by hand, and what `watch` does for you; an old
    |---|---|
    | `busy` — a live spinner or `Waiting for N …` row just above the composer, `esc to interrupt`, or a shell or monitor still running | WAIT — not a review point yet. A monitor alone is soft busy: a question or a limit notice under it reads `question` / `limited`, because a monitor can run for hours |
    | the busy indicator that *was* there is now gone | the turn finished → go REVIEW |
-   | `prompt` — an approval box (`Do you want…`, `1. Yes / 2. No`, trust-folder prompt) | read WHAT it asks. Matches the task and is safe → approve GUARDED on a row the box shows: `aterm ctl "@$SID" key if=Do.you.want.to.proceed 1` (the option's number, or `enter`); `OK skipped seq=<n>` = NO VISIBLE ROW matched your regex and nothing was pressed — which is equally true when the box is GONE and when a *different* box is up (an Edit box asks `Do you want to make this edit to …?`, a workflow box `Run a dynamic workflow?`). Re-read the screen and classify what is actually there; re-pressing the same guard just skips again. Surprising, destructive, or off-task → deny (`key escape`) and redirect, or ESCALATE |
+   | `prompt` — an approval box (`Do you want…`, `1. Yes / 2. No`, a trust-folder box): what makes a screen `prompt` is a LIVE `Esc to cancel` row, and a box without one is no `prompt` to `phase` | read WHAT it asks. Matches the task and is safe → approve GUARDED on a row the box shows: `aterm ctl "@$SID" key if=Do.you.want.to.proceed 1` (the option's number, or `enter`); `OK skipped seq=<n>` = NO VISIBLE ROW matched your regex and nothing was pressed — which is equally true when the box is GONE and when a *different* box is up (an Edit box asks `Do you want to make this edit to …?`, a workflow box `Run a dynamic workflow?`). Re-read the screen and classify what is actually there; re-pressing the same guard just skips again. Surprising, destructive, or off-task → deny (`key escape`) and redirect, or ESCALATE |
    | Claude Code's permission prompt: the command line, then `Do you want to proceed?` with numbered options — `1.` Yes (this once), `2.` Yes and don't ask again for a SCOPE (`git log *`, `allow reading from <dir>`), one option `switch to auto mode`, the last `No`; footer `Esc to cancel · Tab to amend` | classify the COMMAND LINE, not the box — the `classify` line `phase` printed, or `aterm drive classify '<command>'`. Read-only and the scope on option 2 is a read-only grant → option 2 (it removes a whole class of future prompts; see *Auto-approving reads*). A write or delete → judge that one command; option 1 at most, never the scope grant. **Never pick `switch to auto mode` unless the human said so.** Off-task or unsafe → `key escape` and redirect, or ESCALATE |
    | `limited` — its last turn ended on a usage or rate limit notice (`You've hit your session limit · resets 7:30pm`) | the worker cannot act until the limit resets or its model is switched; anything you send it fails. Decide per the human's policy — wait for `reset`, switch with `/model`, or ESCALATE — and never keep driving into the wall |
    | `question` — a prose question, composer idle | answer it with a `turn`, from your notes |
    | `idle` — nothing running, no box, no question | the turn is over → go REVIEW |
-   | a non-TUI worker (build/script/REPL) still streaming output (`phase` running) | WAIT — for these, completion is a returned shell prompt or `phase=exited`, at which point go REVIEW via the **exit code + expected artifacts**, not a busy indicator |
+   | a non-TUI worker (build/script/REPL) still streaming output (`drive phase` says `busy`; `ctl status` says `phase=running`) | WAIT — for these, completion is a returned shell prompt or `phase=exited`, at which point go REVIEW via the **exit code + expected artifacts**, not a busy indicator |
    | a shell prompt where an *interactive agent* used to be | that agent exited — check why, relaunch + re-brief, or ESCALATE (a build returning to the prompt is normal completion, see the row above) |
    | anything you cannot confidently read | **NEVER type into an unknown screen** — ESCALATE |
+
+   **The harness answers one class of box itself.** With aterm's hooks installed (they
+   are, by default: `aterm agents` shows the `hooks` row), a worker running with bypass
+   permissions on has the vendor's `Dangerous rm operation on possibly-empty variable path`
+   box answered for it WHEN every removal target's variables resolve on the line to paths
+   outside the critical classes (`S=/tmp/x; … set -- $pair; rm -rf $S/$1` runs as
+   `rm -rf ${S:?}/${1:?}`): the `permission-request` hook guards, allows, and tells the
+   window `story approved` — the same `✓ approved` your own approvals show. A form it
+   cannot resolve or guard (`${DIR:-…}`, `$HOME` or `$TMPDIR` as the whole target, a
+   variable from `read` or a sourced file, a `$(…)` in the target, `xargs rm`, a
+   traversing glob, a here-document) is left up like every other box, and about six
+   seconds later the vendor's own "needs you" ESCALATES it: the worker's `attention`
+   meta reads `claude needs approval: …` (`aterm ctl "@$SID" meta`, `ls` shows
+   `meta=1`, `status` reads `level=attention`), a worker installed with
+   `--report-to @<you>` posts you a kind=ask, and the box waits for YOUR judgment as
+   above. `phase` prints the box's `note` rows (the vendor's own reason) after
+   `description`. The attention clears at the worker's next session start, human
+   prompt, stop or guarded allow (or tool call, where `--gate-tools` installed that
+   hook) — never at the box itself; after a `No` (which interrupts the turn) it clears
+   when the worker is next told what to do.
 
    **The placeholder rule.** Text in the composer with the cursor at column 2 is Claude
    Code's DIM suggestion, not typed input and not a question — measured: `❯ m7 is
@@ -453,7 +475,7 @@ things keep that from happening again:
 ### Assign work by mail: `aterm drive task`
 
 ```sh
-aterm drive task "@$SID" --no-nudge --deadline 1800 'run the suite; report the counts'   # a worker with the wake hook
+aterm drive task "@$SID" --deadline 1800 'run the suite; report the counts'   # --no-nudge ONLY if installed --keep-alive
 aterm drive task "@$SID" 'run the suite; report the counts'                              # no hook: nudged when idle
 aterm drive task "@$SID" --wait --deadline 600 'which branch is this?'                   # park for the answer
 ```
@@ -463,10 +485,12 @@ are not inside aterm) and never goes through the worker's PTY: it prints `task @
 nudged=0|1` once the post LANDED (`off=` is what the worker's `inbox` row shows and its
 answer carries as `re=`). Without `--no-nudge` it reads the worker's phase once and, ONLY
 when idle, types the one-line `Inbox: task @<off>` as a turn (not waited on); a busy
-worker gets the mail alone. A worker with round 12's hooks that accept you (`aterm link
-hook install claude --accept-from "$ME"`) wakes on its next Stop and needs `--no-nudge`
-— a nudge over that is a second turn; hooks that do not list your sid deliver the task
-and wake nobody, so nudge. A post that did not land is the error in the server's words:
+worker gets the mail alone. A worker installed `--keep-alive` whose hooks accept you
+(`aterm link hook install claude --keep-alive --accept-from "$ME"`) wakes on its next
+Stop and can take `--no-nudge` — a nudge over that is a second turn. WITHOUT
+`--keep-alive` (the round-22 default) the Stop hook reports and returns, so nothing
+wakes it: `--no-nudge` there posts the task and leaves it unread. Hooks that do not
+list your sid deliver the task and wake nobody either. When in doubt, nudge. A post that did not land is the error in the server's words:
 `queued=1` means it
 is in the outbox and WILL land when a bridge drains it (never re-post), `no-bridge=1`
 that this instance has no bridge at all. `--wait` parks `await inbox` on your inbox for
@@ -517,7 +541,7 @@ token ANYWHERE fails the line — `rm mv cp tee …`, a git write (`push pull co
 checkout …`, `stash`/`worktree` other than `list`), a redirect to anything but
 `/dev/null` or an fd (`2>&1`, `>&2`), `sed -i`, `python3 -c`, `bash|sh|zsh -c`, `perl -e`, a `python3 - <<`
 heredoc, `find -delete`, `find -exec` unless it feeds `du/ls/cat/head/wc/stat/file/grep`,
-`xargs rm|mv|cp`; then every segment's head (split on `;`, `&&`, `||`, `|`, `$( … )`)
+`xargs rm|mv|cp`; then every segment's head (split on `;`, `&`, `&&`, `||`, `|`, `$( … )`)
 must be a known read-only program — `git` only with a read-only subcommand, `python3`
 only a script on the `--allow-python` globs, an unknown program is not a read. A tie
 breaks toward `not-read-only`. `git log && rm -rf .` opens read-only and is refused; so

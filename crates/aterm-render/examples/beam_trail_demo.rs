@@ -37,6 +37,7 @@ fn cfg() -> GlowConfig {
         duration: Duration::from_millis(260),
         length: 24,
         intensity: 0.9,
+        audible: true,
         // The beam ships bloom-free from the host: no crown, no ring.
         radius: 0.0,
         ring: false,
