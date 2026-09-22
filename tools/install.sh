@@ -1736,17 +1736,29 @@ uninstall_everything() {
 	# reach out and delete the real /Applications/aterm.app.
 	local app_dirs=(/Applications "$HOME/Applications")
 	[[ -n "${ATERM_INSTALL_DIR:-}" ]] && app_dirs=("$ATERM_INSTALL_DIR")
+	# `aterm.app.rollback` is swept BESIDE `aterm.app`, under the same identity
+	# check. The updater's apply renames the outgoing bundle to that fixed name
+	# (crates/aterm-update/src/install.rs `rollback_path`) and normally collects
+	# it at the first healthy boot; a wedged trial leaves it behind. Uninstalling
+	# and leaving it there is worse than untidy: it is a complete, signed bundle
+	# carrying aterm's CFBundleIdentifier, and macOS keeps ONE code requirement
+	# per identifier — a stray claimant resets Full Disk Access for anything that
+	# ever shares that id again. Measured 2026-09-21: two such leftovers on the
+	# owner's Mac destroyed three grants in 55 seconds. The identity check is
+	# what keeps this ours to delete.
 	for dir in "${app_dirs[@]}"; do
-		app="$dir/aterm.app"
-		[[ -d "$app" ]] || continue
-		plist="$app/Contents/Info.plist"
-		id=""
-		[[ -f "$plist" ]] && id="$(defaults read "$plist" CFBundleIdentifier 2>/dev/null || true)"
-		if [[ "$id" == "com.aterm.aterm" ]]; then
-			_rm "$app" "app bundle"
-		else
-			_skip "$app" "not an aterm bundle (CFBundleIdentifier=${id:-unreadable})"
-		fi
+		for name in aterm.app aterm.app.rollback; do
+			app="$dir/$name"
+			[[ -d "$app" ]] || continue
+			plist="$app/Contents/Info.plist"
+			id=""
+			[[ -f "$plist" ]] && id="$(defaults read "$plist" CFBundleIdentifier 2>/dev/null || true)"
+			if [[ "$id" == "com.aterm.aterm" ]]; then
+				_rm "$app" "app bundle"
+			else
+				_skip "$app" "not an aterm bundle (CFBundleIdentifier=${id:-unreadable})"
+			fi
+		done
 	done
 
 	# 2. the `aterm` symlink — only when it still resolves into a bundle or our
